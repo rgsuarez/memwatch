@@ -180,7 +180,13 @@ local function startTopStream()
   if topTask then return end
   topStream = procs.newTopStream()
   topTask = hs.task.new("/usr/bin/top",
-    guard("topstream-exit", function() topTask = nil end),
+    guard("topstream-exit", function(exitCode, _, stdErr)
+      topTask = nil
+      -- A dying stream is a fact worth recording: it is the attribution
+      -- lifeline under load, and the next interesting tick respawns it.
+      M.logSnapshot(string.format("topstream-exit:%s:%s",
+        tostring(exitCode), tostring(stdErr):sub(1, 80):gsub("%s+", " ")))
+    end),
     function(_, stdOut)
       local ok, err = pcall(function()
         local published = procs.feedTopStream(topStream, stdOut or "")
@@ -196,7 +202,12 @@ local function startTopStream()
       return true  -- keep streaming
     end,
     TOPSTREAM_ARGS)
-  if topTask then topTask:start() end
+  if topTask then
+    topTask:start()
+    M.logSnapshot("topstream-start")
+  else
+    logError("topstream-spawn", "hs.task.new returned nil")
+  end
 end
 
 ------------------------------------------------------------------------------
@@ -501,10 +512,28 @@ local function launchSampler(onDone)
     sampleTask = nil
   end
   sampleStartedAt = now
-  sampleTask = hs.task.new("/bin/sh", guard("sampler", function(exitCode, stdOut)
-    sampleTask = nil
-    onDone((exitCode == 0 and stdOut) and stdOut or "")
-  end), { "-c", SAMPLER_CMD })
+  -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
+  -- without a streaming drain hs.task never reads the pipe, ps blocks
+  -- mid-write, and the task deadlocks until the watchdog TERMs it (observed
+  -- live as intermittent sampler death that tracked the process count).
+  -- The streaming callback exists purely to drain; assembly happens at exit.
+  local acc = {}
+  sampleTask = hs.task.new("/bin/sh",
+    guard("sampler", function(exitCode)
+      sampleTask = nil
+      -- Keep partial output even on a nonzero exit: under memory pressure ps
+      -- can fail mid-table, and a partial process list beats a blank one.
+      -- The parsers treat garbage as calm, never as alarm.
+      if exitCode ~= 0 then
+        logError("sampler-exit", "code " .. tostring(exitCode))
+      end
+      onDone(table.concat(acc))
+    end),
+    function(_, stdOut)
+      acc[#acc + 1] = stdOut or ""
+      return true
+    end,
+    { "-c", SAMPLER_CMD })
   if sampleTask then sampleTask:start() end
 end
 
@@ -758,6 +787,27 @@ function M.stop()
   stopTopStream()
   flashState = nil
   if menu then menu:delete(); menu = nil end
+end
+
+-- Field diagnostics, for `hs -c "print(hs.inspect(memwatch.debug()))"`.
+function M.debug()
+  local now = hs.timer.secondsSinceEpoch()
+  local tracked = 0
+  for _ in pairs(tracker.procs) do tracked = tracked + 1 end
+  return {
+    state          = smState.state,
+    kern           = lastKern,
+    rates          = { swapOut = lastRates.swapOut, comp = lastRates.comp },
+    streamAlive    = topTask ~= nil,
+    topCacheAgeSec = topCache.at > 0 and math.floor(now - topCache.at) or -1,
+    sampleAgeSec   = lastSampleAt > 0 and math.floor(now - lastSampleAt) or -1,
+    tracked        = tracked,
+    runs           = #lastRuns,
+    ranked         = #lastRanked,
+    offender       = lastOffender and string.format("%s(%d)%s", lastOffender.name,
+                       lastOffender.pid, lastOffender.kind and "/" .. lastOffender.kind or "") or nil,
+    watch          = titleSnap.watchName,
+  }
 end
 
 -- One-line current state, for `hs -c "memwatch.status()"`.

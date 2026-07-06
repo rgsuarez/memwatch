@@ -204,12 +204,31 @@ local function decodeString(s, i)
 end
 
 local function decodeNumber(s, i)
-  local numstr = s:match("^-?%d+%.?%d*[eE]?[+-]?%d*", i)
-  if not numstr or not numstr:match("^-?%d") then
-    return decodeError(i, "invalid number")
+  -- Strict JSON number grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+  -- Scanned in three anchored parts so a trailing bare dot (`1.`), an empty
+  -- fraction before an exponent (`1.e2`), or an empty exponent (`1e`) FAIL
+  -- CLOSED rather than being coerced by a permissive tonumber.
+  local j = i
+  if s:sub(j, j) == "-" then j = j + 1 end
+  -- integer part: 0 alone, or [1-9][0-9]*
+  local intPart = s:match("^0", j) or s:match("^[1-9]%d*", j)
+  if not intPart then return decodeError(i, "invalid number") end
+  j = j + #intPart
+  -- optional fraction: a dot MUST be followed by at least one digit
+  if s:sub(j, j) == "." then
+    local frac = s:match("^%d+", j + 1)
+    if not frac then return decodeError(i, "invalid number (empty fraction)") end
+    j = j + 1 + #frac
   end
-  -- Reject leading zeros like 0123 (strict JSON).
-  if numstr:match("^-?0%d") then return decodeError(i, "leading zero") end
+  -- optional exponent: [eE][+-]?[0-9]+ (at least one digit required)
+  if s:sub(j, j):match("[eE]") then
+    local k = j + 1
+    if s:sub(k, k):match("[+-]") then k = k + 1 end
+    local exp = s:match("^%d+", k)
+    if not exp then return decodeError(i, "invalid number (empty exponent)") end
+    j = k + #exp
+  end
+  local numstr = s:sub(i, j - 1)
   local n = tonumber(numstr)
   if not n or n ~= n or n == math.huge or n == -math.huge then
     return decodeError(i, "non-finite number")

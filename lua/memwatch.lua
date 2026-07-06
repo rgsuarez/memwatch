@@ -1230,6 +1230,11 @@ end
 -- One retire discipline for every exit path (calm, timeout, self-police,
 -- stop): TERM, wait up to 5s for BOTH process exit and port release, else
 -- KILL. Clears all server state; the offline latch is the caller's call.
+-- Before /health passes, the tracked pid is the taskpolicy task and the
+-- real listener may be a child, so retire targets BOTH the tracked pid AND
+-- whatever is actually bound to the port, and only declares success once the
+-- port is free (not merely the tracked pid gone), so a pre-health child can
+-- never be orphaned still holding the port.
 local function retireLfmServer(reason)
   local pid, port = lfmServerPid, lfmServerPort
   lfmServerReady = false
@@ -1240,14 +1245,26 @@ local function retireLfmServer(reason)
   protectedPids = { [selfPid] = true }
   if not pid then return end
   M.logSnapshot(string.format("lfm-retire:%s:pid=%d", reason or "?", pid))
-  sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
+  -- Signal the tracked pid AND the actual port listener (may be a child).
+  local function signalTargets(sig)
+    if pid then sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, pid)) end
+    if port then
+      local owner = listenerPid(port)
+      if owner and owner ~= pid then
+        sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, owner))
+      end
+    end
+  end
+  signalTargets("TERM")
   local deadline = hs.timer.secondsSinceEpoch() + 5
   hs.timer.doUntil(
     function()
+      -- Success requires the PORT free (not just the tracked pid gone), so an
+      -- orphaned child still bound to the port keeps the wait alive.
       local gone = not pidAlive(pid) and (not port or portFree(port))
       if gone then return true end
       if hs.timer.secondsSinceEpoch() > deadline then
-        sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
+        signalTargets("KILL")
         return hs.timer.secondsSinceEpoch() > deadline + 3
       end
       return false

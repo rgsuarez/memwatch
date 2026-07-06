@@ -35,6 +35,7 @@ scan_file() {
   local f="$1"
   case "$f" in
     eval/checks/no-internal-refs.sh) return 0 ;;  # the pattern list itself
+    lua/memwatch_report.lua|test_report.lua) return 0 ;; # emit/assert the league sentinel as a string literal; rendered ARTIFACTS carrying it are the leak class
     *.gguf|*.png) return 0 ;;                      # binary artifacts
   esac
   for pat in "${PATTERNS[@]}"; do

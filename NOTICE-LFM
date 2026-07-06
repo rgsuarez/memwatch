@@ -1,0 +1,9 @@
+The optional LFM adjudication feature downloads Liquid Foundation Model
+(LFM2.5) weights from Hugging Face at install time. Those weights are
+NOT part of this repository and are licensed separately under the
+LFM Open License v1.0 (an Apache-2.0-based license with a revenue
+threshold; see licenses/LFM-Open-License-v1.0.txt for the full text,
+fetched from the model repository and hash-pinned in scripts/models.tsv).
+
+Model weights copyright Liquid AI, Inc. This repository's code is MIT
+licensed (see LICENSE) and carries no model weights.

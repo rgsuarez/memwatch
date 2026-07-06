@@ -1,0 +1,13 @@
+# label	hf_repo	filename	sha256	license_sha256
+# The download registry: get-model.sh and the bake-off fetch exclusively
+# through these rows. resolve URL = https://huggingface.co/<hf_repo>/resolve/main/<filename>
+# sha256 pinned at first verified download (PENDING until then); license
+# hash pins licenses/LFM-Open-License-v1.0.txt.
+230M-Q4_K_M	LiquidAI/LFM2.5-230M-GGUF	LFM2.5-230M-Q4_K_M.gguf	7bbd90384d3deffe4c646ec9643b212802d32d4ce417c90a1ec9282100650062	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+230M-Q8_0	LiquidAI/LFM2.5-230M-GGUF	LFM2.5-230M-Q8_0.gguf	PENDING	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+350M-Q4_K_M	LiquidAI/LFM2.5-350M-GGUF	LFM2.5-350M-Q4_K_M.gguf	PENDING	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+350M-Q8_0	LiquidAI/LFM2.5-350M-GGUF	LFM2.5-350M-Q8_0.gguf	PENDING	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+1.2B-Q4_K_M	LiquidAI/LFM2.5-1.2B-Instruct-GGUF	LFM2.5-1.2B-Instruct-Q4_K_M.gguf	PENDING	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+1.2B-Q8_0	LiquidAI/LFM2.5-1.2B-Instruct-GGUF	LFM2.5-1.2B-Instruct-Q8_0.gguf	PENDING	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+1.2B-Thinking-Q4_K_M	LiquidAI/LFM2.5-1.2B-Thinking-GGUF	LFM2.5-1.2B-Thinking-Q4_K_M.gguf	PENDING	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+8B-A1B-Q4_K_M	LiquidAI/LFM2.5-8B-A1B-GGUF	LFM2.5-8B-A1B-Q4_K_M.gguf	PENDING	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b

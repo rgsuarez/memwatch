@@ -431,7 +431,9 @@ M.OUTPUT_SCHEMA = {
   type = "object",
   properties = {
     action = { type = "string", enum = { "wait", "freeze", "terminate" } },
-    process_class = { type = "string", maxLength = 40 },
+    process_class = { type = "string", enum = {
+      "runaway", "hog", "build", "llm-server", "browser", "vm", "db",
+      "backup", "indexer", "other" } },
     confidence = { type = "number", minimum = 0, maximum = 1 },
     rationale = { type = "string", maxLength = 240 },
   },
@@ -440,6 +442,12 @@ M.OUTPUT_SCHEMA = {
 }
 
 -- opts: { maxTokens, schema = true|false (default true) }.
+-- The response_format shape is the OpenAI-nested one llama-server actually
+-- enforces: {type="json_schema", json_schema={name, strict, schema}}. The
+-- flat {type, schema} variant is SILENTLY IGNORED (verified live against
+-- build 9870: the model echoed the prompt template with extra keys, which
+-- enforced grammar makes impossible). The toolchain probe gate re-verifies
+-- this on every setup.
 function M.buildRequestBody(systemPrompt, userContent, opts)
   opts = opts or {}
   local body = {
@@ -452,7 +460,10 @@ function M.buildRequestBody(systemPrompt, userContent, opts)
     cache_prompt = true,
   }
   if opts.schema ~= false then
-    body.response_format = { type = "json_schema", schema = M.OUTPUT_SCHEMA }
+    body.response_format = {
+      type = "json_schema",
+      json_schema = { name = "verdict", strict = true, schema = M.OUTPUT_SCHEMA },
+    }
   end
   return M.jsonEncode(body)
 end

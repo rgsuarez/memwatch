@@ -34,6 +34,45 @@ local prevCounters, prevCountersAt = nil, nil
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
+------------------------------------------------------------------------------
+-- logging and error containment
+------------------------------------------------------------------------------
+
+local LOG_MAX_BYTES = 1e6
+
+-- Append a line, rotating to .1 when the log exceeds the cap.
+local function appendLog(line)
+  local f = io.open(LOG_PATH, "a")
+  if not f then return end
+  if f:seek("end") > LOG_MAX_BYTES then
+    f:close()
+    os.rename(LOG_PATH, LOG_PATH .. ".1")
+    f = io.open(LOG_PATH, "a")
+    if not f then return end
+  end
+  f:write(line)
+  f:close()
+end
+
+-- Failures in timers and task callbacks land here (rate-limited per label)
+-- instead of dying silently in the Hammerspoon console.
+local lastErrorAt = {}
+local function logError(label, err)
+  local now = os.time()
+  if (now - (lastErrorAt[label] or 0)) < 60 then return end
+  lastErrorAt[label] = now
+  appendLog(string.format("%s state=%s reason=error:%s err=%s\n",
+    os.date("%Y-%m-%d %H:%M:%S"), smState.state, label, tostring(err)))
+end
+
+-- Wrap a callback so an error can never kill the loop that owns it.
+local function guard(label, fn)
+  return function(...)
+    local ok, err = pcall(fn, ...)
+    if not ok then logError(label, err) end
+  end
+end
+
 local LOG_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch.log"
 
 -- RGB (0-1) per level. Apple system green / orange / red.
@@ -54,13 +93,13 @@ end
 
 -- Sample memory metrics. Native hs.host.vmStat() first (no fork, and it
 -- carries the cumulative counters the rate signals need); the vm_stat popen
--- path survives only as a fallback.
+-- path survives only as a fallback. Swap usage and the kernel pressure level
+-- arrive asynchronously from the consolidated sampler fork.
 local lastSwapBytes = 0
 
 local function readMetrics()
   local ok, v = pcall(hs.host.vmStat)
   if ok and type(v) == "table" and v.pageSize then
-    lastSwapBytes = core.parseSwapUsed(sh("/usr/sbin/sysctl -n vm.swapusage"))
     return core.metricsFromVmStat(v, lastSwapBytes)
   end
   local vmText   = sh("/usr/bin/vm_stat")
@@ -179,17 +218,62 @@ function M.logSnapshot(reason)
     "%s state=%s reason=%s kern=%d swapout=%.0f comprate=%.0f comp=%.1fGB swap=%.1fGB avail=%.0f%%\n",
     os.date("%Y-%m-%d %H:%M:%S"), smState.state, reason or "", lastKern,
     lastRates.swapOut, lastRates.comp, m.compGB, m.swapGB, m.availPct)
-  local f = io.open(LOG_PATH, "a")
-  if f then f:write(line); f:close() end
+  appendLog(line)
 end
 
 ------------------------------------------------------------------------------
 -- main loop
 ------------------------------------------------------------------------------
 
-local function tick(silent)
+-- One consolidated fork per tick carries everything the native API cannot
+-- provide: the kernel pressure verdict, swap usage, and the process list.
+-- ~32 ms measured; always async so the main thread never blocks, with an
+-- in-flight guard so a wedged fork skips ticks instead of stacking tasks.
+local SAMPLER_CMD = "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level vm.swapusage; "
+                 .. "/bin/ps -Axo pid,uid,rss,comm -m | /usr/bin/head -40"
+local SAMPLE_WATCHDOG_SEC = 20
+
+local sampleTask, sampleStartedAt = nil, 0
+local lastPsBlob = ""   -- consumed by the process tracker
+
+local function launchSampler(onDone)
   local now = hs.timer.secondsSinceEpoch()
-  local m = readMetrics()
+  if sampleTask then
+    if (now - sampleStartedAt) < SAMPLE_WATCHDOG_SEC then return end
+    pcall(function() sampleTask:terminate() end)
+    sampleTask = nil
+  end
+  sampleStartedAt = now
+  sampleTask = hs.task.new("/bin/sh", guard("sampler", function(exitCode, stdOut)
+    sampleTask = nil
+    onDone((exitCode == 0 and stdOut) and stdOut or "")
+  end), { "-c", SAMPLER_CMD })
+  if sampleTask then sampleTask:start() end
+end
+
+-- Second half of the tick, run when the sampler fork returns. All state
+-- decisions live here because they need the kernel verdict.
+local function onSample(blob)
+  local now = hs.timer.secondsSinceEpoch()
+  local samp = core.parseSampler(blob)
+  lastKern = samp.kernLevel
+  if blob ~= "" then lastSwapBytes = samp.swapBytes end
+  lastPsBlob = blob
+  lastMetrics.swapGB = lastSwapBytes / 1e9
+  local sig = core.signals(lastMetrics, lastRates, lastKern, false)
+  local state, changed, reason = core.smStep(smState, sig, now)
+  titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", lastMetrics.availPct)
+  if changed then M.logSnapshot("state:" .. reason) end
+  if state == "critical" then notifyCrit(lastMetrics) end
+  -- Drive the flash from flashState, not just transitions, so the animation
+  -- always matches the real state and self-heals (e.g. after a self-test).
+  if state ~= flashState then applyFlash(state) end
+  if not flashTimer then renderTitleNow() end
+end
+
+local function tick()
+  local now = hs.timer.secondsSinceEpoch()
+  local m = readMetrics()   -- native, fork-free
   lastMetrics = m
   -- Activity rates from the cumulative counter deltas.
   if m.counters then
@@ -201,20 +285,10 @@ local function tick(silent)
     end
     prevCounters, prevCountersAt = m.counters, now
   end
-  -- Kernel verdict (sync for now; the consolidated async sampler replaces this).
-  lastKern = tonumber(sh("/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level")) or 1
-  local sig = core.signals(m, lastRates, lastKern, false)
-  local state, changed, reason = core.smStep(smState, sig, now)
-  titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
-  if changed and not silent then M.logSnapshot("state:" .. reason) end
-  if state == "critical" then notifyCrit(m) end
-  -- Drive the flash from flashState, not just transitions, so the animation
-  -- always matches the real state and self-heals (e.g. after a self-test).
-  if state ~= flashState then applyFlash(state) end
-  -- Repaint the title every tick. The flash timer used to do this as a side
-  -- effect; with the steady dot there is no other repaint path, and the title
-  -- would otherwise freeze at whatever value it had when the state last changed.
+  -- Repaint the title every tick from what is already known, even when the
+  -- fork is skipped: the gauge must keep breathing while the system is dying.
   if not flashTimer then renderTitleNow() end
+  launchSampler(onSample)
 end
 
 ------------------------------------------------------------------------------
@@ -225,11 +299,18 @@ function M.start()
   M.stop()
   menu = hs.menubar.new()
   if not menu then return M end
-  menu:setMenu(buildMenu)         -- recomputed fresh on every click
+  -- Recomputed fresh on every click; a menu-build error must never leave a
+  -- dead menu, so it degrades to a pointer at the log instead.
+  menu:setMenu(function()
+    local ok, items = pcall(buildMenu)
+    if ok then return items end
+    logError("menu", items)
+    return { { title = "memwatch: menu error (see memwatch.log)", disabled = true } }
+  end)
   smState = core.newSMState(hs.timer.secondsSinceEpoch())
   flashState = nil                -- force first tick to set the flash state
   renderTitleNow()
-  pollTimer = hs.timer.doEvery(core.cfg.pollSec, tick)
+  pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
   tick()                          -- immediate first sample
   return M
 end
@@ -237,6 +318,7 @@ end
 function M.stop()
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
+  if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
   flashState = nil
   if menu then menu:delete(); menu = nil end
 end
@@ -270,12 +352,12 @@ function M.test(level, seconds)
     lastNotifyAt = 0
     notifyCrit(lastMetrics)
   end
-  hs.timer.doAfter(dur, function()
+  hs.timer.doAfter(dur, guard("test-resume", function()
     smState = core.newSMState(hs.timer.secondsSinceEpoch())
     titleSnap = {}
-    pollTimer = hs.timer.doEvery(core.cfg.pollSec, tick)  -- resume live sampling
-    tick(true)                                            -- silent revert to the real state
-  end)
+    pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
+    tick()                                                -- revert to the real state
+  end))
   return string.format("memwatch.test(%s) running for %ds (live sampling paused)", state, dur)
 end
 

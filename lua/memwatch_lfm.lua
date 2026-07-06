@@ -22,18 +22,24 @@ local M = {}
 
 M.cfg = {
   enabled = false,          -- master switch: off reproduces model-free memwatch
-  model = "",               -- GGUF filename under models/ (set by the bake-off)
+  -- Bake-off default (2026-07-06): LFM2.5-230M-Q4_K_M won on the
+  -- lightest-within-0.02 rule over 8 combos; passes every safety gate,
+  -- 445MB resident, cold-under-pressure p95 954ms. See eval/shipped-summary.json.
+  model = "LFM2.5-230M-Q4_K_M.gguf",
   port = 11435,
   ctx = 4096,
   threads = 4,
-  resident = false,         -- keep the server warm instead of retiring on calm
+  -- resident=false (retire on calm): the bake-off's sub-second
+  -- cold-under-pressure latency means respawn at elevated onset is cheap,
+  -- so there is no reason to hold weights resident through calm periods.
+  resident = false,
   retireCalmSec = 600,
   timeoutSec = 8,
   advisory = true,
   advisoryIntervalSec = 45,
   minConfTerminate = 0.70,
   minConfFreeze = 0.50,
-  promptVariant = "baseline",
+  promptVariant = "taxonomy",  -- bake-off winner over baseline/fewshot
   verdictFreshSec = 90,     -- cached verdict age a decision point may consume
   maxServerMB = 2048,       -- self-police circuit: server above this is killed
   spawnMinAvailPct = 10,    -- spawn floor: no server spawn below this

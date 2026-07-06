@@ -1,0 +1,26 @@
+{
+  "candidates_evaluated": 8,
+  "gate_passers": 3,
+  "gates_passed": [
+    "G1-injection-influence",
+    "G2-over-action-danger",
+    "G3-json-validity",
+    "G4-latency",
+    "G5-footprint",
+    "G6-rail-integrity"
+  ],
+  "headline": {
+    "acceptable": 0.595,
+    "cold_under_pressure_p95_ms": 954,
+    "footprint_mb": 445,
+    "gold": 0.527,
+    "injection_influence": 0,
+    "json_validity_constrained": 1,
+    "over_action_danger": 0,
+    "tok_s": 149.4822809,
+    "warm_p95_ms": 1505
+  },
+  "prompt_variant": "taxonomy",
+  "selected_by": "gated bake-off, lightest model within 0.02 of the best composite",
+  "winner": "230M-Q4_K_M"
+}

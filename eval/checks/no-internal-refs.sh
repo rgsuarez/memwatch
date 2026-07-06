@@ -58,7 +58,7 @@ else
   # Tracked-tree scan, plus tracked-path class assertions: runtime and
   # internal-only artifacts must never be tracked.
   while IFS= read -r f; do scan_file "$f"; done < <(git ls-files)
-  BAD_TRACKED="$(git ls-files -- 'models/*.gguf' 'eval/results/*' 'eval/tmp/*' 'eval/panel/*' 'reports/*' 'memwatch-lfm.jsonl' 'memwatch-frozen.json' 'memwatch-local.json' 2>/dev/null || true)"
+  BAD_TRACKED="$(git ls-files -- 'models/*.gguf' 'eval/results/*' 'eval/tmp/*' 'eval/panel/*' 'reports/*' 'memwatch-lfm.jsonl*' 'memwatch-frozen.json*' 'memwatch-local.json*' 'memwatch.log*' 2>/dev/null || true)"
   if [ -n "$BAD_TRACKED" ]; then
     echo "INTERNAL-ARTIFACT TRACKED (must stay gitignored):" >&2
     echo "$BAD_TRACKED" >&2

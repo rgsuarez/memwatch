@@ -29,10 +29,12 @@ local LEDGER = table.concat({
   '{"at":"2026-07-06T16:43:53Z","outcome_for":"2026-07-06T16:42:53Z","action":"freeze","adjudicator":"deterministic-fallback","fate":"frozen","availPctBefore":10,"availPctAfter":10}',
   'garbage line that must be skipped',
   '{"action":"terminate","adjudicator":"lfm","at":"2026-07-06T17:00:00Z","confidence":0.9,"latencyMs":800,"offender":{"kind":"extreme","name":"node","weightMB":8000},"rationale":"sustained 8GB/min growth"}',
+  '{"at":"2026-07-06T17:01:00Z","outcome_for":"2026-07-06T17:00:00Z","action":"terminate","adjudicator":"lfm","fate":"exited","availPctBefore":9,"availPctAfter":27}',
 }, "\n")
 local decisions, outcomes = report.parseLedger(LEDGER)
 check("ledger: decisions parsed", #decisions, 3)
 check("ledger: outcome keyed", outcomes["2026-07-06T16:42:53Z"] ~= nil, true)
+check("ledger: terminate outcome keyed", outcomes["2026-07-06T17:00:00Z"] ~= nil, true)
 check("ledger: garbage skipped", decisions[2].action, "freeze")
 
 -- ---- watchdog log parsing ----
@@ -55,10 +57,16 @@ check("log: actions attributed", #episodes[1].actions, 2)
 -- ---- aggregation ----
 local agg = report.aggregate(decisions, outcomes, episodes)
 check("agg: decisions", agg.decisions, 3)
-check("agg: interventions exclude advisory", agg.interventions, 2)
+-- Interventions are only counted when a terminal outcome corroborates them:
+-- the freeze (fate=frozen) and the terminate (fate=exited) both have outcomes.
+check("agg: interventions require an outcome", agg.interventions, 2)
 check("agg: action mix", agg.waits .. "/" .. agg.freezes .. "/" .. agg.terminates, "1/1/1")
 check("agg: fallback counted", agg.byAdjudicator["deterministic-fallback"], 1)
-check("agg: relief positive", agg.reliefGBmin > 0, true)
+-- Relief is reclaimed memory: ONLY the terminate that exited contributes.
+check("agg: relief from terminate only", agg.reliefGBmin > 0, true)
+-- The freeze holds memory: reported as growth-stopped, never relief.
+check("agg: freeze counted as stopped", agg.freezeStopped, 1)
+check("agg: freeze held GB tracked", agg.freezeHeldGB > 0, true)
 check("agg: relief cap stated", agg.reliefCapMin, 60)
 check("agg: latencies collected", #agg.latencies, 2)
 check("agg: episodes counted", agg.episodeCount, 2)

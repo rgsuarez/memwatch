@@ -53,7 +53,7 @@ local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
 local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
-local unattendedFiredFor = {} -- [pid] = epoch of the last unattended adjudication
+local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
 local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
@@ -764,9 +764,21 @@ local function alertSurfaces(state, now)
     local mode = core.resolveUnattended(core.cfg)
     if mode ~= "off" and offender and offender.kind == "extreme"
        and hud and hud:isShowing() and not hudInteracted and not hudHold
-       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec
-       and (now - (unattendedFiredFor[offender.pid] or 0)) >= core.cfg.cool.autoKillGraceSec then
-      unattendedFiredFor[offender.pid] = now
+       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec then
+      -- Bind the offender's start time BEFORE reading the fired/streak state:
+      -- a same-name pid reuse (a new node/python reusing the pid) must NOT
+      -- inherit the prior process's fired stamp or wait streak. The entry
+      -- carries lstart; a mismatch resets it (a fresh offender starts clean).
+      local bound = probePid(offender.pid)
+      local lstart = bound and bound.lstart or nil
+      local fired = unattendedFiredFor[offender.pid]
+      if fired and fired.lstart and lstart and fired.lstart ~= lstart then
+        unattendedFiredFor[offender.pid] = nil
+        unattendedWaitStreak[offender.pid] = nil
+        fired = nil
+      end
+      if (now - ((fired and fired.at) or 0)) >= core.cfg.cool.autoKillGraceSec then
+      unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
       local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
       M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
         action, offender.name, offender.pid, adjudicator))
@@ -783,18 +795,17 @@ local function alertSurfaces(state, now)
           if hud then hud[3].text = "AUTO: " .. text end
           if done then hs.timer.doAfter(6, guard("hud-close", function() M.hideHud() end)) end
         end
-        -- Bind the offender's start time NOW so the autonomous signal (and
-        -- its TERM->KILL escalation seconds later) can never act on a pid
-        -- reused since this decision. Autonomous action is where a wrong
-        -- target destroys work, so identity is bound most strictly here.
-        local bound = probePid(offender.pid)
-        local lstart = bound and bound.lstart or nil
+        -- The bound start time also protects the autonomous signal (and its
+        -- TERM->KILL escalation seconds later) from acting on a pid reused
+        -- since this decision. Autonomous action is where a wrong target
+        -- destroys work, so identity is bound most strictly here.
         if action == "terminate" then
           M.killPid(offender.pid, offender.name, narrate, { expectedLstart = lstart })
         else
           M.freezePid(offender.pid, offender.name, narrate,
             { weightMB = offender.weightMB, expectedLstart = lstart })
         end
+      end
       end
     end
   else

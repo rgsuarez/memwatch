@@ -139,6 +139,8 @@ function M.aggregate(decisions, outcomes, episodes)
     reliefCapMin = RELIEF_CAP_MIN,
     latencies = {},
     confidences = {},
+    freezeStopped = 0,   -- freeze actions (growth stopped, memory NOT reclaimed)
+    freezeHeldGB = 0,    -- GB held frozen (not released; the honest framing)
     episodeCount = #episodes,
     episodeMinutes = { lfm = {}, fallback = {}, none = {} },
     timeline = {},
@@ -150,30 +152,35 @@ function M.aggregate(decisions, outcomes, episodes)
     elseif d.action == "freeze" then agg.freezes = agg.freezes + 1
     elseif d.action == "terminate" then agg.terminates = agg.terminates + 1 end
     if d.action ~= "wait" and adjudicator ~= "lfm-advisory" then
-      agg.interventions = agg.interventions + 1
       local out = outcomes[d.at]
+      -- An intervention is only COUNTED as executed when a terminal outcome
+      -- record corroborates it (the decision alone does not prove the signal
+      -- landed - it can be refused for pid reuse, policy, or exit).
+      local executed = out and (out.fate == "exited" or out.fate == "frozen")
+      if executed then agg.interventions = agg.interventions + 1 end
       local heldGB = ((d.offender or {}).weightMB or 0) / 1024
-      -- Observed relief window: action to episode end. Relief is claimed
-      -- ONLY when the action actually correlates with a bounded episode (a
-      -- matching critical episode, or a recorded exited/frozen outcome);
-      -- an action with no correlate contributes ZERO, never a floor of 1
-      -- minute, so the number stays an honest observation.
-      local minutes = 0
-      local at = parseIso(d.at)
-      if at then
-        for _, ep in ipairs(episodes) do
-          if ep.stop and at >= ep.start - 60 and at <= (ep.stop + 60) then
-            minutes = math.max(minutes, (ep.stop - at) / 60)
-            break
+      -- MEMORY RELIEF is reclaimed memory, so ONLY a terminate that actually
+      -- exited counts: a freeze (SIGSTOP) STOPS GROWTH but holds every page
+      -- resident, so it is tracked separately as growth-stopped time, never
+      -- as GB relieved. When the outcome recorded a real availability delta,
+      -- prefer that measured reclaim over the held-GB estimate.
+      if executed and out.fate == "exited" and d.action == "terminate" then
+        local minutes = 0
+        local at = parseIso(d.at)
+        if at then
+          for _, ep in ipairs(episodes) do
+            if ep.stop and at >= ep.start - 60 and at <= (ep.stop + 60) then
+              minutes = math.max(minutes, (ep.stop - at) / 60)
+              break
+            end
           end
         end
-      end
-      -- A recorded terminal outcome corroborates at least the follow-up
-      -- window (60s) of relief even if no episode boundary was captured.
-      if out and (out.fate == "exited" or out.fate == "frozen") then
         minutes = math.max(minutes, 1)
+        agg.reliefGBmin = agg.reliefGBmin + heldGB * math.min(minutes, RELIEF_CAP_MIN)
+      elseif executed and out.fate == "frozen" then
+        agg.freezeStopped = agg.freezeStopped + 1
+        agg.freezeHeldGB = agg.freezeHeldGB + heldGB
       end
-      agg.reliefGBmin = agg.reliefGBmin + heldGB * math.min(minutes, RELIEF_CAP_MIN)
     end
     if type(d.latencyMs) == "number" then agg.latencies[#agg.latencies + 1] = d.latencyMs end
     if type(d.confidence) == "number" then agg.confidences[#agg.confidences + 1] = d.confidence end
@@ -267,9 +274,11 @@ function M.renderHTML(agg, opts)
   -- Scoreboard.
   w("<h2>Scoreboard</h2><div class='grid'>")
   w(string.format("<div class='stat'><div class='n'>%d</div><div class='l'>adjudications</div></div>", agg.decisions))
-  w(string.format("<div class='stat'><div class='n'>%d</div><div class='l'>interventions</div></div>", agg.interventions))
-  w(string.format("<div class='stat'><div class='n blue'>%.0f</div><div class='l'>GB-minutes relieved (cap %d min/action)</div></div>",
+  w(string.format("<div class='stat'><div class='n'>%d</div><div class='l'>interventions executed</div></div>", agg.interventions))
+  w(string.format("<div class='stat'><div class='n blue'>%.0f</div><div class='l'>GB-minutes relieved by terminate (cap %d min/action)</div></div>",
     agg.reliefGBmin, agg.reliefCapMin))
+  w(string.format("<div class='stat'><div class='n'>%d</div><div class='l'>freezes: growth stopped, %.1f GB held (not released)</div></div>",
+    agg.freezeStopped, agg.freezeHeldGB))
   w(string.format("<div class='stat'><div class='n'>%.0f%%</div><div class='l'>deterministic fallback share</div></div>",
     agg.fallbackRate * 100))
   w("<div class='stat'><div class='n green'>$0</div><div class='l'>marginal inference cost<span class='chip'>local CPU; cloud LLM call priced $0.002+</span></div></div>")
@@ -361,7 +370,8 @@ function M.renderHTML(agg, opts)
   w("<h2>Honest metrics glossary</h2><div class='card glossary'>")
   w("<div>ADJUDICATIONS: ledger decision records, advisory and acting.</div>")
   w("<div>INTERVENTIONS: non-wait actions executed by the unattended path (advisory verdicts excluded).</div>")
-  w(string.format("<div>GB-MINUTES RELIEVED: held GB of an acted-on offender times observed minutes from action to episode end, capped at %d min per action. Says nothing about what would have happened otherwise.</div>", agg.reliefCapMin))
+  w(string.format("<div>GB-MINUTES RELIEVED: reclaimed memory only - a TERMINATE that actually exited, its held GB times observed minutes to episode end, capped at %d min per action. A FREEZE stops growth but holds every page resident, so it is reported separately (freezes: GB held), never as relief.</div>", agg.reliefCapMin))
+  w("<div>INTERVENTIONS EXECUTED: acting decisions corroborated by a terminal outcome record (exited/frozen); a decision alone is not counted, since the signal can be refused for pid reuse, policy, or exit.</div>")
   w("<div>EPISODE DURATION: wall time from entering critical to leaving it, split by cohort; the cohorts are differently selected populations and are not a controlled comparison.</div>")
   w("<div>MARGINAL COST: local CPU inference on hardware already owned; the comparison chip prices one hosted-LLM call at typical published rates.</div>")
   w("<div>No crashes-prevented or counterfactual claims appear in this report.</div>")

@@ -1,12 +1,14 @@
-# Runtime output: regenerated on threshold crossings, not source.
-memwatch.log
+# Runtime output: regenerated on threshold crossings, not source. The
+# trailing * catches rotated files (memwatch.log.1, memwatch-lfm.jsonl.1),
+# which carry the same local process history and must never be committed.
+memwatch.log*
 *.log
 
-# LFM adjudication runtime artifacts (never tracked).
+# LFM adjudication runtime artifacts (never tracked; rotations included).
 models/
-memwatch-lfm.jsonl
-memwatch-frozen.json
-memwatch-local.json
+memwatch-lfm.jsonl*
+memwatch-frozen.json*
+memwatch-local.json*
 reports/
 
 # Evaluation artifacts: full results and panel workspaces stay local.

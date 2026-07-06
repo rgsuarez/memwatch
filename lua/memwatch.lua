@@ -185,6 +185,117 @@ local function applyFlash(state)
 end
 
 ------------------------------------------------------------------------------
+-- alert HUD (hs.canvas): the reliable one-click surface. Never steals
+-- keyboard focus (clickActivating false), floats on every Space, and there is
+-- only ever one instance, reused.
+------------------------------------------------------------------------------
+
+local hud            = nil
+local hudShownAt     = 0
+local hudInteracted  = false
+local hudHold        = false  -- a kill narrative owns the body text
+local hudBelowCritSince = nil
+local lastHudRaiseAt = 0
+local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind } at raise
+local autoKillFiredFor = {}
+
+local HUD_W, HUD_H = 380, 150
+
+local function hudFrame()
+  local scr = hs.screen.mainScreen()
+  local f = scr and scr:fullFrame() or { x = 0, y = 0, w = 1440, h = 900 }
+  return { x = f.x + f.w - HUD_W - 20, y = f.y + 37, w = HUD_W, h = HUD_H }
+end
+
+function M.hideHud()
+  if hud then hud:hide() end
+  hudOffender = nil
+  hudHold = false
+end
+
+local function hudBodyText()
+  if hudOffender then
+    local slope = (hudOffender.slopeMBmin and hudOffender.slopeMBmin > 0)
+      and string.format(", +%.0f MB/min", hudOffender.slopeMBmin) or ""
+    return string.format("%s (pid %d)\n%.1f GB%s",
+      hudOffender.name, hudOffender.pid, (hudOffender.weightMB or 0) / 1024, slope)
+  end
+  return "No single offender identified.\n" .. (titleSnap.causeTag or "")
+end
+
+local function buildHud()
+  if hud then return hud end
+  hud = hs.canvas.new(hudFrame())
+  hud:level(hs.canvas.windowLevels.overlay)
+  hud:behaviorAsLabels({ "canJoinAllSpaces", "stationary" })
+  if hud.clickActivating then hud:clickActivating(false) end
+  hud:canvasMouseEvents(false, true, false, false)  -- mouseUp only
+  hud[1] = { id = "bg", type = "rectangle", action = "fill",
+             roundedRectRadii = { xRadius = 12, yRadius = 12 },
+             fillColor = { red = 0.11, green = 0.11, blue = 0.12, alpha = 0.94 } }
+  hud[2] = { id = "title", type = "text", frame = { x = 16, y = 10, w = HUD_W - 60, h = 24 },
+             text = "Memory CRITICAL",
+             textColor = { red = 1, green = 0.32, blue = 0.28, alpha = 1 },
+             textSize = 15, textFont = "Menlo-Bold" }
+  hud[3] = { id = "body", type = "text", frame = { x = 16, y = 38, w = HUD_W - 32, h = 58 },
+             text = "", textColor = { white = 0.92, alpha = 1 },
+             textSize = 12, textFont = "Menlo" }
+  local function button(idx, id, x, w, label, fill)
+    hud[idx] = { id = id, type = "rectangle", action = "fill",
+                 frame = { x = x, y = HUD_H - 44, w = w, h = 30 },
+                 roundedRectRadii = { xRadius = 7, yRadius = 7 },
+                 fillColor = fill, trackMouseUp = true }
+    hud[idx + 1] = { id = id .. "-label", type = "text",
+                     frame = { x = x, y = HUD_H - 40, w = w, h = 22 },
+                     text = label, textAlignment = "center",
+                     textColor = { white = 1, alpha = 0.95 },
+                     textSize = 12, textFont = "Menlo-Bold", trackMouseUp = true }
+  end
+  button(4, "kill",    16,  120, "Force Quit",   { red = 0.75, green = 0.16, blue = 0.13, alpha = 1 })
+  button(6, "ignore",  148, 100, "Ignore 30m",   { white = 0.28, alpha = 1 })
+  button(8, "monitor", 260, 104, "Activity Mon", { white = 0.28, alpha = 1 })
+  hud[10] = { id = "close", type = "text", frame = { x = HUD_W - 30, y = 8, w = 22, h = 22 },
+              text = "\u{2715}", textAlignment = "center",
+              textColor = { white = 0.6, alpha = 1 }, textSize = 13, trackMouseUp = true }
+  hud:mouseCallback(guard("hud-click", function(_, evt, id)
+    if evt ~= "mouseUp" then return end
+    hudInteracted = true
+    if id == "kill" or id == "kill-label" then
+      if hudOffender then
+        local target = hudOffender
+        hudHold = true
+        M.killPid(target.pid, target.name, function(text, done)
+          if hud then hud[3].text = text end
+          if done then
+            hs.timer.doAfter(4, guard("hud-close", function() M.hideHud() end))
+          end
+        end)
+      end
+    elseif id == "ignore" or id == "ignore-label" then
+      if hudOffender then M.ignore(hudOffender.pid, hudOffender.name) end
+      M.hideHud()
+    elseif id == "monitor" or id == "monitor-label" then
+      hs.application.launchOrFocus("Activity Monitor")
+    elseif id == "close" then
+      M.hideHud()
+    end
+  end))
+  return hud
+end
+
+local function raiseHud(offender, titleText)
+  buildHud()
+  hudOffender = offender
+  hudInteracted = false
+  hudHold = false
+  hudShownAt = hs.timer.secondsSinceEpoch()
+  hud:frame(hudFrame())
+  hud[2].text = titleText or "Memory CRITICAL"
+  hud[3].text = hudBodyText()
+  hud:show()
+end
+
+------------------------------------------------------------------------------
 -- menu, notification, logging
 ------------------------------------------------------------------------------
 
@@ -256,12 +367,21 @@ local function notifyCrit(m)
     if i > 3 then break end
     names[#names + 1] = string.format("%s (%.1f GB)", p.name, p.weightMB / 1024)
   end
-  hs.notify.new({
-    title           = "Memory pressure: CRITICAL",
-    subTitle        = sub,
-    informativeText = "Top: " .. table.concat(names, ", "),
-    withdrawAfter   = 0,      -- stays in Notification Center until dismissed
-    hasActionButton = false,
+  -- Action button is best-effort: macOS only renders it reliably when
+  -- Hammerspoon notifications are set to the Alerts style. The HUD is the
+  -- dependable one-click surface; this is the breadcrumb.
+  local off = lastOffender
+  hs.notify.new(guard("notify-action", function(notif)
+    if off and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
+      M.killPid(off.pid, off.name)
+    end
+  end), {
+    title             = "Memory pressure: CRITICAL",
+    subTitle          = sub,
+    informativeText   = "Top: " .. table.concat(names, ", "),
+    withdrawAfter     = 0,      -- stays in Notification Center until dismissed
+    hasActionButton   = off ~= nil,
+    actionButtonTitle = off and "Force Quit" or nil,
     -- intentionally no soundName: alerts are silent by design
   }):send()
 end
@@ -355,7 +475,51 @@ local function onSample(blob)
 
   if state ~= "ok" or #kept > 0 then topRefresh() end
   if changed then M.logSnapshot("state:" .. reason) end
-  if state == "critical" then notifyCrit(lastMetrics) end
+
+  -- Alert surfaces: the HUD is the actionable one, the notification the
+  -- breadcrumb. One reusable HUD, raise-cooldown gated, a new offender
+  -- preempts the cooldown, and the body tracks live numbers unless a kill
+  -- narrative owns it.
+  if state == "critical" then
+    hudBelowCritSince = nil
+    local visible = hud and hud:isShowing()
+    if not visible then
+      local newOffender = offender and (not hudOffender or hudOffender.pid ~= offender.pid)
+      if (now - lastHudRaiseAt) >= core.cfg.cool.hudRaiseSec or newOffender then
+        lastHudRaiseAt = now
+        raiseHud(offender)
+      end
+    elseif not hudHold then
+      hudOffender = offender or hudOffender
+      hud[3].text = hudBodyText()
+    end
+    notifyCrit(lastMetrics)
+    -- Last-resort auto-kill: opt-in, extreme growers only, HUD unanswered.
+    if core.cfg.autoKill and offender and offender.kind == "extreme"
+       and hud and hud:isShowing() and not hudInteracted and not hudHold
+       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec
+       and not autoKillFiredFor[offender.pid] then
+      autoKillFiredFor[offender.pid] = true
+      M.logSnapshot(string.format("auto-kill:%s(%d)", offender.name, offender.pid))
+      hs.notify.new({ title = "memwatch auto-kill",
+                      subTitle = string.format("%s (pid %d)", offender.name, offender.pid),
+                      informativeText = "Extreme runaway, no response to the alert.",
+                      withdrawAfter = 0 }):send()
+      hudHold = true
+      M.killPid(offender.pid, offender.name, function(text, done)
+        if hud then hud[3].text = "AUTO: " .. text end
+        if done then hs.timer.doAfter(6, guard("hud-close", function() M.hideHud() end)) end
+      end)
+    end
+  else
+    if hud and hud:isShowing() then
+      hudBelowCritSince = hudBelowCritSince or now
+      if (now - hudBelowCritSince) >= 10 and not hudHold then M.hideHud() end
+    else
+      hudBelowCritSince = nil
+    end
+  end
+
   -- Drive the flash from flashState, not just transitions, so the animation
   -- always matches the real state and self-heals (e.g. after a self-test).
   if state ~= flashState then applyFlash(state) end
@@ -533,15 +697,47 @@ function M.test(level, seconds)
   applyFlash(state)
   if state == "critical" then
     lastNotifyAt = 0
+    lastOffender = { pid = 99999, name = "FakeProc", weightMB = 22 * 1024,
+                     slopeMBmin = 12000, kind = "extreme" }
     notifyCrit(lastMetrics)
+    -- Clicking Force Quit here is safe: pid 99999 probes as already exited.
+    raiseHud(lastOffender, "Memory CRITICAL (self-test)")
   end
   hs.timer.doAfter(dur, guard("test-resume", function()
+    M.hideHud()
+    lastOffender = nil
     smState = core.newSMState(hs.timer.secondsSinceEpoch())
     titleSnap = {}
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
     tick()                                                -- revert to the real state
   end))
   return string.format("memwatch.test(%s) running for %ds (live sampling paused)", state, dur)
+end
+
+-- Full alert-surface demo with a synthetic runaway: red title, HUD, and
+-- notification, no real process involved (the kill probe reports it already
+-- exited). Usage: hs -c "memwatch.simulate()"
+function M.simulate(seconds)
+  local dur = tonumber(seconds) or 20
+  if pollTimer then pollTimer:stop(); pollTimer = nil end
+  smState.state = "critical"
+  smState.since = hs.timer.secondsSinceEpoch()
+  local fake = { pid = 99999, name = "SimRunaway", weightMB = 22 * 1024,
+                 slopeMBmin = 12000, kind = "extreme" }
+  lastOffender = fake
+  titleSnap = { offenderName = fake.name, offenderGB = fake.weightMB / 1024, causeTag = "SWAP" }
+  applyFlash("critical")
+  if not flashTimer then renderTitleNow() end
+  raiseHud(fake, "Runaway process (simulation)")
+  hs.timer.doAfter(dur, guard("simulate-end", function()
+    M.hideHud()
+    lastOffender = nil
+    smState = core.newSMState(hs.timer.secondsSinceEpoch())
+    titleSnap = {}
+    pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
+    tick()
+  end))
+  return string.format("memwatch.simulate running for %ds (live sampling paused)", dur)
 end
 
 _G.memwatch = M  -- expose for the hs CLI

@@ -32,10 +32,13 @@ M.cfg = {
   growthExtremeMBmin = 9000,  -- 150 MB/s over the rising tail
   nRisingExtreme     = 4,     -- rising samples for the streak route (~20s)
   extremeNetMB       = 6000,  -- net window growth route (still-climbing gate)
-  extremeLatchSec    = 45,    -- once extreme, stays extreme this long unless
-                              -- the footprint clearly deflates: interleaved
-                              -- feeds make the rising tail choppy, and the
-                              -- escalation to critical must not flap with it
+  extremeLatchSec    = 45,    -- once extreme, stays extreme this long:
+                              -- interleaved feeds make the rising tail
+                              -- choppy, and RSS collapsing under active
+                              -- compression must never read as recovery
+  runawayFreshSec    = 12,    -- only pids seen alive this recently can be
+                              -- runaways, so a killed process clears the
+                              -- list within two ticks despite the latch
   -- Absolute footprint: attribution only, and only once the system is
   -- critical, so a steady 20 GB model server never alarms on size alone.
   absFrac            = 0.40,  -- fraction of total RAM
@@ -252,34 +255,33 @@ function M.runaways(tr, now, systemState, totalMB)
   local cfg = tr.cfg
   local out = {}
   for pid, e in pairs(tr.procs) do
-    local slope, rising, span = growth(e.ring, cfg.risingEpsMB)
-    local netMB = (#e.ring >= 2) and (e.ring[#e.ring].v - e.ring[1].v) or 0
-    local kind
-    if (slope >= cfg.growthExtremeMBmin and rising >= cfg.nRisingExtreme)
-       or (netMB >= cfg.extremeNetMB and rising >= 2) then
-      kind = "extreme"
-      e.extremeUntil = now + cfg.extremeLatchSec
-    elseif slope >= cfg.growthMBmin and rising >= cfg.nRising and span >= cfg.minWindowSec then
-      kind = "sustained"
-    elseif systemState == "critical" and totalMB and (e.weightMB or 0) >= cfg.absFrac * totalMB then
-      kind = "absolute"
-    end
-    -- Latch: an extreme verdict survives choppy ticks until it expires or
-    -- the footprint visibly deflates (the process died, was killed, or
-    -- released its memory).
-    if kind ~= "extreme" and e.extremeUntil and now < e.extremeUntil then
-      local n = #e.ring
-      local recentNet = (n >= 3) and (e.ring[n].v - e.ring[n - 2].v) or 0
-      if recentNet > -(cfg.risingEpsMB * 4) then
+    -- Only pids seen alive recently can be runaways: the extreme latch below
+    -- must not keep a killed process on the books.
+    if (now - (e.lastSeen or 0)) <= cfg.runawayFreshSec then
+      local slope, rising, span = growth(e.ring, cfg.risingEpsMB)
+      local netMB = (#e.ring >= 2) and (e.ring[#e.ring].v - e.ring[1].v) or 0
+      local kind
+      if (slope >= cfg.growthExtremeMBmin and rising >= cfg.nRisingExtreme)
+         or (netMB >= cfg.extremeNetMB and rising >= 2) then
         kind = "extreme"
-      else
-        e.extremeUntil = nil
+        e.extremeUntil = now + cfg.extremeLatchSec
+      elseif slope >= cfg.growthMBmin and rising >= cfg.nRising and span >= cfg.minWindowSec then
+        kind = "sustained"
+      elseif systemState == "critical" and totalMB and (e.weightMB or 0) >= cfg.absFrac * totalMB then
+        kind = "absolute"
       end
-    end
-    if kind then
-      out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,
-                        rssMB = e.rssMB or 0, weightMB = e.weightMB or e.rssMB or 0,
-                        slopeMBmin = slope, kind = kind }
+      -- Latch: an extreme verdict holds for its full window. No deflation
+      -- release on purpose: under active compression the kernel collapses a
+      -- runaway's RSS while it is still growing, and that must never read
+      -- as recovery. A genuinely recovered process ages out with the latch.
+      if kind ~= "extreme" and e.extremeUntil and now < e.extremeUntil then
+        kind = "extreme"
+      end
+      if kind then
+        out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,
+                          rssMB = e.rssMB or 0, weightMB = e.weightMB or e.rssMB or 0,
+                          slopeMBmin = slope, kind = kind }
+      end
     end
   end
   local rank = { extreme = 3, sustained = 2, absolute = 1 }

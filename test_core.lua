@@ -325,10 +325,25 @@ procs.update(trLatch, { row(94, 2000 + 5 * 1600, "latchy") }, 30)  -- flat tick
 procs.update(trLatch, { row(94, 2000 + 5 * 1600, "latchy") }, 35)  -- flat tick
 local latched = procs.runaways(trLatch, 35, "ok", 36864)
 check("latch: survives choppy flat ticks", latched[1] and latched[1].kind, "extreme")
-procs.update(trLatch, { row(94, 900, "latchy") }, 40)   -- clearly deflating
+-- RSS collapsing under compression must NOT release the latch
+procs.update(trLatch, { row(94, 900, "latchy") }, 40)
 procs.update(trLatch, { row(94, 850, "latchy") }, 45)
-local released = procs.runaways(trLatch, 45, "ok", 36864)
-check("latch: releases on deflation", #released, 0)
+local held = procs.runaways(trLatch, 45, "ok", 36864)
+check("latch: rss collapse does not release", held[1] and held[1].kind, "extreme")
+-- but a killed pid (absent from updates) leaves the books within freshSec
+local gone = procs.runaways(trLatch, 45 + PC.runawayFreshSec + 1, "ok", 36864)
+check("latch: dead pid clears fast", #gone, 0)
+-- and the latch itself expires
+local trExp = procs.newTracker(PC)
+for i = 0, 5 do
+  procs.update(trExp, { row(93, 2000 + i * 1600, "expiry") }, i * 5)
+end
+check("latch: expiry precondition", procs.runaways(trExp, 25, "ok", 36864)[1].kind, "extreme")
+for t = 30, 30 + PC.extremeLatchSec + 10, 5 do
+  procs.update(trExp, { row(93, 10000, "expiry") }, t)
+end
+local expired = procs.runaways(trExp, 30 + PC.extremeLatchSec + 10, "ok", 36864)
+check("latch: expires after its window", #expired, 0)
 
 -- but two consecutive flat ticks still end the streak (plateau stays silent).
 local trFlat = procs.newTracker(PC)

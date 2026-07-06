@@ -123,6 +123,12 @@ toggle. See [docs/lfm-adjudication.md](docs/lfm-adjudication.md) and the
 [bake-off methodology](docs/bakeoff-methodology.md); the model weights are
 licensed separately (`NOTICE-LFM`).
 
+Every adjudication lands in a local decision ledger, and the **Open value
+report** menu item renders it into a self-contained dashboard with every
+metric operationally defined:
+
+![memwatch value report](docs/report-scoreboard.png)
+
 ## Layout
 
 ```

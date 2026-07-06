@@ -652,6 +652,24 @@ check("request: maxTokens override", (lfm.jsonDecode(lfm.buildRequestBody("s", "
 local reqNoSchema = lfm.jsonDecode(lfm.buildRequestBody("s", "u", { schema = false }))
 check("request: schema off", reqNoSchema and reqNoSchema.response_format, nil)
 
+-- ---- LFM: killAllowed protectedPids + unattended shim ----
+check("kill: protected pid refused",
+  (core.killAllowed({ pid = 5555, uid = UID, comm = "llama-server" }, UID, 999, nil, { [5555] = true })), false)
+local _, whyProt = core.killAllowed({ pid = 5555, uid = UID, comm = "llama-server" }, UID, 999, nil, { [5555] = true })
+check("kill: protected pid reason", whyProt, "protected pid (memwatch)")
+check("kill: unprotected still allowed",
+  (core.killAllowed({ pid = 6000, uid = UID, comm = "python3" }, UID, 999, nil, { [5555] = true })), true)
+check("kill: self still denied under protected set",
+  (core.killAllowed({ pid = 999, uid = UID, comm = "python3" }, UID, 999, nil, { [5555] = true })), false)
+check("kill: 3-arg call still valid (nil protected)",
+  (core.killAllowed({ pid = 6000, uid = UID, comm = "python3" }, UID, 999)), true)
+-- The compat-shim + rails composition (autoKill legacy path preserved).
+check("unattended: default off", core.resolveUnattended({ unattended = "off", autoKill = false }), "off")
+check("unattended: explicit freeze", core.resolveUnattended({ unattended = "freeze", autoKill = false }), "freeze")
+check("unattended: explicit kill", core.resolveUnattended({ unattended = "kill", autoKill = false }), "kill")
+check("unattended: autoKill shim -> kill", core.resolveUnattended({ unattended = "off", autoKill = true }), "kill")
+check("unattended: explicit wins over shim", core.resolveUnattended({ unattended = "freeze", autoKill = true }), "freeze")
+
 -- ---- LFM: scenario corpus schema lint ----
 local CLASS_COUNTS = {
   ["extreme-runaway"] = 10, ["build-burst"] = 6, ["llm-server"] = 6,

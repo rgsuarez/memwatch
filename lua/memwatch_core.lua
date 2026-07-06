@@ -57,10 +57,21 @@ M.cfg = {
     hudRaiseSec      = 60,   -- min seconds between HUD raises (a new offender preempts)
     autoKillGraceSec = 60,   -- HUD unanswered this long before auto-kill (if enabled)
   },
-  -- Last-resort auto-kill. OFF by default: enable only once the detector has
-  -- earned trust. When on, it fires only for an extreme-growth runaway while
-  -- the system is critical, after the HUD has gone unanswered for the grace
-  -- window, and only if the kill policy allows the target.
+  -- Unattended action at critical + grace expiry. The deterministic
+  -- autonomous layer (successor to autoKill), model-free and shipping in
+  -- Phase 0:
+  --   "off"    alert only, exactly today's default
+  --   "freeze" SIGSTOP the offender (reversible; memory not released)
+  --   "kill"   SIGTERM/SIGKILL the offender
+  -- It fires only for an extreme-growth runaway while critical, after the
+  -- HUD has gone unanswered for the grace window, and only if the kill
+  -- policy allows the target. When the LFM feature is enabled and a fresh
+  -- verdict is available, the glue consults it to refine the action within
+  -- the "off"|"freeze"|"kill" ceiling; the model never widens it.
+  unattended = "off",
+  -- Compat shim: the old boolean still works. autoKill=true maps to
+  -- unattended="kill" (see M.resolveUnattended); leave it false and set
+  -- unattended directly for new config.
   autoKill = false,
   -- One-click kill behavior and its safety rails.
   kill = {
@@ -297,16 +308,32 @@ end
 ------------------------------------------------------------------------------
 
 -- proc = { pid, uid, comm }. Same-uid only, curated basename denylist, never
--- init and never the host process. Returns allowed, reason.
-function M.killAllowed(proc, ownUid, selfPid, cfg)
+-- init and never the host process. protectedPids (optional 5th arg) is a
+-- pid-set { [pid]=true } refused outright; the glue builds it from the
+-- watchdog pid and its own llama-server so memwatch can never signal its
+-- adjudicator. It is an explicit fifth argument, NOT a cfg field, because
+-- cfg here is a full replace (cfg = cfg or M.cfg), so a partial cfg table
+-- would silently drop the denylist. Returns allowed, reason.
+function M.killAllowed(proc, ownUid, selfPid, cfg, protectedPids)
   cfg = cfg or M.cfg
   if not proc or not proc.pid then return false, "no process" end
   if proc.pid <= 1 then return false, "protected pid" end
   if selfPid and proc.pid == selfPid then return false, "own process" end
+  if protectedPids and protectedPids[proc.pid] then return false, "protected pid (memwatch)" end
   if proc.uid ~= ownUid then return false, "not your process" end
   local base = (proc.comm or ""):match("([^/]+)$") or ""
   if cfg.kill.deny[base] then return false, "protected process" end
   return true, "ok"
+end
+
+-- Resolve the effective unattended mode, honoring the autoKill compat shim.
+-- Explicit unattended wins; autoKill=true with unattended unset -> "kill".
+function M.resolveUnattended(cfg)
+  cfg = cfg or M.cfg
+  if cfg.unattended and cfg.unattended ~= "off" then return cfg.unattended end
+  if cfg.unattended == "off" and not cfg.autoKill then return "off" end
+  if cfg.autoKill then return "kill" end
+  return "off"
 end
 
 ------------------------------------------------------------------------------

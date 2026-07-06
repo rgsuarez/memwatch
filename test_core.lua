@@ -464,6 +464,45 @@ local _, whyDeny = core.killAllowed({ pid = 500, uid = UID, comm = "Finder" }, U
 check("kill: denylist reason", whyDeny, "protected process")
 check("kill: nil proc denied", (core.killAllowed(nil, UID, 999)), false)
 
+-- ---- split-scope guard ----
+-- A top-level `local X` referenced by a function defined ABOVE it silently
+-- splits into a global writer and a local reader. This class caused three
+-- live incidents (dead logging blocked the kill path; a detector flag the
+-- state machine never saw; a broken menu). Scan every module: no top-level
+-- local may be referenced on an earlier line than its declaration.
+local function earlyRefs(path)
+  local lines = {}
+  for line in io.lines(path) do lines[#lines + 1] = line end
+  local decls = {}
+  for i, line in ipairs(lines) do
+    local names = line:match("^local%s+([%w_,%s]+)=") or line:match("^local%s+([%w_,%s]+)$")
+    if names and not line:match("^local%s+function") then
+      for name in names:gmatch("[%w_]+") do
+        if not decls[name] then decls[name] = i end
+      end
+    end
+  end
+  local bad = {}
+  for name, declLine in pairs(decls) do
+    for i = 1, declLine - 1 do
+      local code = lines[i]:gsub('"[^"]*"', '""'):gsub("'[^']*'", "''"):gsub("%-%-.*$", "")
+      for pos in code:gmatch("()" .. name:gsub("(%W)", "%%%1") .. "%f[%W]") do
+        if not code:sub(pos - 1, pos - 1):match("[%w_%.]") then
+          bad[#bad + 1] = string.format("%s: %s declared L%d, referenced L%d", path, name, declLine, i)
+          break
+        end
+      end
+    end
+  end
+  return bad
+end
+
+for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua" }) do
+  local bad = earlyRefs(path)
+  for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end
+  check("split-scope clean: " .. path, #bad, 0)
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

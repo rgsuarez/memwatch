@@ -525,6 +525,66 @@ local line = lfm.ledgerLine({ action = "wait", hash = "00000000" })
 check("ledger: newline-terminated", line:sub(-1), "\n")
 check("ledger: valid json", (lfm.jsonDecode(line:sub(1, -2)) or {}).action, "wait")
 
+-- ---- LFM: verdict validation (untrusted model reply) ----
+local vOk = lfm.validateVerdict({ action = "freeze", process_class = "runaway", confidence = 0.9, rationale = "r" })
+check("verdict: happy action", vOk and vOk.action, "freeze")
+check("verdict: happy class", vOk and vOk.process_class, "runaway")
+check("verdict: missing action rejected", (lfm.validateVerdict({ confidence = 1 })), nil)
+check("verdict: bad action rejected", (lfm.validateVerdict({ action = "reboot" })), nil)
+check("verdict: non-table rejected", (lfm.validateVerdict("terminate")), nil)
+check("verdict: bad class -> other", (lfm.validateVerdict({ action = "wait", process_class = "nuke" }) or {}).process_class, "other")
+check("verdict: missing class -> other", (lfm.validateVerdict({ action = "wait" }) or {}).process_class, "other")
+check("verdict: conf clamps high", (lfm.validateVerdict({ action = "wait", confidence = 7 }) or {}).confidence, 1)
+check("verdict: conf clamps low", (lfm.validateVerdict({ action = "wait", confidence = -2 }) or {}).confidence, 0)
+check("verdict: conf non-number -> 0", (lfm.validateVerdict({ action = "wait", confidence = "high" }) or {}).confidence, 0)
+check("verdict: rationale control chars stripped", (lfm.validateVerdict({ action = "wait", rationale = "a\nb\1c" }) or {}).rationale, "a b c")
+check("verdict: rationale clamped", #((lfm.validateVerdict({ action = "wait", rationale = string.rep("x", 500) }) or {}).rationale), 240)
+local vWhitelist = lfm.validateVerdict({ action = "wait", pid = 1234, extra = "smuggle" })
+check("verdict: unknown fields dropped", vWhitelist and vWhitelist.pid == nil and vWhitelist.extra == nil, true)
+
+-- ---- LFM: parseResponse (chat-completions envelope) ----
+local envelope = '{"choices":[{"message":{"content":"{\\"action\\":\\"wait\\",\\"confidence\\":0.5}"}}]}'
+check("parse: happy envelope", (lfm.parseResponse(envelope) or {}).action, "wait")
+check("parse: no choices", (lfm.parseResponse('{"ok":true}')), nil)
+check("parse: content not json", (lfm.parseResponse('{"choices":[{"message":{"content":"sorry, I refuse"}}]}')), nil)
+check("parse: content not object", (lfm.parseResponse('{"choices":[{"message":{"content":"42"}}]}')), nil)
+check("parse: body garbage", (lfm.parseResponse("<html>502</html>")), nil)
+
+-- ---- LFM: applyVerdict rails (the deterministic bounds) ----
+local function rails(action, conf, ceiling, allowed, kind)
+  local eff, applied = lfm.applyVerdict(
+    { action = action, confidence = conf, process_class = "other", rationale = "" },
+    ceiling, allowed, { offenderKind = kind })
+  return eff, table.concat(applied, ",")
+end
+
+-- Rail 1: ceiling.
+check("rails: off ceils terminate", (rails("terminate", 0.99, "off", true, "extreme")), "wait")
+check("rails: off ceils freeze", (rails("freeze", 0.99, "off", true, "extreme")), "wait")
+check("rails: off passes wait", (rails("wait", 0.99, "off", true, "extreme")), "wait")
+check("rails: freeze ceils terminate", (rails("terminate", 0.99, "freeze", true, "extreme")), "freeze")
+check("rails: kill passes terminate", (rails("terminate", 0.99, "kill", true, "extreme")), "terminate")
+-- Rail 2: offender kind.
+check("rails: hog never terminated", (rails("terminate", 0.99, "kill", true, "hog")), "freeze")
+check("rails: unknown kind never terminated", (rails("terminate", 0.99, "kill", true, nil)), "freeze")
+-- Rail 3: confidence floors.
+check("rails: terminate floor demotes", (rails("terminate", 0.69, "kill", true, "extreme")), "freeze")
+check("rails: terminate floor passes", (rails("terminate", 0.70, "kill", true, "extreme")), "terminate")
+check("rails: freeze floor demotes", (rails("freeze", 0.49, "freeze", true, "extreme")), "wait")
+check("rails: freeze floor passes", (rails("freeze", 0.50, "freeze", true, "extreme")), "freeze")
+-- Rail 4: policy gate final.
+check("rails: policy denies terminate", (rails("terminate", 0.99, "kill", false, "extreme")), "wait")
+check("rails: policy denies freeze", (rails("freeze", 0.99, "freeze", false, "extreme")), "wait")
+check("rails: wait needs no gate", (rails("wait", 0.99, "kill", false, "extreme")), "wait")
+-- Composition: demoted terminate still honors the freeze floor.
+check("rails: demoted terminate hits freeze floor", (rails("terminate", 0.45, "kill", true, "extreme")), "wait")
+-- Trace and degenerate input.
+local _, trace = rails("terminate", 0.99, "freeze", true, "hog")
+check("rails: trace records ceiling", trace:find("ceiling%-freeze") ~= nil, true)
+local effNil, tNil = lfm.applyVerdict(nil, "kill", true, {})
+check("rails: nil verdict waits", effNil, "wait")
+check("rails: nil verdict trace", tNil[1], "no-verdict")
+
 -- ---- split-scope guard ----
 -- A top-level `local X` referenced by a function defined ABOVE it silently
 -- splits into a global writer and a local reader. This class caused three

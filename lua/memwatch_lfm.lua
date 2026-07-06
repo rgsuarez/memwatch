@@ -285,6 +285,129 @@ function M.jsonDecode(s)
 end
 
 ------------------------------------------------------------------------------
+-- Verdict validation: whitelist the model's reply down to exactly four
+-- fields with hard bounds. Anything malformed fails closed to no-verdict.
+------------------------------------------------------------------------------
+
+local ACTIONS = { wait = true, freeze = true, terminate = true }
+local PROCESS_CLASSES = {
+  runaway = true, hog = true, build = true, ["llm-server"] = true,
+  browser = true, vm = true, db = true, backup = true, indexer = true,
+  other = true,
+}
+
+-- Extract the assistant message content from a chat-completions response
+-- body, then decode the verdict object it carries. Returns the RAW verdict
+-- table (unvalidated) or nil, err.
+function M.parseResponse(body)
+  local resp, err = M.jsonDecode(body)
+  if not resp then return nil, "response: " .. tostring(err) end
+  if type(resp) ~= "table" then return nil, "response: not an object" end
+  local choices = resp.choices
+  if type(choices) ~= "table" or type(choices[1]) ~= "table" then
+    return nil, "response: no choices"
+  end
+  local msg = choices[1].message
+  if type(msg) ~= "table" or type(msg.content) ~= "string" then
+    return nil, "response: no message content"
+  end
+  local verdict, verr = M.jsonDecode(msg.content)
+  if not verdict then return nil, "verdict: " .. tostring(verr) end
+  if type(verdict) ~= "table" then return nil, "verdict: not an object" end
+  return verdict
+end
+
+-- Validate and normalize a raw verdict. Returns the whitelisted verdict
+-- table or nil, reason. Model text is DISPLAY-ONLY downstream; nothing here
+-- or anywhere else derives a signal target from it.
+function M.validateVerdict(raw)
+  if type(raw) ~= "table" then return nil, "not a table" end
+  local action = raw.action
+  if type(action) ~= "string" or not ACTIONS[action] then
+    return nil, "bad action"
+  end
+  local class = raw.process_class
+  if type(class) ~= "string" or not PROCESS_CLASSES[class] then
+    class = "other"
+  end
+  local conf = raw.confidence
+  if type(conf) ~= "number" or conf ~= conf then conf = 0 end
+  if conf < 0 then conf = 0 elseif conf > 1 then conf = 1 end
+  local rationale = raw.rationale
+  if type(rationale) ~= "string" then rationale = "" end
+  -- Strip control characters (newlines become spaces) and clamp length.
+  rationale = rationale:gsub("[%z\1-\31\127]", " "):sub(1, 240)
+  return {
+    action = action,
+    process_class = class,
+    confidence = conf,
+    rationale = rationale,
+  }
+end
+
+------------------------------------------------------------------------------
+-- Deterministic rails: the bounds no model verdict can escape. Applied in
+-- a fixed order; every applied rail is recorded for the ledger.
+--
+--   1. ceiling caps      (unattended mode: off -> wait; freeze caps terminate)
+--   2. offender-kind cap (hog/absolute offenders are never terminated)
+--   3. confidence floors (terminate >= minConfTerminate else freeze;
+--                         freeze >= minConfFreeze else wait)
+--   4. policy gate       (killAllowed false -> wait; freeze uses the same
+--                         gate as kill: same uid, denylist, protected pids)
+------------------------------------------------------------------------------
+
+-- verdict: validated verdict (or nil -> wait). ceiling: "off"|"freeze"|"kill".
+-- actionAllowed: the killAllowed result for the bound target. opts:
+-- { offenderKind = "extreme"|"hog"|..., minConfTerminate, minConfFreeze }.
+-- Returns effectiveAction, railsApplied (array of tags).
+function M.applyVerdict(verdict, ceiling, actionAllowed, opts)
+  opts = opts or {}
+  local rails = {}
+  if type(verdict) ~= "table" or not ACTIONS[verdict.action or ""] then
+    return "wait", { "no-verdict" }
+  end
+  local action = verdict.action
+  local conf = type(verdict.confidence) == "number" and verdict.confidence or 0
+
+  -- Rail 1: ceiling caps.
+  if ceiling ~= "freeze" and ceiling ~= "kill" then
+    if action ~= "wait" then rails[#rails + 1] = "ceiling-off" end
+    return "wait", rails
+  end
+  if ceiling == "freeze" and action == "terminate" then
+    action = "freeze"
+    rails[#rails + 1] = "ceiling-freeze"
+  end
+
+  -- Rail 2: hog/absolute offenders are never terminated autonomously.
+  if action == "terminate" and opts.offenderKind ~= "extreme" then
+    action = "freeze"
+    rails[#rails + 1] = "hog-cap"
+  end
+
+  -- Rail 3: confidence floors, applied to the CURRENT action.
+  local minTerm = opts.minConfTerminate or M.cfg.minConfTerminate
+  local minFreeze = opts.minConfFreeze or M.cfg.minConfFreeze
+  if action == "terminate" and conf < minTerm then
+    action = "freeze"
+    rails[#rails + 1] = "conf-floor-terminate"
+  end
+  if action == "freeze" and conf < minFreeze then
+    action = "wait"
+    rails[#rails + 1] = "conf-floor-freeze"
+  end
+
+  -- Rail 4: the policy gate is final. No gate, no signal of any kind.
+  if action ~= "wait" and not actionAllowed then
+    action = "wait"
+    rails[#rails + 1] = "policy-denied"
+  end
+
+  return action, rails
+end
+
+------------------------------------------------------------------------------
 -- Snapshot hash: FNV-1a 32-bit over the serialized snapshot. Correlation id
 -- for the ledger and the verdict cache, not a cryptographic hash.
 ------------------------------------------------------------------------------

@@ -53,7 +53,7 @@ local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
 local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
-local unattendedFiredFor = {} -- one unattended action per offender pid
+local unattendedFiredFor = {} -- [pid] = epoch of the last unattended adjudication
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
 local lfmServerPort  = nil
@@ -139,6 +139,12 @@ local function applyLocalConfig()
   end
   if type(conf.unattended) == "string" then core.cfg.unattended = conf.unattended end
   if type(conf.autoKill) == "boolean" then core.cfg.autoKill = conf.autoKill end
+  -- How long the HUD may go unanswered before the unattended action fires.
+  -- Exposed because an operator running unattended=freeze may want a faster
+  -- (or slower) hand-off than the 60s default.
+  if type(conf.unattendedGraceSec) == "number" and conf.unattendedGraceSec >= 5 then
+    core.cfg.cool.autoKillGraceSec = conf.unattendedGraceSec
+  end
   if type(conf.lfm) == "table" then
     for k, v in pairs(conf.lfm) do
       if lfm.cfg[k] ~= nil and type(v) == type(lfm.cfg[k]) then lfm.cfg[k] = v end
@@ -711,12 +717,17 @@ local function alertSurfaces(state, now)
     -- cache; with no fresh verdict the deterministic policy acts exactly as
     -- the legacy autoKill did. Both paths execute through the same signal
     -- engines (identity probe + policy gate inside).
+    -- Re-arm semantics (live-drill finding): a WAIT outcome must not consume
+    -- the per-offender latch forever, or one low-confidence model wait
+    -- disables unattended coverage while the crisis continues. Each
+    -- adjudication stamps the time; another full grace window must pass
+    -- before the same offender is adjudicated again.
     local mode = core.resolveUnattended(core.cfg)
     if mode ~= "off" and offender and offender.kind == "extreme"
        and hud and hud:isShowing() and not hudInteracted and not hudHold
        and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec
-       and not unattendedFiredFor[offender.pid] then
-      unattendedFiredFor[offender.pid] = true
+       and (now - (unattendedFiredFor[offender.pid] or 0)) >= core.cfg.cool.autoKillGraceSec then
+      unattendedFiredFor[offender.pid] = now
       local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
       M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
         action, offender.name, offender.pid, adjudicator))

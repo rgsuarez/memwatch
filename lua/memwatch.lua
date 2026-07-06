@@ -125,29 +125,77 @@ local function readMetrics()
   return core.metrics(vm, swapByte, totalByt, pageSize)
 end
 
--- Throttled async top for per-process CMPRS attribution (~756 ms measured,
--- so it never runs on the main thread, never more than once per interval,
--- and only while the system is interesting). top truncates command names;
--- results are joined to ps rows by pid.
--- Sorted by CMPRS, not MEM: the pids that matter here are the ones whose
--- weight lives in the compressor, which a residency sort would never surface.
-local TOP_CMD = "/usr/bin/top -l 1 -n 25 -o cmprs -stats pid,command,mem,cmprs"
--- One top per tick while interesting: attribution lag is what stands between
--- a compressed-away runaway and its detection window.
-local TOP_MIN_INTERVAL = 4.5
-local topTask = nil
-
-local function topRefresh()
-  if topTask then return end
-  local now = hs.timer.secondsSinceEpoch()
-  if (now - topCache.at) < TOP_MIN_INTERVAL then return end
-  topCache.at = now  -- stamp at launch so a slow top cannot double-fire
-  topTask = hs.task.new("/bin/sh", guard("top", function(exitCode, stdOut)
-    topTask = nil
-    if exitCode == 0 and stdOut and stdOut ~= "" then
-      topCache.map = procs.parseTop(stdOut)
+-- Assess the tracked processes: runaway classification, ignore filtering,
+-- extreme flag, offender/watch selection, runaway logging. Called from both
+-- attribution feeds (the ps sampler and the streaming top), so whichever one
+-- is still alive under load keeps the picture current.
+local function assessProcesses(now)
+  local totalMB = (lastMetrics.totalGB or 0) * 1024
+  local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
+  local kept = {}
+  for _, r in ipairs(runs) do
+    if (ignoredUntil[r.pid .. "|" .. r.name] or 0) < now then kept[#kept + 1] = r end
+  end
+  lastRuns = kept
+  lastExtreme = false
+  for _, r in ipairs(kept) do
+    if r.kind == "extreme" then lastExtreme = true end
+    local lk = r.pid .. "|" .. r.kind
+    if (now - (runawayLogAt[lk] or 0)) > 300 then
+      runawayLogAt[lk] = now
+      M.logSnapshot(string.format("runaway-%s:%s(%d)@%.0fMB/min",
+        r.kind, r.name, r.pid, r.slopeMBmin))
     end
-  end), { "-c", TOP_CMD })
+  end
+  local offender, watch = procs.pickOffender(kept, lastRanked, smState.state)
+  if offender and not offender.weightMB then offender.weightMB = offender.rssMB or 0 end
+  lastOffender = offender
+  -- A hog is named in the HUD and menu with its "largest, not growing"
+  -- framing; the menu-bar title shows the systemic cause tag instead, so a
+  -- steady bystander never headlines as the culprit.
+  local named = offender and offender.kind ~= "hog"
+  titleSnap.offenderName = named and offender.name or nil
+  titleSnap.offenderGB   = named and (offender.weightMB / 1024) or nil
+  titleSnap.watchName    = watch and watch.name or nil
+end
+
+-- Streaming top: ONE long-lived `top -l 0` process, started at the onset of
+-- pressure while the system can still spawn it, feeding per-pid footprint
+-- (MEM, CMPRS) every 5s right through the storm. Live drills proved that
+-- fork-per-tick attribution starves for minutes exactly when it matters;
+-- an already-resident top keeps sampling. Sorted by CMPRS so the pids whose
+-- weight lives in the compressor are always in the block.
+local TOPSTREAM_ARGS = { "-l", "0", "-s", "5", "-n", "30", "-o", "cmprs",
+                         "-stats", "pid,command,mem,cmprs" }
+local topTask = nil
+local topStream = nil
+local topIdleSince = nil
+
+local function stopTopStream()
+  if topTask then pcall(function() topTask:terminate() end); topTask = nil end
+  topStream = nil
+end
+
+local function startTopStream()
+  if topTask then return end
+  topStream = procs.newTopStream()
+  topTask = hs.task.new("/usr/bin/top",
+    guard("topstream-exit", function() topTask = nil end),
+    function(_, stdOut)
+      local ok, err = pcall(function()
+        local published = procs.feedTopStream(topStream, stdOut or "")
+        if published then
+          local now = hs.timer.secondsSinceEpoch()
+          topCache.map = published
+          topCache.at = now
+          procs.updateFromTop(tracker, published, now)
+          assessProcesses(now)
+        end
+      end)
+      if not ok then logError("topstream", err) end
+      return true  -- keep streaming
+    end,
+    TOPSTREAM_ARGS)
   if topTask then topTask:start() end
 end
 
@@ -474,48 +522,12 @@ local function onSample(blob)
   lastPsBlob = blob
   lastMetrics.swapGB = lastSwapBytes / 1e9
 
-  -- Per-process pipeline: track growth, spot runaways, rank the hogs.
+  -- Per-process pipeline: fresh identities and RSS from ps, then the shared
+  -- assessment. Attribution continuity under load is the top stream's job.
   lastPsList = procs.parsePsList(blob)
   procs.update(tracker, lastPsList, now, topCache.map)
-  local totalMB = (lastMetrics.totalGB or 0) * 1024
-  local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
-  local kept = {}
-  for _, r in ipairs(runs) do
-    if (ignoredUntil[r.pid .. "|" .. r.name] or 0) < now then kept[#kept + 1] = r end
-  end
-  lastRuns = kept
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
-
-  lastExtreme = false
-  for _, r in ipairs(kept) do
-    if r.kind == "extreme" then lastExtreme = true end
-    local lk = r.pid .. "|" .. r.kind
-    if (now - (runawayLogAt[lk] or 0)) > 300 then
-      runawayLogAt[lk] = now
-      M.logSnapshot(string.format("runaway-%s:%s(%d)@%.0fMB/min",
-        r.kind, r.name, r.pid, r.slopeMBmin))
-    end
-  end
-
-  local offender, watch = procs.pickOffender(kept, lastRanked, smState.state)
-  if offender and not offender.weightMB then offender.weightMB = offender.rssMB or 0 end
-  lastOffender = offender
-  -- A hog is named in the HUD and menu with its "largest, not growing"
-  -- framing; the menu-bar title shows the systemic cause tag instead, so a
-  -- steady bystander never headlines as the culprit.
-  local named = offender and offender.kind ~= "hog"
-  titleSnap.offenderName = named and offender.name or nil
-  titleSnap.offenderGB   = named and (offender.weightMB / 1024) or nil
-  titleSnap.watchName    = watch and watch.name or nil
-
-  -- top runs whenever the system is interesting OR compression/swap is
-  -- actively churning even at ok: that is exactly when a fast allocator's
-  -- pages get compressed away and it goes invisible to RSS.
-  if smState.state ~= "ok" or #kept > 0
-     or lastRates.comp >= core.cfg.rates.compLo
-     or lastRates.swapOut >= core.cfg.rates.swapLo then
-    topRefresh()
-  end
+  assessProcesses(now)
 end
 
 -- Alert surfaces: the HUD is the actionable one, the notification the
@@ -597,6 +609,19 @@ local function tick()
     M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
   end
 
+  -- Attribution stream lifecycle: spawn at the onset of anything interesting
+  -- (while spawning still works), retire after a calm minute.
+  local interesting = state ~= "ok" or #lastRuns > 0
+    or lastRates.comp >= core.cfg.rates.compLo
+    or lastRates.swapOut >= core.cfg.rates.swapLo
+  if interesting then
+    topIdleSince = nil
+    startTopStream()
+  elseif topTask then
+    topIdleSince = topIdleSince or now
+    if (now - topIdleSince) > 60 then stopTopStream() end
+  end
+
   -- Drive the flash from flashState, not just transitions, so the animation
   -- always matches the real state and self-heals (e.g. after a self-test).
   if state ~= flashState then applyFlash(state) end
@@ -646,7 +671,13 @@ function M.killPid(pid, expectedName, onUpdate)
     return
   end
   local liveName = procs.friendlyName(proc.comm)
-  if expectedName and liveName ~= expectedName then
+  -- Names sourced from the top stream are truncated at ~16 chars, so a long
+  -- expected name may only be a prefix of the live one. Short names must
+  -- still match exactly.
+  local nameMatches = (liveName == expectedName)
+    or (expectedName ~= nil and #expectedName >= 15
+        and liveName:sub(1, #expectedName) == expectedName)
+  if expectedName and not nameMatches then
     M.logSnapshot(string.format("kill-refuse:pid-reused:%d(%s!=%s)", pid, liveName, expectedName))
     onUpdate(string.format("pid %d is now %s, refusing", pid, liveName), true)
     return
@@ -724,6 +755,7 @@ function M.stop()
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
+  stopTopStream()
   flashState = nil
   if menu then menu:delete(); menu = nil end
 end

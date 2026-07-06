@@ -72,20 +72,55 @@ local function memValMB(num, unit)
   return num / (1024 * 1024) -- B
 end
 
--- Parse `top -l 1 -o mem -stats pid,command,mem,cmprs` into
--- { [pid] = { memMB =, cmprsMB = } }. top truncates COMMAND, so names from
--- here are never used; join by pid. Values look like 1954M, 27M, 0B, 3G,
--- occasionally suffixed with + or -.
+-- One `top -stats pid,command,mem,cmprs` row. Values look like 1954M, 27M,
+-- 0B, 3G, occasionally suffixed with + or -. COMMAND is truncated by top, so
+-- the name is display/prefix material only; joins happen by pid. top's MEM
+-- approximates the footprint (it includes compressed), so mem alone is the
+-- weight-basis-compatible number.
+local function parseTopLine(line)
+  local pid, name, mem, memU, cmprs, cmprsU =
+    line:match("^%s*(%d+)%s+(.-)%s+([%d%.]+)([BKMG])[%+%-]?%s+([%d%.]+)([BKMG])[%+%-]?%s*$")
+  if not pid then return nil end
+  return tonumber(pid), { memMB = memValMB(mem, memU), cmprsMB = memValMB(cmprs, cmprsU),
+                          name = (name or ""):gsub("%s+$", "") }
+end
+
+-- Parse a complete one-shot top sample into { [pid] = row }.
 function M.parseTop(text)
   local map = {}
   for line in (text or ""):gmatch("[^\n]+") do
-    local pid, mem, memU, cmprs, cmprsU =
-      line:match("^%s*(%d+)%s+.-%s+([%d%.]+)([BKMG])[%+%-]?%s+([%d%.]+)([BKMG])[%+%-]?%s*$")
-    if pid then
-      map[tonumber(pid)] = { memMB = memValMB(mem, memU), cmprsMB = memValMB(cmprs, cmprsU) }
-    end
+    local pid, row = parseTopLine(line)
+    if pid then map[pid] = row end
   end
   return map
+end
+
+-- Streaming top (`top -l 0`): a single long-lived process that keeps
+-- emitting samples right through a memory storm, when forking anything new
+-- starves. Chunks arrive with arbitrary boundaries; blocks are delimited by
+-- the PID header line. feed() returns the previous block's map whenever a
+-- new header completes it, else nil.
+function M.newTopStream()
+  return { buf = "", cur = nil }
+end
+
+function M.feedTopStream(st, chunk)
+  st.buf = st.buf .. (chunk or "")
+  local published = nil
+  while true do
+    local nl = st.buf:find("\n", 1, true)
+    if not nl then break end
+    local line = st.buf:sub(1, nl - 1)
+    st.buf = st.buf:sub(nl + 1)
+    if line:match("^%s*PID%s") then
+      if st.cur and next(st.cur) then published = st.cur end
+      st.cur = {}
+    elseif st.cur then
+      local pid, row = parseTopLine(line)
+      if pid then st.cur[pid] = row end
+    end
+  end
+  return published
 end
 
 ------------------------------------------------------------------------------
@@ -110,12 +145,18 @@ function M.update(tr, psList, now, topMap)
   for _ in pairs(tr.procs) do n = n + 1 end
   for _, p in ipairs(psList) do
     local e = tr.procs[p.pid]
-    if e and e.comm ~= p.comm then
+    if e and e.comm and e.comm ~= p.comm then
       tr.procs[p.pid] = nil; e = nil; n = n - 1
     end
     if not e and n < cfg.maxTracked then
       e = { comm = p.comm, uid = p.uid, name = M.friendlyName(p.comm), ring = {} }
       tr.procs[p.pid] = e; n = n + 1
+    end
+    if e and not e.comm then
+      -- Born from a streamed top block: fill in the full identity now that
+      -- ps has seen it (reuse detection could not apply to that transition).
+      e.comm = p.comm
+      e.name = M.friendlyName(p.comm)
     end
     if e then
       local t = topMap and topMap[p.pid]
@@ -129,6 +170,40 @@ function M.update(tr, psList, now, topMap)
   end
   for pid, e in pairs(tr.procs) do
     if (now - (e.lastSeen or 0)) > cfg.staleSec then tr.procs[pid] = nil end
+  end
+end
+
+-- Feed a streamed top block into the tracker: the attribution path that
+-- keeps working when the system is too starved to fork ps. Only pids whose
+-- ring has not been refreshed in the last 4s get a sample (cadence guard, so
+-- interleaved ps and top feeds cannot double-rate the rings). Ring value is
+-- top's MEM (footprint, includes compressed), the same basis as the ps
+-- formula rss + sticky cmprs. Entries born here carry top's truncated name
+-- and no comm/uid; a later ps row fills identity in, and the kill path
+-- re-probes the live pid regardless.
+function M.updateFromTop(tr, topMap, now)
+  if not topMap then return end
+  local cfg = tr.cfg
+  local n = 0
+  for _ in pairs(tr.procs) do n = n + 1 end
+  for pid, t in pairs(topMap) do
+    local e = tr.procs[pid]
+    if not e and n < cfg.maxTracked then
+      e = { comm = nil, uid = nil, ring = {},
+            name = (t.name and t.name ~= "") and t.name or ("pid " .. pid) }
+      tr.procs[pid] = e; n = n + 1
+    end
+    if e then
+      e.cmprsMB = t.cmprsMB
+      e.lastSeen = now
+      e.weightMB = t.memMB
+      local ring = e.ring
+      local lastT = ring[#ring] and ring[#ring].t or -1e9
+      if (now - lastT) >= 4 then
+        ring[#ring + 1] = { t = now, v = t.memMB }
+        if #ring > cfg.windowSamples then table.remove(ring, 1) end
+      end
+    end
   end
 end
 

@@ -334,6 +334,34 @@ local runsAbsW = procs.runaways(trAbsW, 25, "critical", 36864)
 check("absolute-by-weight fires at critical", #runsAbsW, 1)
 check("absolute-by-weight carries weight", runsAbsW[1].weightMB, 16000)
 
+-- streaming top feeder: chunk boundaries are arbitrary; a block publishes
+-- only when the next header line completes.
+local st = procs.newTopStream()
+check("stream: no publish before a block completes",
+      procs.feedTopStream(st, "PID  COMMAND  MEM  CMPRS\n123  leaky-proc  100M  50M\n"), nil)
+local pub = procs.feedTopStream(st, "456  other  2G  1G\nPID  COMM")
+check("stream: mid-line header no publish yet", pub, nil)
+pub = procs.feedTopStream(st, "AND  MEM  CMPRS\n")
+check("stream: publish once header completes", pub ~= nil, true)
+check("stream: rows parsed", pub and pub[123].memMB, 100)
+check("stream: name captured", pub and pub[123].name, "leaky-proc")
+check("stream: G unit", pub and pub[456].cmprsMB, 1024)
+
+-- updateFromTop: attribution without ps, cadence-guarded, identity filled
+-- in later by ps without losing history.
+local trT = procs.newTracker(PC)
+procs.updateFromTop(trT, { [321] = { memMB = 1000, cmprsMB = 800, name = "com.apple.Virtua" } }, 0)
+procs.updateFromTop(trT, { [321] = { memMB = 3000, cmprsMB = 2500, name = "com.apple.Virtua" } }, 2)
+procs.updateFromTop(trT, { [321] = { memMB = 5000, cmprsMB = 4200, name = "com.apple.Virtua" } }, 5)
+check("topfeed: born with truncated name", trT.procs[321].name, "com.apple.Virtua")
+check("topfeed: cadence guard dedupes", #trT.procs[321].ring, 2)
+check("topfeed: ring holds footprint", trT.procs[321].ring[2].v, 5000)
+procs.update(trT, { { pid = 321, uid = 502, rssMB = 40,
+                      comm = "/App/com.apple.Virtualization.VirtualMachine" } }, 9)
+check("topfeed: ps fills full name", trT.procs[321].name, "com.apple.Virtualization.VirtualMachine")
+check("topfeed: ring survives identity fill", #trT.procs[321].ring, 3)
+check("topfeed: ps push keeps weight basis", trT.procs[321].ring[3].v, 40 + 4200)
+
 -- pid reuse: same pid, new comm resets the ring.
 local trReuse = procs.newTracker(PC)
 for i = 0, 5 do procs.update(trReuse, { row(60, 1000 + i * 1600, "leaky") }, i * 5) end

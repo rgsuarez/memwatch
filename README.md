@@ -47,18 +47,27 @@ stretch never dilutes a fresh climb. One flat tick between rises is tolerated
 (the compressed component refreshes on `top`'s slower cadence); two
 consecutive flats or any real drop end the streak:
 
-- **Extreme growth** (>= 150 MB/s across ~25s of monotonic climb): fires even
-  while the system is still `ok` and forces `critical`. This is the
-  Chrome-runaway catcher; the point is to act while there is headroom left.
+- **Extreme growth** (>= 150 MB/s across ~20s of climb, or >= 6 GB net window
+  growth while still climbing): fires even while the system is still `ok`
+  and forces `critical`. This is the Chrome-runaway catcher; the point is to
+  act while there is headroom left. An extreme verdict latches for 45s: RSS
+  collapsing because the kernel is compressing the runaway must never read
+  as recovery. A killed pid still clears the books within two ticks
+  (runaways are only reported for pids seen alive in the last 12s).
 - **Sustained growth** (>= 1.5 GB/min across ~20s): a watch (amber hint) while
   the system is `ok`, an alert once it is `elevated`.
-- **Absolute footprint** (>= 40% of RAM): attribution only while the system is
-  already `critical`. A steady 20 GB local model server never alarms on size.
+- **Absolute footprint** (>= 40% of RAM by weight): attribution only while the
+  system is already `critical`. A steady 20 GB local model server never
+  alarms on size.
+- **No proven runaway at `critical`**: the largest process by weight is named
+  as attribution, explicitly tagged "largest process, not growing" on every
+  surface, and the menu-bar title shows the systemic cause (`● SWAP`) instead
+  of the bystander's name.
 
-Hog ranking joins fresh `ps` RSS with `top`'s per-process `CMPRS` column
-(async, throttled): a runaway whose pages were compressed away shows a small
-RSS and a huge CMPRS, so RSS-only lists mislead exactly when it matters.
-pid reuse is detected by a comm change and resets that pid's history.
+Hog ranking joins fresh `ps` RSS with the top stream's per-process `CMPRS`:
+a runaway whose pages were compressed away shows a small RSS and a huge
+CMPRS, so RSS-only lists mislead exactly when it matters. pid reuse is
+detected by a comm change and resets that pid's history.
 
 ## Alerts and one-click kill
 
@@ -108,11 +117,16 @@ Leave it off until the detector has earned your trust.
   memwatch.log            state transitions, runaways, kills, errors; rotates at 1 MB
 ```
 
-The tick (5s) is fork-free on the main thread: metrics come from native
-`hs.host.vmStat()`, and everything else (kernel level, swap, ps list) arrives
-via one consolidated ~32 ms async `hs.task` fork with an in-flight guard, so
-memwatch keeps breathing while the system is dying. `top` (~750 ms) runs
-async, at most once per 10s, and only while the system is interesting.
+The verdict is fork-free: signals and the state machine run every 5s tick
+from native `hs.host.vmStat()` counters plus the last-known kernel level, so
+the gauge keeps deciding while the system is dying. Enrichment arrives on two
+async feeds: a consolidated `sysctl` + full `ps` fork per tick (streaming
+drain, in-flight guard, watchdog; a failed or starved fork degrades to stale
+process data, never to a wrong verdict, and the menu says so), and a single
+persistent `top -l 0` stream, spawned at the onset of pressure while spawning
+still works, feeding per-pid footprint (MEM + CMPRS) right through a storm in
+which forking anything new starves for tens of seconds. Live drills measured
+every one of those failure modes before this shape settled.
 
 ## Install
 

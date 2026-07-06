@@ -326,6 +326,26 @@ local offC = procs.pickOffender({}, ranked, "critical")
 check("critical blames top weight", offC.pid, 80)
 check("ok with no runaway names nobody", procs.pickOffender({}, ranked, "ok"), nil)
 
+-- ---- kill policy ----
+local UID = 502
+check("kill: own app allowed",
+      (core.killAllowed({ pid = 4242, uid = UID, comm = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" }, UID, 999)), true)
+check("kill: WindowServer denied (uid)",
+      (core.killAllowed({ pid = 600, uid = 88, comm = "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer" }, UID, 999)), false)
+check("kill: Finder denied (denylist)",
+      (core.killAllowed({ pid = 500, uid = UID, comm = "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder" }, UID, 999)), false)
+check("kill: Hammerspoon denied",
+      (core.killAllowed({ pid = 700, uid = UID, comm = "Hammerspoon" }, UID, 999)), false)
+check("kill: launchd denied",
+      (core.killAllowed({ pid = 1, uid = 0, comm = "/sbin/launchd" }, UID, 999)), false)
+check("kill: self denied",
+      (core.killAllowed({ pid = 999, uid = UID, comm = "whatever" }, UID, 999)), false)
+local _, whyUid = core.killAllowed({ pid = 600, uid = 88, comm = "WindowServer" }, UID, 999)
+check("kill: uid reason", whyUid, "not your process")
+local _, whyDeny = core.killAllowed({ pid = 500, uid = UID, comm = "Finder" }, UID, 999)
+check("kill: denylist reason", whyDeny, "protected process")
+check("kill: nil proc denied", (core.killAllowed(nil, UID, 999)), false)
+
 if fails == 0 then
   print("\nALL PASS")
 else

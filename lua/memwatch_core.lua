@@ -51,6 +51,35 @@ M.cfg = {
     minDwellElevSec = 20,
     minDwellCritSec = 30,
   },
+  -- Cooldowns and grace windows.
+  cool = {
+    ignoreSec        = 1800, -- per-offender "Ignore 30 min"
+    hudRaiseSec      = 60,   -- min seconds between HUD raises (a new offender preempts)
+    autoKillGraceSec = 60,   -- HUD unanswered this long before auto-kill (if enabled)
+  },
+  -- Last-resort auto-kill. OFF by default: enable only once the detector has
+  -- earned trust. When on, it fires only for an extreme-growth runaway while
+  -- the system is critical, after the HUD has gone unanswered for the grace
+  -- window, and only if the kill policy allows the target.
+  autoKill = false,
+  -- One-click kill behavior and its safety rails.
+  kill = {
+    escalateSec = 7,   -- SIGTERM, then SIGKILL after this long if still alive
+    verifySec   = 2,   -- wait after KILL before the death check
+    settleSec   = 3,   -- wait before measuring reclaimed memory
+    -- Basename denylist. uid must also match the operator, so root-owned
+    -- daemons are already unreachable; this list guards same-uid session
+    -- infrastructure. No pid<=100 rule on purpose: WindowServer is pid 600
+    -- on this machine, so a low-pid floor would protect nothing real.
+    deny = {
+      ["kernel_task"] = true, ["launchd"] = true, ["WindowServer"] = true,
+      ["loginwindow"] = true, ["Finder"] = true, ["Dock"] = true,
+      ["SystemUIServer"] = true, ["WindowManager"] = true,
+      ["ControlCenter"] = true, ["Spotlight"] = true, ["coreaudiod"] = true,
+      ["cfprefsd"] = true, ["Hammerspoon"] = true, ["hidd"] = true,
+      ["logd"] = true, ["opendirectoryd"] = true,
+    },
+  },
 }
 
 -- Detect the VM page size from a vm_stat header line, else fall back to M.PAGE.
@@ -261,6 +290,23 @@ function M.smStep(sm, s, now, cfg)
     end
   end
   return sm.state, false, ""
+end
+
+------------------------------------------------------------------------------
+-- Kill policy (pure; the glue executes signals, this decides legitimacy)
+------------------------------------------------------------------------------
+
+-- proc = { pid, uid, comm }. Same-uid only, curated basename denylist, never
+-- init and never the host process. Returns allowed, reason.
+function M.killAllowed(proc, ownUid, selfPid, cfg)
+  cfg = cfg or M.cfg
+  if not proc or not proc.pid then return false, "no process" end
+  if proc.pid <= 1 then return false, "protected pid" end
+  if selfPid and proc.pid == selfPid then return false, "own process" end
+  if proc.uid ~= ownUid then return false, "not your process" end
+  local base = (proc.comm or ""):match("([^/]+)$") or ""
+  if cfg.kill.deny[base] then return false, "protected process" end
+  return true, "ok"
 end
 
 ------------------------------------------------------------------------------

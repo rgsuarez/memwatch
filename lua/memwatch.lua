@@ -210,12 +210,28 @@ local function buildMenu()
     items[#items + 1] = { title = "   sampling\u{2026}", disabled = true }
   end
   for _, p in ipairs(lastRanked) do
+    local pid, name = p.pid, p.name
     items[#items + 1] = {
-      title = string.format("   %-22s %5.1f GB  (pid %d)", p.name:sub(1, 22), p.weightMB / 1024, p.pid),
-      disabled = true,
+      title = string.format("%-22s %5.1f GB  (pid %d)", name:sub(1, 22), p.weightMB / 1024, pid),
+      menu = {
+        { title = "Force Quit " .. name,
+          fn = function() M.killPid(pid, name) end },
+        { title = "Ignore for 30 min",
+          fn = function() M.ignore(pid, name) end },
+        { title = "Show in Activity Monitor",
+          fn = function() hs.application.launchOrFocus("Activity Monitor") end },
+      },
     }
   end
   items[#items + 1] = { title = "-" }
+  if lastOffender then
+    local off = lastOffender
+    items[#items + 1] = { title = string.format("Force Quit %s (pid %d)", off.name, off.pid),
+      fn = function() M.killPid(off.pid, off.name) end }
+    items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
+      fn = function() M.ignore(off.pid, off.name) end }
+    items[#items + 1] = { title = "-" }
+  end
   items[#items + 1] = { title = "Open Activity Monitor",
     fn = function() hs.application.launchOrFocus("Activity Monitor") end }
   items[#items + 1] = { title = "Log snapshot now",
@@ -364,6 +380,96 @@ local function tick()
   -- fork is skipped: the gauge must keep breathing while the system is dying.
   if not flashTimer then renderTitleNow() end
   launchSampler(onSample)
+end
+
+------------------------------------------------------------------------------
+-- kill engine
+------------------------------------------------------------------------------
+
+local ownUid  = tonumber(sh("/usr/bin/id -u")) or -1
+local selfPid = hs.processInfo.processID
+
+-- Look up a live process; returns { pid, uid, comm } or nil if gone.
+local function probePid(pid)
+  local out = sh(string.format("/bin/ps -p %d -o uid=,comm= 2>/dev/null", pid))
+  local uid, comm = out:match("^%s*(%d+)%s+(.-)%s*$")
+  if not uid then return nil end
+  return { pid = pid, uid = tonumber(uid), comm = comm }
+end
+
+local function pidAlive(pid)
+  return sh(string.format("/bin/ps -p %d -o pid= 2>/dev/null", pid)):match("%d") ~= nil
+end
+
+-- Default progress surface for menu-initiated kills (the menu closes on
+-- click, so feedback lands as a brief on-screen alert).
+local function alertUpdate(text)
+  hs.alert.show("memwatch: " .. text, 2.5)
+end
+
+-- One-click kill: re-validate identity first (pid-reuse guard), check the
+-- pure policy, SIGTERM, escalate to SIGKILL after cfg.kill.escalateSec if the
+-- target is still alive (re-validated again), then verify death and report
+-- how much memory actually came back. onUpdate(text, done) drives whichever
+-- surface initiated the kill.
+function M.killPid(pid, expectedName, onUpdate)
+  onUpdate = onUpdate or alertUpdate
+  local k = core.cfg.kill
+  local proc = probePid(pid)
+  if not proc then
+    M.logSnapshot(string.format("kill-skip:%s(%d)-already-exited", expectedName or "?", pid))
+    onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+    return
+  end
+  local liveName = procs.friendlyName(proc.comm)
+  if expectedName and liveName ~= expectedName then
+    M.logSnapshot(string.format("kill-refuse:pid-reused:%d(%s!=%s)", pid, liveName, expectedName))
+    onUpdate(string.format("pid %d is now %s, refusing", pid, liveName), true)
+    return
+  end
+  local allowed, why = core.killAllowed(proc, ownUid, selfPid)
+  if not allowed then
+    M.logSnapshot(string.format("kill-refuse:%s(%d):%s", liveName, pid, why))
+    onUpdate(string.format("refusing to kill %s: %s", liveName, why), true)
+    return
+  end
+  local availBefore = lastMetrics.availPct or 0
+  local totalGB = lastMetrics.totalGB or 0
+  M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
+  onUpdate(string.format("terminating %s\u{2026}", liveName), false)
+  sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
+  hs.timer.doAfter(k.escalateSec, guard("kill-escalate", function()
+    if pidAlive(pid) then
+      local again = probePid(pid)
+      if again and procs.friendlyName(again.comm) == liveName then
+        M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
+        onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
+        sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
+      end
+    end
+    hs.timer.doAfter(k.verifySec + k.settleSec, guard("kill-verify", function()
+      local gone = not pidAlive(pid)
+      local m = readMetrics()
+      local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
+      if gone then
+        M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB", liveName, pid, reclaimedGB))
+        onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB", liveName, reclaimedGB), true)
+      else
+        M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
+        onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true)
+      end
+    end))
+  end))
+end
+
+-- Silence alerts for one process for the standard window.
+function M.ignore(pid, name)
+  ignoredUntil[pid .. "|" .. name] = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec
+  M.logSnapshot(string.format("ignore:%s(%d)", name, pid))
+  if lastOffender and lastOffender.pid == pid then
+    lastOffender = nil
+    titleSnap.offenderName, titleSnap.offenderGB = nil, nil
+  end
 end
 
 ------------------------------------------------------------------------------

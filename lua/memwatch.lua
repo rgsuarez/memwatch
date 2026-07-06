@@ -184,6 +184,10 @@ local function tick(silent)
   -- Drive the flash from flashLevel, not just transitions, so the animation
   -- always matches the real level and self-heals (e.g. after a self-test).
   if level ~= flashLevel then applyFlash(level) end
+  -- Repaint the title every tick. The flash timer used to do this as a side
+  -- effect; with the steady dot there is no other repaint path, and the title
+  -- would otherwise freeze at whatever value it had when the level last changed.
+  if not flashTimer then setIcon(level, lastMetrics, true) end
   if level == "crit" then notifyCrit(m) end
 end
 

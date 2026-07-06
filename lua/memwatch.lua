@@ -49,6 +49,9 @@ local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 -- logging and error containment
 ------------------------------------------------------------------------------
 
+-- Declared here, above appendLog: a reference to a local declared later in
+-- the file silently compiles as a nil global inside the earlier function.
+local LOG_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch.log"
 local LOG_MAX_BYTES = 1e6
 
 -- Append a line, rotating to .1 when the log exceeds the cap.
@@ -72,7 +75,8 @@ local function logError(label, err)
   local now = os.time()
   if (now - (lastErrorAt[label] or 0)) < 60 then return end
   lastErrorAt[label] = now
-  appendLog(string.format("%s state=%s reason=error:%s err=%s\n",
+  -- pcall: the error reporter must never become a second error source.
+  pcall(appendLog, string.format("%s state=%s reason=error:%s err=%s\n",
     os.date("%Y-%m-%d %H:%M:%S"), smState.state, label, tostring(err)))
 end
 
@@ -83,8 +87,6 @@ local function guard(label, fn)
     if not ok then logError(label, err) end
   end
 end
-
-local LOG_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch.log"
 
 -- RGB (0-1) per level. Apple system green / orange / red.
 local COLOR = {

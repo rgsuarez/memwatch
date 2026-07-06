@@ -3,15 +3,16 @@
 -- Project: ~/projects/memwatch  (wired into ~/.hammerspoon/init.lua)
 --
 -- An always-present, glanceable dot in the menu bar:
---   green (dim)    = healthy
---   amber (steady) = warning, pressure building
---   red   (steady) = critical; also fires a silent notification naming the
---                    top memory consumers
--- The dot is steady by default; set core.cfg.flash = true to pulse warn/crit.
--- Click the dot for live compressor / swap / available numbers and the top 5
--- memory consumers. Threshold crossings are appended to memwatch.log.
---
--- Calibrated to the 2026-05-29 freeze. See memwatch_core.lua for thresholds.
+--   green (dim) = ok        no active pressure; the dot stays quiet
+--   amber       = elevated  memory demand is building (rates or kernel warn)
+--   red         = critical  the system is actively degrading; the title names
+--                           the offending process when one is identified
+-- Alerting is driven by activity rates (swap-out / compression pages per
+-- second), the kernel's own pressure verdict, and runaway-process growth,
+-- never by absolute compressor or swap size: macOS keeps those high
+-- indefinitely, so they only carry information, not alarm.
+-- The dot is steady by default; set core.cfg.flash = true to pulse on trouble.
+-- State transitions are appended to memwatch.log.
 
 local core = require("memwatch_core")
 
@@ -21,11 +22,17 @@ local M = {}
 local menu        = nil
 local pollTimer   = nil
 local flashTimer  = nil
-local flashLevel  = nil   -- the level the flash animation is currently rendering
+local flashState  = nil   -- the state the flash animation is currently rendering
 local flashLit    = true
-local lastLevel   = "ok"
 local lastNotifyAt = 0
 local lastMetrics = { compGB = 0, swapGB = 0, availPct = 100 }
+local lastRates   = { swapOut = 0, comp = 0, pageOut = 0 }
+local lastKern    = 1
+local smState     = core.newSMState(0)
+local titleSnap   = {}    -- offenderName / offenderGB / watchName / causeTag
+local prevCounters, prevCountersAt = nil, nil
+
+local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
 local LOG_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch.log"
 
@@ -35,8 +42,6 @@ local COLOR = {
   warn = { red = 1.00, green = 0.62, blue = 0.04 },
   crit = { red = 1.00, green = 0.23, blue = 0.19 },
 }
-
-local DOT = "\u{25CF}" -- ● geometric circle (not an emoji)
 
 ------------------------------------------------------------------------------
 -- shell helpers
@@ -86,40 +91,38 @@ end
 -- rendering
 ------------------------------------------------------------------------------
 
-local function setIcon(level, m, lit)
+-- Paint the menu-bar title for the current state. Content comes from the pure
+-- core.renderTitle; only color, alpha, and font live here.
+local function renderTitleNow()
   if not menu then return end
-  local c = COLOR[level] or COLOR.ok
+  local spec = core.renderTitle(smState.state, titleSnap)
+  local c = COLOR[spec.level] or COLOR.ok
   local alpha
-  if level == "ok" then
-    alpha = 0.40                 -- steady, understated
+  if spec.level == "ok" then
+    alpha = 0.35                 -- steady, understated
   else
-    alpha = lit and 1.0 or 0.12  -- blink between bright and near-invisible
+    alpha = flashLit and 1.0 or 0.12
   end
-  local label = DOT
-  if level ~= "ok" then
-    label = string.format("%s %.0fG", DOT, m.compGB) -- show compressor GB when elevated
-  end
-  local styled = hs.styledtext.new(label, {
+  menu:setTitle(hs.styledtext.new(spec.text, {
     color = { red = c.red, green = c.green, blue = c.blue, alpha = alpha },
     font  = { name = "Menlo", size = 13 },
-  })
-  menu:setTitle(styled)
+  }))
 end
 
-local function applyFlash(level)
+local function applyFlash(state)
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   flashLit = true
-  flashLevel = level
+  flashState = state
   -- Steady render unless the pulse is explicitly enabled. "ok" is always steady.
-  if level == "ok" or not core.cfg.flash then
-    setIcon(level, lastMetrics, true)
+  if state == "ok" or not core.cfg.flash then
+    renderTitleNow()
     return
   end
-  local interval = (level == "crit") and 0.45 or 1.0
-  setIcon(level, lastMetrics, true)
+  local interval = (state == "critical") and 0.45 or 1.0
+  renderTitleNow()
   flashTimer = hs.timer.doEvery(interval, function()
     flashLit = not flashLit
-    setIcon(level, lastMetrics, flashLit)
+    renderTitleNow()
   end)
 end
 
@@ -128,13 +131,14 @@ end
 ------------------------------------------------------------------------------
 
 local function buildMenu()
-  local m = readMetrics()
-  local level = core.classify(m)
+  local m = lastMetrics
   local items = {
-    { title = string.format("Compressor:  %.1f GB", m.compGB), disabled = true },
-    { title = string.format("Swap used:   %.1f GB", m.swapGB), disabled = true },
-    { title = string.format("Available:   %.0f%%", m.availPct), disabled = true },
-    { title = string.format("Status:      %s", level:upper()), disabled = true },
+    { title = string.format("Memory: %s", smState.state:upper()), disabled = true },
+    { title = "-" },
+    { title = string.format("Kernel pressure: %s (%d)", KERN_NAME[lastKern] or "?", lastKern), disabled = true },
+    { title = string.format("Swap-out %.0f pg/s \u{00B7} Comp %.0f pg/s", lastRates.swapOut, lastRates.comp), disabled = true },
+    { title = string.format("Available %.0f%%  \u{00B7}  Swap used %.1f GB", m.availPct, m.swapGB), disabled = true },
+    { title = string.format("Compressor (info) %.1f GB", m.compGB), disabled = true },
     { title = "-" },
     { title = "Top memory consumers", disabled = true },
   }
@@ -159,8 +163,8 @@ local function notifyCrit(m)
   end
   hs.notify.new({
     title           = "Memory pressure: CRITICAL",
-    subTitle        = string.format("Compressor %.0f GB | swap %.1f GB | avail %.0f%%",
-                                    m.compGB, m.swapGB, m.availPct),
+    subTitle        = string.format("swap-out %.0f pg/s | avail %.0f%% | swap %.1f GB",
+                                    lastRates.swapOut, m.availPct, m.swapGB),
     informativeText = "Top: " .. table.concat(names, ", "),
     withdrawAfter   = 0,      -- stays in Notification Center until dismissed
     hasActionButton = false,
@@ -170,10 +174,11 @@ end
 
 -- Append one line to memwatch.log. Cheap forensic trail for the next incident.
 function M.logSnapshot(reason)
-  local m = readMetrics()
+  local m = lastMetrics
   local line = string.format(
-    "%s level=%s reason=%s comp=%.1fGB swap=%.1fGB avail=%.0f%%\n",
-    os.date("%Y-%m-%d %H:%M:%S"), core.classify(m), reason or "", m.compGB, m.swapGB, m.availPct)
+    "%s state=%s reason=%s kern=%d swapout=%.0f comprate=%.0f comp=%.1fGB swap=%.1fGB avail=%.0f%%\n",
+    os.date("%Y-%m-%d %H:%M:%S"), smState.state, reason or "", lastKern,
+    lastRates.swapOut, lastRates.comp, m.compGB, m.swapGB, m.availPct)
   local f = io.open(LOG_PATH, "a")
   if f then f:write(line); f:close() end
 end
@@ -183,21 +188,33 @@ end
 ------------------------------------------------------------------------------
 
 local function tick(silent)
+  local now = hs.timer.secondsSinceEpoch()
   local m = readMetrics()
   lastMetrics = m
-  local level = core.classify(m)
-  if level ~= lastLevel then
-    if not silent then M.logSnapshot("level-change:" .. lastLevel .. "->" .. level) end
-    lastLevel = level
+  -- Activity rates from the cumulative counter deltas.
+  if m.counters then
+    if prevCounters then
+      local dt = now - prevCountersAt
+      lastRates.swapOut = core.rate(m.counters.swapOuts,   prevCounters.swapOuts,   dt)
+      lastRates.comp    = core.rate(m.counters.compressed, prevCounters.compressed, dt)
+      lastRates.pageOut = core.rate(m.counters.pageOuts,   prevCounters.pageOuts,   dt)
+    end
+    prevCounters, prevCountersAt = m.counters, now
   end
-  -- Drive the flash from flashLevel, not just transitions, so the animation
-  -- always matches the real level and self-heals (e.g. after a self-test).
-  if level ~= flashLevel then applyFlash(level) end
+  -- Kernel verdict (sync for now; the consolidated async sampler replaces this).
+  lastKern = tonumber(sh("/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level")) or 1
+  local sig = core.signals(m, lastRates, lastKern, false)
+  local state, changed, reason = core.smStep(smState, sig, now)
+  titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
+  if changed and not silent then M.logSnapshot("state:" .. reason) end
+  if state == "critical" then notifyCrit(m) end
+  -- Drive the flash from flashState, not just transitions, so the animation
+  -- always matches the real state and self-heals (e.g. after a self-test).
+  if state ~= flashState then applyFlash(state) end
   -- Repaint the title every tick. The flash timer used to do this as a side
   -- effect; with the steady dot there is no other repaint path, and the title
-  -- would otherwise freeze at whatever value it had when the level last changed.
-  if not flashTimer then setIcon(level, lastMetrics, true) end
-  if level == "crit" then notifyCrit(m) end
+  -- would otherwise freeze at whatever value it had when the state last changed.
+  if not flashTimer then renderTitleNow() end
 end
 
 ------------------------------------------------------------------------------
@@ -209,9 +226,9 @@ function M.start()
   menu = hs.menubar.new()
   if not menu then return M end
   menu:setMenu(buildMenu)         -- recomputed fresh on every click
-  lastLevel = "ok"
-  flashLevel = nil                -- force first tick to set the flash state
-  setIcon("ok", lastMetrics, true)
+  smState = core.newSMState(hs.timer.secondsSinceEpoch())
+  flashState = nil                -- force first tick to set the flash state
+  renderTitleNow()
   pollTimer = hs.timer.doEvery(core.cfg.pollSec, tick)
   tick()                          -- immediate first sample
   return M
@@ -220,37 +237,46 @@ end
 function M.stop()
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
-  flashLevel = nil
+  flashState = nil
   if menu then menu:delete(); menu = nil end
 end
 
 -- One-line current state, for `hs -c "memwatch.status()"`.
 function M.status()
-  local m = readMetrics()
-  return string.format("level=%s comp=%.1fGB swap=%.1fGB avail=%.0f%%",
-    core.classify(m), m.compGB, m.swapGB, m.availPct)
+  local m = lastMetrics
+  return string.format(
+    "state=%s kern=%d swapout=%.0fpg/s comprate=%.0fpg/s avail=%.0f%% swap=%.1fGB compressor=%.1fGB",
+    smState.state, lastKern, lastRates.swapOut, lastRates.comp,
+    m.availPct, m.swapGB, m.compGB)
 end
 
 -- Force a visual state for ~12s to verify the icon + notification paths.
--- Usage: hs -c "memwatch.test('warn')"  /  hs -c "memwatch.test('crit')"
+-- Usage: hs -c "memwatch.test('elevated')"  /  hs -c "memwatch.test('critical')"
 function M.test(level, seconds)
-  level = (level == "crit" or level == "warn") and level or "crit"
+  local alias = { warn = "elevated", crit = "critical",
+                  elevated = "elevated", critical = "critical" }
+  local state = alias[tostring(level)] or "critical"
   local dur = tonumber(seconds) or 12
-  -- Freeze live sampling so the faked metrics are not overwritten mid-demo
-  -- (the bug behind "red flashing 0G": the poll loop reset compGB to the live 0).
+  -- Freeze live sampling so the faked state is not overwritten mid-demo.
   if pollTimer then pollTimer:stop(); pollTimer = nil end
-  lastLevel = level
-  lastMetrics = { compGB = (level == "crit") and 16 or 9, swapGB = (level == "crit") and 7 or 2, availPct = (level == "crit") and 6 or 14 }
-  applyFlash(level)
-  if level == "crit" then
+  smState.state = state
+  smState.since = hs.timer.secondsSinceEpoch()
+  lastMetrics = { compGB = 16, swapGB = 7, availPct = (state == "critical") and 6 or 12 }
+  titleSnap = (state == "critical")
+    and { offenderName = "FakeProc", offenderGB = 22, causeTag = "SWAP" }
+    or  { watchName = "FakeProc" }
+  applyFlash(state)
+  if state == "critical" then
     lastNotifyAt = 0
     notifyCrit(lastMetrics)
   end
   hs.timer.doAfter(dur, function()
+    smState = core.newSMState(hs.timer.secondsSinceEpoch())
+    titleSnap = {}
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, tick)  -- resume live sampling
-    tick(true)                                            -- silent revert to the real level
+    tick(true)                                            -- silent revert to the real state
   end)
-  return string.format("memwatch.test(%s) running for %ds (live sampling paused)", level, dur)
+  return string.format("memwatch.test(%s) running for %ds (live sampling paused)", state, dur)
 end
 
 _G.memwatch = M  -- expose for the hs CLI

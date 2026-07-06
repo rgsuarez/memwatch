@@ -89,6 +89,111 @@ check("sampler crit level",  core.parseSampler("4\ntotal = 0M used = 0M free = 0
 check("sampler garbled calm", core.parseSampler("").kernLevel, 1)
 check("sampler garbled swap", core.parseSampler("garbage with no fields").swapBytes, 0)
 
+-- ---- signals ----
+local R0 = { swapOut = 0, comp = 0, pageOut = 0 }
+-- This machine at rest: huge compressor + swap held, but idle rates, kern 1.
+local mRest = { availPct = 40, compGB = 31, swapGB = 8.4 }
+local sCalm = core.signals(mRest, R0, 1, false)
+check("rest: no elev cond",  sCalm.elevCond, false)
+check("rest: no crit cond",  sCalm.critCond, false)
+check("rest: calm for exit", sCalm.calmElev, true)
+
+local sSwap  = core.signals(mRest, { swapOut = 250,  comp = 0, pageOut = 0 }, 1, false)
+check("swap 250pg/s is active",   sSwap.swapActive, true)
+check("swap active raises elev",  sSwap.elevCond, true)
+check("swap active is not crit",  sSwap.critCond, false)
+
+local sStorm = core.signals(mRest, { swapOut = 2500, comp = 0, pageOut = 0 }, 1, false)
+check("swap 2500pg/s is a storm", sStorm.critSlow, true)
+
+local sKern4 = core.signals(mRest, R0, 4, false)
+check("kernel 4 is critFast",     sKern4.critFast, true)
+local sRun   = core.signals(mRest, R0, 1, true)
+check("runaway is critFast",      sRun.critFast, true)
+
+local sFloor = core.signals({ availPct = 4 }, { swapOut = 0, comp = 6000, pageOut = 0 }, 1, false)
+check("floor + compActive crit",  sFloor.critSlow, true)
+check("floor alone is not crit",  core.signals({ availPct = 4 }, R0, 1, false).critSlow, false)
+
+-- ---- state machine ----
+-- confirm debounce: blips never raise
+local sm = core.newSMState(0)
+core.smStep(sm, sSwap, 5)
+check("sm: single blip stays ok", sm.state, "ok")
+core.smStep(sm, sCalm, 10)
+core.smStep(sm, sSwap, 15)
+check("sm: broken streak stays ok", sm.state, "ok")
+core.smStep(sm, sSwap, 20); core.smStep(sm, sSwap, 25)
+check("sm: 2 consecutive -> elevated", sm.state, "elevated")
+
+-- storm escalation needs its own confirmation
+core.smStep(sm, sStorm, 30)
+check("sm: 1 storm tick holds elevated", sm.state, "elevated")
+core.smStep(sm, sStorm, 35)
+check("sm: 2 storm ticks -> critical", sm.state, "critical")
+
+-- release: calm ticks alone are not enough before the dwell expires
+for t = 40, 60, 5 do core.smStep(sm, sCalm, t) end
+check("sm: calm before dwell holds critical", sm.state, "critical")
+core.smStep(sm, sCalm, 65)
+check("sm: dwell + release -> elevated", sm.state, "elevated")
+for t = 70, 80, 5 do core.smStep(sm, sCalm, t) end
+check("sm: elevated holds until its dwell", sm.state, "elevated")
+core.smStep(sm, sCalm, 85)
+check("sm: elevated -> ok after dwell", sm.state, "ok")
+
+-- kernel critical and extreme runaways take one tick
+local sm2 = core.newSMState(0)
+core.smStep(sm2, sKern4, 5)
+check("sm: kernel 4 -> critical in one tick", sm2.state, "critical")
+local sm3 = core.newSMState(0)
+local _, _, rs3 = core.smStep(sm3, sRun, 5)
+check("sm: runaway -> critical in one tick", sm3.state, "critical")
+check("sm: runaway reason", rs3, "runaway-extreme")
+
+-- flap replay: the 2026-06-30 series. compGB oscillated around the old 14 GB
+-- absolute boundary (crit<->warn every 5s in the log) with idle rates, kernel
+-- normal, avail 27-48%. The new model must not move at all.
+local sm4 = core.newSMState(0)
+local flips = 0
+for i = 1, 60 do
+  local sig = core.signals(
+    { availPct = (i % 2 == 0) and 27 or 48, compGB = (i % 2 == 0) and 14.3 or 13.9 },
+    R0, 1, false)
+  local _, changed = core.smStep(sm4, sig, i * 5)
+  if changed then flips = flips + 1 end
+end
+check("sm: flap replay zero transitions", flips, 0)
+check("sm: flap replay stays ok", sm4.state, "ok")
+
+-- boundary hover: enter on a sustained rate, then hover just under the entry
+-- threshold. Exit needs swapOut < swapLo/2, so hovering must not flap.
+local sm5 = core.newSMState(0)
+local flips5, t5 = 0, 0
+local function hover(rateVal)
+  t5 = t5 + 5
+  local sig = core.signals(mRest, { swapOut = rateVal, comp = 0, pageOut = 0 }, 1, false)
+  local _, changed = core.smStep(sm5, sig, t5)
+  if changed then flips5 = flips5 + 1 end
+end
+hover(210); hover(210)
+for i = 1, 20 do hover(i % 2 == 0 and 210 or 190) end
+check("sm: boundary hover one transition", flips5, 1)
+check("sm: boundary hover holds elevated", sm5.state, "elevated")
+
+-- ---- title rendering ----
+check("title ok text",  core.renderTitle("ok", {}).text, core.DOT)
+check("title ok level", core.renderTitle("ok", {}).level, "ok")
+local tE = core.renderTitle("elevated", { watchName = "Google Chrome Helper (Renderer)" })
+check("title elevated hint", tE.text, core.DOT .. " Google Chrome\u{2191}")
+check("title elevated level", tE.level, "warn")
+check("title elevated bare", core.renderTitle("elevated", {}).text, core.DOT)
+local tC = core.renderTitle("critical", { offenderName = "python3", offenderGB = 8.4 })
+check("title critical offender", tC.text, core.DOT .. " python3 8G")
+check("title critical level", tC.level, "crit")
+check("title critical cause", core.renderTitle("critical", { causeTag = "SWAP" }).text, core.DOT .. " SWAP")
+check("title long name capped", core.shortName(("A"):rep(20)), ("A"):rep(13) .. "\u{2026}")
+
 if fails == 0 then
   print("\nALL PASS")
 else

@@ -322,6 +322,13 @@ local function buildMenu()
     { title = string.format("Compressor (info) %.1f GB", m.compGB), disabled = true },
     { title = "-" },
   }
+  local sinceSample = lastSampleAt > 0 and (hs.timer.secondsSinceEpoch() - lastSampleAt) or 0
+  if sinceSample > 15 then
+    items[#items + 1] = {
+      title = string.format("\u{26A0} process data %.0fs stale (system under load)", sinceSample),
+      disabled = true,
+    }
+  end
   local cmprsNote = ""
   if not topCache.map then
     cmprsNote = " (compressed pending)"
@@ -425,13 +432,18 @@ end
 -- The ps table is deliberately uncapped: a runaway whose pages are being
 -- compressed away in real time can hold a tiny RSS, and any top-N-by-RSS cut
 -- would drop exactly the process this tool exists to catch. ~600 rows parse
--- in well under a millisecond.
+-- in well under a millisecond. No -m: we sort ourselves, and ps's
+-- memory-sort is precisely the work that crawls when the system is dying.
 local SAMPLER_CMD = "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level vm.swapusage; "
-                 .. "/bin/ps -Axo pid,uid,rss,comm -m"
+                 .. "/bin/ps -Axo pid,uid,rss,comm"
 local SAMPLE_WATCHDOG_SEC = 20
+local SAMPLE_STALE_SEC    = 30
 
 local sampleTask, sampleStartedAt = nil, 0
-local lastPsBlob = ""   -- consumed by the process tracker
+local lastPsBlob = ""     -- consumed by the process tracker
+local lastSampleAt = 0    -- when a sampler callback last landed
+local lastStaleLogAt = 0
+local lastExtreme = false -- extreme runaway seen by the most recent sample
 
 local function launchSampler(onDone)
   local now = hs.timer.secondsSinceEpoch()
@@ -448,10 +460,14 @@ local function launchSampler(onDone)
   if sampleTask then sampleTask:start() end
 end
 
--- Second half of the tick, run when the sampler fork returns. All state
--- decisions live here because they need the kernel verdict and the ps list.
+-- Enrichment half: runs when the sampler fork returns. Refreshes the kernel
+-- verdict, swap usage, and the per-process pipeline. Deliberately makes NO
+-- state decision: under heavy pressure this fork can starve for tens of
+-- seconds (a live drill measured ~95s of stalled callbacks during a swap
+-- storm), and the verdict must never be hostage to it.
 local function onSample(blob)
   local now = hs.timer.secondsSinceEpoch()
+  lastSampleAt = now
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -470,9 +486,9 @@ local function onSample(blob)
   lastRuns = kept
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
 
-  local extreme = false
+  lastExtreme = false
   for _, r in ipairs(kept) do
-    if r.kind == "extreme" then extreme = true end
+    if r.kind == "extreme" then lastExtreme = true end
     local lk = r.pid .. "|" .. r.kind
     if (now - (runawayLogAt[lk] or 0)) > 300 then
       runawayLogAt[lk] = now
@@ -481,10 +497,7 @@ local function onSample(blob)
     end
   end
 
-  local sig = core.signals(lastMetrics, lastRates, lastKern, extreme)
-  local state, changed, reason = core.smStep(smState, sig, now)
-
-  local offender, watch = procs.pickOffender(kept, lastRanked, state)
+  local offender, watch = procs.pickOffender(kept, lastRanked, smState.state)
   if offender and not offender.weightMB then offender.weightMB = offender.rssMB or 0 end
   lastOffender = offender
   -- A hog is named in the HUD and menu with its "largest, not growing"
@@ -494,20 +507,25 @@ local function onSample(blob)
   titleSnap.offenderName = named and offender.name or nil
   titleSnap.offenderGB   = named and (offender.weightMB / 1024) or nil
   titleSnap.watchName    = watch and watch.name or nil
-  titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", lastMetrics.availPct)
 
   -- top runs whenever the system is interesting OR compression/swap is
   -- actively churning even at ok: that is exactly when a fast allocator's
   -- pages get compressed away and it goes invisible to RSS.
-  if state ~= "ok" or #kept > 0 or sig.compActive or sig.swapActive then topRefresh() end
-  if changed then M.logSnapshot("state:" .. reason) end
+  if smState.state ~= "ok" or #kept > 0
+     or lastRates.comp >= core.cfg.rates.compLo
+     or lastRates.swapOut >= core.cfg.rates.swapLo then
+    topRefresh()
+  end
+end
 
-  -- Alert surfaces: the HUD is the actionable one, the notification the
-  -- breadcrumb. One reusable HUD, raise-cooldown gated, a new offender
-  -- preempts the cooldown, and the body tracks live numbers unless a kill
-  -- narrative owns it.
+-- Alert surfaces: the HUD is the actionable one, the notification the
+-- breadcrumb. One reusable HUD, raise-cooldown gated, a new offender
+-- preempts the cooldown, and the body tracks live numbers unless a kill
+-- narrative owns it.
+local function alertSurfaces(state, now)
   if state == "critical" then
     hudBelowCritSince = nil
+    local offender = lastOffender
     local visible = hud and hud:isShowing()
     if not visible then
       local newOffender = offender and (not hudOffender or hudOffender.pid ~= offender.pid)
@@ -545,13 +563,12 @@ local function onSample(blob)
       hudBelowCritSince = nil
     end
   end
-
-  -- Drive the flash from flashState, not just transitions, so the animation
-  -- always matches the real state and self-heals (e.g. after a self-test).
-  if state ~= flashState then applyFlash(state) end
-  if not flashTimer then renderTitleNow() end
 end
 
+-- Decision half: fork-free, runs every tick no matter what. Everything it
+-- needs is native (rates and headroom from hs.host.vmStat counters) or
+-- last-known (kernel level, extreme flag), so the state machine, title, and
+-- alert surfaces keep working even while the sampler fork is starving.
 local function tick()
   local now = hs.timer.secondsSinceEpoch()
   local m = readMetrics()   -- native, fork-free
@@ -566,6 +583,23 @@ local function tick()
     end
     prevCounters, prevCountersAt = m.counters, now
   end
+
+  local sig = core.signals(m, lastRates, lastKern, lastExtreme)
+  local state, changed, reason = core.smStep(smState, sig, now)
+  titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
+  if changed then M.logSnapshot("state:" .. reason) end
+  alertSurfaces(state, now)
+
+  -- Honesty when degraded: if the fork has not reported for a while, say so.
+  if lastSampleAt > 0 and (now - lastSampleAt) > SAMPLE_STALE_SEC
+     and (now - lastStaleLogAt) > 60 then
+    lastStaleLogAt = now
+    M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
+  end
+
+  -- Drive the flash from flashState, not just transitions, so the animation
+  -- always matches the real state and self-heals (e.g. after a self-test).
+  if state ~= flashState then applyFlash(state) end
   -- Repaint the title every tick from what is already known, even when the
   -- fork is skipped: the gauge must keep breathing while the system is dying.
   if not flashTimer then renderTitleNow() end

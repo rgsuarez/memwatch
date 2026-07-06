@@ -132,7 +132,9 @@ end
 -- Sorted by CMPRS, not MEM: the pids that matter here are the ones whose
 -- weight lives in the compressor, which a residency sort would never surface.
 local TOP_CMD = "/usr/bin/top -l 1 -n 25 -o cmprs -stats pid,command,mem,cmprs"
-local TOP_MIN_INTERVAL = 10
+-- One top per tick while interesting: attribution lag is what stands between
+-- a compressed-away runaway and its detection window.
+local TOP_MIN_INTERVAL = 4.5
 local topTask = nil
 
 local function topRefresh()
@@ -681,10 +683,12 @@ function M.status()
   local m = lastMetrics
   local off = lastOffender
     and string.format(" offender=%s(%d)", lastOffender.name, lastOffender.pid) or ""
+  local watch = titleSnap.watchName
+    and string.format(" watch=%s", titleSnap.watchName) or ""
   return string.format(
-    "state=%s kern=%d swapout=%.0fpg/s comprate=%.0fpg/s avail=%.0f%% swap=%.1fGB compressor=%.1fGB%s",
+    "state=%s kern=%d swapout=%.0fpg/s comprate=%.0fpg/s avail=%.0f%% swap=%.1fGB compressor=%.1fGB%s%s",
     smState.state, lastKern, lastRates.swapOut, lastRates.comp,
-    m.availPct, m.swapGB, m.compGB, off)
+    m.availPct, m.swapGB, m.compGB, off, watch)
 end
 
 -- Force a visual state for ~12s to verify the icon + notification paths.

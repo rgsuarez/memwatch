@@ -464,6 +464,67 @@ local _, whyDeny = core.killAllowed({ pid = 500, uid = UID, comm = "Finder" }, U
 check("kill: denylist reason", whyDeny, "protected process")
 check("kill: nil proc denied", (core.killAllowed(nil, UID, 999)), false)
 
+-- ---- LFM: JSON codec (trust-boundary parser; adversarial floor) ----
+local lfm = require("memwatch_lfm")
+
+check("json: sorted keys", lfm.jsonEncode({ b = 1, a = 2 }), '{"a":2,"b":1}')
+check("json: integer", lfm.jsonEncode(42), "42")
+check("json: float", lfm.jsonEncode(1.5), "1.5")
+check("json: escapes", lfm.jsonEncode('a"b\\c\nd'), '"a\\"b\\\\c\\nd"')
+check("json: control escape", lfm.jsonEncode("\1"), '"\\u0001"')
+check("json: empty array", lfm.jsonEncode(lfm.jsonArray({})), "[]")
+check("json: empty object", lfm.jsonEncode({}), "{}")
+check("json: nested", lfm.jsonEncode({ a = { 1, 2 }, b = true }), '{"a":[1,2],"b":true}')
+check("json: NaN rejected", (lfm.jsonEncode(0 / 0)), nil)
+check("json: inf rejected", (lfm.jsonEncode(math.huge)), nil)
+check("json: non-string key rejected", (lfm.jsonEncode({ [1.5] = "x", a = 1 })), nil)
+
+local deepEnc = {}
+do
+  local cur = deepEnc
+  for _ = 1, 12 do cur.n = {}; cur = cur.n end
+end
+check("json: encode too deep rejected", (lfm.jsonEncode(deepEnc)), nil)
+
+local dec = lfm.jsonDecode('{"action":"wait","confidence":0.8,"n":-3,"ok":true,"arr":[1,"x"]}')
+check("json: decode object", dec and dec.action, "wait")
+check("json: decode number", dec and dec.confidence, 0.8)
+check("json: decode negative", dec and dec.n, -3)
+check("json: decode bool", dec and dec.ok, true)
+check("json: decode array elem", dec and dec.arr and dec.arr[2], "x")
+check("json: decode unicode", lfm.jsonDecode('"\\u0041\\u00e9"'), "A\u{e9}")
+check("json: decode surrogate pair", lfm.jsonDecode('"\\ud83d\\ude00"'), utf8.char(0x1F600))
+check("json: whitespace tolerated", (lfm.jsonDecode('  { "a" : 1 }  ') or {}).a, 1)
+
+local function decodeFails(name, input)
+  local v, err = lfm.jsonDecode(input)
+  check(name, v == nil and err ~= nil, true)
+end
+decodeFails("json: truncated rejected", '{"a":1')
+decodeFails("json: trailing garbage rejected", '{"a":1}x')
+decodeFails("json: invalid escape rejected", '"\\q"')
+decodeFails("json: lone surrogate rejected", '"\\ud800"')
+decodeFails("json: raw control in string rejected", '"a\1b"')
+decodeFails("json: duplicate key rejected", '{"a":1,"a":2}')
+decodeFails("json: leading zero rejected", '{"a":0123}')
+decodeFails("json: bare word rejected", 'garbage')
+decodeFails("json: top-level null is no-verdict", 'null')
+decodeFails("json: null in array rejected", '[null]')
+decodeFails("json: deep nesting rejected", string.rep("[", 20) .. "1" .. string.rep("]", 20))
+decodeFails("json: oversized input rejected", '"' .. string.rep("a", 70000) .. '"')
+check("json: non-string input rejected", (lfm.jsonDecode(42)), nil)
+
+local rt = lfm.jsonDecode(lfm.jsonEncode({ z = { 1, 2, 3 }, a = "x\ny" }))
+check("json: roundtrip", lfm.jsonEncode(rt), '{"a":"x\\ny","z":[1,2,3]}')
+
+check("hash: stable", lfm.snapshotHash("abc"), lfm.snapshotHash("abc"))
+check("hash: differs", lfm.snapshotHash("abc") == lfm.snapshotHash("abd"), false)
+check("hash: format", lfm.snapshotHash("x"):match("^%x%x%x%x%x%x%x%x$") ~= nil, true)
+
+local line = lfm.ledgerLine({ action = "wait", hash = "00000000" })
+check("ledger: newline-terminated", line:sub(-1), "\n")
+check("ledger: valid json", (lfm.jsonDecode(line:sub(1, -2)) or {}).action, "wait")
+
 -- ---- split-scope guard ----
 -- A top-level `local X` referenced by a function defined ABOVE it silently
 -- splits into a global writer and a local reader. This class caused three
@@ -497,7 +558,7 @@ local function earlyRefs(path)
   return bad
 end
 
-for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua" }) do
+for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua" }) do
   local bad = earlyRefs(path)
   for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end
   check("split-scope clean: " .. path, #bad, 0)

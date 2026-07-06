@@ -110,9 +110,15 @@ local function runMode(args)
   local files = listScenarios(scenariosDir)
   assert(#files > 0, "no scenarios found in " .. scenariosDir)
   -- Per-invocation temp paths so concurrent runs (a Phase-B fan-out, or two
-  -- operators) never clobber each other's request/response scratch.
-  local tag = (label .. "-" .. variant .. "-" .. tostring(os.time()))
-    :gsub("[^%w%-]", "_")
+  -- operators) never clobber each other's request/response scratch. The tag
+  -- includes the schema mode AND a per-process nonce (pid via the runner
+  -- pipe) so two jobs for the same label/variant started in the same second
+  -- (a schema + noschema pair) still get distinct paths.
+  local pidHandle = io.popen("echo $PPID"); local noncePid = pidHandle:read("*n"); pidHandle:close()
+  local tag = table.concat({
+    label, variant, useSchema and "s" or "ns",
+    tostring(os.time()), tostring(noncePid or 0),
+  }, "-"):gsub("[^%w%-]", "_")
   local reqPath = "eval/tmp/req-" .. tag .. ".json"
   local respPath = "eval/tmp/resp-" .. tag .. ".json"
 

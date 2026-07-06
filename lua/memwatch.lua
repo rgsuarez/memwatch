@@ -59,6 +59,7 @@ local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
 local lfmServerPort  = nil
 local lfmServerReady = false
+local lfmSpawnedAt   = nil    -- epoch of the current spawn (fast-crash detection)
 local lfmOffline     = false  -- timeout/self-police latch; clears at an elevated tick
 local lfmCalmSince   = nil    -- retire-on-calm bookkeeping
 local lfmLastAdvisoryAt = 0
@@ -805,6 +806,11 @@ local function tick()
   local state, changed, reason = core.smStep(smState, sig, now)
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
   if changed then M.logSnapshot("state:" .. reason) end
+  -- GC the recycled-pid unattended state BEFORE alertSurfaces consumes it:
+  -- if a pid left the runaway set (old process gone) its streak/fired stamp
+  -- must be cleared before this tick's unattended decision can read it, or a
+  -- recycled pid could inherit stale state for one tick.
+  gcUnattendedState()
   alertSurfaces(state, now)
 
   -- Honesty when degraded: if the fork has not reported for a while, say so.
@@ -827,12 +833,9 @@ local function tick()
     if (now - topIdleSince) > 60 then stopTopStream() end
   end
 
-  -- Recycled-pid hygiene for the unattended state, every tick regardless of
-  -- whether the model feature is on (the deterministic path uses it too).
-  gcUnattendedState()
-
   -- LFM adjudicator lifecycle: spawn/retire/self-police/advisory. Async
   -- everywhere; a disabled feature makes this a single boolean check.
+  -- (Unattended-state GC runs earlier in the tick, before alertSurfaces.)
   lfmTick(state, now, interesting)
 
   -- Drive the flash from flashState, not just transitions, so the animation
@@ -1004,7 +1007,19 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
   hs.timer.doAfter(0.5, guard("freeze-verify", function()
-    if pidState(pid) == "T" then
+    -- Re-probe IDENTITY after the signal, not just the stop state: if the
+    -- pid was recycled between the pre-signal probe and the SIGSTOP, we
+    -- would have stopped the WRONG (new) process. If it stopped but its
+    -- identity no longer matches, CONTINUE it (undo our SIGSTOP) and drop
+    -- the ledger entry - never strand a bystander stopped.
+    local reprobe = resolveSignalTarget(pid, proc.liveName, proc.lstart)
+    if not reprobe then
+      sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+      frozen[pid] = nil
+      saveFrozen()
+      M.logSnapshot(string.format("freeze-abort:%s(%d)-identity-changed", proc.liveName, pid))
+      onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true)
+    elseif pidState(pid) == "T" then
       M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
       onUpdate(string.format(
         "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true)
@@ -1239,18 +1254,30 @@ local function retireLfmServer(reason)
   local pid, port = lfmServerPid, lfmServerPort
   lfmServerReady = false
   lfmServerPid, lfmServerPort = nil, nil
+  lfmSpawnedAt = nil  -- a deliberate retire must not trip the fast-crash latch
   lfmInFlight = nil
   if lfmServerTask then pcall(function() lfmServerTask:terminate() end) end
   lfmServerTask = nil
   protectedPids = { [selfPid] = true }
   if not pid then return end
   M.logSnapshot(string.format("lfm-retire:%s:pid=%d", reason or "?", pid))
-  -- Signal the tracked pid AND the actual port listener (may be a child).
+  -- Signal the tracked pid AND the actual port listener (may be a child),
+  -- but only signal the listener if it is CONFIRMED ours: our tracked pid,
+  -- or an llama-server serving OUR model dir. In the narrow window after our
+  -- server died, an unrelated process could bind the port; never kill it.
+  local function listenerIsOurs(owner)
+    if not owner then return false end
+    if owner == pid then return true end
+    local info = sh(string.format("/bin/ps -p %d -o comm=,args= 2>/dev/null", owner))
+    local comm = info:match("^(%S+)")
+    return comm ~= nil and comm:match("([^/]+)$") == "llama-server"
+      and info:find("projects/memwatch/models/", 1, true) ~= nil
+  end
   local function signalTargets(sig)
     if pid then sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, pid)) end
     if port then
       local owner = listenerPid(port)
-      if owner and owner ~= pid then
+      if owner and owner ~= pid and listenerIsOurs(owner) then
         sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, owner))
       end
     end
@@ -1259,9 +1286,12 @@ local function retireLfmServer(reason)
   local deadline = hs.timer.secondsSinceEpoch() + 5
   hs.timer.doUntil(
     function()
-      -- Success requires the PORT free (not just the tracked pid gone), so an
-      -- orphaned child still bound to the port keeps the wait alive.
-      local gone = not pidAlive(pid) and (not port or portFree(port))
+      -- Success requires the tracked pid gone AND our hold on the port
+      -- released: the port counts as released if it is free OR now held by
+      -- a process that is NOT ours (an unrelated squatter must not keep our
+      -- retire waiting, and we already refuse to signal it above).
+      local portReleased = (not port) or portFree(port) or not listenerIsOurs(listenerPid(port))
+      local gone = not pidAlive(pid) and portReleased
       if gone then return true end
       if hs.timer.secondsSinceEpoch() > deadline then
         signalTargets("KILL")
@@ -1312,6 +1342,7 @@ local function spawnLfmServer()
   lfmServerPort = port
   lfmServerReady = false
   lfmSpawnedAt = hs.timer.secondsSinceEpoch()
+  local spawnAt = lfmSpawnedAt
   -- taskpolicy -c utility keeps inference threads out of the crisis's way;
   -- the drain callback exists because llama-server logs continuously and an
   -- undrained pipe deadlocks at 64KB.
@@ -1322,6 +1353,16 @@ local function spawnLfmServer()
       lfmServerReady = false
       lfmServerPid, lfmServerPort = nil, nil
       protectedPids = { [selfPid] = true }
+      -- A FAST crash (died within a few seconds of spawn, before it was ever
+      -- ready) latches the adjudicator offline: otherwise the next elevated
+      -- tick respawns it and a crash-looping binary thrashes load/exec cycles
+      -- through the pressure episode. A clean retire nils lfmSpawnedAt first,
+      -- so this only fires on an unexpected early exit.
+      if lfmSpawnedAt == spawnAt
+         and (hs.timer.secondsSinceEpoch() - spawnAt) < 10 then
+        lfmOffline = true
+        M.logSnapshot("lfm-fast-crash:latched-offline")
+      end
     end),
     function() return true end,
     { "-c", "utility", bin,

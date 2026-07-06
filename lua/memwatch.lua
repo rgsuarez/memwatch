@@ -54,6 +54,7 @@ local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
 local unattendedFiredFor = {} -- [pid] = epoch of the last unattended adjudication
+local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
 local lfmServerPort  = nil
@@ -1112,6 +1113,26 @@ resolveUnattendedAction = function(mode, offender)
       offenderKind = offender.kind,
       offenderForeground = offender.foreground,
     })
+    -- Wait-deferral bound (a rail in the TIME dimension, bake-off finding):
+    -- a model wait DEFERS the deterministic policy, protecting a
+    -- false-positive extreme (a build burst resolves within a window or
+    -- two), but an inert or over-conservative model must not capture the
+    -- decision forever while a true runaway grinds the machine down. After
+    -- three consecutive model-wait outcomes on the same offender at grace
+    -- expiry, the deterministic policy proceeds.
+    if eff == "wait" then
+      local streak = (unattendedWaitStreak[offender.pid] or 0) + 1
+      unattendedWaitStreak[offender.pid] = streak
+      if streak >= 3 then
+        rails[#rails + 1] = "wait-deferral-exhausted"
+        local action = (mode == "kill") and "terminate" or "freeze"
+        return action, "deterministic-fallback", e.verdict.rationale, rails,
+          { model = lfm.cfg.model, snapshotHash = e.snapshotHash,
+            confidence = e.verdict.confidence, deferrals = streak }
+      end
+    else
+      unattendedWaitStreak[offender.pid] = 0
+    end
     return eff, "lfm", e.verdict.rationale, rails,
       { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence }
   end

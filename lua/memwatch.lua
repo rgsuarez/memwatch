@@ -71,6 +71,7 @@ local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, 
 local resolveUnattendedAction
 local writeDecisionOutcome
 local lfmTick
+local gcUnattendedState
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -809,6 +810,10 @@ local function tick()
     if (now - topIdleSince) > 60 then stopTopStream() end
   end
 
+  -- Recycled-pid hygiene for the unattended state, every tick regardless of
+  -- whether the model feature is on (the deterministic path uses it too).
+  gcUnattendedState()
+
   -- LFM adjudicator lifecycle: spawn/retire/self-police/advisory. Async
   -- everywhere; a disabled feature makes this a single boolean check.
   lfmTick(state, now, interesting)
@@ -968,19 +973,27 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     onUpdate(string.format("%s is already frozen", proc.liveName), true)
     return
   end
+  -- Record the ledger entry BEFORE the SIGSTOP, not after the verify: a
+  -- reload in the verify window would otherwise leave a SIGSTOPped process
+  -- with no ledger row (an orphan reconcile cannot find). Persisting first
+  -- means a reload finds it and frozenReconcile re-validates (still stopped
+  -- -> kept; failed to stop -> dropped). The verify below downgrades a
+  -- process that never entered state T.
+  frozen[pid] = {
+    pid = pid, name = proc.liveName, lstart = proc.lstart,
+    weightMB = opts.weightMB or 0,
+    frozenAt = hs.timer.secondsSinceEpoch(),
+  }
+  saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
   hs.timer.doAfter(0.5, guard("freeze-verify", function()
     if pidState(pid) == "T" then
-      frozen[pid] = {
-        pid = pid, name = proc.liveName, lstart = proc.lstart,
-        weightMB = opts.weightMB or 0,
-        frozenAt = hs.timer.secondsSinceEpoch(),
-      }
-      saveFrozen()
       M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
       onUpdate(string.format(
         "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true)
     else
+      frozen[pid] = nil
+      saveFrozen()
       M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, pidState(pid)))
       onUpdate(string.format("%s did not stop (state %s)", proc.liveName, pidState(pid)), true)
     end
@@ -1097,11 +1110,25 @@ local function consumeVerdict(offender)
   return e
 end
 
+-- The model-free deterministic policy: the mode is the action (kill ->
+-- terminate, freeze -> freeze), but a foreground offender is never
+-- terminated autonomously even here (capped to freeze), mirroring the LFM
+-- rail so the deterministic path is no more aggressive than the adjudicated
+-- one. The extreme-only gate lives upstream in alertSurfaces.
+local function deterministicAction(mode, foreground)
+  if mode == "kill" and not foreground then return "terminate" end
+  return "freeze"
+end
+
 -- Choose the unattended action. A fresh model verdict is refined through
 -- the deterministic rails within the mode ceiling; no verdict means the
 -- deterministic policy acts exactly as the legacy autoKill did (the mode is
 -- the action, extreme-only, policy-gated inside the signal path).
 resolveUnattendedAction = function(mode, offender)
+  -- The foreground termination rail must fire in the LIVE path, not only in
+  -- the advisory snapshot: lastOffender never carries a foreground flag, so
+  -- compute it here against the frontmost app before applyVerdict.
+  local foreground = offenderIsForeground(offender)
   local e = consumeVerdict(offender)
   if e then
     local proc = probePid(offender.pid)
@@ -1111,7 +1138,7 @@ resolveUnattendedAction = function(mode, offender)
     end
     local eff, rails = lfm.applyVerdict(e.verdict, mode, allowed, {
       offenderKind = offender.kind,
-      offenderForeground = offender.foreground,
+      offenderForeground = foreground,
     })
     -- Wait-deferral bound (a rail in the TIME dimension, bake-off finding):
     -- a model wait DEFERS the deterministic policy, protecting a
@@ -1124,11 +1151,13 @@ resolveUnattendedAction = function(mode, offender)
       local streak = (unattendedWaitStreak[offender.pid] or 0) + 1
       unattendedWaitStreak[offender.pid] = streak
       if streak >= 3 then
-        rails[#rails + 1] = "wait-deferral-exhausted"
-        local action = (mode == "kill") and "terminate" or "freeze"
-        return action, "deterministic-fallback", e.verdict.rationale, rails,
-          { model = lfm.cfg.model, snapshotHash = e.snapshotHash,
-            confidence = e.verdict.confidence, deferrals = streak }
+        -- The model's wait rationale is SUPERSEDED here, so do not attach it
+        -- to the deterministic action (it would mislabel the report card).
+        local action = deterministicAction(mode, foreground)
+        local drails = { "deterministic", "wait-deferral-exhausted" }
+        return action, "deterministic-fallback", nil, drails,
+          { model = lfm.cfg.model, deferrals = streak,
+            supersededModelAction = "wait" }
       end
     else
       unattendedWaitStreak[offender.pid] = 0
@@ -1136,8 +1165,7 @@ resolveUnattendedAction = function(mode, offender)
     return eff, "lfm", e.verdict.rationale, rails,
       { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence }
   end
-  local action = (mode == "kill") and "terminate" or "freeze"
-  return action, "deterministic-fallback", nil, { "deterministic" }, nil
+  return deterministicAction(mode, foreground), "deterministic-fallback", nil, { "deterministic" }, nil
 end
 
 ------------------------------------------------------------------------------
@@ -1235,8 +1263,18 @@ local function spawnLfmServer()
     return
   end
   lfmApiKey = sh("/usr/bin/openssl rand -hex 16"):gsub("%s+$", "")
-  sh(string.format("umask 177 && mkdir -p %q && printf '%%s' %q > %q",
-    os.getenv("HOME") .. "/projects/memwatch/eval/tmp", lfmApiKey, LFM_KEY_PATH))
+  -- Create the dir at normal perms (a restrictive umask on the mkdir would
+  -- drop the dir's execute bit and make the subsequent key write fail on a
+  -- fresh clone), then write the key file itself 0600 and VERIFY it landed;
+  -- if it did not, do not launch a server with a key file that is not there.
+  local tmpDir = os.getenv("HOME") .. "/projects/memwatch/eval/tmp"
+  sh(string.format("mkdir -p %q && (umask 177 && printf '%%s' %q > %q)",
+    tmpDir, lfmApiKey, LFM_KEY_PATH))
+  if not sh(string.format("test -s %q && echo yes", LFM_KEY_PATH)):match("yes") then
+    M.logSnapshot("lfm-spawn-skip:api-key-write-failed")
+    lfmApiKey = nil
+    return
+  end
   lfmServerPort = port
   lfmServerReady = false
   lfmSpawnedAt = hs.timer.secondsSinceEpoch()
@@ -1301,6 +1339,20 @@ local function spawnLfmServer()
     end,
     guard("lfm-health-poll", function() end),
     1)
+end
+
+-- Is this offender the user's frontmost app? A name match against the
+-- frontmost application (no pid involved). Used both to tag the snapshot
+-- and to feed the foreground termination rail in the live unattended path.
+local function offenderIsForeground(offender)
+  if not offender or not offender.name then return false end
+  local frontName = nil
+  pcall(function()
+    local app = hs.application.frontmostApplication()
+    frontName = app and app:name() or nil
+  end)
+  if not frontName then return false end
+  return offender.name == frontName or offender.name:find(frontName, 1, true) ~= nil
 end
 
 -- Assemble the model-facing snapshot from what the tick already knows. The
@@ -1485,6 +1537,22 @@ lfmTick = function(state, now, interesting)
   end
 end
 
+-- Drop per-offender unattended state (fired stamp, wait streak) for any pid
+-- that is not a currently-tracked runaway, so a recycled pid cannot inherit
+-- a prior process's streak or fired stamp and trigger a premature action.
+-- The signal path also re-validates identity, but this keeps the DECISION
+-- from ever consuming stale streak state. Runs every tick regardless of LFM.
+gcUnattendedState = function()
+  local liveRun = {}
+  for _, r in ipairs(lastRuns) do liveRun[r.pid] = true end
+  for pid in pairs(unattendedWaitStreak) do
+    if not liveRun[pid] then unattendedWaitStreak[pid] = nil end
+  end
+  for pid in pairs(unattendedFiredFor) do
+    if not liveRun[pid] then unattendedFiredFor[pid] = nil end
+  end
+end
+
 -- One-click kill: re-validate identity first (pid-reuse guard), check the
 -- pure policy, SIGTERM, escalate to SIGKILL after cfg.kill.escalateSec if the
 -- target is still alive (re-validated again), then verify death and report
@@ -1517,6 +1585,12 @@ function M.killPid(pid, expectedName, onUpdate)
   end
   local availBefore = lastMetrics.availPct or 0
   local totalGB = lastMetrics.totalGB or 0
+  -- A SIGSTOPped process cannot handle SIGTERM until it is continued, so a
+  -- TERM to a frozen target would just pend and force the full escalation
+  -- wait before SIGKILL. Continue it first so the graceful signal can land.
+  if frozenEntry or pidState(pid) == "T" then
+    sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+  end
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
@@ -1575,9 +1649,21 @@ function M.start()
   flashState = nil                -- force first tick to set the flash state
   frozenReconcile()               -- SIGSTOPped processes survive reloads
   -- Orphan sweep: a hard Hammerspoon crash can leave a previous session's
-  -- llama-server running with no owner. Anything serving from OUR model
-  -- directory is ours by construction; nothing else matches the path.
-  sh("/usr/bin/pkill -f 'llama-server.*projects/memwatch/models/' 2>/dev/null")
+  -- llama-server running with no owner. Enumerate candidate pids and kill
+  -- only those whose executable basename is exactly llama-server AND whose
+  -- argv serves from our model dir; a bare `pkill -f` on the pattern would
+  -- also match an unrelated process (an editor, a grep) carrying that
+  -- string in its command line.
+  local sweep = sh("/bin/ps -Axo pid=,comm=,args= 2>/dev/null")
+  for line in sweep:gmatch("[^\n]+") do
+    local spid, comm, args = line:match("^%s*(%d+)%s+(%S+)%s+(.*)$")
+    if spid and comm and args
+       and comm:match("([^/]+)$") == "llama-server"
+       and args:find("projects/memwatch/models/", 1, true) then
+      sh(string.format("/bin/kill -KILL %s 2>/dev/null", spid))
+      M.logSnapshot("lfm-orphan-sweep:pid=" .. spid)
+    end
+  end
   renderTitleNow()
   pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
   tick()                          -- immediate first sample

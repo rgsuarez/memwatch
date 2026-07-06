@@ -147,19 +147,26 @@ function M.aggregate(decisions, outcomes, episodes)
       agg.interventions = agg.interventions + 1
       local out = outcomes[d.at]
       local heldGB = ((d.offender or {}).weightMB or 0) / 1024
-      -- Observed relief window: action to episode end when known, else the
-      -- 60s outcome check; always capped.
-      local minutes = 1
+      -- Observed relief window: action to episode end. Relief is claimed
+      -- ONLY when the action actually correlates with a bounded episode (a
+      -- matching critical episode, or a recorded exited/frozen outcome);
+      -- an action with no correlate contributes ZERO, never a floor of 1
+      -- minute, so the number stays an honest observation.
+      local minutes = 0
       local at = parseIso(d.at)
       if at then
         for _, ep in ipairs(episodes) do
           if ep.stop and at >= ep.start - 60 and at <= (ep.stop + 60) then
-            minutes = math.max(1, (ep.stop - at) / 60)
+            minutes = math.max(minutes, (ep.stop - at) / 60)
             break
           end
         end
       end
-      if out and out.fate == "exited" then minutes = math.max(minutes, 1) end
+      -- A recorded terminal outcome corroborates at least the follow-up
+      -- window (60s) of relief even if no episode boundary was captured.
+      if out and (out.fate == "exited" or out.fate == "frozen") then
+        minutes = math.max(minutes, 1)
+      end
       agg.reliefGBmin = agg.reliefGBmin + heldGB * math.min(minutes, RELIEF_CAP_MIN)
     end
     if type(d.latencyMs) == "number" then agg.latencies[#agg.latencies + 1] = d.latencyMs end

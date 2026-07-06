@@ -226,6 +226,11 @@ decodeValueAt = function(s, i, depth)
     local obj = {}
     i = skipWs(s, i + 1)
     if s:sub(i, i) == "}" then return obj, i + 1 end
+    -- Track seen keys in a SEPARATE set, not by value presence: a key whose
+    -- value decodes to null leaves obj[key]==nil, so a presence check would
+    -- not catch a duplicate like {"a":null,"a":"x"} (last-key-wins smuggling
+    -- on the unconstrained path). The seen-set rejects it structurally.
+    local seen = {}
     while true do
       i = skipWs(s, i)
       if s:sub(i, i) ~= '"' then return decodeError(i, "expected key string") end
@@ -237,9 +242,10 @@ decodeValueAt = function(s, i, depth)
       -- Failure iff the second return is not a numeric next-index (a decoded
       -- null is a legitimate nil value WITH a numeric index).
       if type(nj) ~= "number" then return nil, nj end
-      if obj[key] ~= nil then
+      if seen[key] then
         return decodeError(i, "duplicate key " .. key)
       end
+      seen[key] = true
       obj[key] = val
       i = skipWs(s, nj)
       local d = s:sub(i, i)

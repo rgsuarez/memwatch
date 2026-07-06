@@ -51,11 +51,20 @@ if [ -f "$OUT" ]; then
   rm -f "$OUT"
 fi
 
+# A PENDING (unpinned) row must never arm the adjudicator with unverified
+# weights on the install path. Refuse by default; --allow-unpinned is the
+# explicit escape hatch used only while first pinning a new combo's hash.
+if [ "$SHA" = "PENDING" ] && [ "${ALLOW_UNPINNED:-0}" != "1" ]; then
+  echo "get-model: $LABEL has no pinned sha256 in scripts/models.tsv; refusing." >&2
+  echo "get-model: pin the hash first, or re-run with ALLOW_UNPINNED=1 to compute it." >&2
+  exit 1
+fi
+
 echo "get-model: fetching $FILE from $REPO"
 curl -fL --progress-bar -o "$OUT" "$URL"
 GOT="$(shasum -a 256 "$OUT" | awk '{print $1}')"
 if [ "$SHA" = "PENDING" ]; then
-  echo "get-model: WARNING no pinned hash for $LABEL yet; computed $GOT" >&2
+  echo "get-model: ALLOW_UNPINNED set; computed $GOT (NOT verified)" >&2
   echo "get-model: pin it in scripts/models.tsv before shipping this label" >&2
 else
   if [ "$GOT" != "$SHA" ]; then

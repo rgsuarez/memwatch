@@ -47,8 +47,17 @@ local function sh(cmd)
   return out or ""
 end
 
--- Sample the three pressure signals and return derived metrics.
+-- Sample memory metrics. Native hs.host.vmStat() first (no fork, and it
+-- carries the cumulative counters the rate signals need); the vm_stat popen
+-- path survives only as a fallback.
+local lastSwapBytes = 0
+
 local function readMetrics()
+  local ok, v = pcall(hs.host.vmStat)
+  if ok and type(v) == "table" and v.pageSize then
+    lastSwapBytes = core.parseSwapUsed(sh("/usr/sbin/sysctl -n vm.swapusage"))
+    return core.metricsFromVmStat(v, lastSwapBytes)
+  end
   local vmText   = sh("/usr/bin/vm_stat")
   local swapText = sh("/usr/sbin/sysctl -n vm.swapusage")
   local memText  = sh("/usr/sbin/sysctl -n hw.memsize")

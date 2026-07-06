@@ -75,6 +75,51 @@ function M.metrics(vm, swapBytes, totalBytes, pageSize)
   }
 end
 
+-- Derive metrics from hs.host.vmStat()'s native table (no fork needed).
+-- Field note: the native API names vm_stat's "Pages stored in compressor"
+-- `uncompressedPages` (the logical volume held by the compressor);
+-- `pagesUsedByVMCompressor` is the compressor's physical footprint and is NOT
+-- what the compressor row in the UI reports. Also carries the cumulative
+-- counters whose deltas give activity rates.
+function M.metricsFromVmStat(v, swapBytes)
+  v = v or {}
+  local pageSize = v.pageSize or M.cfg.pageSize
+  local total = v.memSize or 0
+  local function n(k) return v[k] or 0 end
+  local availPages = n("pagesFree") + n("pagesSpeculative")
+                   + n("pagesPurgeable") + n("fileBackedPages")
+  return {
+    compGB   = n("uncompressedPages") * pageSize / 1e9,
+    swapGB   = (swapBytes or 0) / 1e9,
+    availPct = total > 0 and (availPages * pageSize / total * 100) or 100,
+    totalGB  = total / 1e9,
+    counters = {
+      swapOuts   = n("swapOuts"),
+      compressed = n("pagesCompressed"),
+      pageOuts   = n("pageOuts"),
+    },
+  }
+end
+
+-- Per-second rate from a cumulative counter pair. Clamps to 0 on the first
+-- sample, a non-positive interval, or a counter reset (reboot / wraparound):
+-- a negative delta must never read as activity.
+function M.rate(cur, prev, dt)
+  if not cur or not prev or not dt or dt <= 0 or cur < prev then return 0 end
+  return (cur - prev) / dt
+end
+
+-- Parse the consolidated sampler blob. Line 1 is
+-- `sysctl -n kern.memorystatus_vm_pressure_level` (1 normal / 2 warn / 4
+-- critical); the vm.swapusage line follows. A missing or garbled blob parses
+-- to the calm defaults (level 1, swap 0) so a failed fork can never raise an
+-- alert on its own.
+function M.parseSampler(text)
+  text = text or ""
+  local kern = tonumber(text:match("^%s*(%d+)%s*\n")) or tonumber(text:match("^%s*(%d+)%s*$")) or 1
+  return { kernLevel = kern, swapBytes = M.parseSwapUsed(text) }
+end
+
 -- Classify metrics into "ok" | "warn" | "crit".
 function M.classify(m, cfg)
   cfg = cfg or M.cfg

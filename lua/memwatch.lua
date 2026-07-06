@@ -16,6 +16,7 @@
 
 local core  = require("memwatch_core")
 local procs = require("memwatch_procs")
+local lfm   = require("memwatch_lfm")
 
 local M = {}
 
@@ -48,6 +49,32 @@ local lastStaleLogAt = 0
 -- global writer and a local reader. Three live incidents came from that.
 local ignoredUntil = {}   -- ["pid|name"] = epoch when the ignore expires
 local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
+
+-- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
+local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
+local frozen        = {}  -- [pid] = persisted frozen-ledger entry
+local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
+local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
+local lfmServerTask  = nil    -- hs.task handle for llama-server
+local lfmServerPid   = nil
+local lfmServerPort  = nil
+local lfmServerReady = false
+local lfmSpawnedAt   = nil    -- epoch of the current spawn (fast-crash detection)
+local lfmOffline     = false  -- timeout/self-police latch; clears at an elevated tick
+local lfmCalmSince   = nil    -- retire-on-calm bookkeeping
+local lfmLastAdvisoryAt = 0
+local lfmReqNonce    = 0      -- monotonic request generation
+local lfmInFlight    = nil    -- { nonce, pid, hash, at, ident }
+local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident }
+-- Forward declarations, assigned in the kill-engine section: alertSurfaces
+-- (defined earlier in the file) calls these at tick time, and a top-level
+-- local referenced above its declaration silently splits into a global.
+local resolveUnattendedAction
+local writeDecisionOutcome
+local lfmTick
+local gcUnattendedState
+local offenderIsForeground
+local probePid
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -92,6 +119,86 @@ local function guard(label, fn)
     local ok, err = pcall(fn, ...)
     if not ok then logError(label, err) end
   end
+end
+
+------------------------------------------------------------------------------
+-- local config (memwatch-local.json, gitignored)
+--
+-- Read at require time, BEFORE M.start() fires at the bottom of this file,
+-- so operator overrides (unattended mode, LFM enablement) shape the very
+-- first tick. The runtime toggle and install.sh --with-lfm write the same
+-- file. Absent file == all defaults == model-free memwatch.
+------------------------------------------------------------------------------
+
+local LOCAL_CONFIG_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-local.json"
+
+local function applyLocalConfig()
+  local f = io.open(LOCAL_CONFIG_PATH, "r")
+  if not f then return end
+  local raw = f:read("a")
+  f:close()
+  local conf, err = lfm.jsonDecode(raw)
+  if type(conf) ~= "table" then
+    logError("local-config", err or "not an object")
+    return
+  end
+  local invalidMode = false
+  if type(conf.unattended) == "string" then
+    if core.UNATTENDED_MODES[conf.unattended] then
+      core.cfg.unattended = conf.unattended
+    else
+      invalidMode = true
+      logError("local-config", "unknown unattended mode '" .. conf.unattended
+        .. "'; failing closed to off and ignoring autoKill from this config")
+      core.cfg.unattended = "off"
+    end
+  end
+  -- Fail closed: an invalid explicit mode disarms the legacy autoKill shim
+  -- too, so a typo'd config can never leave autonomous kill armed via the
+  -- back door ({"unattended":"disabled","autoKill":true} -> off, not kill).
+  if type(conf.autoKill) == "boolean" and not invalidMode then
+    core.cfg.autoKill = conf.autoKill
+  elseif invalidMode then
+    core.cfg.autoKill = false
+  end
+  -- How long the HUD may go unanswered before the unattended action fires.
+  -- Exposed because an operator running unattended=freeze may want a faster
+  -- (or slower) hand-off than the 60s default.
+  if type(conf.unattendedGraceSec) == "number" and conf.unattendedGraceSec >= 5 then
+    core.cfg.cool.autoKillGraceSec = conf.unattendedGraceSec
+  end
+  if type(conf.lfm) == "table" then
+    for k, v in pairs(conf.lfm) do
+      if lfm.cfg[k] ~= nil and type(v) == type(lfm.cfg[k]) then lfm.cfg[k] = v end
+    end
+  end
+end
+
+local function saveLocalConfig()
+  -- MERGE into the existing file, never clobber it: the menu LFM toggle
+  -- writes only enabled + a few keys, but an operator may have set
+  -- autoKill, unattendedGraceSec, timeoutSec, maxServerMB, spawnMinAvailPct,
+  -- ctx, threads, etc. by hand. Read what is there, overlay the fields this
+  -- toggle owns, and preserve every other key.
+  local conf = {}
+  local rf = io.open(LOCAL_CONFIG_PATH, "r")
+  if rf then
+    local existing = lfm.jsonDecode(rf:read("a"))
+    rf:close()
+    if type(existing) == "table" then conf = existing end
+  end
+  conf.unattended = core.cfg.unattended
+  if type(conf.lfm) ~= "table" then conf.lfm = {} end
+  conf.lfm.enabled = lfm.cfg.enabled
+  conf.lfm.model = lfm.cfg.model
+  conf.lfm.resident = lfm.cfg.resident
+  conf.lfm.promptVariant = lfm.cfg.promptVariant
+  local enc = lfm.jsonEncode(conf)
+  if not enc then return end
+  local f = io.open(LOCAL_CONFIG_PATH, "w")
+  if not f then return end
+  f:write(enc, "\n")
+  f:close()
 end
 
 -- RGB (0-1) per level. Apple system green / orange / red.
@@ -140,7 +247,10 @@ local function assessProcesses(now)
   local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
   local kept = {}
   for _, r in ipairs(runs) do
-    if (ignoredUntil[r.pid .. "|" .. r.name] or 0) < now then kept[#kept + 1] = r end
+    if (ignoredUntil[r.pid .. "|" .. r.name] or 0) < now
+       and not protectedPids[r.pid] then
+      kept[#kept + 1] = r
+    end
   end
   lastRuns = kept
   lastExtreme = false
@@ -270,9 +380,8 @@ local hudHold        = false  -- a kill narrative owns the body text
 local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
 local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind } at raise
-local autoKillFiredFor = {}
 
-local HUD_W, HUD_H = 380, 150
+local HUD_W, HUD_H = 380, 176
 
 local function hudFrame()
   local scr = hs.screen.mainScreen()
@@ -316,30 +425,45 @@ local function buildHud()
              text = "Memory CRITICAL",
              textColor = { red = 1, green = 0.32, blue = 0.28, alpha = 1 },
              textSize = 15, textFont = "Menlo-Bold" }
-  hud[3] = { id = "body", type = "text", frame = { x = 16, y = 38, w = HUD_W - 32, h = 58 },
+  hud[3] = { id = "body", type = "text", frame = { x = 16, y = 38, w = HUD_W - 32, h = 52 },
              text = "", textColor = { white = 0.92, alpha = 1 },
              textSize = 12, textFont = "Menlo" }
-  local function button(idx, id, x, w, label, fill)
+  local function button(idx, id, x, y, w, label, fill)
     hud[idx] = { id = id, type = "rectangle", action = "fill",
-                 frame = { x = x, y = HUD_H - 44, w = w, h = 30 },
+                 frame = { x = x, y = y, w = w, h = 30 },
                  roundedRectRadii = { xRadius = 7, yRadius = 7 },
                  fillColor = fill, trackMouseUp = true }
     hud[idx + 1] = { id = id .. "-label", type = "text",
-                     frame = { x = x, y = HUD_H - 40, w = w, h = 22 },
+                     frame = { x = x, y = y + 4, w = w, h = 22 },
                      text = label, textAlignment = "center",
                      textColor = { white = 1, alpha = 0.95 },
                      textSize = 12, textFont = "Menlo-Bold", trackMouseUp = true }
   end
-  button(4, "kill",    16,  120, "Force Quit",   { red = 0.75, green = 0.16, blue = 0.13, alpha = 1 })
-  button(6, "ignore",  148, 100, "Ignore 30m",   { white = 0.28, alpha = 1 })
-  button(8, "monitor", 260, 104, "Activity Mon", { white = 0.28, alpha = 1 })
-  hud[10] = { id = "close", type = "text", frame = { x = HUD_W - 30, y = 8, w = 22, h = 22 },
+  -- Two rows: Freeze is the primary action (reversible; the right unattended
+  -- default), Force Quit the red one. Utility actions ride the second row.
+  local row1, row2 = HUD_H - 82, HUD_H - 44
+  button(4,  "freeze",  16,  row1, 172, "Freeze",       { red = 0.16, green = 0.42, blue = 0.75, alpha = 1 })
+  button(6,  "kill",    200, row1, 164, "Force Quit",   { red = 0.75, green = 0.16, blue = 0.13, alpha = 1 })
+  button(8,  "ignore",  16,  row2, 172, "Ignore 30m",   { white = 0.28, alpha = 1 })
+  button(10, "monitor", 200, row2, 164, "Activity Mon", { white = 0.28, alpha = 1 })
+  hud[12] = { id = "close", type = "text", frame = { x = HUD_W - 30, y = 8, w = 22, h = 22 },
               text = "\u{2715}", textAlignment = "center",
               textColor = { white = 0.6, alpha = 1 }, textSize = 13, trackMouseUp = true }
   hud:mouseCallback(guard("hud-click", function(_, evt, id)
     if evt ~= "mouseUp" then return end
     hudInteracted = true
-    if id == "kill" or id == "kill-label" then
+    if id == "freeze" or id == "freeze-label" then
+      if hudOffender then
+        local target = hudOffender
+        hudHold = true
+        M.freezePid(target.pid, target.name, function(text, done)
+          if hud then hud[3].text = text end
+          if done then
+            hs.timer.doAfter(4, guard("hud-close", function() M.hideHud() end))
+          end
+        end, { weightMB = target.weightMB, expectedLstart = target.lstart })
+      end
+    elseif id == "kill" or id == "kill-label" then
       if hudOffender then
         local target = hudOffender
         hudHold = true
@@ -348,7 +472,7 @@ local function buildHud()
           if done then
             hs.timer.doAfter(4, guard("hud-close", function() M.hideHud() end))
           end
-        end)
+        end, { expectedLstart = target.lstart })
       end
     elseif id == "ignore" or id == "ignore-label" then
       if hudOffender then M.ignore(hudOffender.pid, hudOffender.name) end
@@ -365,6 +489,12 @@ end
 local function raiseHud(offender, titleText)
   buildHud()
   hudOffender = offender
+  -- Capture the offender's start time at raise, so a Freeze/Force Quit click
+  -- seconds later binds identity and cannot signal a pid reused meanwhile.
+  if offender and offender.pid and not offender.lstart then
+    local probed = probePid(offender.pid)
+    if probed then offender.lstart = probed.lstart end
+  end
   hudInteracted = false
   hudHold = false
   hudShownAt = hs.timer.secondsSinceEpoch()
@@ -407,10 +537,12 @@ local function buildMenu()
     items[#items + 1] = { title = "   sampling\u{2026}", disabled = true }
   end
   for _, p in ipairs(lastRanked) do
-    local pid, name = p.pid, p.name
+    local pid, name, wMB = p.pid, p.name, p.weightMB
     items[#items + 1] = {
       title = string.format("%-22s %5.1f GB  (pid %d)", name:sub(1, 22), p.weightMB / 1024, pid),
       menu = {
+        { title = "Freeze " .. name,
+          fn = function() M.freezePid(pid, name, nil, { weightMB = wMB }) end },
         { title = "Force Quit " .. name,
           fn = function() M.killPid(pid, name) end },
         { title = "Ignore for 30 min",
@@ -419,6 +551,31 @@ local function buildMenu()
           fn = function() hs.application.launchOrFocus("Activity Monitor") end },
       },
     }
+  end
+  -- Frozen-by-memwatch section: what is held, for how long, and the way out.
+  local frozenRows = {}
+  for pid, e in pairs(frozen) do frozenRows[#frozenRows + 1] = { pid = pid, e = e } end
+  table.sort(frozenRows, function(a, b) return (a.e.frozenAt or 0) < (b.e.frozenAt or 0) end)
+  if #frozenRows > 0 then
+    items[#items + 1] = { title = "-" }
+    items[#items + 1] = { title = "Frozen by memwatch", disabled = true }
+    for _, row in ipairs(frozenRows) do
+      local pid, e = row.pid, row.e
+      local mins = (hs.timer.secondsSinceEpoch() - (e.frozenAt or 0)) / 60
+      items[#items + 1] = {
+        title = string.format("   %-20s %4.1f GB held \u{00B7} %.0f min", (e.name or "?"):sub(1, 20),
+          (e.weightMB or 0) / 1024, mins),
+        menu = {
+          { title = "Resume " .. (e.name or "?"),
+            fn = function() M.resumePid(pid) end },
+          { title = "Force Quit " .. (e.name or "?"),
+            fn = function() M.killPid(pid, e.name) end },
+        },
+      }
+    end
+    if #frozenRows > 1 then
+      items[#items + 1] = { title = "Resume all", fn = function() M.resumeAll() end }
+    end
   end
   items[#items + 1] = { title = "-" }
   if lastOffender then
@@ -436,6 +593,11 @@ local function buildMenu()
     fn = function() hs.application.launchOrFocus("Activity Monitor") end }
   items[#items + 1] = { title = "Log snapshot now",
     fn = function() M.logSnapshot("manual") end }
+  items[#items + 1] = { title = string.format("LFM adjudication: %s",
+      lfm.cfg.enabled and (lfmServerReady and "on (warm)" or "on") or "off"),
+    fn = function() M.setLfmEnabled(not lfm.cfg.enabled) end }
+  items[#items + 1] = { title = "Open value report",
+    fn = function() M.report() end }
   return items
 end
 
@@ -561,6 +723,10 @@ local function onSample(blob)
   lastPsList = procs.parsePsList(blob)
   procs.update(tracker, lastPsList, now, topCache.map)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
+  -- The watchdog and its own adjudicator never appear as offenders.
+  for i = #lastRanked, 1, -1 do
+    if protectedPids[lastRanked[i].pid] then table.remove(lastRanked, i) end
+  end
   assessProcesses(now)
 end
 
@@ -584,22 +750,63 @@ local function alertSurfaces(state, now)
       hud[3].text = hudBodyText()
     end
     notifyCrit(lastMetrics)
-    -- Last-resort auto-kill: opt-in, extreme growers only, HUD unanswered.
-    if core.cfg.autoKill and offender and offender.kind == "extreme"
+    -- Unattended action: opt-in, extreme growers only, HUD unanswered for
+    -- the grace window, once per offender. The LFM (when enabled and warm)
+    -- refines the action within the mode ceiling via the async verdict
+    -- cache; with no fresh verdict the deterministic policy acts exactly as
+    -- the legacy autoKill did. Both paths execute through the same signal
+    -- engines (identity probe + policy gate inside).
+    -- Re-arm semantics (live-drill finding): a WAIT outcome must not consume
+    -- the per-offender latch forever, or one low-confidence model wait
+    -- disables unattended coverage while the crisis continues. Each
+    -- adjudication stamps the time; another full grace window must pass
+    -- before the same offender is adjudicated again.
+    local mode = core.resolveUnattended(core.cfg)
+    if mode ~= "off" and offender and offender.kind == "extreme"
        and hud and hud:isShowing() and not hudInteracted and not hudHold
-       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec
-       and not autoKillFiredFor[offender.pid] then
-      autoKillFiredFor[offender.pid] = true
-      M.logSnapshot(string.format("auto-kill:%s(%d)", offender.name, offender.pid))
-      hs.notify.new({ title = "memwatch auto-kill",
+       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec then
+      -- Bind the offender's start time BEFORE reading the fired/streak state:
+      -- a same-name pid reuse (a new node/python reusing the pid) must NOT
+      -- inherit the prior process's fired stamp or wait streak. The entry
+      -- carries lstart; a mismatch resets it (a fresh offender starts clean).
+      local bound = probePid(offender.pid)
+      local lstart = bound and bound.lstart or nil
+      local fired = unattendedFiredFor[offender.pid]
+      if fired and fired.lstart and lstart and fired.lstart ~= lstart then
+        unattendedFiredFor[offender.pid] = nil
+        unattendedWaitStreak[offender.pid] = nil
+        fired = nil
+      end
+      if (now - ((fired and fired.at) or 0)) >= core.cfg.cool.autoKillGraceSec then
+      unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
+      local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
+      M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
+        action, offender.name, offender.pid, adjudicator))
+      writeDecisionOutcome(offender, action, adjudicator, rationale, rails, extra)
+      hs.notify.new({ title = "memwatch unattended " .. action,
                       subTitle = string.format("%s (pid %d)", offender.name, offender.pid),
-                      informativeText = "Extreme runaway, no response to the alert.",
+                      informativeText = (adjudicator == "lfm")
+                        and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
+                        or "Extreme runaway, no response to the alert.",
                       withdrawAfter = 0 }):send()
-      hudHold = true
-      M.killPid(offender.pid, offender.name, function(text, done)
-        if hud then hud[3].text = "AUTO: " .. text end
-        if done then hs.timer.doAfter(6, guard("hud-close", function() M.hideHud() end)) end
-      end)
+      if action ~= "wait" then
+        hudHold = true
+        local narrate = function(text, done)
+          if hud then hud[3].text = "AUTO: " .. text end
+          if done then hs.timer.doAfter(6, guard("hud-close", function() M.hideHud() end)) end
+        end
+        -- The bound start time also protects the autonomous signal (and its
+        -- TERM->KILL escalation seconds later) from acting on a pid reused
+        -- since this decision. Autonomous action is where a wrong target
+        -- destroys work, so identity is bound most strictly here.
+        if action == "terminate" then
+          M.killPid(offender.pid, offender.name, narrate, { expectedLstart = lstart })
+        else
+          M.freezePid(offender.pid, offender.name, narrate,
+            { weightMB = offender.weightMB, expectedLstart = lstart })
+        end
+      end
+      end
     end
   else
     if hud and hud:isShowing() then
@@ -634,6 +841,11 @@ local function tick()
   local state, changed, reason = core.smStep(smState, sig, now)
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
   if changed then M.logSnapshot("state:" .. reason) end
+  -- GC the recycled-pid unattended state BEFORE alertSurfaces consumes it:
+  -- if a pid left the runaway set (old process gone) its streak/fired stamp
+  -- must be cleared before this tick's unattended decision can read it, or a
+  -- recycled pid could inherit stale state for one tick.
+  gcUnattendedState()
   alertSurfaces(state, now)
 
   -- Honesty when degraded: if the fork has not reported for a while, say so.
@@ -656,6 +868,11 @@ local function tick()
     if (now - topIdleSince) > 60 then stopTopStream() end
   end
 
+  -- LFM adjudicator lifecycle: spawn/retire/self-police/advisory. Async
+  -- everywhere; a disabled feature makes this a single boolean check.
+  -- (Unattended-state GC runs earlier in the tick, before alertSurfaces.)
+  lfmTick(state, now, interesting)
+
   -- Drive the flash from flashState, not just transitions, so the animation
   -- always matches the real state and self-heals (e.g. after a self-test).
   if state ~= flashState then applyFlash(state) end
@@ -671,17 +888,48 @@ end
 
 local ownUid  = tonumber(sh("/usr/bin/id -u")) or -1
 local selfPid = hs.processInfo.processID
+protectedPids[selfPid] = true
 
--- Look up a live process; returns { pid, uid, comm } or nil if gone.
-local function probePid(pid)
-  local out = sh(string.format("/bin/ps -p %d -o uid=,comm= 2>/dev/null", pid))
-  local uid, comm = out:match("^%s*(%d+)%s+(.-)%s*$")
+-- Look up a live process; returns { pid, uid, comm, lstart } or nil if gone.
+-- lstart (process start time) is the identity component a recycled pid
+-- cannot fake; the frozen ledger persists it across reloads. Forward-declared
+-- at the top: the HUD raise and the unattended path (both earlier in the
+-- file) capture identity through it.
+probePid = function(pid)
+  local out = sh(string.format("/bin/ps -p %d -o uid=,lstart=,comm= 2>/dev/null", pid))
+  local uid, lstart, comm = out:match("^%s*(%d+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
   if not uid then return nil end
-  return { pid = pid, uid = tonumber(uid), comm = comm }
+  return { pid = pid, uid = tonumber(uid), comm = comm, lstart = lstart }
 end
 
 local function pidAlive(pid)
   return sh(string.format("/bin/ps -p %d -o pid= 2>/dev/null", pid)):match("%d") ~= nil
+end
+
+local function pidState(pid)
+  return (sh(string.format("/bin/ps -p %d -o state= 2>/dev/null", pid)):match("%a") or "")
+end
+
+-- The single identity gate every signal path goes through (kill, freeze,
+-- resume, and the frozen-ledger reconcile), so probe discipline never
+-- drifts between them. Names sourced from the top stream are truncated at
+-- ~16 chars, so a long expected name may be a prefix of the live one; short
+-- names must match exactly. Returns proc (with .liveName) or nil, reason.
+local function resolveSignalTarget(pid, expectedName, expectedLstart)
+  local proc = probePid(pid)
+  if not proc then return nil, "exited" end
+  local liveName = procs.friendlyName(proc.comm)
+  local nameMatches = (liveName == expectedName)
+    or (expectedName ~= nil and #expectedName >= 15
+        and liveName:sub(1, #expectedName) == expectedName)
+  if expectedName and not nameMatches then
+    return nil, string.format("pid-reused:%s", liveName)
+  end
+  if expectedLstart and proc.lstart and proc.lstart ~= expectedLstart then
+    return nil, "pid-reused:start-time"
+  end
+  proc.liveName = liveName
+  return proc
 end
 
 -- Default progress surface for menu-initiated kills (the menu closes on
@@ -690,33 +938,833 @@ local function alertUpdate(text)
   hs.alert.show("memwatch: " .. text, 2.5)
 end
 
+------------------------------------------------------------------------------
+-- frozen ledger (Phase 0 freeze)
+--
+-- SIGSTOPped processes must survive hs.reload without being orphaned, so
+-- every freeze persists to memwatch-frozen.json and start-up reconciles the
+-- file against live identity (pid + name + start time). Stop persists;
+-- resume is always a deliberate action, never automatic.
+------------------------------------------------------------------------------
+
+local FROZEN_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-frozen.json"
+
+local function saveFrozen()
+  local list = lfm.jsonArray({})
+  for _, e in pairs(frozen) do list[#list + 1] = e end
+  table.sort(list, function(a, b) return (a.frozenAt or 0) < (b.frozenAt or 0) end)
+  local enc = lfm.jsonEncode(list)
+  if not enc then return end
+  local f = io.open(FROZEN_PATH, "w")
+  if not f then return end
+  f:write(enc, "\n")
+  f:close()
+end
+
+local function loadFrozen()
+  local f = io.open(FROZEN_PATH, "r")
+  if not f then return {} end
+  local raw = f:read("a")
+  f:close()
+  local list = lfm.jsonDecode(raw)
+  return type(list) == "table" and list or {}
+end
+
+-- Re-probe every persisted entry: identity-confirmed and still stopped stays
+-- managed; anything exited, recycled, or externally resumed is dropped with
+-- a log line, never managed. A one-time notification surfaces survivors.
+local function frozenReconcile()
+  local list = loadFrozen()
+  frozen = {}
+  local survivors = {}
+  for _, e in ipairs(list) do
+    if type(e) == "table" and type(e.pid) == "number" then
+      local proc, why = resolveSignalTarget(e.pid, e.name, e.lstart)
+      if not proc then
+        M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):%s", e.name or "?", e.pid, why))
+      elseif pidState(e.pid) ~= "T" then
+        M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):resumed-externally", e.name or "?", e.pid))
+      else
+        frozen[e.pid] = e
+        survivors[#survivors + 1] = e.name
+      end
+    end
+  end
+  saveFrozen()
+  if #survivors > 0 then
+    hs.notify.new({
+      title = "memwatch: frozen processes persist",
+      subTitle = table.concat(survivors, ", "):sub(1, 100),
+      informativeText = string.format(
+        "%d process(es) remain frozen from the previous session. Resume from the memwatch menu.",
+        #survivors),
+      withdrawAfter = 0,
+    }):send()
+  end
+end
+
+-- Freeze: same identity probe and policy gate as kill, then SIGSTOP with a
+-- verified stop state and a persisted ledger entry. Memory is NOT released
+-- by a freeze; the win is stopping the growth reversibly.
+function M.freezePid(pid, expectedName, onUpdate, opts)
+  onUpdate = onUpdate or alertUpdate
+  opts = opts or {}
+  -- Bind start time when the caller captured one at selection, so a pid
+  -- reused between selection and this call is refused (same-name reuse).
+  local proc, twhy = resolveSignalTarget(pid, expectedName, opts.expectedLstart)
+  if not proc then
+    if twhy == "exited" then
+      M.logSnapshot(string.format("freeze-skip:%s(%d)-already-exited", expectedName or "?", pid))
+      onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+    else
+      M.logSnapshot(string.format("freeze-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
+      onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true)
+    end
+    return
+  end
+  local allowed, why = core.killAllowed(proc, ownUid, selfPid, nil, protectedPids)
+  if not allowed then
+    M.logSnapshot(string.format("freeze-refuse:%s(%d):%s", proc.liveName, pid, why))
+    onUpdate(string.format("refusing to freeze %s: %s", proc.liveName, why), true)
+    return
+  end
+  if frozen[pid] then
+    onUpdate(string.format("%s is already frozen", proc.liveName), true)
+    return
+  end
+  -- Record the ledger entry BEFORE the SIGSTOP, not after the verify: a
+  -- reload in the verify window would otherwise leave a SIGSTOPped process
+  -- with no ledger row (an orphan reconcile cannot find). Persisting first
+  -- means a reload finds it and frozenReconcile re-validates (still stopped
+  -- -> kept; failed to stop -> dropped). The verify below downgrades a
+  -- process that never entered state T.
+  frozen[pid] = {
+    pid = pid, name = proc.liveName, lstart = proc.lstart,
+    weightMB = opts.weightMB or 0,
+    frozenAt = hs.timer.secondsSinceEpoch(),
+  }
+  saveFrozen()
+  sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
+  hs.timer.doAfter(0.5, guard("freeze-verify", function()
+    -- Re-probe IDENTITY after the signal, not just the stop state: if the
+    -- pid was recycled between the pre-signal probe and the SIGSTOP, we
+    -- would have stopped the WRONG (new) process. If it stopped but its
+    -- identity no longer matches, CONTINUE it (undo our SIGSTOP) and drop
+    -- the ledger entry - never strand a bystander stopped.
+    local reprobe = resolveSignalTarget(pid, proc.liveName, proc.lstart)
+    if not reprobe then
+      sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+      frozen[pid] = nil
+      saveFrozen()
+      M.logSnapshot(string.format("freeze-abort:%s(%d)-identity-changed", proc.liveName, pid))
+      onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true)
+    elseif pidState(pid) == "T" then
+      M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
+      onUpdate(string.format(
+        "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true)
+    else
+      frozen[pid] = nil
+      saveFrozen()
+      M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, pidState(pid)))
+      onUpdate(string.format("%s did not stop (state %s)", proc.liveName, pidState(pid)), true)
+    end
+  end))
+end
+
+-- Resume: identity re-validated against the ledger entry (a recycled pid is
+-- dropped AND the signal blocked), then SIGCONT with a verified state.
+function M.resumePid(pid, onUpdate)
+  onUpdate = onUpdate or alertUpdate
+  local e = frozen[pid]
+  if not e then
+    onUpdate(string.format("pid %d is not in the frozen ledger", pid), true)
+    return
+  end
+  local proc, twhy = resolveSignalTarget(pid, e.name, e.lstart)
+  if not proc then
+    frozen[pid] = nil
+    saveFrozen()
+    M.logSnapshot(string.format("resume-drop:%s(%d):%s", e.name or "?", pid, twhy))
+    onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name or tostring(pid), twhy), true)
+    return
+  end
+  sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+  hs.timer.doAfter(0.5, guard("resume-verify", function()
+    if pidState(pid) ~= "T" then
+      frozen[pid] = nil
+      saveFrozen()
+      M.logSnapshot(string.format("resume-done:%s(%d)", e.name, pid))
+      onUpdate(string.format("%s resumed after %.0f min frozen", e.name,
+        (hs.timer.secondsSinceEpoch() - (e.frozenAt or 0)) / 60), true)
+    else
+      M.logSnapshot(string.format("resume-failed:%s(%d)-still-stopped", e.name, pid))
+      onUpdate(string.format("%s is still stopped; try again or use Activity Monitor", e.name), true)
+    end
+  end))
+end
+
+function M.resumeAll()
+  for pid in pairs(frozen) do M.resumePid(pid) end
+end
+
+------------------------------------------------------------------------------
+-- decision ledger + unattended adjudication
+------------------------------------------------------------------------------
+
+local LFM_LEDGER_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-lfm.jsonl"
+local LFM_LEDGER_MAX_BYTES = 2e6
+
+local function appendLedger(line)
+  local f = io.open(LFM_LEDGER_PATH, "a")
+  if not f then return end
+  if f:seek("end") > LFM_LEDGER_MAX_BYTES then
+    f:close()
+    os.rename(LFM_LEDGER_PATH, LFM_LEDGER_PATH .. ".1")
+    f = io.open(LFM_LEDGER_PATH, "a")
+    if not f then return end
+  end
+  f:write(line)
+  f:close()
+end
+
+-- One decision record per unattended adjudication (either adjudicator).
+-- The ledger is local and gitignored; the value report renders it.
+writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails, extra)
+  local rec = {
+    at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    adjudicator = adjudicator,
+    action = action,
+    offender = { name = offender.name, kind = offender.kind or "?",
+                 weightMB = math.floor(offender.weightMB or 0),
+                 slopeMBmin = math.floor(offender.slopeMBmin or 0) },
+    state = smState.state,
+    availPct = math.floor(lastMetrics.availPct or 0),
+    rationale = rationale,
+    rails = rails and lfm.jsonArray(rails) or nil,
+  }
+  if type(extra) == "table" then
+    for k, v in pairs(extra) do rec[k] = v end
+  end
+  local line = lfm.ledgerLine(rec)
+  if line then appendLedger(line) end
+  -- 60s outcome follow-up: what actually happened to the process and the
+  -- availability trajectory after the action.
+  local pid = offender.pid
+  local availBefore = math.floor(lastMetrics.availPct or 0)
+  hs.timer.doAfter(60, guard("ledger-outcome", function()
+    local fate
+    if not pidAlive(pid) then fate = "exited"
+    elseif pidState(pid) == "T" then fate = "frozen"
+    else fate = "running" end
+    local out = lfm.ledgerLine({
+      at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+      outcome_for = rec.at, action = action, adjudicator = adjudicator,
+      fate = fate, availPctBefore = availBefore,
+      availPctAfter = math.floor(lastMetrics.availPct or 0),
+      state = smState.state,
+    })
+    if out then appendLedger(out) end
+  end))
+end
+
+-- Consume the freshest cached verdict for the bound offender: pid keyed,
+-- identity re-validated live, age-bounded. The snapshot hash in the entry is
+-- ledger correlation, never a consumption predicate.
+local function consumeVerdict(offender)
+  local e = verdictCache[offender.pid]
+  if not e or not e.verdict then return nil end
+  if (hs.timer.secondsSinceEpoch() - (e.at or 0)) > lfm.cfg.verdictFreshSec then return nil end
+  local proc = resolveSignalTarget(offender.pid,
+    e.ident and e.ident.name or offender.name,
+    e.ident and e.ident.lstart or nil)
+  if not proc then return nil end
+  return e
+end
+
+-- The model-free deterministic policy: the mode is the action (kill ->
+-- terminate, freeze -> freeze), but a foreground offender is never
+-- terminated autonomously even here (capped to freeze), mirroring the LFM
+-- rail so the deterministic path is no more aggressive than the adjudicated
+-- one. The extreme-only gate lives upstream in alertSurfaces.
+local function deterministicAction(mode, foreground)
+  if mode == "kill" and not foreground then return "terminate" end
+  return "freeze"
+end
+
+-- Choose the unattended action. A fresh model verdict is refined through
+-- the deterministic rails within the mode ceiling; no verdict means the
+-- deterministic policy acts exactly as the legacy autoKill did (the mode is
+-- the action, extreme-only, policy-gated inside the signal path).
+resolveUnattendedAction = function(mode, offender)
+  -- The foreground termination rail must fire in the LIVE path, not only in
+  -- the advisory snapshot: lastOffender never carries a foreground flag, so
+  -- compute it here against the frontmost app before applyVerdict.
+  local foreground = offenderIsForeground(offender)
+  local e = consumeVerdict(offender)
+  if e then
+    local proc = probePid(offender.pid)
+    local allowed = false
+    if proc then
+      allowed = core.killAllowed(proc, ownUid, selfPid, nil, protectedPids)
+    end
+    local eff, rails = lfm.applyVerdict(e.verdict, mode, allowed, {
+      offenderKind = offender.kind,
+      offenderForeground = foreground,
+    })
+    -- Wait-deferral bound (a rail in the TIME dimension, bake-off finding):
+    -- a model wait DEFERS the deterministic policy, protecting a
+    -- false-positive extreme (a build burst resolves within a window or
+    -- two), but an inert or over-conservative model must not capture the
+    -- decision forever while a true runaway grinds the machine down. After
+    -- three consecutive model-wait outcomes on the same offender at grace
+    -- expiry, the deterministic policy proceeds.
+    if eff == "wait" then
+      local streak = (unattendedWaitStreak[offender.pid] or 0) + 1
+      unattendedWaitStreak[offender.pid] = streak
+      if streak >= 3 then
+        -- The model's wait rationale is SUPERSEDED here, so do not attach it
+        -- to the deterministic action (it would mislabel the report card).
+        local action = deterministicAction(mode, foreground)
+        local drails = { "deterministic", "wait-deferral-exhausted" }
+        return action, "deterministic-fallback", nil, drails,
+          { model = lfm.cfg.model, deferrals = streak,
+            supersededModelAction = "wait" }
+      end
+    else
+      unattendedWaitStreak[offender.pid] = 0
+    end
+    return eff, "lfm", e.verdict.rationale, rails,
+      { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence }
+  end
+  return deterministicAction(mode, foreground), "deterministic-fallback", nil, { "deterministic" }, nil
+end
+
+------------------------------------------------------------------------------
+-- LFM server lifecycle
+--
+-- The adjudicator is an ENHANCEMENT the decision path consults through the
+-- async verdict cache; nothing here ever blocks a tick. Spawn happens at
+-- ELEVATED onset only (never during critical, never below the availability
+-- floor), on an ephemeral port with a per-spawn api-key file, at reduced
+-- QoS. Any timeout or self-police trip retires the server through one
+-- discipline (TERM, wait for exit AND port release, else KILL) and latches
+-- the adjudicator offline until the next elevated tick.
+------------------------------------------------------------------------------
+
+local LFM_KEY_PATH = os.getenv("HOME") .. "/projects/memwatch/eval/tmp/lfm-api-key"
+local LFM_PIDFILE  = os.getenv("HOME") .. "/projects/memwatch/eval/tmp/lfm-server.pid"
+local lfmApiKey = nil
+local lfmBinPath = nil
+
+local function resolveLlamaServer()
+  if lfmBinPath then return lfmBinPath end
+  local brewPrefix = sh("/opt/homebrew/bin/brew --prefix llama.cpp 2>/dev/null"):gsub("%s+$", "")
+  local candidates = {
+    brewPrefix ~= "" and (brewPrefix .. "/bin/llama-server") or nil,
+    "/opt/homebrew/bin/llama-server",
+    "/usr/local/bin/llama-server",
+    sh("command -v llama-server 2>/dev/null"):gsub("%s+$", ""),
+  }
+  for _, p in ipairs(candidates) do
+    if p ~= "" and sh(string.format("test -x %q && echo yes", p)):match("yes") then
+      lfmBinPath = p
+      return p
+    end
+  end
+  return nil
+end
+
+local function portFree(port)
+  return sh(string.format("/usr/sbin/lsof -nP -iTCP:%d -sTCP:LISTEN -t 2>/dev/null", port)) == ""
+end
+
+local function listenerPid(port)
+  return tonumber(sh(string.format("/usr/sbin/lsof -nP -iTCP:%d -sTCP:LISTEN -t 2>/dev/null", port)):match("%d+"))
+end
+
+-- One retire discipline for every exit path (calm, timeout, self-police,
+-- stop): TERM, wait up to 5s for BOTH process exit and port release, else
+-- KILL. Clears all server state; the offline latch is the caller's call.
+-- Before /health passes, the tracked pid is the taskpolicy task and the
+-- real listener may be a child, so retire targets BOTH the tracked pid AND
+-- whatever is actually bound to the port, and only declares success once the
+-- port is free (not merely the tracked pid gone), so a pre-health child can
+-- never be orphaned still holding the port.
+local function retireLfmServer(reason)
+  local pid, port = lfmServerPid, lfmServerPort
+  lfmServerReady = false
+  lfmServerPid, lfmServerPort = nil, nil
+  lfmSpawnedAt = nil  -- a deliberate retire must not trip the fast-crash latch
+  os.remove(LFM_PIDFILE)  -- a cleanly retired server is not a crash orphan
+  lfmInFlight = nil
+  if lfmServerTask then pcall(function() lfmServerTask:terminate() end) end
+  lfmServerTask = nil
+  protectedPids = { [selfPid] = true }
+  if not pid then return end
+  M.logSnapshot(string.format("lfm-retire:%s:pid=%d", reason or "?", pid))
+  -- Signal the tracked pid AND the actual port listener (may be a child),
+  -- but only signal the listener if it is CONFIRMED ours: our tracked pid,
+  -- or an llama-server serving OUR model dir. In the narrow window after our
+  -- server died, an unrelated process could bind the port; never kill it.
+  local function listenerIsOurs(owner)
+    if not owner then return false end
+    if owner == pid then return true end
+    local info = sh(string.format("/bin/ps -p %d -o comm=,args= 2>/dev/null", owner))
+    local comm = info:match("^(%S+)")
+    return comm ~= nil and comm:match("([^/]+)$") == "llama-server"
+      and info:find("projects/memwatch/models/", 1, true) ~= nil
+  end
+  local function signalTargets(sig)
+    if pid then sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, pid)) end
+    if port then
+      local owner = listenerPid(port)
+      if owner and owner ~= pid and listenerIsOurs(owner) then
+        sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, owner))
+      end
+    end
+  end
+  signalTargets("TERM")
+  local deadline = hs.timer.secondsSinceEpoch() + 5
+  hs.timer.doUntil(
+    function()
+      -- Success requires the tracked pid gone AND our hold on the port
+      -- released: the port counts as released if it is free OR now held by
+      -- a process that is NOT ours (an unrelated squatter must not keep our
+      -- retire waiting, and we already refuse to signal it above).
+      local portReleased = (not port) or portFree(port) or not listenerIsOurs(listenerPid(port))
+      local gone = not pidAlive(pid) and portReleased
+      if gone then return true end
+      if hs.timer.secondsSinceEpoch() > deadline then
+        signalTargets("KILL")
+        return hs.timer.secondsSinceEpoch() > deadline + 3
+      end
+      return false
+    end,
+    guard("lfm-retire-wait", function() end),
+    1)
+end
+
+local function spawnLfmServer()
+  local bin = resolveLlamaServer()
+  if not bin then
+    M.logSnapshot("lfm-spawn-skip:no-llama-server-binary")
+    lfmOffline = true
+    return
+  end
+  -- The model name comes from a runtime control file (memwatch-local.json),
+  -- so validate it as a PLAIN .gguf filename before it ever reaches a shell
+  -- or the server argv: no path separators, no shell metacharacters, no
+  -- traversal. A name that does not match is refused, not interpolated.
+  local model = lfm.cfg.model
+  if type(model) ~= "string" or not model:match("^[%w%.%-_]+%.gguf$") then
+    M.logSnapshot("lfm-spawn-skip:invalid-model-name:" .. tostring(model))
+    lfmOffline = true
+    return
+  end
+  local modelPath = os.getenv("HOME") .. "/projects/memwatch/models/" .. model
+  if not sh(string.format("test -f %q && echo yes", modelPath)):match("yes") then
+    M.logSnapshot("lfm-spawn-skip:model-missing:" .. model)
+    lfmOffline = true
+    return
+  end
+  -- Ephemeral port, availability-checked; per-spawn key in a 0600 file.
+  local port
+  for _ = 1, 8 do
+    local candidate = math.random(49152, 65151)
+    if portFree(candidate) then port = candidate; break end
+  end
+  if not port then
+    M.logSnapshot("lfm-spawn-skip:no-free-port")
+    return
+  end
+  lfmApiKey = sh("/usr/bin/openssl rand -hex 16"):gsub("%s+$", "")
+  -- Create the dir at normal perms (a restrictive umask on the mkdir would
+  -- drop the dir's execute bit and make the subsequent key write fail on a
+  -- fresh clone), then write the key file itself 0600 and VERIFY it landed;
+  -- if it did not, do not launch a server with a key file that is not there.
+  local tmpDir = os.getenv("HOME") .. "/projects/memwatch/eval/tmp"
+  sh(string.format("mkdir -p %q && (umask 177 && printf '%%s' %q > %q)",
+    tmpDir, lfmApiKey, LFM_KEY_PATH))
+  if not sh(string.format("test -s %q && echo yes", LFM_KEY_PATH)):match("yes") then
+    M.logSnapshot("lfm-spawn-skip:api-key-write-failed")
+    lfmApiKey = nil
+    return
+  end
+  lfmServerPort = port
+  lfmServerReady = false
+  lfmSpawnedAt = hs.timer.secondsSinceEpoch()
+  local spawnAt = lfmSpawnedAt
+  -- taskpolicy -c utility keeps inference threads out of the crisis's way;
+  -- the drain callback exists because llama-server logs continuously and an
+  -- undrained pipe deadlocks at 64KB.
+  lfmServerTask = hs.task.new("/usr/sbin/taskpolicy",
+    guard("lfm-server-exit", function(code)
+      M.logSnapshot(string.format("lfm-server-exit:code=%s", tostring(code)))
+      lfmServerTask = nil
+      lfmServerReady = false
+      lfmServerPid, lfmServerPort = nil, nil
+      protectedPids = { [selfPid] = true }
+      -- A FAST crash (died within a few seconds of spawn, before it was ever
+      -- ready) latches the adjudicator offline: otherwise the next elevated
+      -- tick respawns it and a crash-looping binary thrashes load/exec cycles
+      -- through the pressure episode. A clean retire nils lfmSpawnedAt first,
+      -- so this only fires on an unexpected early exit.
+      if lfmSpawnedAt == spawnAt
+         and (hs.timer.secondsSinceEpoch() - spawnAt) < 10 then
+        lfmOffline = true
+        M.logSnapshot("lfm-fast-crash:latched-offline")
+      end
+    end),
+    function() return true end,
+    { "-c", "utility", bin,
+      "-m", modelPath, "--host", "127.0.0.1", "--port", tostring(port),
+      "-c", tostring(lfm.cfg.ctx), "-np", "1", "-t", tostring(lfm.cfg.threads),
+      "-ngl", "0", "--api-key-file", LFM_KEY_PATH })
+  if not (lfmServerTask and lfmServerTask:start()) then
+    M.logSnapshot("lfm-spawn-failed:task-start")
+    lfmServerTask = nil
+    return
+  end
+  lfmServerPid = lfmServerTask:pid()
+  -- Protect the adjudicator from the FIRST tick, not only once /health
+  -- passes: model load can take seconds, during which the server process
+  -- exists and could otherwise appear in the ranked/offender lists and pass
+  -- killAllowed. Guard the task pid now; the health check below refines the
+  -- set to the verified listener owner (and its taskpolicy parent).
+  protectedPids = { [selfPid] = true, [lfmServerPid] = true }
+  -- Record the spawned pid + start time so a crash-orphan sweep on the next
+  -- start kills exactly OUR server, never a user's manual benchmark.
+  do
+    local probed = probePid(lfmServerPid)
+    local rec = lfm.jsonEncode({ pid = lfmServerPid, lstart = probed and probed.lstart or nil })
+    if rec then
+      local pf = io.open(LFM_PIDFILE, "w")
+      if pf then pf:write(rec, "\n"); pf:close() end
+    end
+  end
+  M.logSnapshot(string.format("lfm-spawn:pid=%d:port=%d:avail=%d%%",
+    lfmServerPid, port, math.floor(lastMetrics.availPct or 0)))
+  -- Health poll to ready, with the listener-ownership check: the pid bound
+  -- to our port must be our child (or its direct descendant via taskpolicy).
+  local healthDeadline = hs.timer.secondsSinceEpoch() + 60
+  hs.timer.doUntil(
+    function()
+      if not lfmServerTask then return true end -- died; exit callback logged it
+      if hs.timer.secondsSinceEpoch() > healthDeadline then
+        M.logSnapshot("lfm-health-timeout")
+        retireLfmServer("health-timeout")
+        lfmOffline = true
+        return true
+      end
+      local body = sh(string.format(
+        "curl -s -m 2 http://127.0.0.1:%d/health 2>/dev/null", port))
+      if body:find('"ok"', 1, true) then
+        local owner = listenerPid(port)
+        local expected = lfmServerTask and lfmServerTask:pid()
+        local ownerOk = owner ~= nil and expected ~= nil
+          and (owner == expected
+               or sh(string.format("/bin/ps -o ppid= -p %d 2>/dev/null", owner)):match("%d+") == tostring(expected))
+        if not ownerOk then
+          M.logSnapshot(string.format("lfm-listener-mismatch:owner=%s", tostring(owner)))
+          retireLfmServer("listener-mismatch")
+          lfmOffline = true
+          return true
+        end
+        -- Protect BOTH the listener owner and the launched task pid (the
+        -- taskpolicy parent), so neither the wrapper nor the server is ever
+        -- signalable during the run.
+        protectedPids = { [selfPid] = true, [owner] = true }
+        if expected then protectedPids[expected] = true end
+        lfmServerPid = owner
+        lfmServerReady = true
+        M.logSnapshot(string.format("lfm-ready:%.1fs:pid=%d",
+          hs.timer.secondsSinceEpoch() - lfmSpawnedAt, owner))
+        return true
+      end
+      return false
+    end,
+    guard("lfm-health-poll", function() end),
+    1)
+end
+
+-- Is this offender the user's frontmost app? A name match against the
+-- frontmost application (no pid involved). Used both to tag the snapshot
+-- and to feed the foreground termination rail in the live unattended path.
+-- Forward-declared at the top: resolveUnattendedAction (defined earlier)
+-- calls this, so a bare `local function` here would bind that call to a nil
+-- global (the split-scope class the scanner guards, now extended to catch
+-- `local function` too).
+offenderIsForeground = function(offender)
+  if not offender or not offender.pid then return "unknown" end
+  local frontName, frontPid = nil, nil
+  pcall(function()
+    local app = hs.application.frontmostApplication()
+    frontName = app and app:name() or nil
+    frontPid = app and app:pid() or nil
+  end)
+  -- Fail closed: if the frontmost app cannot be determined, we cannot prove
+  -- the offender is a background process, so return "unknown" (the caller
+  -- treats unknown like foreground for the autonomous-terminate cap).
+  if not frontName and not frontPid then return "unknown" end
+  -- Direct name match (the app itself is the offender).
+  if offender.name and frontName
+     and (offender.name == frontName or offender.name:find(frontName, 1, true)) then
+    return true
+  end
+  -- Process-tree match: the offender is a descendant of the frontmost app
+  -- (an unsaved REPL/build/tab running UNDER the frontmost terminal, IDE, or
+  -- browser). Walk ppid up to a bounded depth.
+  if frontPid then
+    local pid = offender.pid
+    for _ = 1, 12 do
+      if pid == frontPid then return true end
+      local ppid = tonumber(sh(string.format("/bin/ps -o ppid= -p %d 2>/dev/null", pid)):match("%d+"))
+      if not ppid or ppid <= 1 then break end
+      pid = ppid
+    end
+  end
+  return false
+end
+
+-- Assemble the model-facing snapshot from what the tick already knows. The
+-- serializer strips pids structurally; foreground is a name match against
+-- the frontmost app (no pid involved).
+local function buildLfmSnapshot(offender)
+  local frontName = nil
+  pcall(function()
+    local app = hs.application.frontmostApplication()
+    frontName = app and app:name() or nil
+  end)
+  local function withForeground(p)
+    if not p then return nil end
+    return {
+      name = p.name, kind = p.kind, weightMB = p.weightMB,
+      slopeMBmin = p.slopeMBmin, ageSec = p.ageSec,
+      foreground = (frontName ~= nil and p.name ~= nil
+        and (p.name == frontName or p.name:find(frontName, 1, true) ~= nil)) or nil,
+    }
+  end
+  local frozenCount = 0
+  for _ in pairs(frozen) do frozenCount = frozenCount + 1 end
+  local runaways = {}
+  for i = 1, math.min(#lastRuns, 5) do runaways[i] = withForeground(lastRuns[i]) end
+  return {
+    state = smState.state, kern = lastKern,
+    availPct = lastMetrics.availPct, swapGB = lastMetrics.swapGB,
+    compressorGB = lastMetrics.compGB,
+    swapoutRate = lastRates.swapOut, compRate = lastRates.comp,
+    frozenCount = frozenCount,
+    offender = withForeground(offender),
+    runaways = runaways,
+  }, (withForeground(offender) or {}).foreground
+end
+
+-- Dispatch one async adjudication request for the bound offender. Replies
+-- land in the per-pid verdict cache; the nonce discards anything late or
+-- stale; the unified timeout policy retires the server and latches offline.
+local function dispatchAdjudication(offender, why)
+  if not (lfmServerReady and lfmServerPort and not lfmInFlight) then return end
+  local proc = probePid(offender.pid)
+  if not proc then return end
+  local snap, foreground = buildLfmSnapshot(offender)
+  local user, serr = lfm.serializeSnapshot(snap)
+  if not user then
+    M.logSnapshot("lfm-serialize-error:" .. tostring(serr))
+    return
+  end
+  local body = lfm.buildRequestBody(lfm.buildSystemPrompt({}), user, {})
+  if not body then return end
+  lfmReqNonce = lfmReqNonce + 1
+  local nonce = lfmReqNonce
+  local hash = lfm.snapshotHash(user)
+  local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart }
+  local pid = offender.pid
+  local sentAt = hs.timer.secondsSinceEpoch()
+  lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
+  M.logSnapshot(string.format("lfm-dispatch:%s:%s(%d):nonce=%d", why, ident.name, pid, nonce))
+  hs.http.asyncPost(
+    string.format("http://127.0.0.1:%d/v1/chat/completions", lfmServerPort),
+    body,
+    { ["Content-Type"] = "application/json",
+      ["Authorization"] = "Bearer " .. (lfmApiKey or "") },
+    guard("lfm-reply", function(status, respBody)
+      if not lfmInFlight or lfmInFlight.nonce ~= nonce then
+        M.logSnapshot(string.format("lfm-reply-discard:stale-nonce=%d", nonce))
+        return
+      end
+      lfmInFlight = nil
+      if status ~= 200 then
+        M.logSnapshot(string.format("lfm-reply-error:http=%s", tostring(status)))
+        return
+      end
+      local raw, perr = lfm.parseResponse(respBody or "")
+      local verdict = raw and lfm.validateVerdict(raw) or nil
+      if not verdict then
+        M.logSnapshot("lfm-reply-invalid:" .. tostring(perr or "validation"))
+        return
+      end
+      local latencyMs = math.floor((hs.timer.secondsSinceEpoch() - sentAt) * 1000)
+      verdictCache[pid] = {
+        verdict = verdict, snapshotHash = hash, reqNonce = nonce,
+        at = hs.timer.secondsSinceEpoch(), ident = ident,
+      }
+      M.logSnapshot(string.format("lfm-verdict:%s(%d):%s:conf=%.2f:%dms",
+        ident.name, pid, verdict.action, verdict.confidence, latencyMs))
+      writeDecisionOutcome(
+        { name = ident.name, kind = offender.kind, pid = pid,
+          weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
+          foreground = foreground },
+        verdict.action, "lfm-advisory", verdict.rationale, nil,
+        { model = lfm.cfg.model, snapshotHash = hash,
+          confidence = verdict.confidence, latencyMs = latencyMs })
+    end))
+  -- Unified timeout policy: any request still in flight at the watchdog
+  -- retires the server (reclaiming its CPU for the crisis) and latches the
+  -- adjudicator offline until the next elevated tick.
+  hs.timer.doAfter(lfm.cfg.timeoutSec, guard("lfm-timeout", function()
+    if lfmInFlight and lfmInFlight.nonce == nonce then
+      M.logSnapshot(string.format("lfm-timeout:nonce=%d:%.0fs", nonce, lfm.cfg.timeoutSec))
+      lfmInFlight = nil
+      retireLfmServer("timeout")
+      lfmOffline = true
+    end
+  end))
+end
+
+-- Per-tick lifecycle: spawn discipline, retire-on-calm, the self-police
+-- circuit, advisory dispatch, and cache hygiene. Called from tick(); never
+-- blocks; every fork here happens at elevated or calmer.
+lfmTick = function(state, now, interesting)
+  if not lfm.cfg.enabled then
+    if lfmServerTask then retireLfmServer("disabled") end
+    return
+  end
+  -- The offline latch clears only on CALM recovery (state == ok), never
+  -- merely on elevated: a model that timed out or was self-policed during a
+  -- storm must stay out for the REST of that pressure episode, or a still-
+  -- elevated tick would clear the latch and respawn, thrashing the model's
+  -- page-ins through the same crisis it degraded in. Re-arm happens at the
+  -- next elevated onset AFTER things have gone quiet.
+  if lfmOffline and state == "ok" then lfmOffline = false end
+
+  local running = lfmServerTask ~= nil
+
+  -- Self-police circuit (independent of adjudication): the server's own
+  -- footprint is measured the SAME way memwatch ranks every process - RSS
+  -- PLUS compressed pages - not RSS alone. The kernel compresses an
+  -- allocator's pages in real time (the RSS-vs-CMPRS lesson this tool was
+  -- built on), so an RSS-only cap would miss a server whose weight has been
+  -- compressed away. Over budget -> retire + offline latch + loud notice.
+  if running and lfmServerPid then
+    for _, p in ipairs(lastPsList) do
+      if p.pid == lfmServerPid then
+        local cmprsMB = (topCache.map and topCache.map[lfmServerPid]) or 0
+        local footprintMB = (p.rssMB or 0) + cmprsMB
+        if footprintMB > lfm.cfg.maxServerMB then
+        M.logSnapshot(string.format("lfm-self-police:footprint=%dMB(rss=%d+cmprs=%d)>cap=%dMB",
+          math.floor(footprintMB), math.floor(p.rssMB or 0), math.floor(cmprsMB), lfm.cfg.maxServerMB))
+        hs.notify.new({ title = "memwatch: adjudicator over budget",
+          informativeText = string.format(
+            "llama-server hit %d MB (cap %d); killed and latched offline.",
+            math.floor(footprintMB), lfm.cfg.maxServerMB),
+          withdrawAfter = 0 }):send()
+        retireLfmServer("self-police")
+        lfmOffline = true
+        return
+        end
+      end
+    end
+  end
+
+  -- Spawn discipline: elevated onset only (resident mode may also spawn at
+  -- ok), above the availability floor, never critical, never while latched.
+  if not running and not lfmOffline
+     and state ~= "critical"
+     and (lfm.cfg.resident or state == "elevated")
+     and (lastMetrics.availPct or 0) >= lfm.cfg.spawnMinAvailPct then
+    spawnLfmServer()
+  end
+
+  -- Retire on calm (resident servers stay).
+  if running and not lfm.cfg.resident then
+    if state == "ok" and #lastRuns == 0 then
+      lfmCalmSince = lfmCalmSince or now
+      if (now - lfmCalmSince) > lfm.cfg.retireCalmSec then
+        retireLfmServer("calm")
+        lfmCalmSince = nil
+      end
+    else
+      lfmCalmSince = nil
+    end
+  end
+
+  -- Advisory dispatch: a warm server adjudicates the current offender on
+  -- the advisory cadence, and immediately at critical when nothing fresh is
+  -- cached (the grace-expiry consumer needs a verdict to consume).
+  if lfmServerReady and interesting and lastOffender then
+    local cached = verdictCache[lastOffender.pid]
+    local fresh = cached and (now - (cached.at or 0)) <= lfm.cfg.verdictFreshSec
+    local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
+    if (lfm.cfg.advisory and due) or (state == "critical" and not fresh and not lfmInFlight) then
+      lfmLastAdvisoryAt = now
+      dispatchAdjudication(lastOffender, state == "critical" and "critical" or "advisory")
+    end
+  end
+
+  -- Cache hygiene: drop entries for pids that are gone or stale beyond use.
+  for pid, e in pairs(verdictCache) do
+    if (now - (e.at or 0)) > (lfm.cfg.verdictFreshSec * 2) then
+      verdictCache[pid] = nil
+    end
+  end
+end
+
+-- Drop per-offender unattended state (fired stamp, wait streak) for any pid
+-- that is not a currently-tracked runaway, so a recycled pid cannot inherit
+-- a prior process's streak or fired stamp and trigger a premature action.
+-- The signal path also re-validates identity, but this keeps the DECISION
+-- from ever consuming stale streak state. Runs every tick regardless of LFM.
+gcUnattendedState = function()
+  local liveRun = {}
+  for _, r in ipairs(lastRuns) do liveRun[r.pid] = true end
+  for pid in pairs(unattendedWaitStreak) do
+    if not liveRun[pid] then unattendedWaitStreak[pid] = nil end
+  end
+  for pid in pairs(unattendedFiredFor) do
+    if not liveRun[pid] then unattendedFiredFor[pid] = nil end
+  end
+end
+
 -- One-click kill: re-validate identity first (pid-reuse guard), check the
 -- pure policy, SIGTERM, escalate to SIGKILL after cfg.kill.escalateSec if the
 -- target is still alive (re-validated again), then verify death and report
 -- how much memory actually came back. onUpdate(text, done) drives whichever
 -- surface initiated the kill.
-function M.killPid(pid, expectedName, onUpdate)
+function M.killPid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
+  opts = opts or {}
   local k = core.cfg.kill
-  local proc = probePid(pid)
+  local frozenEntry = frozen[pid]
+  -- Bind identity by start time when the caller captured one at selection
+  -- (the frozen ledger, or an offender/HUD snapshot), so a pid reused
+  -- between selection and this call is refused. Same-name pid reuse is
+  -- exactly the bystander-kill class this tool was scarred by.
+  local expectLstart = opts.expectedLstart or (frozenEntry and frozenEntry.lstart) or nil
+  local proc, twhy = resolveSignalTarget(pid, expectedName, expectLstart)
   if not proc then
-    M.logSnapshot(string.format("kill-skip:%s(%d)-already-exited", expectedName or "?", pid))
-    onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+    if twhy == "exited" then
+      M.logSnapshot(string.format("kill-skip:%s(%d)-already-exited", expectedName or "?", pid))
+      onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+    else
+      -- Identity mismatch: drop any stale ledger entry AND block the action.
+      if frozenEntry then frozen[pid] = nil; saveFrozen() end
+      M.logSnapshot(string.format("kill-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
+      onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true)
+    end
     return
   end
-  local liveName = procs.friendlyName(proc.comm)
-  -- Names sourced from the top stream are truncated at ~16 chars, so a long
-  -- expected name may only be a prefix of the live one. Short names must
-  -- still match exactly.
-  local nameMatches = (liveName == expectedName)
-    or (expectedName ~= nil and #expectedName >= 15
-        and liveName:sub(1, #expectedName) == expectedName)
-  if expectedName and not nameMatches then
-    M.logSnapshot(string.format("kill-refuse:pid-reused:%d(%s!=%s)", pid, liveName, expectedName))
-    onUpdate(string.format("pid %d is now %s, refusing", pid, liveName), true)
-    return
-  end
-  local allowed, why = core.killAllowed(proc, ownUid, selfPid)
+  local liveName = proc.liveName
+  local allowed, why = core.killAllowed(proc, ownUid, selfPid, nil, protectedPids)
   if not allowed then
     M.logSnapshot(string.format("kill-refuse:%s(%d):%s", liveName, pid, why))
     onUpdate(string.format("refusing to kill %s: %s", liveName, why), true)
@@ -724,16 +1772,28 @@ function M.killPid(pid, expectedName, onUpdate)
   end
   local availBefore = lastMetrics.availPct or 0
   local totalGB = lastMetrics.totalGB or 0
+  -- A SIGSTOPped process cannot handle SIGTERM until it is continued, so a
+  -- TERM to a frozen target would just pend and force the full escalation
+  -- wait before SIGKILL. Continue it first so the graceful signal can land.
+  if frozenEntry or pidState(pid) == "T" then
+    sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+  end
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
   hs.timer.doAfter(k.escalateSec, guard("kill-escalate", function()
     if pidAlive(pid) then
-      local again = probePid(pid)
-      if again and procs.friendlyName(again.comm) == liveName then
+      -- Re-validate FULL identity (name AND the start time bound above)
+      -- before SIGKILL: between TERM and this escalation the original may
+      -- have exited and the pid been reused by another same-name process;
+      -- name alone would not catch that, start time does.
+      local again = resolveSignalTarget(pid, liveName, proc.lstart)
+      if again then
         M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
         onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
         sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
+      else
+        M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
       end
     end
     hs.timer.doAfter(k.verifySec + k.settleSec, guard("kill-verify", function()
@@ -741,6 +1801,7 @@ function M.killPid(pid, expectedName, onUpdate)
       local m = readMetrics()
       local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
       if gone then
+        if frozen[pid] then frozen[pid] = nil; saveFrozen() end
         M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB", liveName, pid, reclaimedGB))
         onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB", liveName, reclaimedGB), true)
       else
@@ -779,6 +1840,31 @@ function M.start()
   end)
   smState = core.newSMState(hs.timer.secondsSinceEpoch())
   flashState = nil                -- force first tick to set the flash state
+  frozenReconcile()               -- SIGSTOPped processes survive reloads
+  -- Orphan sweep: a hard Hammerspoon crash can leave OUR previous session's
+  -- llama-server running with no owner. Only ever kill a server WE spawned:
+  -- each spawn records its pid + start time to a pidfile, and this sweep
+  -- kills exactly that pid IFF it is still alive AND its identity matches AND
+  -- it is an llama-server serving our model dir. This never touches a user's
+  -- own manual benchmark using the same model, and it only runs at all when
+  -- the LFM feature is enabled.
+  if lfm.cfg.enabled then
+    local pf = io.open(LFM_PIDFILE, "r")
+    if pf then
+      local rec = lfm.jsonDecode(pf:read("a")); pf:close()
+      if type(rec) == "table" and type(rec.pid) == "number" then
+        local info = sh(string.format("/bin/ps -p %d -o lstart=,comm=,args= 2>/dev/null", rec.pid))
+        local comm = info:match("%d%s+(%S+)") or info:match("^%s*%a+%s+%a+%s+%d+%s+[%d:]+%s+%d+%s+(%S+)")
+        if info:find("projects/memwatch/models/", 1, true)
+           and info:find("llama-server", 1, true)
+           and (not rec.lstart or info:find(rec.lstart, 1, true)) then
+          sh(string.format("/bin/kill -KILL %d 2>/dev/null", rec.pid))
+          M.logSnapshot("lfm-orphan-sweep:pid=" .. rec.pid)
+        end
+      end
+    end
+    os.remove(LFM_PIDFILE)
+  end
   renderTitleNow()
   pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
   tick()                          -- immediate first sample
@@ -790,6 +1876,7 @@ function M.stop()
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
   stopTopStream()
+  if lfmServerTask then retireLfmServer("stop") end
   flashState = nil
   if menu then menu:delete(); menu = nil end
 end
@@ -812,6 +1899,17 @@ function M.debug()
     offender       = lastOffender and string.format("%s(%d)%s", lastOffender.name,
                        lastOffender.pid, lastOffender.kind and "/" .. lastOffender.kind or "") or nil,
     watch          = titleSnap.watchName,
+    unattended     = core.resolveUnattended(core.cfg),
+    frozenCount    = (function() local n = 0; for _ in pairs(frozen) do n = n + 1 end; return n end)(),
+    protectedPids  = (function()
+                       local t = {}
+                       for pid in pairs(protectedPids) do t[#t + 1] = pid end
+                       table.sort(t)
+                       return t
+                     end)(),
+    lfm            = { enabled = lfm.cfg.enabled, ready = lfmServerReady,
+                       offline = lfmOffline, pid = lfmServerPid, port = lfmServerPort,
+                       cached = (function() local n = 0; for _ in pairs(verdictCache) do n = n + 1 end; return n end)() },
   }
 end
 
@@ -889,6 +1987,36 @@ function M.simulate(seconds)
   return string.format("memwatch.simulate running for %ds (live sampling paused)", dur)
 end
 
+-- Render the value report from the local ledgers and open it.
+function M.report(public)
+  local ok, reportMod = pcall(require, "memwatch_report")
+  if not ok then return "report module unavailable" end
+  local home = os.getenv("HOME") .. "/projects/memwatch/"
+  os.execute("mkdir -p " .. home .. "reports")
+  local out, err = reportMod.generate({
+    ledger = home .. "memwatch-lfm.jsonl",
+    log = home .. "memwatch.log",
+    league = home .. "eval/results/league.json",
+    out = home .. "reports/report.html",
+  }, {
+    public = public == true,
+    generatedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+  })
+  if not out then return "report failed: " .. tostring(err) end
+  sh(string.format("/usr/bin/open %q", out))
+  return "report opened: " .. out
+end
+
+-- Toggle the LFM adjudicator from the menu or the CLI; persists to the
+-- local config so the choice survives reloads.
+function M.setLfmEnabled(on)
+  lfm.cfg.enabled = on == true
+  saveLocalConfig()
+  M.logSnapshot("lfm-" .. (lfm.cfg.enabled and "enabled" or "disabled"))
+  return lfm.cfg.enabled
+end
+
+applyLocalConfig()  -- operator overrides land before the first tick
 _G.memwatch = M  -- expose for the hs CLI
 M.start()
 return M

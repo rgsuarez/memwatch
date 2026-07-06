@@ -93,12 +93,41 @@ The dropdown menu shows the state and its cause, kernel level, live rates,
 headroom, top-5 processes by true weight (each with Force Quit / Ignore
 submenus), and direct Force Quit / Ignore items for the current offender.
 
-### Last-resort auto-kill (opt-in, default OFF)
+### Freeze (reversible)
 
-`core.cfg.autoKill = true` arms an unattended guard: an extreme-growth
-runaway while the system is critical, whose HUD has gone unanswered for 60s,
-gets the same policy-checked TERM-then-KILL flow, loudly logged and notified.
-Leave it off until the detector has earned your trust.
+Alongside Force Quit, the HUD and menu offer **Freeze**: a SIGSTOP that
+pauses a process instantly and reversibly. It does not release the memory
+(that happens on resume or quit), but it stops the growth with nothing
+lost, which is the right first move for a process you are not ready to
+kill. Frozen processes are tracked in a ledger that survives a Hammerspoon
+reload with a start-time identity check, so nothing is ever left paused and
+orphaned, and a "Frozen by memwatch" menu section resumes them.
+
+### Unattended modes (opt-in, default OFF)
+
+`core.cfg.unattended = "off" | "freeze" | "kill"` (or the local config file)
+arms an unattended guard for the away-from-keyboard case: an extreme-growth
+runaway while critical, whose HUD has gone unanswered for the grace window,
+is frozen or killed through the same policy-checked flow, loudly logged and
+notified. `freeze` is the recommended reversible default. The legacy
+`autoKill = true` still works and maps to `unattended = "kill"`. Leave it
+off until the detector has earned your trust.
+
+### LFM adjudication (opt-in, default OFF)
+
+An optional on-device LFM2.5 model can adjudicate the unattended decision,
+choosing wait, freeze, or terminate inside the deterministic rails at zero
+marginal cost. It is off by default; a plain install is exactly the
+deterministic sentinel. Enable with `./install.sh --with-lfm` or the menu
+toggle. See [docs/lfm-adjudication.md](docs/lfm-adjudication.md) and the
+[bake-off methodology](docs/bakeoff-methodology.md); the model weights are
+licensed separately (`NOTICE-LFM`).
+
+Every adjudication lands in a local decision ledger, and the **Open value
+report** menu item renders it into a self-contained dashboard with every
+metric operationally defined:
+
+![memwatch value report](docs/report-scoreboard.png)
 
 ## Layout
 
@@ -106,9 +135,13 @@ Leave it off until the detector has earned your trust.
 ~/projects/memwatch/
   lua/memwatch_core.lua   pure: metrics, rates, signals, state machine, title, kill policy
   lua/memwatch_procs.lua  pure: ps/top parsers, growth rings, runaway detection, ranking
-  lua/memwatch.lua        Hammerspoon glue: timers, async sampling, HUD, menu, kill engine, log
-  test_core.lua           unit tests for both pure modules (lua test_core.lua)
-  install.sh              idempotent wiring into ~/.hammerspoon/init.lua (with backup)
+  lua/memwatch_lfm.lua    pure: LFM JSON codec, prompt, serializer, validator, rails (opt-in)
+  lua/memwatch_report.lua pure: the value report renderer (opt-in)
+  lua/memwatch.lua        Hammerspoon glue: timers, async sampling, HUD, menu, kill/freeze, LFM lifecycle, log
+  test_core.lua           unit tests for the pure modules (lua test_core.lua)
+  test_report.lua         unit tests for the report renderer (lua test_report.lua)
+  eval/                   the model bake-off: corpus, runner, gates, methodology
+  install.sh              idempotent wiring into ~/.hammerspoon/init.lua (with backup); --with-lfm adds adjudication
   memwatch.log            state transitions, runaways, kills, errors; rotates at 1 MB
 ```
 

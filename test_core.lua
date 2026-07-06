@@ -314,6 +314,22 @@ local runsAlt = procs.runaways(trAlt, 35, "ok", 36864)
 check("alternating climb detected", #runsAlt, 1)
 check("alternating climb is sustained", runsAlt[1].kind, "sustained")
 
+-- extreme latch: a confirmed extreme survives choppy follow-up ticks (feed
+-- interleaving), but releases early when the footprint clearly deflates.
+local trLatch = procs.newTracker(PC)
+for i = 0, 5 do
+  procs.update(trLatch, { row(94, 2000 + i * 1600, "latchy") }, i * 5)
+end
+check("latch: extreme confirmed", procs.runaways(trLatch, 25, "ok", 36864)[1].kind, "extreme")
+procs.update(trLatch, { row(94, 2000 + 5 * 1600, "latchy") }, 30)  -- flat tick
+procs.update(trLatch, { row(94, 2000 + 5 * 1600, "latchy") }, 35)  -- flat tick
+local latched = procs.runaways(trLatch, 35, "ok", 36864)
+check("latch: survives choppy flat ticks", latched[1] and latched[1].kind, "extreme")
+procs.update(trLatch, { row(94, 900, "latchy") }, 40)   -- clearly deflating
+procs.update(trLatch, { row(94, 850, "latchy") }, 45)
+local released = procs.runaways(trLatch, 45, "ok", 36864)
+check("latch: releases on deflation", #released, 0)
+
 -- but two consecutive flat ticks still end the streak (plateau stays silent).
 local trFlat = procs.newTracker(PC)
 local vFlat = { 1000, 2200, 3400, 4600, 4600, 4600, 4600, 4600 }

@@ -32,6 +32,10 @@ M.cfg = {
   growthExtremeMBmin = 9000,  -- 150 MB/s over the rising tail
   nRisingExtreme     = 4,     -- rising samples for the streak route (~20s)
   extremeNetMB       = 6000,  -- net window growth route (still-climbing gate)
+  extremeLatchSec    = 45,    -- once extreme, stays extreme this long unless
+                              -- the footprint clearly deflates: interleaved
+                              -- feeds make the rising tail choppy, and the
+                              -- escalation to critical must not flap with it
   -- Absolute footprint: attribution only, and only once the system is
   -- critical, so a steady 20 GB model server never alarms on size alone.
   absFrac            = 0.40,  -- fraction of total RAM
@@ -254,10 +258,23 @@ function M.runaways(tr, now, systemState, totalMB)
     if (slope >= cfg.growthExtremeMBmin and rising >= cfg.nRisingExtreme)
        or (netMB >= cfg.extremeNetMB and rising >= 2) then
       kind = "extreme"
+      e.extremeUntil = now + cfg.extremeLatchSec
     elseif slope >= cfg.growthMBmin and rising >= cfg.nRising and span >= cfg.minWindowSec then
       kind = "sustained"
     elseif systemState == "critical" and totalMB and (e.weightMB or 0) >= cfg.absFrac * totalMB then
       kind = "absolute"
+    end
+    -- Latch: an extreme verdict survives choppy ticks until it expires or
+    -- the footprint visibly deflates (the process died, was killed, or
+    -- released its memory).
+    if kind ~= "extreme" and e.extremeUntil and now < e.extremeUntil then
+      local n = #e.ring
+      local recentNet = (n >= 3) and (e.ring[n].v - e.ring[n - 2].v) or 0
+      if recentNet > -(cfg.risingEpsMB * 4) then
+        kind = "extreme"
+      else
+        e.extremeUntil = nil
+      end
     end
     if kind then
       out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,

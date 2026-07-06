@@ -156,7 +156,9 @@ local function assessProcesses(now)
   local named = offender and offender.kind ~= "hog"
   titleSnap.offenderName = named and offender.name or nil
   titleSnap.offenderGB   = named and (offender.weightMB / 1024) or nil
-  titleSnap.watchName    = watch and watch.name or nil
+  -- The elevated title hint names whichever grower we know about, watch or
+  -- offender: an amber dot with a name beats a bare amber dot.
+  titleSnap.watchName    = (watch and watch.name) or (named and offender.name) or nil
 end
 
 -- Streaming top: ONE long-lived `top -l 0` process, started at the onset of

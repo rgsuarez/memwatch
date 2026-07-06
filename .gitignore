@@ -13,3 +13,4 @@ reports/
 eval/results/
 eval/tmp/
 eval/panel/
+eval/checks/internal-terms.txt

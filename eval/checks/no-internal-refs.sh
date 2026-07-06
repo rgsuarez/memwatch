@@ -13,21 +13,26 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$0")/" 2>/dev/null || true
 
-# Internal-reference patterns. Workspace document ids (dashed or bare 32-hex
-# with the known prefixes), issue-tracker keys, internal team/hub names,
-# session callsigns, and machine-local coordination paths. The model vendor's
-# public names (model cards, HF repos, license) are PUBLIC and not matched.
+# Internal-reference patterns. STRUCTURAL only, so this tracked script
+# carries no specific internal identifier: any Notion-style workspace UUID
+# (dashed or bare 32-hex), any issue-tracker key, Notion URLs, and the
+# report's full-league render sentinel. The model vendor's public names
+# (model cards, HF repos, license) are PUBLIC and not matched. A local,
+# gitignored eval/checks/internal-terms.txt (one pattern per line) adds
+# machine-specific terms without ever committing them to the public tree.
 PATTERNS=(
   '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-  '\b(28ecbef0|245cbef0|368cbef0|1073af5b|279cbef0|38ecbef0|31acbef0)[0-9a-f-]*'
-  '\bLQOS-[0-9]+'
-  'Multimodal LFM'
+  '\b[0-9a-f]{32}\b'
+  '\b[A-Z]{2,6}-[0-9]{2,}\b'
   'notion\.so|app\.notion\.com'
-  '\bLFM1\b'
-  'mission packet'
-  '\.zeos|zeos-lane'
   'league:full'
 )
+LOCAL_TERMS="$(dirname "$0")/internal-terms.txt"
+if [ -f "$LOCAL_TERMS" ]; then
+  while IFS= read -r pat; do
+    [ -n "$pat" ] && [ "${pat#\#}" = "$pat" ] && PATTERNS+=("$pat")
+  done < "$LOCAL_TERMS"
+fi
 
 fail=0
 

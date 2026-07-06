@@ -40,6 +40,12 @@ local lastPsList   = {}
 local lastRanked   = {}   -- top hogs by RSS+CMPRS weight (menu rows)
 local lastRuns     = {}   -- current runaway list, ignores applied
 local lastOffender = nil  -- the process alerts name right now
+local lastExtreme  = false -- extreme runaway currently on the books
+local lastSampleAt = 0    -- when a sampler callback last landed
+local lastStaleLogAt = 0
+-- All of the above are declared here, at the top, on purpose: a local
+-- declared below a function that references it silently splits into a
+-- global writer and a local reader. Three live incidents came from that.
 local ignoredUntil = {}   -- ["pid|name"] = epoch when the ignore expires
 local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 
@@ -502,9 +508,6 @@ local SAMPLE_STALE_SEC    = 30
 
 local sampleTask, sampleStartedAt = nil, 0
 local lastPsBlob = ""     -- consumed by the process tracker
-local lastSampleAt = 0    -- when a sampler callback last landed
-local lastStaleLogAt = 0
-local lastExtreme = false -- extreme runaway seen by the most recent sample
 
 local function launchSampler(onDone)
   local now = hs.timer.secondsSinceEpoch()

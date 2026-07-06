@@ -440,7 +440,7 @@ local function onSample(blob)
 
   -- Per-process pipeline: track growth, spot runaways, rank the hogs.
   lastPsList = procs.parsePsList(blob)
-  procs.update(tracker, lastPsList, now)
+  procs.update(tracker, lastPsList, now, topCache.map)
   local totalMB = (lastMetrics.totalGB or 0) * 1024
   local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
   local kept = {}
@@ -465,17 +465,17 @@ local function onSample(blob)
   local state, changed, reason = core.smStep(smState, sig, now)
 
   local offender, watch = procs.pickOffender(kept, lastRanked, state)
-  if offender and not offender.weightMB then
-    local t = topCache.map and topCache.map[offender.pid]
-    offender.weightMB = (offender.rssMB or 0) + (t and t.cmprsMB or 0)
-  end
+  if offender and not offender.weightMB then offender.weightMB = offender.rssMB or 0 end
   lastOffender = offender
   titleSnap.offenderName = offender and offender.name or nil
   titleSnap.offenderGB   = offender and (offender.weightMB / 1024) or nil
   titleSnap.watchName    = watch and watch.name or nil
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", lastMetrics.availPct)
 
-  if state ~= "ok" or #kept > 0 then topRefresh() end
+  -- top runs whenever the system is interesting OR compression/swap is
+  -- actively churning even at ok: that is exactly when a fast allocator's
+  -- pages get compressed away and it goes invisible to RSS.
+  if state ~= "ok" or #kept > 0 or sig.compActive or sig.swapActive then topRefresh() end
   if changed then M.logSnapshot("state:" .. reason) end
 
   -- Alert surfaces: the HUD is the actionable one, the notification the

@@ -93,7 +93,13 @@ end
 
 -- Feed one ps snapshot into the tracker. pid reuse is detected by a comm
 -- change (ps has no etimes on this macOS), which resets that pid's history.
-function M.update(tr, psList, now)
+--
+-- Rings hold FOOTPRINT WEIGHT (rss + this pid's compressed size from the
+-- most recent top sample, sticky between top refreshes), not raw RSS. A
+-- machine under load compresses a fast allocator's pages in near-real-time,
+-- deflating its RSS while it grows; weight keeps climbing and stays visible.
+-- topMap may be nil or stale; the last known cmprs carries forward.
+function M.update(tr, psList, now, topMap)
   local cfg = tr.cfg
   local n = 0
   for _ in pairs(tr.procs) do n = n + 1 end
@@ -107,9 +113,12 @@ function M.update(tr, psList, now)
       tr.procs[p.pid] = e; n = n + 1
     end
     if e then
-      e.uid, e.lastSeen, e.rssMB = p.uid, now, p.rssMB
+      local t = topMap and topMap[p.pid]
+      if t then e.cmprsMB = t.cmprsMB end
+      local w = p.rssMB + (e.cmprsMB or 0)
+      e.uid, e.lastSeen, e.rssMB, e.weightMB = p.uid, now, p.rssMB, w
       local ring = e.ring
-      ring[#ring + 1] = { t = now, rssMB = p.rssMB }
+      ring[#ring + 1] = { t = now, v = w }
       if #ring > cfg.windowSamples then table.remove(ring, 1) end
     end
   end
@@ -118,20 +127,35 @@ function M.update(tr, psList, now)
   end
 end
 
--- Growth over the RISING TAIL of a ring: how many consecutive samples (from
--- the newest backwards) climbed by more than eps, and the slope in MB/min
--- across exactly that tail. Judging the tail, not the whole window, keeps an
--- old flat stretch from diluting a fresh climb.
+-- Growth over the RISING TAIL of a ring: how many samples (from the newest
+-- backwards) climbed by more than eps, and the slope in MB/min across that
+-- tail. Judging the tail, not the whole window, keeps an old flat stretch
+-- from diluting a fresh climb. ONE flat tick between rises is tolerated
+-- (grace): the compressed component refreshes on top's slower cadence, so a
+-- real climb can legitimately land on alternate ticks. Two consecutive flat
+-- ticks or any real drop still end the streak, which keeps plateaued
+-- installers and steady servers silent.
 local function growth(ring, eps)
   local n = #ring
   if n < 2 then return 0, 0, 0 end
-  local rising = 0
+  local rising, i0, consecFlat = 0, n, 0
   for i = n, 2, -1 do
-    if (ring[i].rssMB - ring[i - 1].rssMB) > eps then rising = rising + 1 else break end
+    local d = ring[i].v - ring[i - 1].v
+    if d > eps then
+      rising = rising + 1
+      consecFlat = 0
+      i0 = i - 1
+    elseif d >= -eps then
+      consecFlat = consecFlat + 1
+      if consecFlat >= 2 then break end
+      i0 = i - 1  -- the grace tick joins the tail
+    else
+      break       -- a real drop ends the story
+    end
   end
-  local i0 = math.max(1, n - rising)
+  if rising == 0 then return 0, 0, 0 end
   local span = ring[n].t - ring[i0].t
-  local slope = span > 0 and (ring[n].rssMB - ring[i0].rssMB) / span * 60 or 0
+  local slope = span > 0 and (ring[n].v - ring[i0].v) / span * 60 or 0
   return slope, rising, span
 end
 M.growth = growth -- exposed for tests
@@ -150,12 +174,13 @@ function M.runaways(tr, now, systemState, totalMB)
       kind = "extreme"
     elseif slope >= cfg.growthMBmin and rising >= cfg.nRising and span >= cfg.minWindowSec then
       kind = "sustained"
-    elseif systemState == "critical" and totalMB and (e.rssMB or 0) >= cfg.absFrac * totalMB then
+    elseif systemState == "critical" and totalMB and (e.weightMB or 0) >= cfg.absFrac * totalMB then
       kind = "absolute"
     end
     if kind then
       out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,
-                        rssMB = e.rssMB or 0, slopeMBmin = slope, kind = kind }
+                        rssMB = e.rssMB or 0, weightMB = e.weightMB or e.rssMB or 0,
+                        slopeMBmin = slope, kind = kind }
     end
   end
   local rank = { extreme = 3, sustained = 2, absolute = 1 }

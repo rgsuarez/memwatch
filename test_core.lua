@@ -294,6 +294,46 @@ local runsBig = procs.runaways(trBig, 25, "critical", 36864)
 check("absolute fires at critical", #runsBig, 1)
 check("absolute kind", runsBig[1].kind, "absolute")
 
+-- weight rings: cmprs from top joins rss and sticks between top refreshes,
+-- so a runaway whose pages are compressed away in real time stays visible.
+local trW = procs.newTracker(PC)
+procs.update(trW, { row(95, 1000, "hidden") }, 0, { [95] = { memMB = 1000, cmprsMB = 2000 } })
+procs.update(trW, { row(95, 1000, "hidden") }, 5, nil)  -- top stale this tick
+check("weight ring adds cmprs", trW.procs[95].ring[1].v, 3000)
+check("cmprs sticky when top absent", trW.procs[95].ring[2].v, 3000)
+check("weightMB exposed", trW.procs[95].weightMB, 3000)
+
+-- alternating climb (rss flat while cmprs steps on top's slower cadence):
+-- one flat tick of grace keeps the streak alive; still classified sustained.
+local trAlt = procs.newTracker(PC)
+local vAlt = { 1000, 2200, 2200, 3400, 3400, 4600, 4600, 5800 }
+for i, v in ipairs(vAlt) do
+  procs.update(trAlt, { row(96, v, "stepper") }, (i - 1) * 5)
+end
+local runsAlt = procs.runaways(trAlt, 35, "ok", 36864)
+check("alternating climb detected", #runsAlt, 1)
+check("alternating climb is sustained", runsAlt[1].kind, "sustained")
+
+-- but two consecutive flat ticks still end the streak (plateau stays silent).
+local trFlat = procs.newTracker(PC)
+local vFlat = { 1000, 2200, 3400, 4600, 4600, 4600, 4600, 4600 }
+for i, v in ipairs(vFlat) do
+  procs.update(trFlat, { row(97, v, "plateaued") }, (i - 1) * 5)
+end
+check("plateau after climb silent", #procs.runaways(trFlat, 35, "ok", 36864), 0)
+
+-- absolute trigger judges weight, not raw rss: 8 GB resident + 8 GB
+-- compressed crosses the 40% line even though rss alone would not.
+local trAbsW = procs.newTracker(PC)
+for i = 0, 5 do
+  procs.update(trAbsW, { row(98, 8000, "vm-big") }, i * 5,
+               { [98] = { memMB = 8000, cmprsMB = 8000 } })
+end
+check("absolute-by-weight silent at ok", #procs.runaways(trAbsW, 25, "ok", 36864), 0)
+local runsAbsW = procs.runaways(trAbsW, 25, "critical", 36864)
+check("absolute-by-weight fires at critical", #runsAbsW, 1)
+check("absolute-by-weight carries weight", runsAbsW[1].weightMB, 16000)
+
 -- pid reuse: same pid, new comm resets the ring.
 local trReuse = procs.newTracker(PC)
 for i = 0, 5 do procs.update(trReuse, { row(60, 1000 + i * 1600, "leaky") }, i * 5) end

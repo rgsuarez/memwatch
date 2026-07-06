@@ -23,7 +23,7 @@ What actually predicts the beachball is motion:
 | Compression rate | `pagesCompressed` counter delta | how hard the compressor is being fed right now |
 | Kernel pressure level | `sysctl kern.memorystatus_vm_pressure_level` | the OS's own verdict (1 normal / 2 warn / 4 critical) |
 | Available headroom | free + speculative + purgeable + file-backed pages | only meaningful paired with active compression, never alone |
-| Per-process growth | `ps` RSS deltas per pid | the runaway catcher: what is CLIMBING, not what is big |
+| Per-process growth | footprint weight per pid: `ps` RSS + sticky per-pid compressed size from `top` | the runaway catcher: what is CLIMBING, not what is big; weight stays visible even when the kernel compresses a fast allocator's pages away in real time |
 
 ## States
 
@@ -41,8 +41,11 @@ thresholds below entry thresholds. The state cannot flap.
 
 ## Runaway detection
 
-Per-pid RSS history rings, judged over the rising tail so an old flat stretch
-never dilutes a fresh climb:
+Per-pid footprint-weight history rings (RSS plus that pid's compressed size,
+sticky between `top` refreshes), judged over the rising tail so an old flat
+stretch never dilutes a fresh climb. One flat tick between rises is tolerated
+(the compressed component refreshes on `top`'s slower cadence); two
+consecutive flats or any real drop end the streak:
 
 - **Extreme growth** (>= 150 MB/s across ~25s of monotonic climb): fires even
   while the system is still `ok` and forces `critical`. This is the

@@ -221,6 +221,12 @@ end
 
 local function hudBodyText()
   if hudOffender then
+    if hudOffender.kind == "hog" then
+      -- Largest process, not a proven cause: never dress a steady VM or
+      -- model server up as a caught runaway.
+      return string.format("%s (pid %d)\n%.1f GB held \u{00B7} largest process, not growing",
+        hudOffender.name, hudOffender.pid, (hudOffender.weightMB or 0) / 1024)
+    end
     local slope = (hudOffender.slopeMBmin and hudOffender.slopeMBmin > 0)
       and string.format(", +%.0f MB/min", hudOffender.slopeMBmin) or ""
     return string.format("%s (pid %d)\n%.1f GB%s",
@@ -343,7 +349,10 @@ local function buildMenu()
   items[#items + 1] = { title = "-" }
   if lastOffender then
     local off = lastOffender
-    items[#items + 1] = { title = string.format("Force Quit %s (pid %d)", off.name, off.pid),
+    local label = (off.kind == "hog")
+      and string.format("Force Quit largest process (%s, pid %d)", off.name, off.pid)
+      or  string.format("Force Quit %s (pid %d)", off.name, off.pid)
+    items[#items + 1] = { title = label,
       fn = function() M.killPid(off.pid, off.name) end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
       fn = function() M.ignore(off.pid, off.name) end }
@@ -361,7 +370,10 @@ local function notifyCrit(m)
   if now - lastNotifyAt < core.cfg.notifyCooldownSec then return end
   lastNotifyAt = now
   local sub
-  if lastOffender then
+  if lastOffender and lastOffender.kind == "hog" then
+    sub = string.format("largest: %s (pid %d) \u{00B7} %.1f GB, not growing",
+      lastOffender.name, lastOffender.pid, (lastOffender.weightMB or 0) / 1024)
+  elseif lastOffender then
     sub = string.format("%s (pid %d) \u{00B7} %.1f GB",
       lastOffender.name, lastOffender.pid, (lastOffender.weightMB or 0) / 1024)
   else
@@ -475,8 +487,12 @@ local function onSample(blob)
   local offender, watch = procs.pickOffender(kept, lastRanked, state)
   if offender and not offender.weightMB then offender.weightMB = offender.rssMB or 0 end
   lastOffender = offender
-  titleSnap.offenderName = offender and offender.name or nil
-  titleSnap.offenderGB   = offender and (offender.weightMB / 1024) or nil
+  -- A hog is named in the HUD and menu with its "largest, not growing"
+  -- framing; the menu-bar title shows the systemic cause tag instead, so a
+  -- steady bystander never headlines as the culprit.
+  local named = offender and offender.kind ~= "hog"
+  titleSnap.offenderName = named and offender.name or nil
+  titleSnap.offenderGB   = named and (offender.weightMB / 1024) or nil
   titleSnap.watchName    = watch and watch.name or nil
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", lastMetrics.availPct)
 

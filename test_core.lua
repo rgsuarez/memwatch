@@ -364,7 +364,26 @@ local offS2 = procs.pickOffender({ { pid = 2, name = "y", kind = "sustained" } }
 check("sustained at elevated is offender", offS2.pid, 2)
 local offC = procs.pickOffender({}, ranked, "critical")
 check("critical blames top weight", offC.pid, 80)
+check("hog fallback is tagged as hog", offC.kind, "hog")
 check("ok with no runaway names nobody", procs.pickOffender({}, ranked, "ok"), nil)
+
+-- extreme via net window growth: heavy load makes per-tick attribution
+-- choppy (big jumps, gaps), but +6 GB across the window while still climbing
+-- is extreme evidence regardless of streak shape.
+local trNet = procs.newTracker(PC)
+local vNet = { 1000, 1000, 4200, 4200, 4200, 7600, 7650, 7710 }
+for i, v in ipairs(vNet) do
+  procs.update(trNet, { row(99, v, "choppy-runaway") }, (i - 1) * 5)
+end
+local runsNet = procs.runaways(trNet, 35, "ok", 36864)
+check("choppy net growth detected", #runsNet, 1)
+check("choppy net growth is extreme", runsNet[1].kind, "extreme")
+-- but a big steady process with tiny jitter never trips the net route
+local trJit = procs.newTracker(PC)
+for i = 0, 7 do
+  procs.update(trJit, { row(100, 20480 + (i % 2) * 10, "steady-jitter") }, i * 5)
+end
+check("steady jitter stays silent", #procs.runaways(trJit, 35, "ok", 36864), 0)
 
 -- ---- kill policy ----
 local UID = 502

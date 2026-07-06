@@ -26,9 +26,12 @@ M.cfg = {
   nRising            = 4,     -- consecutive rising samples (~20s)
   minWindowSec       = 20,    -- the rising tail must span at least this long
   -- Extreme growth: fires even while the system is still ok. This is the
-  -- Chrome-runaway catcher: act while there is still headroom.
-  growthExtremeMBmin = 9000,  -- 150 MB/s
-  nRisingExtreme     = 5,     -- consecutive rising samples (~25s)
+  -- Chrome-runaway catcher: act while there is still headroom. Two routes:
+  -- a fast clean streak, or overwhelming net growth across the window even
+  -- when heavy load makes the per-tick attribution choppy.
+  growthExtremeMBmin = 9000,  -- 150 MB/s over the rising tail
+  nRisingExtreme     = 4,     -- rising samples for the streak route (~20s)
+  extremeNetMB       = 6000,  -- net window growth route (still-climbing gate)
   -- Absolute footprint: attribution only, and only once the system is
   -- critical, so a steady 20 GB model server never alarms on size alone.
   absFrac            = 0.40,  -- fraction of total RAM
@@ -171,8 +174,10 @@ function M.runaways(tr, now, systemState, totalMB)
   local out = {}
   for pid, e in pairs(tr.procs) do
     local slope, rising, span = growth(e.ring, cfg.risingEpsMB)
+    local netMB = (#e.ring >= 2) and (e.ring[#e.ring].v - e.ring[1].v) or 0
     local kind
-    if slope >= cfg.growthExtremeMBmin and rising >= cfg.nRisingExtreme then
+    if (slope >= cfg.growthExtremeMBmin and rising >= cfg.nRisingExtreme)
+       or (netMB >= cfg.extremeNetMB and rising >= 2) then
       kind = "extreme"
     elseif slope >= cfg.growthMBmin and rising >= cfg.nRising and span >= cfg.minWindowSec then
       kind = "sustained"
@@ -218,15 +223,21 @@ end
 -- The single process an alert should name, plus (second return) a watch-only
 -- grower for the elevated title hint. A merely-sustained grower while the
 -- system is still ok is a watch, not an offender; extreme growth is always an
--- offender; when the system is critical with no identified runaway, the top
--- hog by weight takes the blame line.
+-- offender. When the system is critical with NO identified runaway, the top
+-- hog by weight is named but explicitly tagged kind="hog": it is the largest
+-- process, not a proven cause, and every surface must present it that way
+-- (a steady VM or model server must never read like a caught runaway).
 function M.pickOffender(runawayList, ranked, systemState)
   local r = runawayList and runawayList[1]
   if r then
     if r.kind == "sustained" and systemState == "ok" then return nil, r end
     return r, nil
   end
-  if systemState == "critical" and ranked and ranked[1] then return ranked[1], nil end
+  if systemState == "critical" and ranked and ranked[1] then
+    local h = ranked[1]
+    return { pid = h.pid, name = h.name, comm = h.comm, uid = h.uid,
+             rssMB = h.rssMB, weightMB = h.weightMB, kind = "hog" }, nil
+  end
   return nil, nil
 end
 

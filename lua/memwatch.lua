@@ -69,6 +69,7 @@ local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, 
 -- local referenced above its declaration silently splits into a global.
 local resolveUnattendedAction
 local writeDecisionOutcome
+local lfmTick
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -794,6 +795,10 @@ local function tick()
     if (now - topIdleSince) > 60 then stopTopStream() end
   end
 
+  -- LFM adjudicator lifecycle: spawn/retire/self-police/advisory. Async
+  -- everywhere; a disabled feature makes this a single boolean check.
+  lfmTick(state, now, interesting)
+
   -- Drive the flash from flashState, not just transitions, so the animation
   -- always matches the real state and self-heals (e.g. after a self-test).
   if state ~= flashState then applyFlash(state) end
@@ -1101,6 +1106,351 @@ resolveUnattendedAction = function(mode, offender)
   return action, "deterministic-fallback", nil, { "deterministic" }, nil
 end
 
+------------------------------------------------------------------------------
+-- LFM server lifecycle
+--
+-- The adjudicator is an ENHANCEMENT the decision path consults through the
+-- async verdict cache; nothing here ever blocks a tick. Spawn happens at
+-- ELEVATED onset only (never during critical, never below the availability
+-- floor), on an ephemeral port with a per-spawn api-key file, at reduced
+-- QoS. Any timeout or self-police trip retires the server through one
+-- discipline (TERM, wait for exit AND port release, else KILL) and latches
+-- the adjudicator offline until the next elevated tick.
+------------------------------------------------------------------------------
+
+local LFM_KEY_PATH = os.getenv("HOME") .. "/projects/memwatch/eval/tmp/lfm-api-key"
+local lfmApiKey = nil
+local lfmBinPath = nil
+
+local function resolveLlamaServer()
+  if lfmBinPath then return lfmBinPath end
+  local brewPrefix = sh("/opt/homebrew/bin/brew --prefix llama.cpp 2>/dev/null"):gsub("%s+$", "")
+  local candidates = {
+    brewPrefix ~= "" and (brewPrefix .. "/bin/llama-server") or nil,
+    "/opt/homebrew/bin/llama-server",
+    "/usr/local/bin/llama-server",
+    sh("command -v llama-server 2>/dev/null"):gsub("%s+$", ""),
+  }
+  for _, p in ipairs(candidates) do
+    if p ~= "" and sh(string.format("test -x %q && echo yes", p)):match("yes") then
+      lfmBinPath = p
+      return p
+    end
+  end
+  return nil
+end
+
+local function portFree(port)
+  return sh(string.format("/usr/sbin/lsof -nP -iTCP:%d -sTCP:LISTEN -t 2>/dev/null", port)) == ""
+end
+
+local function listenerPid(port)
+  return tonumber(sh(string.format("/usr/sbin/lsof -nP -iTCP:%d -sTCP:LISTEN -t 2>/dev/null", port)):match("%d+"))
+end
+
+-- One retire discipline for every exit path (calm, timeout, self-police,
+-- stop): TERM, wait up to 5s for BOTH process exit and port release, else
+-- KILL. Clears all server state; the offline latch is the caller's call.
+local function retireLfmServer(reason)
+  local pid, port = lfmServerPid, lfmServerPort
+  lfmServerReady = false
+  lfmServerPid, lfmServerPort = nil, nil
+  lfmInFlight = nil
+  if lfmServerTask then pcall(function() lfmServerTask:terminate() end) end
+  lfmServerTask = nil
+  protectedPids = { [selfPid] = true }
+  if not pid then return end
+  M.logSnapshot(string.format("lfm-retire:%s:pid=%d", reason or "?", pid))
+  sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
+  local deadline = hs.timer.secondsSinceEpoch() + 5
+  hs.timer.doUntil(
+    function()
+      local gone = not pidAlive(pid) and (not port or portFree(port))
+      if gone then return true end
+      if hs.timer.secondsSinceEpoch() > deadline then
+        sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
+        return hs.timer.secondsSinceEpoch() > deadline + 3
+      end
+      return false
+    end,
+    guard("lfm-retire-wait", function() end),
+    1)
+end
+
+local function spawnLfmServer()
+  local bin = resolveLlamaServer()
+  if not bin then
+    M.logSnapshot("lfm-spawn-skip:no-llama-server-binary")
+    lfmOffline = true
+    return
+  end
+  local modelPath = os.getenv("HOME") .. "/projects/memwatch/models/" .. lfm.cfg.model
+  if lfm.cfg.model == "" or not sh(string.format("test -f %q && echo yes", modelPath)):match("yes") then
+    M.logSnapshot("lfm-spawn-skip:model-missing:" .. tostring(lfm.cfg.model))
+    lfmOffline = true
+    return
+  end
+  -- Ephemeral port, availability-checked; per-spawn key in a 0600 file.
+  local port
+  for _ = 1, 8 do
+    local candidate = math.random(49152, 65151)
+    if portFree(candidate) then port = candidate; break end
+  end
+  if not port then
+    M.logSnapshot("lfm-spawn-skip:no-free-port")
+    return
+  end
+  lfmApiKey = sh("/usr/bin/openssl rand -hex 16"):gsub("%s+$", "")
+  sh(string.format("umask 177 && mkdir -p %q && printf '%%s' %q > %q",
+    os.getenv("HOME") .. "/projects/memwatch/eval/tmp", lfmApiKey, LFM_KEY_PATH))
+  lfmServerPort = port
+  lfmServerReady = false
+  lfmSpawnedAt = hs.timer.secondsSinceEpoch()
+  -- taskpolicy -c utility keeps inference threads out of the crisis's way;
+  -- the drain callback exists because llama-server logs continuously and an
+  -- undrained pipe deadlocks at 64KB.
+  lfmServerTask = hs.task.new("/usr/sbin/taskpolicy",
+    guard("lfm-server-exit", function(code)
+      M.logSnapshot(string.format("lfm-server-exit:code=%s", tostring(code)))
+      lfmServerTask = nil
+      lfmServerReady = false
+      lfmServerPid, lfmServerPort = nil, nil
+      protectedPids = { [selfPid] = true }
+    end),
+    function() return true end,
+    { "-c", "utility", bin,
+      "-m", modelPath, "--host", "127.0.0.1", "--port", tostring(port),
+      "-c", tostring(lfm.cfg.ctx), "-np", "1", "-t", tostring(lfm.cfg.threads),
+      "-ngl", "0", "--api-key-file", LFM_KEY_PATH })
+  if not (lfmServerTask and lfmServerTask:start()) then
+    M.logSnapshot("lfm-spawn-failed:task-start")
+    lfmServerTask = nil
+    return
+  end
+  lfmServerPid = lfmServerTask:pid()
+  M.logSnapshot(string.format("lfm-spawn:pid=%d:port=%d:avail=%d%%",
+    lfmServerPid, port, math.floor(lastMetrics.availPct or 0)))
+  -- Health poll to ready, with the listener-ownership check: the pid bound
+  -- to our port must be our child (or its direct descendant via taskpolicy).
+  local healthDeadline = hs.timer.secondsSinceEpoch() + 60
+  hs.timer.doUntil(
+    function()
+      if not lfmServerTask then return true end -- died; exit callback logged it
+      if hs.timer.secondsSinceEpoch() > healthDeadline then
+        M.logSnapshot("lfm-health-timeout")
+        retireLfmServer("health-timeout")
+        lfmOffline = true
+        return true
+      end
+      local body = sh(string.format(
+        "curl -s -m 2 http://127.0.0.1:%d/health 2>/dev/null", port))
+      if body:find('"ok"', 1, true) then
+        local owner = listenerPid(port)
+        local expected = lfmServerTask and lfmServerTask:pid()
+        local ownerOk = owner ~= nil and expected ~= nil
+          and (owner == expected
+               or sh(string.format("/bin/ps -o ppid= -p %d 2>/dev/null", owner)):match("%d+") == tostring(expected))
+        if not ownerOk then
+          M.logSnapshot(string.format("lfm-listener-mismatch:owner=%s", tostring(owner)))
+          retireLfmServer("listener-mismatch")
+          lfmOffline = true
+          return true
+        end
+        lfmServerPid = owner
+        protectedPids = { [selfPid] = true, [owner] = true }
+        lfmServerReady = true
+        M.logSnapshot(string.format("lfm-ready:%.1fs:pid=%d",
+          hs.timer.secondsSinceEpoch() - lfmSpawnedAt, owner))
+        return true
+      end
+      return false
+    end,
+    guard("lfm-health-poll", function() end),
+    1)
+end
+
+-- Assemble the model-facing snapshot from what the tick already knows. The
+-- serializer strips pids structurally; foreground is a name match against
+-- the frontmost app (no pid involved).
+local function buildLfmSnapshot(offender)
+  local frontName = nil
+  pcall(function()
+    local app = hs.application.frontmostApplication()
+    frontName = app and app:name() or nil
+  end)
+  local function withForeground(p)
+    if not p then return nil end
+    return {
+      name = p.name, kind = p.kind, weightMB = p.weightMB,
+      slopeMBmin = p.slopeMBmin, ageSec = p.ageSec,
+      foreground = (frontName ~= nil and p.name ~= nil
+        and (p.name == frontName or p.name:find(frontName, 1, true) ~= nil)) or nil,
+    }
+  end
+  local frozenCount = 0
+  for _ in pairs(frozen) do frozenCount = frozenCount + 1 end
+  local runaways = {}
+  for i = 1, math.min(#lastRuns, 5) do runaways[i] = withForeground(lastRuns[i]) end
+  return {
+    state = smState.state, kern = lastKern,
+    availPct = lastMetrics.availPct, swapGB = lastMetrics.swapGB,
+    compressorGB = lastMetrics.compGB,
+    swapoutRate = lastRates.swapOut, compRate = lastRates.comp,
+    frozenCount = frozenCount,
+    offender = withForeground(offender),
+    runaways = runaways,
+  }, (withForeground(offender) or {}).foreground
+end
+
+-- Dispatch one async adjudication request for the bound offender. Replies
+-- land in the per-pid verdict cache; the nonce discards anything late or
+-- stale; the unified timeout policy retires the server and latches offline.
+local function dispatchAdjudication(offender, why)
+  if not (lfmServerReady and lfmServerPort and not lfmInFlight) then return end
+  local proc = probePid(offender.pid)
+  if not proc then return end
+  local snap, foreground = buildLfmSnapshot(offender)
+  local user, serr = lfm.serializeSnapshot(snap)
+  if not user then
+    M.logSnapshot("lfm-serialize-error:" .. tostring(serr))
+    return
+  end
+  local body = lfm.buildRequestBody(lfm.buildSystemPrompt({}), user, {})
+  if not body then return end
+  lfmReqNonce = lfmReqNonce + 1
+  local nonce = lfmReqNonce
+  local hash = lfm.snapshotHash(user)
+  local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart }
+  local pid = offender.pid
+  local sentAt = hs.timer.secondsSinceEpoch()
+  lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
+  M.logSnapshot(string.format("lfm-dispatch:%s:%s(%d):nonce=%d", why, ident.name, pid, nonce))
+  hs.http.asyncPost(
+    string.format("http://127.0.0.1:%d/v1/chat/completions", lfmServerPort),
+    body,
+    { ["Content-Type"] = "application/json",
+      ["Authorization"] = "Bearer " .. (lfmApiKey or "") },
+    guard("lfm-reply", function(status, respBody)
+      if not lfmInFlight or lfmInFlight.nonce ~= nonce then
+        M.logSnapshot(string.format("lfm-reply-discard:stale-nonce=%d", nonce))
+        return
+      end
+      lfmInFlight = nil
+      if status ~= 200 then
+        M.logSnapshot(string.format("lfm-reply-error:http=%s", tostring(status)))
+        return
+      end
+      local raw, perr = lfm.parseResponse(respBody or "")
+      local verdict = raw and lfm.validateVerdict(raw) or nil
+      if not verdict then
+        M.logSnapshot("lfm-reply-invalid:" .. tostring(perr or "validation"))
+        return
+      end
+      local latencyMs = math.floor((hs.timer.secondsSinceEpoch() - sentAt) * 1000)
+      verdictCache[pid] = {
+        verdict = verdict, snapshotHash = hash, reqNonce = nonce,
+        at = hs.timer.secondsSinceEpoch(), ident = ident,
+      }
+      M.logSnapshot(string.format("lfm-verdict:%s(%d):%s:conf=%.2f:%dms",
+        ident.name, pid, verdict.action, verdict.confidence, latencyMs))
+      writeDecisionOutcome(
+        { name = ident.name, kind = offender.kind, pid = pid,
+          weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
+          foreground = foreground },
+        verdict.action, "lfm-advisory", verdict.rationale, nil,
+        { model = lfm.cfg.model, snapshotHash = hash,
+          confidence = verdict.confidence, latencyMs = latencyMs })
+    end))
+  -- Unified timeout policy: any request still in flight at the watchdog
+  -- retires the server (reclaiming its CPU for the crisis) and latches the
+  -- adjudicator offline until the next elevated tick.
+  hs.timer.doAfter(lfm.cfg.timeoutSec, guard("lfm-timeout", function()
+    if lfmInFlight and lfmInFlight.nonce == nonce then
+      M.logSnapshot(string.format("lfm-timeout:nonce=%d:%.0fs", nonce, lfm.cfg.timeoutSec))
+      lfmInFlight = nil
+      retireLfmServer("timeout")
+      lfmOffline = true
+    end
+  end))
+end
+
+-- Per-tick lifecycle: spawn discipline, retire-on-calm, the self-police
+-- circuit, advisory dispatch, and cache hygiene. Called from tick(); never
+-- blocks; every fork here happens at elevated or calmer.
+lfmTick = function(state, now, interesting)
+  if not lfm.cfg.enabled then
+    if lfmServerTask then retireLfmServer("disabled") end
+    return
+  end
+  -- The offline latch clears at any non-critical tick, so the next elevated
+  -- onset may respawn. Never during critical.
+  if lfmOffline and state ~= "critical" then lfmOffline = false end
+
+  local running = lfmServerTask ~= nil
+
+  -- Self-police circuit (independent of adjudication): the server's own
+  -- footprint is read from the ps list the tick already has. Over budget ->
+  -- killed through the retire discipline + offline latch + loud notice.
+  if running and lfmServerPid then
+    for _, p in ipairs(lastPsList) do
+      if p.pid == lfmServerPid and p.rssMB > lfm.cfg.maxServerMB then
+        M.logSnapshot(string.format("lfm-self-police:rss=%dMB>cap=%dMB",
+          math.floor(p.rssMB), lfm.cfg.maxServerMB))
+        hs.notify.new({ title = "memwatch: adjudicator over budget",
+          informativeText = string.format(
+            "llama-server hit %d MB (cap %d); killed and latched offline.",
+            math.floor(p.rssMB), lfm.cfg.maxServerMB),
+          withdrawAfter = 0 }):send()
+        retireLfmServer("self-police")
+        lfmOffline = true
+        return
+      end
+    end
+  end
+
+  -- Spawn discipline: elevated onset only (resident mode may also spawn at
+  -- ok), above the availability floor, never critical, never while latched.
+  if not running and not lfmOffline
+     and state ~= "critical"
+     and (lfm.cfg.resident or state == "elevated")
+     and (lastMetrics.availPct or 0) >= lfm.cfg.spawnMinAvailPct then
+    spawnLfmServer()
+  end
+
+  -- Retire on calm (resident servers stay).
+  if running and not lfm.cfg.resident then
+    if state == "ok" and #lastRuns == 0 then
+      lfmCalmSince = lfmCalmSince or now
+      if (now - lfmCalmSince) > lfm.cfg.retireCalmSec then
+        retireLfmServer("calm")
+        lfmCalmSince = nil
+      end
+    else
+      lfmCalmSince = nil
+    end
+  end
+
+  -- Advisory dispatch: a warm server adjudicates the current offender on
+  -- the advisory cadence, and immediately at critical when nothing fresh is
+  -- cached (the grace-expiry consumer needs a verdict to consume).
+  if lfmServerReady and interesting and lastOffender then
+    local cached = verdictCache[lastOffender.pid]
+    local fresh = cached and (now - (cached.at or 0)) <= lfm.cfg.verdictFreshSec
+    local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
+    if (lfm.cfg.advisory and due) or (state == "critical" and not fresh and not lfmInFlight) then
+      lfmLastAdvisoryAt = now
+      dispatchAdjudication(lastOffender, state == "critical" and "critical" or "advisory")
+    end
+  end
+
+  -- Cache hygiene: drop entries for pids that are gone or stale beyond use.
+  for pid, e in pairs(verdictCache) do
+    if (now - (e.at or 0)) > (lfm.cfg.verdictFreshSec * 2) then
+      verdictCache[pid] = nil
+    end
+  end
+end
+
 -- One-click kill: re-validate identity first (pid-reuse guard), check the
 -- pure policy, SIGTERM, escalate to SIGKILL after cfg.kill.escalateSec if the
 -- target is still alive (re-validated again), then verify death and report
@@ -1190,6 +1540,10 @@ function M.start()
   smState = core.newSMState(hs.timer.secondsSinceEpoch())
   flashState = nil                -- force first tick to set the flash state
   frozenReconcile()               -- SIGSTOPped processes survive reloads
+  -- Orphan sweep: a hard Hammerspoon crash can leave a previous session's
+  -- llama-server running with no owner. Anything serving from OUR model
+  -- directory is ours by construction; nothing else matches the path.
+  sh("/usr/bin/pkill -f 'llama-server.*projects/memwatch/models/' 2>/dev/null")
   renderTitleNow()
   pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
   tick()                          -- immediate first sample
@@ -1201,6 +1555,7 @@ function M.stop()
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
   stopTopStream()
+  if lfmServerTask then retireLfmServer("stop") end
   flashState = nil
   if menu then menu:delete(); menu = nil end
 end

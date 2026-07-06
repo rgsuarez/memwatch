@@ -129,7 +129,9 @@ end
 -- so it never runs on the main thread, never more than once per interval,
 -- and only while the system is interesting). top truncates command names;
 -- results are joined to ps rows by pid.
-local TOP_CMD = "/usr/bin/top -l 1 -n 20 -o mem -stats pid,command,mem,cmprs"
+-- Sorted by CMPRS, not MEM: the pids that matter here are the ones whose
+-- weight lives in the compressor, which a residency sort would never surface.
+local TOP_CMD = "/usr/bin/top -l 1 -n 25 -o cmprs -stats pid,command,mem,cmprs"
 local TOP_MIN_INTERVAL = 10
 local topTask = nil
 
@@ -406,8 +408,12 @@ end
 -- provide: the kernel pressure verdict, swap usage, and the process list.
 -- ~32 ms measured; always async so the main thread never blocks, with an
 -- in-flight guard so a wedged fork skips ticks instead of stacking tasks.
+-- The ps table is deliberately uncapped: a runaway whose pages are being
+-- compressed away in real time can hold a tiny RSS, and any top-N-by-RSS cut
+-- would drop exactly the process this tool exists to catch. ~600 rows parse
+-- in well under a millisecond.
 local SAMPLER_CMD = "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level vm.swapusage; "
-                 .. "/bin/ps -Axo pid,uid,rss,comm -m | /usr/bin/head -40"
+                 .. "/bin/ps -Axo pid,uid,rss,comm -m"
 local SAMPLE_WATCHDOG_SEC = 20
 
 local sampleTask, sampleStartedAt = nil, 0

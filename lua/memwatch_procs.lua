@@ -16,7 +16,9 @@ local M = {}
 M.cfg = {
   windowSamples      = 12,    -- ring size (12 x 5s ticks = 60s of history)
   staleSec           = 30,    -- forget pids unseen this long
-  maxTracked         = 60,    -- hard cap on tracked pids
+  maxTracked         = 1000,  -- backstop only; the whole ps table is tracked
+                              -- because a compressed-away runaway can sit at
+                              -- the bottom of any residency-sorted cut
   risingEpsMB        = 8,     -- a sample must climb this much to count as rising
   -- Sustained growth: the primary trigger. Watch-only while the system is ok;
   -- an alert once the system is elevated.

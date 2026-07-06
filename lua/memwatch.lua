@@ -3,10 +3,11 @@
 -- Project: ~/projects/memwatch  (wired into ~/.hammerspoon/init.lua)
 --
 -- An always-present, glanceable dot in the menu bar:
---   green  (dim)   = healthy
---   amber  (pulse) = warning, pressure building
---   red    (fast)  = critical; also fires a silent notification naming the
+--   green (dim)    = healthy
+--   amber (steady) = warning, pressure building
+--   red   (steady) = critical; also fires a silent notification naming the
 --                    top memory consumers
+-- The dot is steady by default; set core.cfg.flash = true to pulse warn/crit.
 -- Click the dot for live compressor / swap / available numbers and the top 5
 -- memory consumers. Threshold crossings are appended to memwatch.log.
 --
@@ -100,8 +101,9 @@ local function applyFlash(level)
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   flashLit = true
   flashLevel = level
-  if level == "ok" then
-    setIcon("ok", lastMetrics, true)
+  -- Steady render unless the pulse is explicitly enabled. "ok" is always steady.
+  if level == "ok" or not core.cfg.flash then
+    setIcon(level, lastMetrics, true)
     return
   end
   local interval = (level == "crit") and 0.45 or 1.0

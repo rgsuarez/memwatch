@@ -13,8 +13,11 @@ An always-present dot in the menu bar:
 | State | Look | Meaning |
 |-------|------|---------|
 | `ok`   | dim green dot | healthy |
-| `warn` | amber dot, slow pulse, shows compressor GB | pressure building |
-| `crit` | red dot, fast flash, shows compressor GB | critical; fires a silent notification naming the top memory consumers |
+| `warn` | amber dot, shows compressor GB | pressure building |
+| `crit` | red dot, shows compressor GB | critical; fires a silent notification naming the top memory consumers |
+
+The dot is steady by default. To restore the warn slow-pulse / crit fast-flash,
+set `M.cfg.flash = true` in `lua/memwatch_core.lua`.
 
 Click the dot for live compressor / swap / available numbers, the top 5 memory
 consumers, and a shortcut to Activity Monitor.

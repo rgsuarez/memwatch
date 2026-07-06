@@ -19,6 +19,10 @@ M.cfg = {
   pageSize          = M.PAGE,
   pollSec           = 5,    -- how often the gauge samples
   notifyCooldownSec = 180,  -- min seconds between critical notifications
+  -- Pulse the dot on warn/crit? Off by default: the color and the compressor-GB
+  -- readout already signal the level, and a blinking menu-bar item is distracting.
+  -- Set to true to restore the warn slow-pulse / crit fast-flash.
+  flash             = false,
   warn = { compGB = 8,  swapGB = 2, availPct = 15 },
   crit = { compGB = 14, swapGB = 6, availPct = 8  },
 }

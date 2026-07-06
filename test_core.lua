@@ -4,7 +4,8 @@
 -- Exercises the three-case floor: ok / warn / crit, plus the parsers.
 
 package.path = "lua/?.lua;" .. package.path
-local core = require("memwatch_core")
+local core  = require("memwatch_core")
+local procs = require("memwatch_procs")
 
 local fails = 0
 local function check(name, got, want)
@@ -193,6 +194,137 @@ check("title critical offender", tC.text, core.DOT .. " python3 8G")
 check("title critical level", tC.level, "crit")
 check("title critical cause", core.renderTitle("critical", { causeTag = "SWAP" }).text, core.DOT .. " SWAP")
 check("title long name capped", core.shortName(("A"):rep(20)), ("A"):rep(13) .. "\u{2026}")
+
+-- ---- procs: parsers ----
+local psBlob = [[
+1
+total = 9216.00M  used = 7987.06M  free = 1228.94M  (encrypted)
+  PID   UID    RSS COMM
+  771   502 509728 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/138.0/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
+  118   502 489904 claude
+  600    88 448496 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer
+]]
+local psList = procs.parsePsList(psBlob)
+check("ps rows parsed", #psList, 3)
+check("ps rss KB->MB", string.format("%.1f", psList[1].rssMB), string.format("%.1f", 509728 / 1024))
+check("ps comm keeps spaces", procs.friendlyName(psList[1].comm), "Google Chrome Helper (Renderer)")
+check("ps uid parsed", psList[3].uid, 88)
+check("friendlyName bare", procs.friendlyName("claude"), "claude")
+
+local topBlob = [[
+PhysMem: 34G used (11G wired, 9279M compressor), 671M unused.
+PID    COMMAND          MEM   CMPRS
+19581  com.apple.Virtua 1954M 3175M
+600    WindowServer     1250M+ 206M
+1372   Terminal         944M  522M
+70239  claude.exe       608M  0B
+99     big              2G    1G
+]]
+local topMap = procs.parseTop(topBlob)
+check("top rows parsed", topMap[1372].cmprsMB, 522)
+check("top plus suffix", topMap[600].memMB, 1250)
+check("top B unit", topMap[70239].cmprsMB, 0)
+check("top G unit", topMap[99].cmprsMB, 1024)
+check("top preamble skipped", topMap[34], nil)
+
+-- ---- procs: growth detection (three-case floor) ----
+local PC = {}
+for k, v in pairs(procs.cfg) do PC[k] = v end
+
+local function feed(series)  -- series: { {t, {pid,uid,rssMB,comm}, ...}, ... }
+  local tr = procs.newTracker(PC)
+  for _, snap in ipairs(series) do
+    local t = snap.t
+    procs.update(tr, snap.list, t)
+  end
+  return tr
+end
+
+local function row(pid, rssMB, comm)
+  return { pid = pid, uid = 502, rssMB = rssMB, comm = comm or ("proc" .. pid) }
+end
+
+-- steady-large: a 20 GB model server, flat. Never a runaway.
+local steady = {}
+for i = 0, 11 do
+  steady[#steady + 1] = { t = i * 5, list = { row(10, 20480, "llm-server") } }
+end
+local trSteady = feed(steady)
+check("steady-large is silent", #procs.runaways(trSteady, 55, "ok", 36864), 0)
+check("steady-large silent even elevated", #procs.runaways(trSteady, 55, "elevated", 36864), 0)
+
+-- npm-style spike: climbs briefly, then plateaus. rising streak breaks.
+local spike = {}
+local rssSpike = { 200, 500, 800, 1050, 1060, 1055, 1058, 1060 }
+for i, v in ipairs(rssSpike) do
+  spike[#spike + 1] = { t = (i - 1) * 5, list = { row(20, v, "npm install") } }
+end
+local trSpike = feed(spike)
+check("npm spike is silent", #procs.runaways(trSpike, 35, "ok", 36864), 0)
+
+-- chrome-class runaway: +1600 MB every 5s, sustained.
+local chrome = {}
+for i = 0, 6 do
+  chrome[#chrome + 1] = { t = i * 5, list = { row(30, 2000 + i * 1600, "Google Chrome Helper (Renderer)") } }
+end
+local trChrome = feed(chrome)
+local runsChrome = procs.runaways(trChrome, 30, "ok", 36864)
+check("chrome runaway fires", #runsChrome, 1)
+check("chrome runaway is extreme", runsChrome[1].kind, "extreme")
+check("chrome runaway fires at ok", runsChrome[1].pid, 30)
+
+-- sustained (not extreme): +150 MB every 5s = 1800 MB/min.
+local slow = {}
+for i = 0, 6 do
+  slow[#slow + 1] = { t = i * 5, list = { row(40, 1000 + i * 150, "node") } }
+end
+local trSlow = feed(slow)
+local runsSlow = procs.runaways(trSlow, 30, "ok", 36864)
+check("sustained grower detected", #runsSlow, 1)
+check("sustained not extreme", runsSlow[1].kind, "sustained")
+
+-- absolute: huge and flat. Attribution only while critical.
+local big = {}
+for i = 0, 5 do
+  big[#big + 1] = { t = i * 5, list = { row(50, 16000, "vm-host") } }
+end
+local trBig = feed(big)
+check("absolute silent at ok", #procs.runaways(trBig, 25, "ok", 36864), 0)
+local runsBig = procs.runaways(trBig, 25, "critical", 36864)
+check("absolute fires at critical", #runsBig, 1)
+check("absolute kind", runsBig[1].kind, "absolute")
+
+-- pid reuse: same pid, new comm resets the ring.
+local trReuse = procs.newTracker(PC)
+for i = 0, 5 do procs.update(trReuse, { row(60, 1000 + i * 1600, "leaky") }, i * 5) end
+procs.update(trReuse, { row(60, 100, "fresh-proc") }, 30)
+check("pid reuse resets ring", #trReuse.procs[60].ring, 1)
+check("pid reuse resets name", trReuse.procs[60].name, "fresh-proc")
+
+-- stale prune: unseen pids age out.
+local trStale = procs.newTracker(PC)
+procs.update(trStale, { row(70, 500, "gone") }, 0)
+procs.update(trStale, { row(71, 500, "here") }, 40)
+check("stale pid pruned", trStale.procs[70], nil)
+check("live pid kept", trStale.procs[71] ~= nil, true)
+
+-- ---- procs: ranking and offender pick ----
+local ranked = procs.rankByWeight(
+  { row(80, 1000, "small-rss-big-cmprs"), row(81, 1500, "big-rss") },
+  { [80] = { memMB = 1000, cmprsMB = 3000 } }, 5)
+check("cmprs flips the ranking", ranked[1].pid, 80)
+check("weight adds cmprs", ranked[1].weightMB, 4000)
+
+local offE = procs.pickOffender({ { pid = 1, name = "x", kind = "extreme" } }, ranked, "ok")
+check("extreme is offender at ok", offE.pid, 1)
+local offS, watchS = procs.pickOffender({ { pid = 2, name = "y", kind = "sustained" } }, ranked, "ok")
+check("sustained at ok is watch only", offS, nil)
+check("sustained at ok names watch", watchS.pid, 2)
+local offS2 = procs.pickOffender({ { pid = 2, name = "y", kind = "sustained" } }, ranked, "elevated")
+check("sustained at elevated is offender", offS2.pid, 2)
+local offC = procs.pickOffender({}, ranked, "critical")
+check("critical blames top weight", offC.pid, 80)
+check("ok with no runaway names nobody", procs.pickOffender({}, ranked, "ok"), nil)
 
 if fails == 0 then
   print("\nALL PASS")

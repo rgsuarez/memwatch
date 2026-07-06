@@ -14,7 +14,8 @@
 -- The dot is steady by default; set core.cfg.flash = true to pulse on trouble.
 -- State transitions are appended to memwatch.log.
 
-local core = require("memwatch_core")
+local core  = require("memwatch_core")
+local procs = require("memwatch_procs")
 
 local M = {}
 
@@ -31,6 +32,16 @@ local lastKern    = 1
 local smState     = core.newSMState(0)
 local titleSnap   = {}    -- offenderName / offenderGB / watchName / causeTag
 local prevCounters, prevCountersAt = nil, nil
+
+-- per-process pipeline state
+local tracker      = procs.newTracker()
+local topCache     = { map = nil, at = 0 }  -- per-pid CMPRS from async top
+local lastPsList   = {}
+local lastRanked   = {}   -- top hogs by RSS+CMPRS weight (menu rows)
+local lastRuns     = {}   -- current runaway list, ignores applied
+local lastOffender = nil  -- the process alerts name right now
+local ignoredUntil = {}   -- ["pid|name"] = epoch when the ignore expires
+local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -112,18 +123,26 @@ local function readMetrics()
   return core.metrics(vm, swapByte, totalByt, pageSize)
 end
 
--- Top N processes by resident memory: { {name=, mb=}, ... }
-local function topConsumers(n)
-  n = n or 5
-  local out = sh("/bin/ps -Aceo rss,comm -m 2>/dev/null | /usr/bin/head -n " .. (n + 1))
-  local list = {}
-  for line in out:gmatch("[^\n]+") do
-    local rss, comm = line:match("^%s*(%d+)%s+(.+)$") -- header row has no leading digits, so it is skipped
-    if rss and comm then
-      list[#list + 1] = { name = comm, mb = tonumber(rss) / 1024 }
+-- Throttled async top for per-process CMPRS attribution (~756 ms measured,
+-- so it never runs on the main thread, never more than once per interval,
+-- and only while the system is interesting). top truncates command names;
+-- results are joined to ps rows by pid.
+local TOP_CMD = "/usr/bin/top -l 1 -n 20 -o mem -stats pid,command,mem,cmprs"
+local TOP_MIN_INTERVAL = 10
+local topTask = nil
+
+local function topRefresh()
+  if topTask then return end
+  local now = hs.timer.secondsSinceEpoch()
+  if (now - topCache.at) < TOP_MIN_INTERVAL then return end
+  topCache.at = now  -- stamp at launch so a slow top cannot double-fire
+  topTask = hs.task.new("/bin/sh", guard("top", function(exitCode, stdOut)
+    topTask = nil
+    if exitCode == 0 and stdOut and stdOut ~= "" then
+      topCache.map = procs.parseTop(stdOut)
     end
-  end
-  return list
+  end), { "-c", TOP_CMD })
+  if topTask then topTask:start() end
 end
 
 ------------------------------------------------------------------------------
@@ -179,10 +198,22 @@ local function buildMenu()
     { title = string.format("Available %.0f%%  \u{00B7}  Swap used %.1f GB", m.availPct, m.swapGB), disabled = true },
     { title = string.format("Compressor (info) %.1f GB", m.compGB), disabled = true },
     { title = "-" },
-    { title = "Top memory consumers", disabled = true },
   }
-  for _, p in ipairs(topConsumers(5)) do
-    items[#items + 1] = { title = string.format("   %-24s %6.0f MB", p.name, p.mb), disabled = true }
+  local cmprsNote = ""
+  if not topCache.map then
+    cmprsNote = " (compressed pending)"
+  elseif (hs.timer.secondsSinceEpoch() - topCache.at) > 60 then
+    cmprsNote = " (compressed stale)"
+  end
+  items[#items + 1] = { title = "Top by weight, RSS+compressed" .. cmprsNote, disabled = true }
+  if #lastRanked == 0 then
+    items[#items + 1] = { title = "   sampling\u{2026}", disabled = true }
+  end
+  for _, p in ipairs(lastRanked) do
+    items[#items + 1] = {
+      title = string.format("   %-22s %5.1f GB  (pid %d)", p.name:sub(1, 22), p.weightMB / 1024, p.pid),
+      disabled = true,
+    }
   end
   items[#items + 1] = { title = "-" }
   items[#items + 1] = { title = "Open Activity Monitor",
@@ -196,14 +227,22 @@ local function notifyCrit(m)
   local now = os.time()
   if now - lastNotifyAt < core.cfg.notifyCooldownSec then return end
   lastNotifyAt = now
+  local sub
+  if lastOffender then
+    sub = string.format("%s (pid %d) \u{00B7} %.1f GB",
+      lastOffender.name, lastOffender.pid, (lastOffender.weightMB or 0) / 1024)
+  else
+    sub = string.format("swap-out %.0f pg/s | avail %.0f%% | swap %.1f GB",
+      lastRates.swapOut, m.availPct, m.swapGB)
+  end
   local names = {}
-  for _, p in ipairs(topConsumers(3)) do
-    names[#names + 1] = string.format("%s (%.0f MB)", p.name, p.mb)
+  for i, p in ipairs(lastRanked) do
+    if i > 3 then break end
+    names[#names + 1] = string.format("%s (%.1f GB)", p.name, p.weightMB / 1024)
   end
   hs.notify.new({
     title           = "Memory pressure: CRITICAL",
-    subTitle        = string.format("swap-out %.0f pg/s | avail %.0f%% | swap %.1f GB",
-                                    lastRates.swapOut, m.availPct, m.swapGB),
+    subTitle        = sub,
     informativeText = "Top: " .. table.concat(names, ", "),
     withdrawAfter   = 0,      -- stays in Notification Center until dismissed
     hasActionButton = false,
@@ -252,7 +291,7 @@ local function launchSampler(onDone)
 end
 
 -- Second half of the tick, run when the sampler fork returns. All state
--- decisions live here because they need the kernel verdict.
+-- decisions live here because they need the kernel verdict and the ps list.
 local function onSample(blob)
   local now = hs.timer.secondsSinceEpoch()
   local samp = core.parseSampler(blob)
@@ -260,9 +299,45 @@ local function onSample(blob)
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
   lastPsBlob = blob
   lastMetrics.swapGB = lastSwapBytes / 1e9
-  local sig = core.signals(lastMetrics, lastRates, lastKern, false)
+
+  -- Per-process pipeline: track growth, spot runaways, rank the hogs.
+  lastPsList = procs.parsePsList(blob)
+  procs.update(tracker, lastPsList, now)
+  local totalMB = (lastMetrics.totalGB or 0) * 1024
+  local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
+  local kept = {}
+  for _, r in ipairs(runs) do
+    if (ignoredUntil[r.pid .. "|" .. r.name] or 0) < now then kept[#kept + 1] = r end
+  end
+  lastRuns = kept
+  lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
+
+  local extreme = false
+  for _, r in ipairs(kept) do
+    if r.kind == "extreme" then extreme = true end
+    local lk = r.pid .. "|" .. r.kind
+    if (now - (runawayLogAt[lk] or 0)) > 300 then
+      runawayLogAt[lk] = now
+      M.logSnapshot(string.format("runaway-%s:%s(%d)@%.0fMB/min",
+        r.kind, r.name, r.pid, r.slopeMBmin))
+    end
+  end
+
+  local sig = core.signals(lastMetrics, lastRates, lastKern, extreme)
   local state, changed, reason = core.smStep(smState, sig, now)
+
+  local offender, watch = procs.pickOffender(kept, lastRanked, state)
+  if offender and not offender.weightMB then
+    local t = topCache.map and topCache.map[offender.pid]
+    offender.weightMB = (offender.rssMB or 0) + (t and t.cmprsMB or 0)
+  end
+  lastOffender = offender
+  titleSnap.offenderName = offender and offender.name or nil
+  titleSnap.offenderGB   = offender and (offender.weightMB / 1024) or nil
+  titleSnap.watchName    = watch and watch.name or nil
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", lastMetrics.availPct)
+
+  if state ~= "ok" or #kept > 0 then topRefresh() end
   if changed then M.logSnapshot("state:" .. reason) end
   if state == "critical" then notifyCrit(lastMetrics) end
   -- Drive the flash from flashState, not just transitions, so the animation
@@ -326,10 +401,12 @@ end
 -- One-line current state, for `hs -c "memwatch.status()"`.
 function M.status()
   local m = lastMetrics
+  local off = lastOffender
+    and string.format(" offender=%s(%d)", lastOffender.name, lastOffender.pid) or ""
   return string.format(
-    "state=%s kern=%d swapout=%.0fpg/s comprate=%.0fpg/s avail=%.0f%% swap=%.1fGB compressor=%.1fGB",
+    "state=%s kern=%d swapout=%.0fpg/s comprate=%.0fpg/s avail=%.0f%% swap=%.1fGB compressor=%.1fGB%s",
     smState.state, lastKern, lastRates.swapOut, lastRates.comp,
-    m.availPct, m.swapGB, m.compGB)
+    m.availPct, m.swapGB, m.compGB, off)
 end
 
 -- Force a visual state for ~12s to verify the icon + notification paths.

@@ -559,6 +559,8 @@ local function buildMenu()
   items[#items + 1] = { title = string.format("LFM adjudication: %s",
       lfm.cfg.enabled and (lfmServerReady and "on (warm)" or "on") or "off"),
     fn = function() M.setLfmEnabled(not lfm.cfg.enabled) end }
+  items[#items + 1] = { title = "Open value report",
+    fn = function() M.report() end }
   return items
 end
 
@@ -1675,6 +1677,26 @@ function M.simulate(seconds)
     tick()
   end))
   return string.format("memwatch.simulate running for %ds (live sampling paused)", dur)
+end
+
+-- Render the value report from the local ledgers and open it.
+function M.report(public)
+  local ok, reportMod = pcall(require, "memwatch_report")
+  if not ok then return "report module unavailable" end
+  local home = os.getenv("HOME") .. "/projects/memwatch/"
+  os.execute("mkdir -p " .. home .. "reports")
+  local out, err = reportMod.generate({
+    ledger = home .. "memwatch-lfm.jsonl",
+    log = home .. "memwatch.log",
+    league = home .. "eval/results/league.json",
+    out = home .. "reports/report.html",
+  }, {
+    public = public == true,
+    generatedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+  })
+  if not out then return "report failed: " .. tostring(err) end
+  sh(string.format("/usr/bin/open %q", out))
+  return "report opened: " .. out
 end
 
 -- Toggle the LFM adjudicator from the menu or the CLI; persists to the

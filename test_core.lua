@@ -761,7 +761,7 @@ local function earlyRefs(path)
   return bad
 end
 
-for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua" }) do
+for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua", "lua/memwatch_report.lua" }) do
   local bad = earlyRefs(path)
   for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end
   check("split-scope clean: " .. path, #bad, 0)

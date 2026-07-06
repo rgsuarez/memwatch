@@ -74,6 +74,7 @@ local writeDecisionOutcome
 local lfmTick
 local gcUnattendedState
 local offenderIsForeground
+local probePid
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -141,15 +142,25 @@ local function applyLocalConfig()
     logError("local-config", err or "not an object")
     return
   end
+  local invalidMode = false
   if type(conf.unattended) == "string" then
     if core.UNATTENDED_MODES[conf.unattended] then
       core.cfg.unattended = conf.unattended
     else
-      logError("local-config", "unknown unattended mode '" .. conf.unattended .. "'; keeping off")
+      invalidMode = true
+      logError("local-config", "unknown unattended mode '" .. conf.unattended
+        .. "'; failing closed to off and ignoring autoKill from this config")
       core.cfg.unattended = "off"
     end
   end
-  if type(conf.autoKill) == "boolean" then core.cfg.autoKill = conf.autoKill end
+  -- Fail closed: an invalid explicit mode disarms the legacy autoKill shim
+  -- too, so a typo'd config can never leave autonomous kill armed via the
+  -- back door ({"unattended":"disabled","autoKill":true} -> off, not kill).
+  if type(conf.autoKill) == "boolean" and not invalidMode then
+    core.cfg.autoKill = conf.autoKill
+  elseif invalidMode then
+    core.cfg.autoKill = false
+  end
   -- How long the HUD may go unanswered before the unattended action fires.
   -- Exposed because an operator running unattended=freeze may want a faster
   -- (or slower) hand-off than the 60s default.
@@ -450,7 +461,7 @@ local function buildHud()
           if done then
             hs.timer.doAfter(4, guard("hud-close", function() M.hideHud() end))
           end
-        end, { weightMB = target.weightMB })
+        end, { weightMB = target.weightMB, expectedLstart = target.lstart })
       end
     elseif id == "kill" or id == "kill-label" then
       if hudOffender then
@@ -461,7 +472,7 @@ local function buildHud()
           if done then
             hs.timer.doAfter(4, guard("hud-close", function() M.hideHud() end))
           end
-        end)
+        end, { expectedLstart = target.lstart })
       end
     elseif id == "ignore" or id == "ignore-label" then
       if hudOffender then M.ignore(hudOffender.pid, hudOffender.name) end
@@ -478,6 +489,12 @@ end
 local function raiseHud(offender, titleText)
   buildHud()
   hudOffender = offender
+  -- Capture the offender's start time at raise, so a Freeze/Force Quit click
+  -- seconds later binds identity and cannot signal a pid reused meanwhile.
+  if offender and offender.pid and not offender.lstart then
+    local probed = probePid(offender.pid)
+    if probed then offender.lstart = probed.lstart end
+  end
   hudInteracted = false
   hudHold = false
   hudShownAt = hs.timer.secondsSinceEpoch()
@@ -766,10 +783,17 @@ local function alertSurfaces(state, now)
           if hud then hud[3].text = "AUTO: " .. text end
           if done then hs.timer.doAfter(6, guard("hud-close", function() M.hideHud() end)) end
         end
+        -- Bind the offender's start time NOW so the autonomous signal (and
+        -- its TERM->KILL escalation seconds later) can never act on a pid
+        -- reused since this decision. Autonomous action is where a wrong
+        -- target destroys work, so identity is bound most strictly here.
+        local bound = probePid(offender.pid)
+        local lstart = bound and bound.lstart or nil
         if action == "terminate" then
-          M.killPid(offender.pid, offender.name, narrate)
+          M.killPid(offender.pid, offender.name, narrate, { expectedLstart = lstart })
         else
-          M.freezePid(offender.pid, offender.name, narrate, { weightMB = offender.weightMB })
+          M.freezePid(offender.pid, offender.name, narrate,
+            { weightMB = offender.weightMB, expectedLstart = lstart })
         end
       end
     end
@@ -857,8 +881,10 @@ protectedPids[selfPid] = true
 
 -- Look up a live process; returns { pid, uid, comm, lstart } or nil if gone.
 -- lstart (process start time) is the identity component a recycled pid
--- cannot fake; the frozen ledger persists it across reloads.
-local function probePid(pid)
+-- cannot fake; the frozen ledger persists it across reloads. Forward-declared
+-- at the top: the HUD raise and the unattended path (both earlier in the
+-- file) capture identity through it.
+probePid = function(pid)
   local out = sh(string.format("/bin/ps -p %d -o uid=,lstart=,comm= 2>/dev/null", pid))
   local uid, lstart, comm = out:match("^%s*(%d+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
   if not uid then return nil end
@@ -972,7 +998,9 @@ end
 function M.freezePid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
   opts = opts or {}
-  local proc, twhy = resolveSignalTarget(pid, expectedName)
+  -- Bind start time when the caller captured one at selection, so a pid
+  -- reused between selection and this call is refused (same-name reuse).
+  local proc, twhy = resolveSignalTarget(pid, expectedName, opts.expectedLstart)
   if not proc then
     if twhy == "exited" then
       M.logSnapshot(string.format("freeze-skip:%s(%d)-already-exited", expectedName or "?", pid))
@@ -1434,14 +1462,35 @@ end
 -- global (the split-scope class the scanner guards, now extended to catch
 -- `local function` too).
 offenderIsForeground = function(offender)
-  if not offender or not offender.name then return false end
-  local frontName = nil
+  if not offender or not offender.pid then return "unknown" end
+  local frontName, frontPid = nil, nil
   pcall(function()
     local app = hs.application.frontmostApplication()
     frontName = app and app:name() or nil
+    frontPid = app and app:pid() or nil
   end)
-  if not frontName then return false end
-  return offender.name == frontName or offender.name:find(frontName, 1, true) ~= nil
+  -- Fail closed: if the frontmost app cannot be determined, we cannot prove
+  -- the offender is a background process, so return "unknown" (the caller
+  -- treats unknown like foreground for the autonomous-terminate cap).
+  if not frontName and not frontPid then return "unknown" end
+  -- Direct name match (the app itself is the offender).
+  if offender.name and frontName
+     and (offender.name == frontName or offender.name:find(frontName, 1, true)) then
+    return true
+  end
+  -- Process-tree match: the offender is a descendant of the frontmost app
+  -- (an unsaved REPL/build/tab running UNDER the frontmost terminal, IDE, or
+  -- browser). Walk ppid up to a bounded depth.
+  if frontPid then
+    local pid = offender.pid
+    for _ = 1, 12 do
+      if pid == frontPid then return true end
+      local ppid = tonumber(sh(string.format("/bin/ps -o ppid= -p %d 2>/dev/null", pid)):match("%d+"))
+      if not ppid or ppid <= 1 then break end
+      pid = ppid
+    end
+  end
+  return false
 end
 
 -- Assemble the model-facing snapshot from what the tick already knows. The
@@ -1651,12 +1700,17 @@ end
 -- target is still alive (re-validated again), then verify death and report
 -- how much memory actually came back. onUpdate(text, done) drives whichever
 -- surface initiated the kill.
-function M.killPid(pid, expectedName, onUpdate)
+function M.killPid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
+  opts = opts or {}
   local k = core.cfg.kill
   local frozenEntry = frozen[pid]
-  local proc, twhy = resolveSignalTarget(pid, expectedName,
-    frozenEntry and frozenEntry.lstart or nil)
+  -- Bind identity by start time when the caller captured one at selection
+  -- (the frozen ledger, or an offender/HUD snapshot), so a pid reused
+  -- between selection and this call is refused. Same-name pid reuse is
+  -- exactly the bystander-kill class this tool was scarred by.
+  local expectLstart = opts.expectedLstart or (frozenEntry and frozenEntry.lstart) or nil
+  local proc, twhy = resolveSignalTarget(pid, expectedName, expectLstart)
   if not proc then
     if twhy == "exited" then
       M.logSnapshot(string.format("kill-skip:%s(%d)-already-exited", expectedName or "?", pid))
@@ -1689,11 +1743,17 @@ function M.killPid(pid, expectedName, onUpdate)
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
   hs.timer.doAfter(k.escalateSec, guard("kill-escalate", function()
     if pidAlive(pid) then
-      local again = probePid(pid)
-      if again and procs.friendlyName(again.comm) == liveName then
+      -- Re-validate FULL identity (name AND the start time bound above)
+      -- before SIGKILL: between TERM and this escalation the original may
+      -- have exited and the pid been reused by another same-name process;
+      -- name alone would not catch that, start time does.
+      local again = resolveSignalTarget(pid, liveName, proc.lstart)
+      if again then
         M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
         onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
         sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
+      else
+        M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
       end
     end
     hs.timer.doAfter(k.verifySec + k.settleSec, guard("kill-verify", function()

@@ -148,17 +148,27 @@ local function runMode(args)
       maxTokens = maxTokens, schema = useSchema,
     }))
     writeFile(reqPath, body)
+    -- Remove the previous response before each request AND gate on curl's
+    -- exit status appended after the timing: if curl fails before writing a
+    -- new body, we must NOT parse the prior scenario's response for this one
+    -- (that would silently score a stale reply and corrupt the gates).
+    os.remove(respPath)
     local cmd = table.concat({
       "curl -sS -m 60 -X POST -H 'Content-Type: application/json'",
       "-d @" .. shellQuote(reqPath), "-o", shellQuote(respPath),
       "-w '%{time_total}'",
       shellQuote(server .. "/v1/chat/completions"),
+      "; printf ' exit=%s' \"$?\"",
     }, " ")
     local p = assert(io.popen(cmd))
-    local wall = tonumber(p:read("a")) or -1
+    local metricLine = p:read("a") or ""
     p:close()
-    local wallMs = wall >= 0 and math.floor(wall * 1000) or -1
-    local respBody = readFile(respPath) or ""
+    local curlOk = metricLine:match("exit=(%d+)") == "0"
+    local wall = curlOk and tonumber(metricLine:match("^%s*([%d%.]+)")) or -1
+    local wallMs = wall and wall >= 0 and math.floor(wall * 1000) or -1
+    -- On a curl failure, treat the response as EMPTY (an invalid/no-verdict
+    -- row), never the stale prior file.
+    local respBody = curlOk and (readFile(respPath) or "") or ""
 
     local raw, perr = lfm.parseResponse(respBody)
     local verdict = raw and lfm.validateVerdict(raw) or nil

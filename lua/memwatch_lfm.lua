@@ -35,6 +35,8 @@ M.cfg = {
   minConfFreeze = 0.50,
   promptVariant = "baseline",
   verdictFreshSec = 90,     -- cached verdict age a decision point may consume
+  maxServerMB = 2048,       -- self-police circuit: server above this is killed
+  spawnMinAvailPct = 10,    -- spawn floor: no server spawn below this
 }
 
 ------------------------------------------------------------------------------
@@ -355,14 +357,38 @@ end
 -- a target identifier into the model's context.
 ------------------------------------------------------------------------------
 
+-- Bidirectional-control codepoints an attacker can hide instruction text
+-- behind. Stripped from names before serialization.
+local BIDI_CONTROLS = { 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069 }
+
+-- Structural name sanitization: a process name is attacker-controlled and
+-- must not be able to break the DATA fence (backticks), corrupt the request
+-- body (invalid UTF-8), or visually reorder the prompt (bidi controls).
+local function sanitizeName(s)
+  if type(s) ~= "string" then return "?" end
+  s = s:sub(1, 200)
+  -- Replace invalid UTF-8 bytes one at a time until the string validates.
+  while true do
+    local n, errpos = utf8.len(s)
+    if n then break end
+    s = s:sub(1, errpos - 1) .. "?" .. s:sub(errpos + 1)
+  end
+  s = s:gsub("`", "'")
+  for _, cp in ipairs(BIDI_CONTROLS) do
+    s = s:gsub(utf8.char(cp), "")
+  end
+  return s
+end
+
 local function copyProc(p)
   if type(p) ~= "table" then return nil end
   return {
-    name = type(p.name) == "string" and p.name:sub(1, 200) or "?",
+    name = sanitizeName(p.name),
     kind = type(p.kind) == "string" and p.kind or "unknown",
     weightMB = type(p.weightMB) == "number" and math.floor(p.weightMB) or 0,
     slopeMBmin = type(p.slopeMBmin) == "number" and math.floor(p.slopeMBmin) or 0,
     ageSec = type(p.ageSec) == "number" and math.floor(p.ageSec) or nil,
+    foreground = p.foreground == true or nil,
     -- pid deliberately absent: the caller binds the target; the model
     -- never sees or names one.
   }
@@ -527,10 +553,16 @@ function M.applyVerdict(verdict, ceiling, actionAllowed, opts)
     rails[#rails + 1] = "ceiling-freeze"
   end
 
-  -- Rail 2: hog/absolute offenders are never terminated autonomously.
+  -- Rail 2: hog/absolute offenders are never terminated autonomously, and
+  -- neither is the FOREGROUND process (the user's active, possibly-unsaved
+  -- work is the worst wrong-terminate).
   if action == "terminate" and opts.offenderKind ~= "extreme" then
     action = "freeze"
     rails[#rails + 1] = "hog-cap"
+  end
+  if action == "terminate" and opts.offenderForeground then
+    action = "freeze"
+    rails[#rails + 1] = "foreground-cap"
   end
 
   -- Rail 3: confidence floors, applied to the CURRENT action.

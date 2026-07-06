@@ -1,3 +1,15 @@
 # Runtime output: regenerated on threshold crossings, not source.
 memwatch.log
 *.log
+
+# LFM adjudication runtime artifacts (never tracked).
+models/
+memwatch-lfm.jsonl
+memwatch-frozen.json
+memwatch-local.json
+reports/
+
+# Evaluation artifacts: full results and panel workspaces stay local.
+eval/results/
+eval/tmp/
+eval/panel/

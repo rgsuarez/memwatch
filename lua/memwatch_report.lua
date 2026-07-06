@@ -105,16 +105,22 @@ local function median(sorted)
   return (sorted[n / 2] + sorted[n / 2 + 1]) / 2
 end
 
--- iso8601 (UTC, the ledger's format) -> epoch.
+-- iso8601 (UTC, the ledger's format) -> absolute epoch. os.time interprets
+-- the field table as LOCAL, so correct by the local-UTC offset measured AT
+-- the target timestamp (not at epoch 0): the offset is DST-dependent, and a
+-- summer ledger event compared against a winter-computed offset would land
+-- an hour off and mis-correlate with the local watchdog log.
 local function parseIso(s)
   if type(s) ~= "string" then return nil end
   local y, mo, d, h, mi, sec = s:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)Z")
   if not y then return nil end
-  local t = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+  local guess = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
     hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) })
-  -- os.time interprets the table as local; correct by the local-UTC delta.
-  local utcDelta = os.difftime(os.time(os.date("*t", 0)), os.time(os.date("!*t", 0)))
-  return t + utcDelta
+  -- Offset at `guess`: os.date("!*t", guess) is the UTC clock at that epoch;
+  -- re-interpreting it as local and differencing yields the signed local-UTC
+  -- offset in effect then (DST-correct).
+  local offset = os.difftime(guess, os.time(os.date("!*t", guess)))
+  return guess + offset
 end
 
 -- GB-minutes relieved: held GB of an acted-on offender times observed

@@ -72,6 +72,7 @@ local resolveUnattendedAction
 local writeDecisionOutcome
 local lfmTick
 local gcUnattendedState
+local offenderIsForeground
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -139,7 +140,14 @@ local function applyLocalConfig()
     logError("local-config", err or "not an object")
     return
   end
-  if type(conf.unattended) == "string" then core.cfg.unattended = conf.unattended end
+  if type(conf.unattended) == "string" then
+    if core.UNATTENDED_MODES[conf.unattended] then
+      core.cfg.unattended = conf.unattended
+    else
+      logError("local-config", "unknown unattended mode '" .. conf.unattended .. "'; keeping off")
+      core.cfg.unattended = "off"
+    end
+  end
   if type(conf.autoKill) == "boolean" then core.cfg.autoKill = conf.autoKill end
   -- How long the HUD may go unanswered before the unattended action fires.
   -- Exposed because an operator running unattended=freeze may want a faster
@@ -1344,7 +1352,11 @@ end
 -- Is this offender the user's frontmost app? A name match against the
 -- frontmost application (no pid involved). Used both to tag the snapshot
 -- and to feed the foreground termination rail in the live unattended path.
-local function offenderIsForeground(offender)
+-- Forward-declared at the top: resolveUnattendedAction (defined earlier)
+-- calls this, so a bare `local function` here would bind that call to a nil
+-- global (the split-scope class the scanner guards, now extended to catch
+-- `local function` too).
+offenderIsForeground = function(offender)
   if not offender or not offender.name then return false end
   local frontName = nil
   pcall(function()

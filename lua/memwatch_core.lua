@@ -326,12 +326,21 @@ function M.killAllowed(proc, ownUid, selfPid, cfg, protectedPids)
   return true, "ok"
 end
 
+M.UNATTENDED_MODES = { off = true, freeze = true, kill = true }
+
 -- Resolve the effective unattended mode, honoring the autoKill compat shim.
 -- Explicit unattended wins; autoKill=true with unattended unset -> "kill".
+-- FAILS CLOSED: any value that is not exactly off|freeze|kill resolves to
+-- "off" (a typo like "disabled" must never arm autonomous SIGSTOP/SIGKILL).
+-- Returns mode, invalidValue-or-nil so the caller can log the rejected input.
 function M.resolveUnattended(cfg)
   cfg = cfg or M.cfg
-  if cfg.unattended and cfg.unattended ~= "off" then return cfg.unattended end
-  if cfg.unattended == "off" and not cfg.autoKill then return "off" end
+  local u = cfg.unattended
+  if u ~= nil and not M.UNATTENDED_MODES[u] then
+    -- Unknown mode: never fall through to the compat shim; fail to off.
+    return "off", u
+  end
+  if u and u ~= "off" then return u end
   if cfg.autoKill then return "kill" end
   return "off"
 end

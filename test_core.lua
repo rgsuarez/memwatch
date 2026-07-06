@@ -675,6 +675,11 @@ check("unattended: explicit freeze", core.resolveUnattended({ unattended = "free
 check("unattended: explicit kill", core.resolveUnattended({ unattended = "kill", autoKill = false }), "kill")
 check("unattended: autoKill shim -> kill", core.resolveUnattended({ unattended = "off", autoKill = true }), "kill")
 check("unattended: explicit wins over shim", core.resolveUnattended({ unattended = "freeze", autoKill = true }), "freeze")
+check("unattended: nil unattended + autoKill -> kill", core.resolveUnattended({ autoKill = true }), "kill")
+-- Fail closed on invalid modes: a typo must never arm autonomous action.
+check("unattended: typo fails to off", (core.resolveUnattended({ unattended = "disabled", autoKill = false })), "off")
+check("unattended: typo reports invalid value", (select(2, core.resolveUnattended({ unattended = "disabled" }))), "disabled")
+check("unattended: invalid mode ignores autoKill shim", (core.resolveUnattended({ unattended = "false", autoKill = true })), "off")
 
 -- ---- LFM: scenario corpus schema lint ----
 local CLASS_COUNTS = {
@@ -734,19 +739,28 @@ check("corpus: class counts", classOk, true)
 
 -- ---- split-scope guard ----
 -- A top-level `local X` referenced by a function defined ABOVE it silently
--- splits into a global writer and a local reader. This class caused three
+-- splits into a global writer and a local reader. This class caused FOUR
 -- live incidents (dead logging blocked the kill path; a detector flag the
--- state machine never saw; a broken menu). Scan every module: no top-level
--- local may be referenced on an earlier line than its declaration.
+-- state machine never saw; a broken menu; and a `local function` helper
+-- called by an earlier forward-declared function, which bound to a nil
+-- global). Scan every module: no top-level local -- INCLUDING a
+-- `local function` -- may be referenced on an earlier line than its
+-- declaration. (A correct forward reference uses a plain `local X` decl
+-- above the caller, which the scanner sees as the earlier declaration.)
 local function earlyRefs(path)
   local lines = {}
   for line in io.lines(path) do lines[#lines + 1] = line end
   local decls = {}
   for i, line in ipairs(lines) do
-    local names = line:match("^local%s+([%w_,%s]+)=") or line:match("^local%s+([%w_,%s]+)$")
-    if names and not line:match("^local%s+function") then
-      for name in names:gmatch("[%w_]+") do
-        if not decls[name] then decls[name] = i end
+    local fnName = line:match("^local%s+function%s+([%w_]+)")
+    if fnName then
+      if not decls[fnName] then decls[fnName] = i end
+    else
+      local names = line:match("^local%s+([%w_,%s]+)=") or line:match("^local%s+([%w_,%s]+)$")
+      if names then
+        for name in names:gmatch("[%w_]+") do
+          if name ~= "function" and not decls[name] then decls[name] = i end
+        end
       end
     end
   end

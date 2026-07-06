@@ -163,15 +163,24 @@ local function applyLocalConfig()
 end
 
 local function saveLocalConfig()
-  local conf = {
-    unattended = core.cfg.unattended,
-    lfm = {
-      enabled = lfm.cfg.enabled,
-      model = lfm.cfg.model,
-      resident = lfm.cfg.resident,
-      promptVariant = lfm.cfg.promptVariant,
-    },
-  }
+  -- MERGE into the existing file, never clobber it: the menu LFM toggle
+  -- writes only enabled + a few keys, but an operator may have set
+  -- autoKill, unattendedGraceSec, timeoutSec, maxServerMB, spawnMinAvailPct,
+  -- ctx, threads, etc. by hand. Read what is there, overlay the fields this
+  -- toggle owns, and preserve every other key.
+  local conf = {}
+  local rf = io.open(LOCAL_CONFIG_PATH, "r")
+  if rf then
+    local existing = lfm.jsonDecode(rf:read("a"))
+    rf:close()
+    if type(existing) == "table" then conf = existing end
+  end
+  conf.unattended = core.cfg.unattended
+  if type(conf.lfm) ~= "table" then conf.lfm = {} end
+  conf.lfm.enabled = lfm.cfg.enabled
+  conf.lfm.model = lfm.cfg.model
+  conf.lfm.resident = lfm.cfg.resident
+  conf.lfm.promptVariant = lfm.cfg.promptVariant
   local enc = lfm.jsonEncode(conf)
   if not enc then return end
   local f = io.open(LOCAL_CONFIG_PATH, "w")
@@ -1308,6 +1317,12 @@ local function spawnLfmServer()
     return
   end
   lfmServerPid = lfmServerTask:pid()
+  -- Protect the adjudicator from the FIRST tick, not only once /health
+  -- passes: model load can take seconds, during which the server process
+  -- exists and could otherwise appear in the ranked/offender lists and pass
+  -- killAllowed. Guard the task pid now; the health check below refines the
+  -- set to the verified listener owner (and its taskpolicy parent).
+  protectedPids = { [selfPid] = true, [lfmServerPid] = true }
   M.logSnapshot(string.format("lfm-spawn:pid=%d:port=%d:avail=%d%%",
     lfmServerPid, port, math.floor(lastMetrics.availPct or 0)))
   -- Health poll to ready, with the listener-ownership check: the pid bound
@@ -1336,8 +1351,12 @@ local function spawnLfmServer()
           lfmOffline = true
           return true
         end
-        lfmServerPid = owner
+        -- Protect BOTH the listener owner and the launched task pid (the
+        -- taskpolicy parent), so neither the wrapper nor the server is ever
+        -- signalable during the run.
         protectedPids = { [selfPid] = true, [owner] = true }
+        if expected then protectedPids[expected] = true end
+        lfmServerPid = owner
         lfmServerReady = true
         M.logSnapshot(string.format("lfm-ready:%.1fs:pid=%d",
           hs.timer.secondsSinceEpoch() - lfmSpawnedAt, owner))
@@ -1480,9 +1499,13 @@ lfmTick = function(state, now, interesting)
     if lfmServerTask then retireLfmServer("disabled") end
     return
   end
-  -- The offline latch clears at any non-critical tick, so the next elevated
-  -- onset may respawn. Never during critical.
-  if lfmOffline and state ~= "critical" then lfmOffline = false end
+  -- The offline latch clears only on CALM recovery (state == ok), never
+  -- merely on elevated: a model that timed out or was self-policed during a
+  -- storm must stay out for the REST of that pressure episode, or a still-
+  -- elevated tick would clear the latch and respawn, thrashing the model's
+  -- page-ins through the same crisis it degraded in. Re-arm happens at the
+  -- next elevated onset AFTER things have gone quiet.
+  if lfmOffline and state == "ok" then lfmOffline = false end
 
   local running = lfmServerTask ~= nil
 

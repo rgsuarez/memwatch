@@ -220,4 +220,9 @@ time) and reload Hammerspoon.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Code: MIT. See [LICENSE](LICENSE).
+
+The optional LFM adjudication feature downloads model weights separately at
+install time; those are licensed under the LFM Open License v1.0, not MIT.
+See [NOTICE-LFM](NOTICE-LFM) and
+[licenses/LFM-Open-License-v1.0.txt](licenses/LFM-Open-License-v1.0.txt).

@@ -74,12 +74,7 @@ detected by a comm change and resets that pid's history.
 On `critical` (or an extreme runaway), a small floating HUD appears under the
 menu bar on every Space, without stealing keyboard focus:
 
-```
-Memory CRITICAL
-python3 (pid 4242)
-8.2 GB, +18000 MB/min
-[Force Quit]  [Ignore 30m]  [Activity Mon]
-```
+![The alert HUD](docs/hud.png)
 
 **Force Quit** sends SIGTERM immediately (no confirmation), escalates to
 SIGKILL after 7s if the target refuses to die, verifies death, and reports the
@@ -130,7 +125,11 @@ every one of those failure modes before this shape settled.
 
 ## Install
 
+Requires [Hammerspoon](https://www.hammerspoon.org). The install script wires
+`~/projects/memwatch`, so clone to that path:
+
 ```sh
+git clone https://github.com/rgsuarez/memwatch.git ~/projects/memwatch
 bash ~/projects/memwatch/install.sh
 ```
 
@@ -185,3 +184,7 @@ time) and reload Hammerspoon.
 - All thresholds live in `M.cfg` tables at the top of the two pure modules,
   sized for a 36 GB machine under a heavy dev workload (agents, node, Chrome,
   Notion); scale the rate and growth numbers with RAM if this ever moves.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

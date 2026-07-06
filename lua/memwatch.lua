@@ -1241,6 +1241,7 @@ end
 ------------------------------------------------------------------------------
 
 local LFM_KEY_PATH = os.getenv("HOME") .. "/projects/memwatch/eval/tmp/lfm-api-key"
+local LFM_PIDFILE  = os.getenv("HOME") .. "/projects/memwatch/eval/tmp/lfm-server.pid"
 local lfmApiKey = nil
 local lfmBinPath = nil
 
@@ -1283,6 +1284,7 @@ local function retireLfmServer(reason)
   lfmServerReady = false
   lfmServerPid, lfmServerPort = nil, nil
   lfmSpawnedAt = nil  -- a deliberate retire must not trip the fast-crash latch
+  os.remove(LFM_PIDFILE)  -- a cleanly retired server is not a crash orphan
   lfmInFlight = nil
   if lfmServerTask then pcall(function() lfmServerTask:terminate() end) end
   lfmServerTask = nil
@@ -1338,9 +1340,19 @@ local function spawnLfmServer()
     lfmOffline = true
     return
   end
-  local modelPath = os.getenv("HOME") .. "/projects/memwatch/models/" .. lfm.cfg.model
-  if lfm.cfg.model == "" or not sh(string.format("test -f %q && echo yes", modelPath)):match("yes") then
-    M.logSnapshot("lfm-spawn-skip:model-missing:" .. tostring(lfm.cfg.model))
+  -- The model name comes from a runtime control file (memwatch-local.json),
+  -- so validate it as a PLAIN .gguf filename before it ever reaches a shell
+  -- or the server argv: no path separators, no shell metacharacters, no
+  -- traversal. A name that does not match is refused, not interpolated.
+  local model = lfm.cfg.model
+  if type(model) ~= "string" or not model:match("^[%w%.%-_]+%.gguf$") then
+    M.logSnapshot("lfm-spawn-skip:invalid-model-name:" .. tostring(model))
+    lfmOffline = true
+    return
+  end
+  local modelPath = os.getenv("HOME") .. "/projects/memwatch/models/" .. model
+  if not sh(string.format("test -f %q && echo yes", modelPath)):match("yes") then
+    M.logSnapshot("lfm-spawn-skip:model-missing:" .. model)
     lfmOffline = true
     return
   end
@@ -1409,6 +1421,16 @@ local function spawnLfmServer()
   -- killAllowed. Guard the task pid now; the health check below refines the
   -- set to the verified listener owner (and its taskpolicy parent).
   protectedPids = { [selfPid] = true, [lfmServerPid] = true }
+  -- Record the spawned pid + start time so a crash-orphan sweep on the next
+  -- start kills exactly OUR server, never a user's manual benchmark.
+  do
+    local probed = probePid(lfmServerPid)
+    local rec = lfm.jsonEncode({ pid = lfmServerPid, lstart = probed and probed.lstart or nil })
+    if rec then
+      local pf = io.open(LFM_PIDFILE, "w")
+      if pf then pf:write(rec, "\n"); pf:close() end
+    end
+  end
   M.logSnapshot(string.format("lfm-spawn:pid=%d:port=%d:avail=%d%%",
     lfmServerPid, port, math.floor(lastMetrics.availPct or 0)))
   -- Health poll to ready, with the listener-ownership check: the pid bound
@@ -1617,21 +1639,28 @@ lfmTick = function(state, now, interesting)
   local running = lfmServerTask ~= nil
 
   -- Self-police circuit (independent of adjudication): the server's own
-  -- footprint is read from the ps list the tick already has. Over budget ->
-  -- killed through the retire discipline + offline latch + loud notice.
+  -- footprint is measured the SAME way memwatch ranks every process - RSS
+  -- PLUS compressed pages - not RSS alone. The kernel compresses an
+  -- allocator's pages in real time (the RSS-vs-CMPRS lesson this tool was
+  -- built on), so an RSS-only cap would miss a server whose weight has been
+  -- compressed away. Over budget -> retire + offline latch + loud notice.
   if running and lfmServerPid then
     for _, p in ipairs(lastPsList) do
-      if p.pid == lfmServerPid and p.rssMB > lfm.cfg.maxServerMB then
-        M.logSnapshot(string.format("lfm-self-police:rss=%dMB>cap=%dMB",
-          math.floor(p.rssMB), lfm.cfg.maxServerMB))
+      if p.pid == lfmServerPid then
+        local cmprsMB = (topCache.map and topCache.map[lfmServerPid]) or 0
+        local footprintMB = (p.rssMB or 0) + cmprsMB
+        if footprintMB > lfm.cfg.maxServerMB then
+        M.logSnapshot(string.format("lfm-self-police:footprint=%dMB(rss=%d+cmprs=%d)>cap=%dMB",
+          math.floor(footprintMB), math.floor(p.rssMB or 0), math.floor(cmprsMB), lfm.cfg.maxServerMB))
         hs.notify.new({ title = "memwatch: adjudicator over budget",
           informativeText = string.format(
             "llama-server hit %d MB (cap %d); killed and latched offline.",
-            math.floor(p.rssMB), lfm.cfg.maxServerMB),
+            math.floor(footprintMB), lfm.cfg.maxServerMB),
           withdrawAfter = 0 }):send()
         retireLfmServer("self-police")
         lfmOffline = true
         return
+        end
       end
     end
   end
@@ -1801,21 +1830,29 @@ function M.start()
   smState = core.newSMState(hs.timer.secondsSinceEpoch())
   flashState = nil                -- force first tick to set the flash state
   frozenReconcile()               -- SIGSTOPped processes survive reloads
-  -- Orphan sweep: a hard Hammerspoon crash can leave a previous session's
-  -- llama-server running with no owner. Enumerate candidate pids and kill
-  -- only those whose executable basename is exactly llama-server AND whose
-  -- argv serves from our model dir; a bare `pkill -f` on the pattern would
-  -- also match an unrelated process (an editor, a grep) carrying that
-  -- string in its command line.
-  local sweep = sh("/bin/ps -Axo pid=,comm=,args= 2>/dev/null")
-  for line in sweep:gmatch("[^\n]+") do
-    local spid, comm, args = line:match("^%s*(%d+)%s+(%S+)%s+(.*)$")
-    if spid and comm and args
-       and comm:match("([^/]+)$") == "llama-server"
-       and args:find("projects/memwatch/models/", 1, true) then
-      sh(string.format("/bin/kill -KILL %s 2>/dev/null", spid))
-      M.logSnapshot("lfm-orphan-sweep:pid=" .. spid)
+  -- Orphan sweep: a hard Hammerspoon crash can leave OUR previous session's
+  -- llama-server running with no owner. Only ever kill a server WE spawned:
+  -- each spawn records its pid + start time to a pidfile, and this sweep
+  -- kills exactly that pid IFF it is still alive AND its identity matches AND
+  -- it is an llama-server serving our model dir. This never touches a user's
+  -- own manual benchmark using the same model, and it only runs at all when
+  -- the LFM feature is enabled.
+  if lfm.cfg.enabled then
+    local pf = io.open(LFM_PIDFILE, "r")
+    if pf then
+      local rec = lfm.jsonDecode(pf:read("a")); pf:close()
+      if type(rec) == "table" and type(rec.pid) == "number" then
+        local info = sh(string.format("/bin/ps -p %d -o lstart=,comm=,args= 2>/dev/null", rec.pid))
+        local comm = info:match("%d%s+(%S+)") or info:match("^%s*%a+%s+%a+%s+%d+%s+[%d:]+%s+%d+%s+(%S+)")
+        if info:find("projects/memwatch/models/", 1, true)
+           and info:find("llama-server", 1, true)
+           and (not rec.lstart or info:find(rec.lstart, 1, true)) then
+          sh(string.format("/bin/kill -KILL %d 2>/dev/null", rec.pid))
+          M.logSnapshot("lfm-orphan-sweep:pid=" .. rec.pid)
+        end
+      end
     end
+    os.remove(LFM_PIDFILE)
   end
   renderTitleNow()
   pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))

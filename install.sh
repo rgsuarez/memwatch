@@ -46,8 +46,14 @@ do
   if not package.path:find(memwatch_lua_dir, 1, true) then
     package.path = package.path .. ";" .. memwatch_lua_dir
   end
-  package.loaded.memwatch = nil
-  package.loaded.memwatch_core = nil
+  -- Clear EVERY loaded memwatch module before re-requiring, so a reload
+  -- picks up fixes to the pure modules (lfm, report, procs), not just the
+  -- glue and core. A partial clear silently runs stale rail/parse/report code.
+  for name in pairs(package.loaded) do
+    if type(name) == "string" and name:match("^memwatch") then
+      package.loaded[name] = nil
+    end
+  end
   local ok, err = pcall(require, "memwatch")
   if not ok then
     hs.alert.show("memwatch: failed to load (" .. tostring(err) .. ")")

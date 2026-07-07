@@ -44,6 +44,7 @@ local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
 local lastStaleLogAt = 0
+local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
@@ -848,11 +849,25 @@ local function tick()
   gcUnattendedState()
   alertSurfaces(state, now)
 
-  -- Honesty when degraded: if the fork has not reported for a while, say so.
-  if lastSampleAt > 0 and (now - lastSampleAt) > SAMPLE_STALE_SEC
-     and (now - lastStaleLogAt) > 60 then
-    lastStaleLogAt = now
-    M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
+  -- Honesty when degraded: if the fork has not reported for a while, say so,
+  -- and say it LOUDLY when it coincides with real pressure. The 2026-07-07
+  -- near-crash sat at 9% headroom with the sampler frozen and only a quiet
+  -- amber dot; degraded plus pressured must page the human.
+  if lastSampleAt > 0 and (now - lastSampleAt) > SAMPLE_STALE_SEC then
+    if (now - lastStaleLogAt) > 60 then
+      lastStaleLogAt = now
+      M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
+    end
+    if (sig.kernWarn or sig.availLow) and (now - lastStaleNotifyAt) > 300 then
+      lastStaleNotifyAt = now
+      hs.notify.new({
+        title           = "memwatch degraded during pressure",
+        subTitle        = string.format("process attribution stale %.0fs \u{00B7} avail %.0f%%",
+                                        now - lastSampleAt, m.availPct),
+        informativeText = "The system gauge is live but per-process detection is not. Open Activity Monitor if pressure climbs.",
+        withdrawAfter   = 0,
+      }):send()
+    end
   end
 
   -- Attribution stream lifecycle: spawn at the onset of anything interesting
@@ -871,7 +886,12 @@ local function tick()
   -- LFM adjudicator lifecycle: spawn/retire/self-police/advisory. Async
   -- everywhere; a disabled feature makes this a single boolean check.
   -- (Unattended-state GC runs earlier in the tick, before alertSurfaces.)
-  lfmTick(state, now, interesting)
+  -- ERROR BOUNDARY: the opt-in adjudicator may never take down the base
+  -- watchdog. In the 2026-07-07 incident an error here aborted the tick
+  -- before launchSampler below, starving per-process detection through a
+  -- real near-crash; contained, the same failure costs only the LFM layer.
+  local lfmOk, lfmErr = pcall(lfmTick, state, now, interesting)
+  if not lfmOk then logError("lfm-tick", lfmErr) end
 
   -- Drive the flash from flashState, not just transitions, so the animation
   -- always matches the real state and self-heals (e.g. after a self-test).
@@ -1658,8 +1678,9 @@ lfmTick = function(state, now, interesting)
   if running and lfmServerPid then
     for _, p in ipairs(lastPsList) do
       if p.pid == lfmServerPid then
-        local cmprsMB = (topCache.map and topCache.map[lfmServerPid]) or 0
-        local footprintMB = (p.rssMB or 0) + cmprsMB
+        local footprintMB = lfm.serverFootprintMB(p.rssMB,
+          topCache.map and topCache.map[lfmServerPid])
+        local cmprsMB = footprintMB - (p.rssMB or 0)
         if footprintMB > lfm.cfg.maxServerMB then
         M.logSnapshot(string.format("lfm-self-police:footprint=%dMB(rss=%d+cmprs=%d)>cap=%dMB",
           math.floor(footprintMB), math.floor(p.rssMB or 0), math.floor(cmprsMB), lfm.cfg.maxServerMB))

@@ -652,4 +652,19 @@ function M.ledgerLine(record)
   return enc .. "\n"
 end
 
+-- Server self-police footprint: rss plus the server pid's compressed pages
+-- from a top-cache entry. The entry is a TABLE ({memMB, cmprsMB, name}) or
+-- nil, never a number; extracting the field here, tolerating any shape, is
+-- the pin for the 2026-07-07 incident: glue added the raw entry to a number,
+-- threw on every tick once the server landed in the top cache, and the
+-- aborted tick starved the base per-process sampler through a real
+-- near-crash. The opt-in layer must never be able to do that again.
+function M.serverFootprintMB(rssMB, topEntry)
+  local cmprs = 0
+  if type(topEntry) == "table" and type(topEntry.cmprsMB) == "number" then
+    cmprs = topEntry.cmprsMB
+  end
+  return (tonumber(rssMB) or 0) + cmprs
+end
+
 return M

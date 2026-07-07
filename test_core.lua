@@ -752,6 +752,22 @@ for class, want in pairs(CLASS_COUNTS) do
 end
 check("corpus: class counts", classOk, true)
 
+-- ---- server self-police footprint (2026-07-07 incident pin) ----
+-- The top-cache entry is a TABLE ({memMB, cmprsMB, name}) or nil, never a
+-- number. Glue once added the raw entry to rss; the arithmetic threw on
+-- every tick as soon as the server landed in the top cache, and the aborted
+-- tick starved the base sampler through a real near-crash. Pin every shape.
+check("selfpolice: table entry sums cmprs",
+      lfm.serverFootprintMB(400, { memMB = 500, cmprsMB = 120, name = "llama-server" }), 520)
+check("selfpolice: nil entry is rss only", lfm.serverFootprintMB(400, nil), 400)
+check("selfpolice: entry missing cmprsMB is rss only",
+      lfm.serverFootprintMB(400, { memMB = 500 }), 400)
+check("selfpolice: string entry tolerated", lfm.serverFootprintMB(400, "garbage"), 400)
+check("selfpolice: numeric entry tolerated", lfm.serverFootprintMB(400, 7), 400)
+check("selfpolice: nil rss tolerated", lfm.serverFootprintMB(nil, { cmprsMB = 50 }), 50)
+local prodShape = procs.parseTop("999  llama-server  445M  80M")[999]
+check("selfpolice: real parseTop shape", lfm.serverFootprintMB(445, prodShape), 525)
+
 -- ---- split-scope guard ----
 -- A top-level `local X` referenced by a function defined ABOVE it silently
 -- splits into a global writer and a local reader. This class caused FOUR

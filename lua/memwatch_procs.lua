@@ -112,6 +112,9 @@ function M.newTopStream()
 end
 
 function M.feedTopStream(st, chunk)
+  -- A late chunk can race the stream's teardown (2026-07-08 field crash:
+  -- attempt to index nil 'st'); a dead stream simply publishes nothing.
+  if not st then return nil end
   st.buf = st.buf .. (chunk or "")
   local published = nil
   while true do

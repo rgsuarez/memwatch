@@ -56,6 +56,7 @@ M.cfg = {
     ignoreSec        = 1800, -- per-offender "Ignore 30 min"
     hudRaiseSec      = 60,   -- min seconds between HUD raises (a new offender preempts)
     autoKillGraceSec = 60,   -- HUD unanswered this long before auto-kill (if enabled)
+    frozenSweepSec   = 60,   -- calm-state frozen-ledger liveness sweep cadence
   },
   -- Unattended action at critical + grace expiry. The deterministic
   -- autonomous layer (successor to autoKill), model-free and shipping in
@@ -361,6 +362,34 @@ function M.shortName(name)
     name = name:sub(1, TITLE_NAME_MAX - 1) .. "\u{2026}"
   end
   return name
+end
+
+-- Frozen-ledger liveness decision (pure): given the persisted frozen map
+-- ([pid] = entry carrying lstart) and probe(pid) -> { lstart, state } | nil,
+-- partition into entries still identity-valid AND stopped versus dead wood,
+-- with a named reason per drop. The startup reconcile validates at load;
+-- this is the same decision for the calm-state sweep, because a frozen
+-- process that exits BETWEEN reloads must not haunt the ledger (2026-07-09
+-- field finding: a dead VM pid held frozenCount=1 for two days).
+function M.pruneFrozen(entries, probe)
+  local kept, dropped = {}, {}
+  for pid, e in pairs(entries or {}) do
+    local p = probe(pid)
+    local why = nil
+    if not p then
+      why = "exited"
+    elseif e.lstart and p.lstart and e.lstart ~= p.lstart then
+      why = "pid-recycled"
+    elseif p.state ~= "T" then
+      why = "resumed-externally"
+    end
+    if why then
+      dropped[#dropped + 1] = { entry = e, why = why }
+    else
+      kept[pid] = e
+    end
+  end
+  return kept, dropped
 end
 
 -- What the menu-bar title should say. Quiet until trouble:

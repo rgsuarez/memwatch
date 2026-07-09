@@ -54,6 +54,7 @@ local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
 local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
+local lastFrozenSweepAt = 0 -- calm-state liveness sweep bookkeeping
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
 local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
 local lfmServerTask  = nil    -- hs.task handle for llama-server
@@ -76,6 +77,7 @@ local lfmTick
 local gcUnattendedState
 local offenderIsForeground
 local probePid
+local frozenSweep
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -848,6 +850,9 @@ local function tick()
   -- recycled pid could inherit stale state for one tick.
   gcUnattendedState()
   alertSurfaces(state, now)
+  -- Frozen-ledger liveness sweep (calm only: probing forks a ps per entry,
+  -- and a phantom entry is harmless mid-crisis).
+  if state == "ok" then frozenSweep(now) end
 
   -- Honesty when degraded: if the fork has not reported for a while, say so,
   -- and say it LOUDLY when it coincides with real pressure. The 2026-07-07
@@ -1021,6 +1026,30 @@ local function frozenReconcile()
       withdrawAfter = 0,
     }):send()
   end
+end
+
+-- Calm-state liveness sweep for the frozen ledger. The startup reconcile
+-- validates entries at load, but a frozen process that exits BETWEEN
+-- reloads leaves a phantom entry (2026-07-09 field finding: a dead VM pid
+-- held frozenCount=1 for two days because nothing re-probed after load).
+-- Same identity semantics as the reconcile (lstart + stopped state), on a
+-- calm cadence only per fork discipline.
+frozenSweep = function(now)
+  if not next(frozen) then return end
+  if (now - lastFrozenSweepAt) < core.cfg.cool.frozenSweepSec then return end
+  lastFrozenSweepAt = now
+  local kept, dropped = core.pruneFrozen(frozen, function(pid)
+    local b = probePid(pid)
+    if not b then return nil end
+    return { lstart = b.lstart, state = pidState(pid) }
+  end)
+  if #dropped == 0 then return end
+  for _, d in ipairs(dropped) do
+    M.logSnapshot(string.format("frozen-prune:%s(%d):%s",
+      d.entry.name or "?", d.entry.pid or -1, d.why))
+  end
+  frozen = kept
+  saveFrozen()
 end
 
 -- Freeze: same identity probe and policy gate as kill, then SIGSTOP with a
@@ -1793,6 +1822,17 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   end
   local availBefore = lastMetrics.availPct or 0
   local totalGB = lastMetrics.totalGB or 0
+  -- Capture the target's last-known top footprint (MEM includes compressed)
+  -- BEFORE signaling: the avail-delta "reclaimed" below misses pages that
+  -- were compressed or swapped at kill time (2026-07-09 field finding: a
+  -- ~4.9 GB search runaway reported reclaimed=0.1GB), and the top row is
+  -- gone once the process exits. Frozen targets fall back to their ledger
+  -- weight, captured at freeze time.
+  local footRow = topCache.map and topCache.map[pid] or nil
+  local footBeforeGB = (footRow and footRow.memMB and footRow.memMB > 0)
+    and footRow.memMB / 1024
+    or (frozenEntry and frozenEntry.weightMB and frozenEntry.weightMB / 1024)
+    or nil
   -- A SIGSTOPped process cannot handle SIGTERM until it is continued, so a
   -- TERM to a frozen target would just pend and force the full escalation
   -- wait before SIGKILL. Continue it first so the graceful signal can land.
@@ -1823,8 +1863,10 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
       if gone then
         if frozen[pid] then frozen[pid] = nil; saveFrozen() end
-        M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB", liveName, pid, reclaimedGB))
-        onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB", liveName, reclaimedGB), true)
+        local footTxt = footBeforeGB and string.format("-footprint=%.1fGB", footBeforeGB) or ""
+        M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB%s", liveName, pid, reclaimedGB, footTxt))
+        onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
+          footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or ""), true)
       else
         M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
         onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true)

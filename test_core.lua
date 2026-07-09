@@ -810,6 +810,39 @@ local function earlyRefs(path)
   return bad
 end
 
+-- ---- frozen-ledger prune (calm-state liveness sweep, 2026-07-09 field fix) ----
+-- Three-case floor: exited / identity-changed / healthy-kept, plus the
+-- resumed-externally drop and the empty no-op.
+do
+  local entries = {
+    [100] = { pid = 100, name = "vm-host", lstart = "Tue Jul  7 07:24:43 2026" },
+    [200] = { pid = 200, name = "leaky",   lstart = "Wed Jul  8 10:00:00 2026" },
+    [300] = { pid = 300, name = "runner",  lstart = "Wed Jul  8 11:00:00 2026" },
+    [400] = { pid = 400, name = "steady",  lstart = "Wed Jul  8 12:00:00 2026" },
+  }
+  local probes = {
+    -- [100] absent: exited
+    [200] = { lstart = "Thu Jul  9 09:00:00 2026", state = "T" }, -- pid recycled
+    [300] = { lstart = "Wed Jul  8 11:00:00 2026", state = "R" }, -- resumed externally
+    [400] = { lstart = "Wed Jul  8 12:00:00 2026", state = "T" }, -- still frozen
+  }
+  local kept, dropped = core.pruneFrozen(entries, function(pid) return probes[pid] end)
+  check("prune: exited dropped",       kept[100], nil)
+  check("prune: recycled dropped",     kept[200], nil)
+  check("prune: resumed dropped",      kept[300], nil)
+  check("prune: live frozen kept",     kept[400] ~= nil, true)
+  local whys = {}
+  for _, d in ipairs(dropped) do whys[d.entry.pid] = d.why end
+  check("prune: exited reason",        whys[100], "exited")
+  check("prune: recycled reason",      whys[200], "pid-recycled")
+  check("prune: resumed reason",       whys[300], "resumed-externally")
+  local k2, d2 = core.pruneFrozen({}, function() return nil end)
+  check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
+end
+
+-- ---- topstream teardown race (2026-07-08 field crash regression pin) ----
+check("feedTopStream: nil stream returns nil", procs.feedTopStream(nil, "PID X\n"), nil)
+
 for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua", "lua/memwatch_report.lua" }) do
   local bad = earlyRefs(path)
   for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end

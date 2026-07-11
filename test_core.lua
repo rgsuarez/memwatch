@@ -843,6 +843,28 @@ end
 -- ---- topstream teardown race (2026-07-08 field crash regression pin) ----
 check("feedTopStream: nil stream returns nil", procs.feedTopStream(nil, "PID X\n"), nil)
 
+-- ---- remote-adjudicator request shape (cloud endpoint contract) ----
+-- The local path must keep the llama.cpp extension field and omit model;
+-- the remote path must carry model/temperature/effort and omit the
+-- extension (providers reject unknown parameters: field lesson 2026-07-10).
+do
+  local lfm = require("memwatch_lfm")
+  local localBody = lfm.jsonDecode(lfm.buildRequestBody("sys", "user", {}))
+  check("reqbody local: cache_prompt on",   localBody.cache_prompt, true)
+  check("reqbody local: no model field",    localBody.model, nil)
+  check("reqbody local: temp 0 default",    localBody.temperature, 0)
+  check("reqbody local: no effort field",   localBody.reasoning_effort, nil)
+  local remoteBody = lfm.jsonDecode(lfm.buildRequestBody("sys", "user", {
+    model = "kimi-k2.6", temperature = 1, maxTokens = 2048, reasoningEffort = "low",
+  }))
+  check("reqbody remote: model set",        remoteBody.model, "kimi-k2.6")
+  check("reqbody remote: no cache_prompt",  remoteBody.cache_prompt, nil)
+  check("reqbody remote: temp override",    remoteBody.temperature, 1)
+  check("reqbody remote: effort low",       remoteBody.reasoning_effort, "low")
+  check("reqbody remote: max tokens",       remoteBody.max_tokens, 2048)
+  check("reqbody remote: schema kept",      remoteBody.response_format.type, "json_schema")
+end
+
 for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua", "lua/memwatch_report.lua" }) do
   local bad = earlyRefs(path)
   for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end

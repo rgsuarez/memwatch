@@ -67,6 +67,7 @@ local lfmCalmSince   = nil    -- retire-on-calm bookkeeping
 local lfmLastAdvisoryAt = 0
 local lfmReqNonce    = 0      -- monotonic request generation
 local lfmInFlight    = nil    -- { nonce, pid, hash, at, ident }
+local lfmRemoteKey   = nil    -- bearer key for the remote adjudicator (never logged)
 local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident }
 -- Forward declarations, assigned in the kill-engine section: alertSurfaces
 -- (defined earlier in the file) calls these at tick time, and a top-level
@@ -78,6 +79,7 @@ local gcUnattendedState
 local offenderIsForeground
 local probePid
 local frozenSweep
+local lfmRemoteActive
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -173,6 +175,22 @@ local function applyLocalConfig()
   if type(conf.lfm) == "table" then
     for k, v in pairs(conf.lfm) do
       if lfm.cfg[k] ~= nil and type(v) == type(lfm.cfg[k]) then lfm.cfg[k] = v end
+    end
+  end
+  -- Remote adjudicator key: read once, held in memory, never logged. A
+  -- configured remote with an unreadable or empty key fails closed to
+  -- local/deterministic behavior with one loud line.
+  if lfm.cfg.remoteServer ~= "" and lfm.cfg.remoteKeyFile ~= "" then
+    local kpath = lfm.cfg.remoteKeyFile:gsub("^~", os.getenv("HOME") or "~")
+    local kf = io.open(kpath, "r")
+    if kf then
+      local key = (kf:read("a") or ""):gsub("%s+$", "")
+      kf:close()
+      if #key > 0 then lfmRemoteKey = key end
+    end
+    if not lfmRemoteKey then
+      logError("local-config", "remote adjudicator key unreadable; remote disabled")
+      lfm.cfg.remoteServer = ""
     end
   end
 end
@@ -597,7 +615,10 @@ local function buildMenu()
   items[#items + 1] = { title = "Log snapshot now",
     fn = function() M.logSnapshot("manual") end }
   items[#items + 1] = { title = string.format("LFM adjudication: %s",
-      lfm.cfg.enabled and (lfmServerReady and "on (warm)" or "on") or "off"),
+      lfm.cfg.enabled
+        and (lfmRemoteActive() and ("on (remote: " .. lfm.cfg.remoteModel .. ")")
+             or (lfmServerReady and "on (warm)" or "on"))
+        or "off"),
     fn = function() M.setLfmEnabled(not lfm.cfg.enabled) end }
   items[#items + 1] = { title = "Open value report",
     fn = function() M.report() end }
@@ -1608,11 +1629,20 @@ local function buildLfmSnapshot(offender)
   }, (withForeground(offender) or {}).foreground
 end
 
+-- Remote adjudicator: active when enabled + configured + key loaded. The
+-- remote brain replaces the local server lifecycle, never the rails.
+lfmRemoteActive = function()
+  return lfm.cfg.enabled and lfm.cfg.remoteServer ~= "" and lfmRemoteKey ~= nil
+end
+
 -- Dispatch one async adjudication request for the bound offender. Replies
 -- land in the per-pid verdict cache; the nonce discards anything late or
--- stale; the unified timeout policy retires the server and latches offline.
+-- stale; the unified timeout policy retires the server and latches offline
+-- (remote mode has no server to retire; it latches offline only, and the
+-- deterministic policy carries the episode).
 local function dispatchAdjudication(offender, why)
-  if not (lfmServerReady and lfmServerPort and not lfmInFlight) then return end
+  local remote = lfmRemoteActive() and not lfmOffline
+  if not ((remote or (lfmServerReady and lfmServerPort)) and not lfmInFlight) then return end
   local proc = probePid(offender.pid)
   if not proc then return end
   local snap, foreground = buildLfmSnapshot(offender)
@@ -1621,7 +1651,12 @@ local function dispatchAdjudication(offender, why)
     M.logSnapshot("lfm-serialize-error:" .. tostring(serr))
     return
   end
-  local body = lfm.buildRequestBody(lfm.buildSystemPrompt({}), user, {})
+  local body = lfm.buildRequestBody(lfm.buildSystemPrompt({}), user, remote and {
+    model = lfm.cfg.remoteModel ~= "" and lfm.cfg.remoteModel or nil,
+    maxTokens = lfm.cfg.remoteMaxTokens,
+    temperature = lfm.cfg.remoteTemperature,
+    reasoningEffort = lfm.cfg.remoteReasoningEffort ~= "" and lfm.cfg.remoteReasoningEffort or nil,
+  } or {})
   if not body then return end
   lfmReqNonce = lfmReqNonce + 1
   local nonce = lfmReqNonce
@@ -1632,10 +1667,11 @@ local function dispatchAdjudication(offender, why)
   lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
   M.logSnapshot(string.format("lfm-dispatch:%s:%s(%d):nonce=%d", why, ident.name, pid, nonce))
   hs.http.asyncPost(
-    string.format("http://127.0.0.1:%d/v1/chat/completions", lfmServerPort),
+    remote and (lfm.cfg.remoteServer .. "/v1/chat/completions")
+           or string.format("http://127.0.0.1:%d/v1/chat/completions", lfmServerPort),
     body,
     { ["Content-Type"] = "application/json",
-      ["Authorization"] = "Bearer " .. (lfmApiKey or "") },
+      ["Authorization"] = "Bearer " .. (remote and lfmRemoteKey or lfmApiKey or "") },
     guard("lfm-reply", function(status, respBody)
       if not lfmInFlight or lfmInFlight.nonce ~= nonce then
         M.logSnapshot(string.format("lfm-reply-discard:stale-nonce=%d", nonce))
@@ -1664,17 +1700,20 @@ local function dispatchAdjudication(offender, why)
           weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
           foreground = foreground },
         verdict.action, "lfm-advisory", verdict.rationale, nil,
-        { model = lfm.cfg.model, snapshotHash = hash,
+        { model = remote and lfm.cfg.remoteModel or lfm.cfg.model, snapshotHash = hash,
           confidence = verdict.confidence, latencyMs = latencyMs })
     end))
   -- Unified timeout policy: any request still in flight at the watchdog
-  -- retires the server (reclaiming its CPU for the crisis) and latches the
-  -- adjudicator offline until the next elevated tick.
-  hs.timer.doAfter(lfm.cfg.timeoutSec, guard("lfm-timeout", function()
+  -- latches the adjudicator offline until calm. The local path also retires
+  -- the server (reclaiming its CPU for the crisis); the remote path has no
+  -- server, so the latch alone hands the episode to the deterministic
+  -- policy.
+  local deadline = remote and lfm.cfg.remoteTimeoutSec or lfm.cfg.timeoutSec
+  hs.timer.doAfter(deadline, guard("lfm-timeout", function()
     if lfmInFlight and lfmInFlight.nonce == nonce then
-      M.logSnapshot(string.format("lfm-timeout:nonce=%d:%.0fs", nonce, lfm.cfg.timeoutSec))
+      M.logSnapshot(string.format("lfm-timeout:nonce=%d:%.0fs", nonce, deadline))
       lfmInFlight = nil
-      retireLfmServer("timeout")
+      if not remote then retireLfmServer("timeout") end
       lfmOffline = true
     end
   end))
@@ -1695,6 +1734,15 @@ lfmTick = function(state, now, interesting)
   -- page-ins through the same crisis it degraded in. Re-arm happens at the
   -- next elevated onset AFTER things have gone quiet.
   if lfmOffline and state == "ok" then lfmOffline = false end
+
+  -- Remote mode replaces the entire local lifecycle: no spawn, no
+  -- self-police circuit (there is no local process to police), no
+  -- retire-on-calm. Any local server still up from a config change is
+  -- retired once; the offline latch and the advisory dispatch below are
+  -- shared with the local path.
+  if lfmRemoteActive() then
+    if lfmServerTask then retireLfmServer("remote-mode") end
+  else
 
   local running = lfmServerTask ~= nil
 
@@ -1748,10 +1796,14 @@ lfmTick = function(state, now, interesting)
     end
   end
 
-  -- Advisory dispatch: a warm server adjudicates the current offender on
-  -- the advisory cadence, and immediately at critical when nothing fresh is
-  -- cached (the grace-expiry consumer needs a verdict to consume).
-  if lfmServerReady and interesting and lastOffender then
+  end -- lfmRemoteActive() lifecycle bypass
+
+  -- Advisory dispatch: a warm adjudicator (local server or remote endpoint)
+  -- adjudicates the current offender on the advisory cadence, and
+  -- immediately at critical when nothing fresh is cached (the grace-expiry
+  -- consumer needs a verdict to consume).
+  if ((lfmServerReady) or (lfmRemoteActive() and not lfmOffline))
+     and interesting and lastOffender then
     local cached = verdictCache[lastOffender.pid]
     local fresh = cached and (now - (cached.at or 0)) <= lfm.cfg.verdictFreshSec
     local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
@@ -1970,8 +2022,10 @@ function M.debug()
                        table.sort(t)
                        return t
                      end)(),
-    lfm            = { enabled = lfm.cfg.enabled, ready = lfmServerReady,
+    lfm            = { enabled = lfm.cfg.enabled,
+                       ready = lfmServerReady or (lfmRemoteActive() and not lfmOffline),
                        offline = lfmOffline, pid = lfmServerPid, port = lfmServerPort,
+                       remote = lfmRemoteActive() and lfm.cfg.remoteModel or nil,
                        cached = (function() local n = 0; for _ in pairs(verdictCache) do n = n + 1 end; return n end)() },
   }
 end

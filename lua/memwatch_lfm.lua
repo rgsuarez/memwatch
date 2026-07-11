@@ -43,6 +43,23 @@ M.cfg = {
   verdictFreshSec = 90,     -- cached verdict age a decision point may consume
   maxServerMB = 2048,       -- self-police circuit: server above this is killed
   spawnMinAvailPct = 10,    -- spawn floor: no server spawn below this
+  -- Remote adjudicator (an OpenAI-compatible cloud endpoint). When
+  -- remoteServer is non-empty (and enabled), the glue skips the local
+  -- llama-server lifecycle entirely and dispatches to this endpoint: same
+  -- prompt, same pid-free snapshot, same schema validation, same confidence
+  -- floors and rails, same ledger. Disabled or unreachable still degrades
+  -- to exactly the deterministic base system. The key file is read once at
+  -- config load and never logged. Trade named at activation: a remote
+  -- brain's verdict rides the network during a crisis (the async cache and
+  -- the deterministic fallback absorb that), and the snapshot's process
+  -- names leave the machine.
+  remoteServer = "",          -- e.g. "https://api.moonshot.ai"; "" = local
+  remoteModel = "",           -- provider model id; also the ledger label
+  remoteKeyFile = "",         -- bearer-key file path (0600)
+  remoteMaxTokens = 768,      -- reasoning models need budget beyond 128
+  remoteTemperature = 0,      -- some thinking models require exactly 1
+  remoteReasoningEffort = "", -- "" omits the field; "low" caps think-budget
+  remoteTimeoutSec = 30,      -- network verdict deadline before offline latch
 }
 
 ------------------------------------------------------------------------------
@@ -472,7 +489,14 @@ M.OUTPUT_SCHEMA = {
   additionalProperties = false,
 }
 
--- opts: { maxTokens, schema = true|false (default true) }.
+-- opts: { maxTokens, schema = true|false (default true), model = <string>,
+--         temperature = <number> }.
+-- model is OPTIONAL: llama-server serves one model and ignores the field, so
+-- the local path omits it; a remote OpenAI-compatible endpoint requires it.
+-- temperature defaults to 0 (deterministic verdicts); some remote thinking
+-- models refuse anything but 1 and need the override. cache_prompt is a
+-- llama.cpp extension, sent only on the local (model-less) path because
+-- remote providers reject unknown parameters.
 -- The response_format shape is the OpenAI-nested one llama-server actually
 -- enforces: {type="json_schema", json_schema={name, strict, schema}}. The
 -- flat {type, schema} variant is SILENTLY IGNORED (verified live against
@@ -486,10 +510,14 @@ function M.buildRequestBody(systemPrompt, userContent, opts)
       { role = "system", content = systemPrompt },
       { role = "user", content = userContent },
     }),
-    temperature = 0,
+    temperature = opts.temperature or 0,
     max_tokens = opts.maxTokens or 128,
-    cache_prompt = true,
   }
+  if opts.model then body.model = opts.model else body.cache_prompt = true end
+  -- Remote reasoning models burn their whole token budget thinking unless
+  -- the effort is capped; sent only when configured, because providers
+  -- reject unknown parameters.
+  if opts.reasoningEffort then body.reasoning_effort = opts.reasoningEffort end
   if opts.schema ~= false then
     body.response_format = {
       type = "json_schema",

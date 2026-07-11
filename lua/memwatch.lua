@@ -68,6 +68,7 @@ local lfmLastAdvisoryAt = 0
 local lfmReqNonce    = 0      -- monotonic request generation
 local lfmInFlight    = nil    -- { nonce, pid, hash, at, ident }
 local lfmRemoteKey   = nil    -- bearer key for the remote adjudicator (never logged)
+local lfmRemoteCooldownUntil = 0 -- F1: remote backoff deadline (retry, not hard latch)
 local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident }
 -- Forward declarations, assigned in the kill-engine section: alertSurfaces
 -- (defined earlier in the file) calls these at tick time, and a top-level
@@ -1642,11 +1643,16 @@ end
 -- deterministic policy carries the episode).
 local function dispatchAdjudication(offender, why)
   local remote = lfmRemoteActive() and not lfmOffline
+    and hs.timer.secondsSinceEpoch() >= lfmRemoteCooldownUntil
   if not ((remote or (lfmServerReady and lfmServerPort)) and not lfmInFlight) then return end
   local proc = probePid(offender.pid)
   if not proc then return end
   local snap, foreground = buildLfmSnapshot(offender)
-  local user, serr = lfm.serializeSnapshot(snap)
+  -- Redact raw process names to deterministic categories for a remote
+  -- frontier model (panel F4.1): a capable model reading an attacker-
+  -- controlled name is a real injection vector; the local path keeps names
+  -- (the 230M is not steerable and the config default follows lfm.cfg).
+  local user, serr = lfm.serializeSnapshot(snap, { redactNames = remote and lfm.cfg.redactNames })
   if not user then
     M.logSnapshot("lfm-serialize-error:" .. tostring(serr))
     return
@@ -1658,6 +1664,13 @@ local function dispatchAdjudication(offender, why)
     reasoningEffort = lfm.cfg.remoteReasoningEffort ~= "" and lfm.cfg.remoteReasoningEffort or nil,
   } or {})
   if not body then return end
+  -- Remote transient failure (non-200): short cooldown, retry next tick.
+  local function remoteBackoff(tag)
+    if remote then
+      lfmRemoteCooldownUntil = hs.timer.secondsSinceEpoch() + lfm.cfg.remoteCooldownSec
+      M.logSnapshot(string.format("lfm-remote-backoff:%s:%.0fs", tag, lfm.cfg.remoteCooldownSec))
+    end
+  end
   lfmReqNonce = lfmReqNonce + 1
   local nonce = lfmReqNonce
   local hash = lfm.snapshotHash(user)
@@ -1680,12 +1693,14 @@ local function dispatchAdjudication(offender, why)
       lfmInFlight = nil
       if status ~= 200 then
         M.logSnapshot(string.format("lfm-reply-error:http=%s", tostring(status)))
+        remoteBackoff("http")
         return
       end
       local raw, perr = lfm.parseResponse(respBody or "")
       local verdict = raw and lfm.validateVerdict(raw) or nil
       if not verdict then
         M.logSnapshot("lfm-reply-invalid:" .. tostring(perr or "validation"))
+        remoteBackoff("invalid")
         return
       end
       local latencyMs = math.floor((hs.timer.secondsSinceEpoch() - sentAt) * 1000)
@@ -1713,8 +1728,17 @@ local function dispatchAdjudication(offender, why)
     if lfmInFlight and lfmInFlight.nonce == nonce then
       M.logSnapshot(string.format("lfm-timeout:nonce=%d:%.0fs", nonce, deadline))
       lfmInFlight = nil
-      if not remote then retireLfmServer("timeout") end
-      lfmOffline = true
+      -- Local: retire the server (reclaim CPU) and hard-latch until calm, so
+      -- a mid-storm respawn cannot thrash page-ins. Remote: no local server
+      -- to thrash, so a short cooldown + retry keeps the model available
+      -- through a network blip instead of going dark for the whole episode
+      -- (F1). The deterministic policy and wait-deferral bound cover the gap.
+      if remote then
+        remoteBackoff("timeout")
+      else
+        retireLfmServer("timeout")
+        lfmOffline = true
+      end
     end
   end))
 end

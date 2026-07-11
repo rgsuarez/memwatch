@@ -167,7 +167,8 @@ local function runMode(args)
 
   for _, fname in ipairs(files) do
     local scenario = assert(lfm.jsonDecode(readFile(scenariosDir .. "/" .. fname)))
-    local userContent = assert(lfm.serializeSnapshot(scenario.snapshot))
+    local userContent = assert(lfm.serializeSnapshot(scenario.snapshot,
+      { redactNames = args.redact_names ~= nil }))
     local body = assert(lfm.buildRequestBody(systemPrompt, userContent, {
       maxTokens = maxTokens, schema = useSchema, model = args.model,
       temperature = tonumber(args.temperature),

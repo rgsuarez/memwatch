@@ -453,12 +453,19 @@ local CATEGORY_PATTERNS = {
   { "database",        { "postgres", "mysqld", "redis%-server", "mongod", "clickhouse", "sqlite" } },
   { "package-manager", { "npm install", "npm exec", "yarn", "pnpm", "pip install", "pip%.", "homebrew", "/brew", "bun install" } },
   { "build-tool",      { "next%-server", "webpack", "vite", "esbuild", "rollup", "turbo", "tsc", "cargo", "rustc", "clang", "gcc", "go build", "gradle", "xcodebuild", "^node", "^node$", "bun run" } },
-  { "search-tool",     { "ugrep", "^grep", "ripgrep", "^rg$", "the_silver", "^ag$", "^find$", "mdworker", "mds_stores", "spotlight" } },
+  -- System infrastructure is matched BEFORE the user-tool buckets so an OS
+  -- daemon (the Spotlight indexer mds_stores/mdworker, Time Machine, iCloud)
+  -- is never mistaken for a killable user tool. The important signal for the
+  -- adjudicator is "protected OS process, do not kill" (the same-uid kill
+  -- gate also refuses these in production, but the category must not invite
+  -- an over-action in the first place: 2026-07-10 redaction drill, mds_stores
+  -- was over-terminated when bucketed as search-tool).
+  { "system",          { "^com%.apple%.", "windowserver", "launchd", "kernel_task", "backupd", "time machine", "mds_stores", "mdworker", "mdbulkimport", "spotlight", "cloudd", "^bird$", "nsurlsession", "corespotlight", "photoanalysisd", "mdsync" } },
+  { "search-tool",     { "ugrep", "^grep", "ripgrep", "^rg$", "the_silver", "^ag$", "^find$", "mdfind" } },
   { "editor",          { "visual studio code", "code helper", "cursor", "zed", "sublime", "jetbrains", "intellij", "pycharm", "xcode", "nvim", "vim", "emacs" } },
   { "terminal",        { "iterm", "terminal", "ghostty", "alacritty", "kitty", "warp", "tmux" } },
   { "media",           { "spotify", "quicktime", "vlc", "ffmpeg", "music", "photos" } },
   { "comms",           { "slack", "discord", "zoom", "teams", "telegram", "signal", "notion" } },
-  { "system",          { "^com%.apple%.", "windowserver", "launchd", "kernel_task", "backupd", "time machine", "mds", "cloudd", "bird", "nsurlsession" } },
 }
 
 -- Exported for tests and the report. Pure; returns a fixed-vocabulary token.

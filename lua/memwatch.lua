@@ -1282,6 +1282,27 @@ resolveUnattendedAction = function(mode, offender)
       offenderKind = offender.kind,
       offenderForeground = foreground,
     })
+    -- Nondeterminism guard for an adjudicated TERMINATE (panel finding C,
+    -- 2026-07-10). A remote frontier model is empirically nondeterministic
+    -- even at temperature 0 (a reasoning trace varies run to run): across
+    -- bake-off repeats it emitted a high-confidence terminate on a
+    -- must-not-terminate (but freeze-acceptable) extreme grower on ~1-2 of
+    -- 74 scenarios, non-reproducibly. A single sample is too thin a margin
+    -- for the irreversible action, so a remote terminate is NOT honored; it
+    -- falls through to the deterministic policy (which still terminates in
+    -- kill mode on the proven-extreme logic, or freezes in freeze mode).
+    -- Model freeze/wait stay single-sample (reversible / deferred). The
+    -- shipped freeze ceiling already caps terminate, so this only changes
+    -- behavior under unattended=kill, making that mode safe for a
+    -- nondeterministic remote model too. Full N-sample consensus (honor a
+    -- remote terminate on a majority vote) is the tracked follow-up.
+    if eff == "terminate" and lfmRemoteActive() then
+      local action = deterministicAction(mode, foreground)
+      return action, "deterministic-fallback", nil,
+        { "deterministic", "remote-terminate-unconfirmed" },
+        { model = lfm.cfg.remoteModel, supersededModelAction = "terminate",
+          confidence = e.verdict.confidence }
+    end
     -- Wait-deferral bound (a rail in the TIME dimension, bake-off finding):
     -- a model wait DEFERS the deterministic policy, protecting a
     -- false-positive extreme (a build burst resolves within a window or

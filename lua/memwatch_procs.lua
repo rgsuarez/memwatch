@@ -32,10 +32,22 @@ M.cfg = {
   growthExtremeMBmin = 9000,  -- 150 MB/s over the rising tail
   nRisingExtreme     = 4,     -- rising samples for the streak route (~20s)
   extremeNetMB       = 6000,  -- net window growth route (still-climbing gate)
-  extremeLatchSec    = 45,    -- once extreme, stays extreme this long:
-                              -- interleaved feeds make the rising tail
-                              -- choppy, and RSS collapsing under active
-                              -- compression must never read as recovery
+  -- Once extreme, stays extreme this long. Two reasons, and the second is a
+  -- HARD INVARIANT: (1) interleaved feeds make the rising tail choppy, and
+  -- RSS collapsing under active compression must never read as recovery;
+  -- (2) THE LATCH MUST OUTLIVE THE UNATTENDED GRACE WINDOW
+  -- (core.cfg.cool.autoKillGraceSec, 60s). The unattended gate fires only for
+  -- an offender that reads kind=extreme AT GRACE EXPIRY. At the old 45s the
+  -- latch died 15s BEFORE the 60s grace elapsed, so a runaway that plateaued
+  -- (hit a cap, paused, or merely dipped below threshold) reverted to
+  -- kind=hog and the autonomous freeze refused to fire - the safety path was
+  -- effectively reachable only by a still-accelerating runaway. Proven live
+  -- 2026-07-13: an 11 GB/min leaker was correctly detected and adjudicated
+  -- (freeze, 0.92 confidence) and then went unfrozen because the latch lapsed
+  -- first. A process holding gigabytes at critical is the problem whether or
+  -- not it is still climbing. test_core pins latch > grace so the two cannot
+  -- silently drift apart again.
+  extremeLatchSec    = 120,
   runawayFreshSec    = 12,    -- only pids seen alive this recently can be
                               -- runaways, so a killed process clears the
                               -- list within two ticks despite the latch
@@ -264,6 +276,15 @@ function M.runaways(tr, now, systemState, totalMB)
       local slope, rising, span = growth(e.ring, cfg.risingEpsMB)
       local netMB = (#e.ring >= 2) and (e.ring[#e.ring].v - e.ring[1].v) or 0
       local kind
+      -- Peak growth ever observed for this pid. A runaway that hits its own
+      -- cap (or pauses) reads slope 0 while still HOLDING every byte it took,
+      -- and a bare {kind=extreme, slope=0} is an incoherent story to any
+      -- consumer: the adjudicator model resolved that contradiction toward
+      -- "steady, therefore innocent" and voted wait on a confirmed 11 GB/min
+      -- runaway (live, 2026-07-13). The peak is the missing evidence: it is
+      -- what makes a plateaued runaway distinguishable from a process that was
+      -- always big and quiet.
+      if slope > (e.peakSlopeMBmin or 0) then e.peakSlopeMBmin = slope end
       if (slope >= cfg.growthExtremeMBmin and rising >= cfg.nRisingExtreme)
          or (netMB >= cfg.extremeNetMB and rising >= 2) then
         kind = "extreme"
@@ -283,7 +304,8 @@ function M.runaways(tr, now, systemState, totalMB)
       if kind then
         out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,
                           rssMB = e.rssMB or 0, weightMB = e.weightMB or e.rssMB or 0,
-                          slopeMBmin = slope, kind = kind }
+                          slopeMBmin = slope, peakSlopeMBmin = e.peakSlopeMBmin or 0,
+                          kind = kind }
       end
     end
   end
@@ -324,7 +346,19 @@ end
 -- hog by weight is named but explicitly tagged kind="hog": it is the largest
 -- process, not a proven cause, and every surface must present it that way
 -- (a steady VM or model server must never read like a caught runaway).
-function M.pickOffender(runawayList, ranked, systemState)
+-- The peak growth ever recorded for a pid (0 if unknown/untracked).
+function M.peakSlopeFor(tr, pid)
+  local e = tr and tr.procs and tr.procs[pid]
+  return (e and e.peakSlopeMBmin) or 0
+end
+
+-- peakFn(pid) -> peak MB/min, optional. The hog fallback builds its offender
+-- from the weight-ranked list, which carries NO growth history, so a
+-- plateaued runaway whose extreme latch has lapsed would present to the
+-- adjudicator as a brand-new innocent hog with peak 0 - which is exactly how
+-- the model talked itself into a wait on a process it had just watched take
+-- 4 GB in 21 seconds (live, 2026-07-13). Carry the peak across.
+function M.pickOffender(runawayList, ranked, systemState, peakFn)
   local r = runawayList and runawayList[1]
   if r then
     if r.kind == "sustained" and systemState == "ok" then return nil, r end
@@ -333,7 +367,9 @@ function M.pickOffender(runawayList, ranked, systemState)
   if systemState == "critical" and ranked and ranked[1] then
     local h = ranked[1]
     return { pid = h.pid, name = h.name, comm = h.comm, uid = h.uid,
-             rssMB = h.rssMB, weightMB = h.weightMB, kind = "hog" }, nil
+             rssMB = h.rssMB, weightMB = h.weightMB, kind = "hog",
+             slopeMBmin = 0,
+             peakSlopeMBmin = peakFn and peakFn(h.pid) or 0 }, nil
   end
   return nil, nil
 end

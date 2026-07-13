@@ -364,6 +364,29 @@ function M.shortName(name)
   return name
 end
 
+-- Top-stream staleness decision (pure, 2026-07-13 drill finding). The `top`
+-- attribution stream is the ONLY feed that sees compressed pages, and a fast
+-- compressible allocator lives almost entirely in the compressor (its RSS
+-- collapses as the kernel compresses it in real time). A stream can stay
+-- ALIVE while silently ceasing to publish: the task handle is not proof of
+-- liveness, fresh samples are. When that happens the growth rings freeze, a
+-- 190 MB/s runaway reads as a steady hog, and the autonomous freeze never
+-- becomes eligible - the watchdog goes blind exactly during the crisis it
+-- exists to catch (observed live: a 5-hour-old stream with a 77s-stale cache
+-- missed a 3.8 GB/21s leaker entirely; a fresh stream caught the identical
+-- leaker at 9063 MB/min). Returns true when a live stream has gone quiet past
+-- staleSec (measured from its last publish, or from its start if it has never
+-- published) and the respawn cooldown has elapsed, so a storm cannot thrash
+-- forks retrying a spawn that is starving.
+function M.topStreamStale(alive, lastPublishAt, startedAt, lastRespawnAt, now, staleSec, cooldownSec)
+  if not alive then return false end
+  if (startedAt or 0) <= 0 then return false end
+  local last = math.max(lastPublishAt or 0, startedAt or 0)
+  if (now - last) <= (staleSec or 30) then return false end
+  if (now - (lastRespawnAt or 0)) <= (cooldownSec or 60) then return false end
+  return true
+end
+
 -- Frozen-ledger liveness decision (pure): given the persisted frozen map
 -- ([pid] = entry carrying lstart) and probe(pid) -> { lstart, state } | nil,
 -- partition into entries still identity-valid AND stopped versus dead wood,

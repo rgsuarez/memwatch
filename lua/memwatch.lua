@@ -285,7 +285,8 @@ local function assessProcesses(now)
         r.kind, r.name, r.pid, r.slopeMBmin))
     end
   end
-  local offender, watch = procs.pickOffender(kept, lastRanked, smState.state)
+  local offender, watch = procs.pickOffender(kept, lastRanked, smState.state,
+    function(pid) return procs.peakSlopeFor(tracker, pid) end)
   if offender and not offender.weightMB then offender.weightMB = offender.rssMB or 0 end
   lastOffender = offender
   -- A hog is named in the HUD and menu with its "largest, not growing"
@@ -310,6 +311,16 @@ local TOPSTREAM_ARGS = { "-l", "0", "-s", "5", "-n", "30", "-o", "cmprs",
 local topTask = nil
 local topStream = nil
 local topIdleSince = nil
+-- Staleness watchdog state (2026-07-13 drill finding; see core.topStreamStale).
+local TOPSTREAM_STALE_SEC    = 30  -- no publish this long (stream emits every 5s) = wedged
+local TOPSTREAM_RESPAWN_SEC  = 60  -- min gap between stale-respawns, so a storm cannot thrash forks
+local topStartedAt  = 0
+local topRespawnAt  = 0
+-- Generation guard: a stale-respawn stops and starts in the SAME tick, so the
+-- DYING stream's exit callback can land after the fresh one is installed and
+-- would null the live handle (leaving a running-but-unowned top). Every task
+-- carries its generation and a superseded one is ignored.
+local topGen = 0
 
 local function stopTopStream()
   if topTask then pcall(function() topTask:terminate() end); topTask = nil end
@@ -318,9 +329,13 @@ end
 
 local function startTopStream()
   if topTask then return end
+  topGen = topGen + 1
+  local myGen = topGen
+  topStartedAt = hs.timer.secondsSinceEpoch()
   topStream = procs.newTopStream()
   topTask = hs.task.new("/usr/bin/top",
     guard("topstream-exit", function(exitCode, _, stdErr)
+      if myGen ~= topGen then return end  -- superseded stream exiting: not ours to clear
       topTask = nil
       -- A dying stream is a fact worth recording: it is the attribution
       -- lifeline under load, and the next interesting tick respawns it.
@@ -328,6 +343,7 @@ local function startTopStream()
         tostring(exitCode), tostring(stdErr):sub(1, 80):gsub("%s+", " ")))
     end),
     function(_, stdOut)
+      if myGen ~= topGen then return false end  -- superseded: stop draining it
       local ok, err = pcall(function()
         local published = procs.feedTopStream(topStream, stdOut or "")
         if published then
@@ -904,6 +920,18 @@ local function tick()
     or lastRates.swapOut >= core.cfg.rates.swapLo
   if interesting then
     topIdleSince = nil
+    -- Staleness watchdog BEFORE the spawn: an alive-but-wedged stream freezes
+    -- the compressed-page attribution the growth rings depend on, so a
+    -- compressible runaway (whose RSS collapses into the compressor) reads as
+    -- a steady hog and no autonomous action is ever eligible. Retire the
+    -- wedged stream so the spawn below installs a fresh one.
+    if core.topStreamStale(topTask ~= nil, topCache.at, topStartedAt, topRespawnAt,
+                           now, TOPSTREAM_STALE_SEC, TOPSTREAM_RESPAWN_SEC) then
+      topRespawnAt = now
+      M.logSnapshot(string.format("topstream-stale-respawn:age=%.0fs",
+        now - math.max(topCache.at, topStartedAt)))
+      stopTopStream()
+    end
     startTopStream()
   elseif topTask then
     topIdleSince = topIdleSince or now
@@ -1631,7 +1659,8 @@ local function buildLfmSnapshot(offender)
     if not p then return nil end
     return {
       name = p.name, kind = p.kind, weightMB = p.weightMB,
-      slopeMBmin = p.slopeMBmin, ageSec = p.ageSec,
+      slopeMBmin = p.slopeMBmin, peakSlopeMBmin = p.peakSlopeMBmin,
+      ageSec = p.ageSec,
       foreground = (frontName ~= nil and p.name ~= nil
         and (p.name == frontName or p.name:find(frontName, 1, true) ~= nil)) or nil,
     }

@@ -85,13 +85,24 @@ never pid 1, never memwatch's own host. The target's identity is re-validated
 by comm before TERM and again before KILL, so a recycled pid can never be
 signaled. Every action and refusal is logged.
 
-A notification breadcrumb accompanies the HUD (180s cooldown; its Force Quit
-action button renders reliably only when Hammerspoon notifications are set to
-the Alerts style; the HUD is the dependable surface).
+A notification breadcrumb accompanies the HUD: one banner per critical
+episode, replaced in place if the named offender changes, never re-posted
+after a manual dismissal, and withdrawn on its own once the state settles
+below critical (its Force Quit action button renders reliably only when
+Hammerspoon notifications are set to the Alerts style; the HUD is the
+dependable surface).
+
+**Desktop alerts: on/off** in the menu mutes both surfaces at will
+(persisted as `"alerts": false` in `memwatch-local.json`; CLI:
+`hs -c "memwatch.setAlertsEnabled(false)"`). Muting hides the HUD and the
+banners only: the menu-bar state icon, logging, and the unattended engine
+stay live, and action receipts (an autonomous freeze/quit, frozen processes
+surviving a reload) still notify.
 
 The dropdown menu shows the state and its cause, kernel level, live rates,
 headroom, top-5 processes by true weight (each with Force Quit / Ignore
-submenus), and direct Force Quit / Ignore items for the current offender.
+submenus), direct Force Quit / Ignore items for the current offender, and
+the desktop-alerts / LFM toggles.
 
 ### Freeze (reversible)
 
@@ -107,9 +118,9 @@ orphaned, and a "Frozen by memwatch" menu section resumes them.
 
 `core.cfg.unattended = "off" | "freeze" | "kill"` (or the local config file)
 arms an unattended guard for the away-from-keyboard case: an extreme-growth
-runaway while critical, whose HUD has gone unanswered for the grace window,
-is frozen or killed through the same policy-checked flow, loudly logged and
-notified. `freeze` is the recommended reversible default. The legacy
+runaway while critical, whose alert has gone unanswered for the grace window
+(muted desktop alerts still arm and count the same clock), is frozen or
+killed through the same policy-checked flow, loudly logged and notified. `freeze` is the recommended reversible default. The legacy
 `autoKill = true` still works and maps to `unattended = "kill"`. Leave it
 off until the detector has earned your trust.
 
@@ -210,7 +221,8 @@ time) and reload Hammerspoon.
 ## Notes
 
 - Auto-starts at login because Hammerspoon does; no launchd job.
-- Alerts are silent by design (icon + HUD + notification, no sound).
+- Alerts are silent by design (icon + HUD + notification, no sound), and the
+  HUD + banners can be muted at will from the menu (`Desktop alerts: off`).
 - The dot is steady by default; `core.cfg.flash = true` restores the pulse.
 - Editing the module does not auto-reload (the pathwatcher only watches
   `~/.hammerspoon/`); run `hs -c "hs.reload()"` after changes.

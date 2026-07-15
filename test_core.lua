@@ -971,6 +971,23 @@ for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwat
   check("split-scope clean: " .. path, #bad, 0)
 end
 
+-- ---- held-timer guard ----
+-- hs.timer handles are garbage-collected when unreferenced, and a collected
+-- timer never fires (2026-07-15 field incident: a collected self-test resume
+-- timer left sampling paused and the watcher blind under real pressure; the
+-- same bare pattern carried the TERM->KILL escalation and the adjudicator
+-- timeout). Transient timers must go through the held helpers; exactly one
+-- bare constructor of each kind may exist, inside the helper itself.
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local _, afterCount = src:gsub("hs%.timer%.doAfter%(", "")
+  local _, untilCount = src:gsub("hs%.timer%.doUntil%(", "")
+  check("held-timer: doAfter only inside afterHeld", afterCount, 1)
+  check("held-timer: doUntil only inside untilHeld", untilCount, 1)
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

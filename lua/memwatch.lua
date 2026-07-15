@@ -45,6 +45,10 @@ local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
+local alertsEnabled = true  -- desktop alert surfaces (HUD + banners); menu toggle, persisted
+local alertActive   = false -- a critical alert episode is live (HUD up, or muted-but-armed)
+local critNotif     = nil   -- the live critical banner; one at a time, withdrawn on recovery
+local critNotifPid  = nil   -- offender pid the live banner names (0 = none identified)
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
@@ -127,6 +131,36 @@ local function guard(label, fn)
   end
 end
 
+-- hs.timer handles are garbage-collected when nothing references them, and a
+-- collected timer silently never fires. That is fatal here: unretained
+-- one-shots carry the TERM->KILL escalation, freeze/kill/resume verification,
+-- the adjudicator timeout, and the self-test's sampling resume (observed live
+-- 2026-07-15: a collected test-resume left sampling paused, the forced state
+-- stuck, and the watcher blind). Every transient timer is held until it
+-- completes; test_core pins that no bare constructor sneaks back in.
+local heldTimers = {}
+local function afterHeld(sec, fn)
+  local t
+  t = hs.timer.doAfter(sec, function()
+    heldTimers[t] = nil
+    fn()
+  end)
+  heldTimers[t] = true
+  return t
+end
+local function untilHeld(pred, action, interval)
+  local t
+  t = hs.timer.doUntil(function()
+    local ok, done = pcall(pred)
+    if not ok then logError("until-held", done) end
+    done = done == true or not ok  -- an erroring predicate ends its poller
+    if done then heldTimers[t] = nil end
+    return done
+  end, action, interval)
+  heldTimers[t] = true
+  return t
+end
+
 ------------------------------------------------------------------------------
 -- local config (memwatch-local.json, gitignored)
 --
@@ -173,6 +207,9 @@ local function applyLocalConfig()
   if type(conf.unattendedGraceSec) == "number" and conf.unattendedGraceSec >= 5 then
     core.cfg.cool.autoKillGraceSec = conf.unattendedGraceSec
   end
+  -- Desktop alert surfaces (HUD + banners). Muting them never disarms the
+  -- unattended engine or the menu-bar state icon.
+  if type(conf.alerts) == "boolean" then alertsEnabled = conf.alerts end
   if type(conf.lfm) == "table" then
     for k, v in pairs(conf.lfm) do
       if lfm.cfg[k] ~= nil and type(v) == type(lfm.cfg[k]) then lfm.cfg[k] = v end
@@ -210,6 +247,7 @@ local function saveLocalConfig()
     if type(existing) == "table" then conf = existing end
   end
   conf.unattended = core.cfg.unattended
+  conf.alerts = alertsEnabled
   if type(conf.lfm) ~= "table" then conf.lfm = {} end
   conf.lfm.enabled = lfm.cfg.enabled
   conf.lfm.model = lfm.cfg.model
@@ -431,6 +469,7 @@ function M.hideHud()
   if hud then hud:hide() end
   hudOffender = nil
   hudHold = false
+  alertActive = false
 end
 
 local function hudBodyText()
@@ -497,7 +536,7 @@ local function buildHud()
         M.freezePid(target.pid, target.name, function(text, done)
           if hud then hud[3].text = text end
           if done then
-            hs.timer.doAfter(4, guard("hud-close", function() M.hideHud() end))
+            afterHeld(4, guard("hud-close", function() M.hideHud() end))
           end
         end, { weightMB = target.weightMB, expectedLstart = target.lstart })
       end
@@ -508,7 +547,7 @@ local function buildHud()
         M.killPid(target.pid, target.name, function(text, done)
           if hud then hud[3].text = text end
           if done then
-            hs.timer.doAfter(4, guard("hud-close", function() M.hideHud() end))
+            afterHeld(4, guard("hud-close", function() M.hideHud() end))
           end
         end, { expectedLstart = target.lstart })
       end
@@ -525,7 +564,6 @@ local function buildHud()
 end
 
 local function raiseHud(offender, titleText)
-  buildHud()
   hudOffender = offender
   -- Capture the offender's start time at raise, so a Freeze/Force Quit click
   -- seconds later binds identity and cannot signal a pid reused meanwhile.
@@ -536,6 +574,11 @@ local function raiseHud(offender, titleText)
   hudInteracted = false
   hudHold = false
   hudShownAt = hs.timer.secondsSinceEpoch()
+  alertActive = true
+  -- Desktop alerts muted: the episode still arms (the unattended grace clock
+  -- runs on hudShownAt); only the canvas stays hidden.
+  if not alertsEnabled then return end
+  buildHud()
   hud:frame(hudFrame())
   hud[2].text = titleText or "Memory CRITICAL"
   hud[3].text = hudBodyText()
@@ -631,6 +674,8 @@ local function buildMenu()
     fn = function() hs.application.launchOrFocus("Activity Monitor") end }
   items[#items + 1] = { title = "Log snapshot now",
     fn = function() M.logSnapshot("manual") end }
+  items[#items + 1] = { title = string.format("Desktop alerts: %s", alertsEnabled and "on" or "off"),
+    fn = function() M.setAlertsEnabled(not alertsEnabled) end }
   items[#items + 1] = { title = string.format("LFM adjudication: %s",
       lfm.cfg.enabled
         and (lfmRemoteActive() and ("on (remote: " .. lfm.cfg.remoteModel .. ")")
@@ -643,6 +688,14 @@ local function buildMenu()
 end
 
 local function notifyCrit(m)
+  -- One banner per critical episode per offender: post on entry or when the
+  -- named offender changes, replace the previous banner instead of stacking
+  -- a new one, never re-post after a manual dismissal, and let alertSurfaces
+  -- withdraw it once the state settles below critical. The cooldown survives
+  -- only to damp offender flap.
+  if not alertsEnabled then return end
+  local pid = lastOffender and lastOffender.pid or 0
+  if critNotif and pid == critNotifPid then return end
   local now = os.time()
   if now - lastNotifyAt < core.cfg.notifyCooldownSec then return end
   lastNotifyAt = now
@@ -666,7 +719,9 @@ local function notifyCrit(m)
   -- Hammerspoon notifications are set to the Alerts style. The HUD is the
   -- dependable one-click surface; this is the breadcrumb.
   local off = lastOffender
-  hs.notify.new(guard("notify-action", function(notif)
+  if critNotif then pcall(function() critNotif:withdraw() end) end
+  critNotifPid = pid
+  critNotif = hs.notify.new(guard("notify-action", function(notif)
     if off and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
       M.killPid(off.pid, off.name)
     end
@@ -674,7 +729,7 @@ local function notifyCrit(m)
     title             = "Memory pressure: CRITICAL",
     subTitle          = sub,
     informativeText   = "Top: " .. table.concat(names, ", "),
-    withdrawAfter     = 0,      -- stays in Notification Center until dismissed
+    withdrawAfter     = 0,      -- no timer: withdrawn when the episode ends
     hasActionButton   = off ~= nil,
     actionButtonTitle = off and "Force Quit" or nil,
     -- intentionally no soundName: alerts are silent by design
@@ -779,7 +834,7 @@ local function alertSurfaces(state, now)
   if state == "critical" then
     hudBelowCritSince = nil
     local offender = lastOffender
-    local visible = hud and hud:isShowing()
+    local visible = alertActive
     if not visible then
       local newOffender = offender and (not hudOffender or hudOffender.pid ~= offender.pid)
       if (now - lastHudRaiseAt) >= core.cfg.cool.hudRaiseSec or newOffender then
@@ -788,11 +843,25 @@ local function alertSurfaces(state, now)
       end
     elseif not hudHold then
       hudOffender = offender or hudOffender
-      hud[3].text = hudBodyText()
+      if alertsEnabled then
+        if hud and hud:isShowing() then
+          hud[3].text = hudBodyText()
+        else
+          -- Alerts toggled back on mid-episode: surface the live episode now
+          -- without resetting the raise or grace clocks.
+          buildHud()
+          hud:frame(hudFrame())
+          hud[2].text = "Memory CRITICAL"
+          hud[3].text = hudBodyText()
+          hud:show()
+        end
+      end
     end
     notifyCrit(lastMetrics)
-    -- Unattended action: opt-in, extreme growers only, HUD unanswered for
-    -- the grace window, once per offender. The LFM (when enabled and warm)
+    -- Unattended action: opt-in, extreme growers only, the alert episode
+    -- unanswered for the grace window, once per offender. With desktop
+    -- alerts muted the episode still arms and counts the same clock:
+    -- muted-and-unanswered is unanswered. The LFM (when enabled and warm)
     -- refines the action within the mode ceiling via the async verdict
     -- cache; with no fresh verdict the deterministic policy acts exactly as
     -- the legacy autoKill did. Both paths execute through the same signal
@@ -804,7 +873,7 @@ local function alertSurfaces(state, now)
     -- before the same offender is adjudicated again.
     local mode = core.resolveUnattended(core.cfg)
     if mode ~= "off" and offender and offender.kind == "extreme"
-       and hud and hud:isShowing() and not hudInteracted and not hudHold
+       and alertActive and not hudInteracted and not hudHold
        and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec then
       -- Bind the offender's start time BEFORE reading the fired/streak state:
       -- a same-name pid reuse (a new node/python reusing the pid) must NOT
@@ -824,17 +893,23 @@ local function alertSurfaces(state, now)
       M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
         action, offender.name, offender.pid, adjudicator))
       writeDecisionOutcome(offender, action, adjudicator, rationale, rails, extra)
-      hs.notify.new({ title = "memwatch unattended " .. action,
-                      subTitle = string.format("%s (pid %d)", offender.name, offender.pid),
-                      informativeText = (adjudicator == "lfm")
-                        and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
-                        or "Extreme runaway, no response to the alert.",
-                      withdrawAfter = 0 }):send()
+      -- A freeze/terminate receipt always notifies, even with desktop alerts
+      -- muted: memwatch changed the operator's processes, and silence there
+      -- turns a muted alert into a mystery hang. A wait is commentary: it
+      -- respects the mute and cleans itself up.
+      if action ~= "wait" or alertsEnabled then
+        hs.notify.new({ title = "memwatch unattended " .. action,
+                        subTitle = string.format("%s (pid %d)", offender.name, offender.pid),
+                        informativeText = (adjudicator == "lfm")
+                          and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
+                          or "Extreme runaway, no response to the alert.",
+                        withdrawAfter = (action == "wait") and 25 or 0 }):send()
+      end
       if action ~= "wait" then
         hudHold = true
         local narrate = function(text, done)
           if hud then hud[3].text = "AUTO: " .. text end
-          if done then hs.timer.doAfter(6, guard("hud-close", function() M.hideHud() end)) end
+          if done then afterHeld(6, guard("hud-close", function() M.hideHud() end)) end
         end
         -- The bound start time also protects the autonomous signal (and its
         -- TERM->KILL escalation seconds later) from acting on a pid reused
@@ -850,11 +925,14 @@ local function alertSurfaces(state, now)
       end
     end
   else
-    if hud and hud:isShowing() then
-      hudBelowCritSince = hudBelowCritSince or now
-      if (now - hudBelowCritSince) >= 10 and not hudHold then M.hideHud() end
-    else
-      hudBelowCritSince = nil
+    hudBelowCritSince = hudBelowCritSince or now
+    local settled = (now - hudBelowCritSince) >= 10
+    if alertActive and settled and not hudHold then M.hideHud() end
+    -- The critical banner lives exactly as long as the episode: withdraw it
+    -- once the state settles below critical, even if the HUD went earlier.
+    if critNotif and settled then
+      pcall(function() critNotif:withdraw() end)
+      critNotif, critNotifPid = nil, nil
     end
   end
 end
@@ -901,14 +979,14 @@ local function tick()
       lastStaleLogAt = now
       M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
     end
-    if (sig.kernWarn or sig.availLow) and (now - lastStaleNotifyAt) > 300 then
+    if alertsEnabled and (sig.kernWarn or sig.availLow) and (now - lastStaleNotifyAt) > 300 then
       lastStaleNotifyAt = now
       hs.notify.new({
         title           = "memwatch degraded during pressure",
         subTitle        = string.format("process attribution stale %.0fs \u{00B7} avail %.0f%%",
                                         now - lastSampleAt, m.availPct),
         informativeText = "The system gauge is live but per-process detection is not. Open Activity Monitor if pressure climbs.",
-        withdrawAfter   = 0,
+        withdrawAfter   = 30,   -- re-posts every 300s while degraded; self-cleaning
       }):send()
     end
   end
@@ -1067,6 +1145,8 @@ local function frozenReconcile()
   end
   saveFrozen()
   if #survivors > 0 then
+    -- Action receipt: deliberately ignores the desktop-alerts mute. Processes
+    -- are still frozen from a previous session; the operator must know.
     hs.notify.new({
       title = "memwatch: frozen processes persist",
       subTitle = table.concat(survivors, ", "):sub(1, 100),
@@ -1144,7 +1224,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   }
   saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
-  hs.timer.doAfter(0.5, guard("freeze-verify", function()
+  afterHeld(0.5, guard("freeze-verify", function()
     -- Re-probe IDENTITY after the signal, not just the stop state: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
     -- would have stopped the WRONG (new) process. If it stopped but its
@@ -1188,7 +1268,7 @@ function M.resumePid(pid, onUpdate)
     return
   end
   sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
-  hs.timer.doAfter(0.5, guard("resume-verify", function()
+  afterHeld(0.5, guard("resume-verify", function()
     if pidState(pid) ~= "T" then
       frozen[pid] = nil
       saveFrozen()
@@ -1250,7 +1330,7 @@ writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails,
   -- availability trajectory after the action.
   local pid = offender.pid
   local availBefore = math.floor(lastMetrics.availPct or 0)
-  hs.timer.doAfter(60, guard("ledger-outcome", function()
+  afterHeld(60, guard("ledger-outcome", function()
     local fate
     if not pidAlive(pid) then fate = "exited"
     elseif pidState(pid) == "T" then fate = "frozen"
@@ -1445,7 +1525,7 @@ local function retireLfmServer(reason)
   end
   signalTargets("TERM")
   local deadline = hs.timer.secondsSinceEpoch() + 5
-  hs.timer.doUntil(
+  untilHeld(
     function()
       -- Success requires the tracked pid gone AND our hold on the port
       -- released: the port counts as released if it is free OR now held by
@@ -1567,7 +1647,7 @@ local function spawnLfmServer()
   -- Health poll to ready, with the listener-ownership check: the pid bound
   -- to our port must be our child (or its direct descendant via taskpolicy).
   local healthDeadline = hs.timer.secondsSinceEpoch() + 60
-  hs.timer.doUntil(
+  untilHeld(
     function()
       if not lfmServerTask then return true end -- died; exit callback logged it
       if hs.timer.secondsSinceEpoch() > healthDeadline then
@@ -1774,7 +1854,7 @@ local function dispatchAdjudication(offender, why)
   -- server, so the latch alone hands the episode to the deterministic
   -- policy.
   local deadline = remote and lfm.cfg.remoteTimeoutSec or lfm.cfg.timeoutSec
-  hs.timer.doAfter(deadline, guard("lfm-timeout", function()
+  afterHeld(deadline, guard("lfm-timeout", function()
     if lfmInFlight and lfmInFlight.nonce == nonce then
       M.logSnapshot(string.format("lfm-timeout:nonce=%d:%.0fs", nonce, deadline))
       lfmInFlight = nil
@@ -1835,11 +1915,13 @@ lfmTick = function(state, now, interesting)
         if footprintMB > lfm.cfg.maxServerMB then
         M.logSnapshot(string.format("lfm-self-police:footprint=%dMB(rss=%d+cmprs=%d)>cap=%dMB",
           math.floor(footprintMB), math.floor(p.rssMB or 0), math.floor(cmprsMB), lfm.cfg.maxServerMB))
-        hs.notify.new({ title = "memwatch: adjudicator over budget",
-          informativeText = string.format(
-            "llama-server hit %d MB (cap %d); killed and latched offline.",
-            math.floor(footprintMB), lfm.cfg.maxServerMB),
-          withdrawAfter = 0 }):send()
+        if alertsEnabled then
+          hs.notify.new({ title = "memwatch: adjudicator over budget",
+            informativeText = string.format(
+              "llama-server hit %d MB (cap %d); killed and latched offline.",
+              math.floor(footprintMB), lfm.cfg.maxServerMB),
+            withdrawAfter = 30 }):send()
+        end
         retireLfmServer("self-police")
         lfmOffline = true
         return
@@ -1968,7 +2050,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
-  hs.timer.doAfter(k.escalateSec, guard("kill-escalate", function()
+  afterHeld(k.escalateSec, guard("kill-escalate", function()
     if pidAlive(pid) then
       -- Re-validate FULL identity (name AND the start time bound above)
       -- before SIGKILL: between TERM and this escalation the original may
@@ -1983,7 +2065,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
         M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
       end
     end
-    hs.timer.doAfter(k.verifySec + k.settleSec, guard("kill-verify", function()
+    afterHeld(k.verifySec + k.settleSec, guard("kill-verify", function()
       local gone = not pidAlive(pid)
       local m = readMetrics()
       local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
@@ -2141,7 +2223,7 @@ function M.test(level, seconds)
     -- Clicking Force Quit here is safe: pid 99999 probes as already exited.
     raiseHud(lastOffender, "Memory CRITICAL (self-test)")
   end
-  hs.timer.doAfter(dur, guard("test-resume", function()
+  afterHeld(dur, guard("test-resume", function()
     M.hideHud()
     lastOffender = nil
     smState = core.newSMState(hs.timer.secondsSinceEpoch())
@@ -2149,7 +2231,8 @@ function M.test(level, seconds)
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
     tick()                                                -- revert to the real state
   end))
-  return string.format("memwatch.test(%s) running for %ds (live sampling paused)", state, dur)
+  return string.format("memwatch.test(%s) running for %ds (live sampling paused)%s",
+    state, dur, alertsEnabled and "" or " [desktop alerts off: no HUD or banner]")
 end
 
 -- Full alert-surface demo with a synthetic runaway: red title, HUD, and
@@ -2167,7 +2250,7 @@ function M.simulate(seconds)
   applyFlash("critical")
   if not flashTimer then renderTitleNow() end
   raiseHud(fake, "Runaway process (simulation)")
-  hs.timer.doAfter(dur, guard("simulate-end", function()
+  afterHeld(dur, guard("simulate-end", function()
     M.hideHud()
     lastOffender = nil
     smState = core.newSMState(hs.timer.secondsSinceEpoch())
@@ -2175,7 +2258,8 @@ function M.simulate(seconds)
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
     tick()
   end))
-  return string.format("memwatch.simulate running for %ds (live sampling paused)", dur)
+  return string.format("memwatch.simulate running for %ds (live sampling paused)%s",
+    dur, alertsEnabled and "" or " [desktop alerts off: no HUD or banner]")
 end
 
 -- One-shot live remote-adjudicator probe: runs a synthetic critical snapshot
@@ -2256,6 +2340,24 @@ function M.report(public)
   if not out then return "report failed: " .. tostring(err) end
   sh(string.format("/usr/bin/open %q", out))
   return "report opened: " .. out
+end
+
+-- Toggle the desktop alert surfaces (the HUD panel and notification banners)
+-- from the menu or the CLI; persists to the local config so the choice
+-- survives reloads. Muting hides alerts only: the menu-bar state icon, the
+-- log, the unattended engine (its grace clock runs on the muted episode),
+-- and action receipts (autonomous freeze/quit, surviving frozen processes)
+-- all keep working.
+function M.setAlertsEnabled(on)
+  alertsEnabled = on == true
+  if not alertsEnabled then
+    if hud then hud:hide() end   -- clear the popup; the episode stays armed
+    if critNotif then pcall(function() critNotif:withdraw() end) end
+    critNotif, critNotifPid = nil, nil
+  end
+  saveLocalConfig()
+  M.logSnapshot("alerts-" .. (alertsEnabled and "enabled" or "disabled"))
+  return alertsEnabled
 end
 
 -- Toggle the LFM adjudicator from the menu or the CLI; persists to the

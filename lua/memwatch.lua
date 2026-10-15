@@ -1046,7 +1046,9 @@ local function tick()
       lastStaleLogAt = now
       M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
     end
-    if alertsEnabled and (sig.kernWarn or sig.availLow) and (now - lastStaleNotifyAt) > 300 then
+    -- Not muted: with desktop alerts off, this page is the only sign that
+    -- memwatch has gone blind while pressure is up.
+    if (sig.kernWarn or sig.availLow) and (now - lastStaleNotifyAt) > 300 then
       lastStaleNotifyAt = now
       hs.notify.new({
         title           = "memwatch degraded during pressure",

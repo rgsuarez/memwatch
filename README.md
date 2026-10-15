@@ -106,7 +106,9 @@ notifications are set to the Alerts style; the HUD is the dependable surface.
 banners only: the menu-bar state icon, logging, and the unattended engine
 stay live, and action receipts (an autonomous freeze/quit, frozen processes
 surviving a reload, the adjudicator killed for exceeding its memory budget)
-still notify. Unmuting during an episode restores its HUD and banner.
+still notify, as does the page that says per-process detection has gone
+stale while pressure is up. Unmuting during an episode restores its HUD and
+banner.
 
 The dropdown menu shows the state and its cause, kernel level, live rates,
 headroom, top-5 processes by true weight (each with Force Quit / Ignore

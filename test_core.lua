@@ -283,6 +283,14 @@ do
     wide.lo <= 900 and wide.hi >= 900, true)
   local narrow = procs.startWindow(105, 1000, 906, 0)
   check("without the widening that start falls outside (control)", narrow.hi < 900, true)
+  -- (round 11) The lower bound widens too. Launched at 1000, a 6 s step back
+  -- at 1000.5, ps read at 1001 (the clock reads 995, so etime is 100 for a
+  -- start at 895) and delivered at 1004 on the new clock: the start sits
+  -- below the unwidened window.
+  local wideLo = procs.startWindow(100, 1000, 1004, 6)
+  check("the lower bound widens by the step too (ps read after it)", wideLo.lo <= 895 and wideLo.hi >= 895, true)
+  check("without the widening that start falls below the window (control)",
+    procs.startWindow(100, 1000, 1004, 0).lo > 895, true)
   check("a window is placed with the raw wall reading, not the callback's basis",
     trStep.procs[11].startLo == 1867 and trStep.procs[11].startHi == 1870, true)
   check("and the sighting keeps memwatch's basis", trStep.procs[11].lastSeen, 2000)
@@ -2549,7 +2557,30 @@ do
   check("sampler glue: completeness comes from the exit code",
     src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time, and the raw delivery reading for its windows",
-    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, steppedSec or 0)", 1, true) ~= nil, true)
+    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, widenSec)", 1, true) ~= nil, true)
+  -- (round 11) A table whose launch record is gone widens the tracker's
+  -- windows by every step back so far: a bound on the steps since its launch.
+  check("sampler glue: a table without its launch record widens by every step back so far",
+    src:find("local widenSec = steppedSec or -(clock.stepTotal + clock.pending)", 1, true) ~= nil, true)
+  -- (round 11) Ages read the raw clock, at the runaways and from lstart.
+  check("ages glue: runaways' ages read the raw clock",
+    src:find("local rawAt = now + clock.pending", 1, true) ~= nil
+      and src:find("totalMB > 0 and totalMB or nil, rawAt)", 1, true) ~= nil, true)
+  check("ages glue: an lstart-derived start reads the raw clock",
+    src:find("observe.startFromLstart(extra.lstart, now + clock.pending)", 1, true) ~= nil, true)
+  -- (round 11) A record born after a step was seen, in the same held frame,
+  -- is closed when the frame ends, by the shift (and by the fold's own step
+  -- check after it, which is why no scenario tells the two apart): both the
+  -- shift and clock.onHeld close every collecting record.
+  do
+    local n = 0
+    for _ in src:gmatch("for _, ev in pairs%(obs%.pending%) do observe%.noteClockStep%(ev%) end") do n = n + 1 end
+    check("clock glue: the shift and the held-step hook both close every collecting record", n, 2)
+  end
+  -- (round 11) An alert is contained whole: the hs.alert lookup and its text
+  -- too, not only the display call.
+  check("alert glue: the alert call is contained whole",
+    src:find('pcall(function() hs.alert.show("memwatch: " .. tostring(text), sec or 2.5) end)', 1, true) ~= nil, true)
   -- The fake cannot build an unbound offender table beside a bound alert,
   -- so the recorded binding's fallback to the alert's is pinned by text.
   check("re-ask: a verdict records the alert's binding when its offender table is unbound",

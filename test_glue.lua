@@ -2237,6 +2237,57 @@ scenario("ledger: a table read before a step its delivery sees keeps identity", 
     fu[1] ~= nil and fu[1].fate ~= "exited", true)
 end)
 
+-- (round 11) A table whose launch record is gone: it was read before a step
+-- back, terminated by the watchdog but still delivered late (a fork stuck in
+-- the kernel), and 16 failed launches since evicted its record. The tracker
+-- windows it places widen by every step back so far, so the decision row
+-- that takes its start from them never reads the process as gone.
+scenario("ledger: a table without its launch record keeps identity across a step", nil, function(W, mw)
+  local row = toDecision(W, 4242)
+  if not row then check("recordless: decision row", false, true); return end
+  local tD = W.now
+  local attempts0 = W.samplerStartAttempts or 0
+  -- The next launch (table k) reads 3 s after its launch and delivers 105 s
+  -- after it; the watchdog lets it go at 20 s, and it still delivers.
+  W.samplerReadDelay, W.samplerDelay, W.terminatedStillDelivers = 3, 105, true
+  runUntil(W, 10, function() return (W.samplerStartAttempts or 0) > attempts0 end)
+  local launchK = W.now
+  W.samplerReadDelay, W.samplerDelay = nil, nil
+  W.samplerStartFails = true          -- every launch after it fails to start
+  W.run(4)                            -- ps reads its table
+  -- Then the clock steps back further than the table has left to fly (102
+  -- s), so its delivery reads earlier than its read: unwidened, its window
+  -- ends before the process's start.
+  W.wallOffset = (W.wallOffset or 0) - 200
+  local deliveredK
+  W.onSamplerDeliver = function() deliveredK = W.now; W.onSamplerDeliver = nil end
+  runUntil(W, 110, function() return deliveredK ~= nil end)
+  check("recordless: the step was taken out (control)", logHas(W, "clock-stepped-back:200s"), true)
+  check("recordless: table k delivered late (control)", deliveredK ~= nil and deliveredK - launchK > 100, true)
+  check("recordless: 16 launches failed after it, so its record is gone (control)",
+    (W.samplerStartAttempts or 0) - attempts0 - 1 >= 16, true)
+  W.terminatedStillDelivers = nil
+  -- The next decision row, the first written after table k, takes its start
+  -- from the tracker as k left it.
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not before[r.seq] then nextRow = nextRow or r end
+    end
+    return nextRow ~= nil
+  end)
+  check("recordless: a decision row after table k (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  W.samplerStartFails = false         -- tables flow again, read on the new clock
+  if not nextRow then return end
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("recordless: its follow-up came", fu[1] ~= nil, true)
+  check("recordless: and never reads the process gone (" .. tostring(fu[1] and fu[1].fate) .. ")",
+    fu[1] ~= nil and fu[1].fate ~= "exited", true)
+end)
+
 -- (round 9) The jetsam blind ceiling is a raw file time: a second step back
 -- never lowers it, so a report from before the first step is never counted
 -- by an observation written before the clock catches up with it.
@@ -4586,6 +4637,27 @@ scenario("a kill refused over the name alone keeps a stopped process's entry", n
   check("name-refuse: nothing was signaled after the freeze", W.signalsTo(4242), "STOP")
   check("name-refuse: the process stays stopped", W.procs[4242] and W.procs[4242].state, "T")
   check("name-refuse: and keeps its row to resume it from", W.menuItem("   node") ~= nil, true)
+end)
+
+-- (round 11) Its counterpart: a Force Quit refused because the pid now holds
+-- another process (the frozen one is gone) drops the gone process's entry,
+-- and signals the newcomer nothing.
+scenario("a kill refused because the pid holds another process drops the gone one's entry", nil, function(W, mw)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.click("freeze")
+  W.run(3)
+  check("reuse-refuse: frozen (control)", mw.debug().frozenCount, 1)
+  W.reusePid(4242, "node", 9000)    -- the frozen node exits; a newer node takes the pid
+  W.run(1)
+  mw.killPid(4242, "node")
+  -- At once, by the refusal itself (a later tick's prune would drop it too).
+  check("reuse-refuse: refused (control)", logHas(W, "kill-refuse"), true)
+  check("reuse-refuse: the gone process's entry is dropped by the refusal", mw.debug().frozenCount, 0)
+  W.run(3)
+  check("reuse-refuse: the newcomer is signaled nothing", W.signalsTo(4242), "STOP")
 end)
 
 

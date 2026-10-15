@@ -414,11 +414,12 @@ function F.new()
           t.delivery = addTimer("after", W.samplerDelay or 0.05, nil, function()
             if t.done then return end
             t.done = true
-            W.samplersLive = W.samplersLive - 1
+            if not t.terminated then W.samplersLive = W.samplersLive - 1 end
             if W.onSamplerDeliver then W.onSamplerDeliver() end
             blob = blob or samplerBlob()
             if streamCb then streamCb(t, blob) end
-            exitCb(W.samplerExit or 0, "", "")   -- nonzero: ps failed or was cut off mid-table
+            -- nonzero: ps failed or was cut off mid-table; 15: it was terminated
+            exitCb(t.terminated and 15 or (W.samplerExit or 0), "", "")
           end)
         end
         -- The streaming top: with topEmits set, one block every 5 s naming
@@ -447,8 +448,12 @@ function F.new()
         -- terminateCallsBack it also reports at once, as SIGTERM ends it:
         -- exit 15, its table lost.
         if t.sampler and not t.done then
-          t.done = true
           W.samplersLive = W.samplersLive - 1
+          -- terminatedStillDelivers: a fork stuck in the kernel takes the TERM
+          -- only when it runs again, and then reports the table it read, late,
+          -- exit 15 (memwatch has let it go: it no longer counts as running).
+          if W.terminatedStillDelivers then t.terminated = true; return end
+          t.done = true
           if W.terminateCallsBack then
             if t.delivery then t.delivery:stop() end
             addTimer("after", 0.05, nil, function() exitCb(15, "", "") end)

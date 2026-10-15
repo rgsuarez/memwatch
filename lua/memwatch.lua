@@ -638,9 +638,16 @@ end
 local function identityRefused(target)
   if not target or not target.pid then return end
   hudStalePid = target.pid
+  -- Only the refused process's own records go: a record already made for
+  -- the process now holding the pid is that process's, not this one's.
   local k = procKey(target)
-  if k then exposure[k], interacted[k] = nil, nil end
+  if recordFor(exposure, target, false) then exposure[k] = nil end
+  if recordFor(interacted, target, false) then interacted[k] = nil end
+  -- The banner goes only when it names the refused process: the same pid
+  -- and name, and its start time when both are known. A banner already
+  -- bound to the process now holding the pid stays.
   if critNotif and critNotifOff and critNotifOff.pid == target.pid
+     and core.sameName(critNotifOff.name, target.name)
      and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then
     pcall(function() critNotif:withdraw() end)
     critNotif, critNotifOff = nil, nil
@@ -1020,6 +1027,9 @@ local function notifyCrit(m)
                                  bannerHandled = critNotifOff ~= nil and isAnswered(critNotifOff, now),
                                  sinceLastPostSec = now - lastNotifyAt,
                                  cooldownSec = core.cfg.notifyCooldownSec })
+  -- The banner being replaced, read before the withdrawal below clears it:
+  -- an in-place replace upgrades this banner's own history record.
+  local wasBanner = critNotifOff
   if (step.withdraw or step.replace) and critNotif then
     pcall(function() critNotif:withdraw() end)
     critNotif, critNotifOff = nil, nil
@@ -1054,7 +1064,6 @@ local function notifyCrit(m)
   -- announcement: the banner's history record (the very table posted) takes
   -- the newly bound identity, rather than leaving an unbound record behind.
   -- A new post adds one record; nothing is ever recorded twice.
-  local wasBanner = critNotifOff
   critNotifOff = off and { pid = off.pid, name = off.name, lstart = lstart, kind = off.kind,
                            canAct = canAct } or nil
   if step.replace and wasBanner and critNotifOff and wasBanner.lstart == nil and lstart ~= nil
@@ -2811,6 +2820,7 @@ function M.debug()
     watch          = titleSnap.watchName,
     unattended     = core.resolveUnattended(core.cfg),
     frozenCount    = (function() local n = 0; for _ in pairs(frozen) do n = n + 1 end; return n end)(),
+    bannerRecords  = #critNotified,   -- this episode's banner history
     protectedPids  = (function()
                        local t = {}
                        for pid in pairs(protectedPids) do t[#t + 1] = pid end

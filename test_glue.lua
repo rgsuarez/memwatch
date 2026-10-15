@@ -80,7 +80,7 @@ scenario("banner follows the named offender", nil, function(W)
 end)
 
 -- ---- banner: an unbound banner gains its action once identity binds ----
-scenario("banner upgrades when identity binds", nil, function(W)
+scenario("banner upgrades when identity binds", nil, function(W, mw)
   leaker(W, 4242)
   W.run(12)
   W.probeFails = true
@@ -90,12 +90,41 @@ scenario("banner upgrades when identity binds", nil, function(W)
   local live = W.liveBanners()
   check("bind: with probes failing the banner offers no Force Quit",
     live[1] ~= nil and live[1].attrs.hasActionButton ~= true, true)
+  local records = mw.debug().bannerRecords
   W.probeFails = false
   W.run(40)
   live = W.liveBanners()
   check("bind: once probes recover the banner offers Force Quit",
     live[1] ~= nil and live[1].attrs.hasActionButton == true, true)
   check("bind: still one live banner", #live, 1)
+  check("bind: the upgrade adds no second history record", mw.debug().bannerRecords, records)
+end)
+
+-- ---- identity: a refusal keeps a banner bound to the pid's new process ----
+-- A Force Quit built while a process was unbound is clicked after another
+-- process, under another name, took its pid and earned a bound banner.
+scenario("a refusal keeps another process's banner", nil, function(W)
+  leaker(W, 4242, "nodeA")
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "nodeA") end)
+  W.run(6)
+  local stale = W.menuItem("Force Quit nodeA")
+  check("refusal: the offender item was built unbound", stale ~= nil and stale.fn ~= nil, true)
+  W.reusePid(4242, "nodeB", 2000)
+  W.grow(4242, 220)
+  W.probeFails = false
+  local function nodeBBanner()
+    local live = W.liveBanners()
+    return #live == 1 and (live[1].attrs.subTitle or ""):find("nodeB", 1, true) ~= nil
+      and live[1].attrs.hasActionButton == true
+  end
+  check("refusal: nodeB earns a bound banner", runUntil(W, 400, nodeBBanner), true)
+  stale.fn()
+  W.run(1)
+  check("refusal: the stale click signals nothing", W.signalsTo(4242), "")
+  check("refusal: nodeB's banner survives a refusal naming nodeA", nodeBBanner(), true)
 end)
 
 -- ---- identity: an unbound HUD refuses instead of signaling by name ----

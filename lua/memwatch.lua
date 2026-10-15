@@ -759,8 +759,10 @@ end
 -- would drop exactly the process this tool exists to catch. ~600 rows parse
 -- in well under a millisecond. No -m: we sort ourselves, and ps's
 -- memory-sort is precisely the work that crawls when the system is dying.
+-- etime rides the same fork (no new process): it gives every pid a real age,
+-- which the adjudicator snapshot and the observation ledger carry as ageSec.
 local SAMPLER_CMD = "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level vm.swapusage; "
-                 .. "/bin/ps -Axo pid,uid,rss,comm"
+                 .. "/bin/ps -Axo pid,uid,rss,etime,comm"
 local SAMPLE_WATCHDOG_SEC = 20
 local SAMPLE_STALE_SEC    = 30
 

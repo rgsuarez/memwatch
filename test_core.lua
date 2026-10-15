@@ -211,6 +211,47 @@ check("ps comm keeps spaces", procs.friendlyName(psList[1].comm), "Google Chrome
 check("ps uid parsed", psList[3].uid, 88)
 check("friendlyName bare", procs.friendlyName("claude"), "claude")
 
+-- ---- procs: etime and process age (the sampler's ps carries etime) ----
+check("etime mm:ss", procs.parseEtime("00:07"), 7)
+check("etime hh:mm:ss", procs.parseEtime("01:02:03"), 3723)
+check("etime dd-hh:mm:ss", procs.parseEtime("2-03:04:05"), 2 * 86400 + 3 * 3600 + 4 * 60 + 5)
+check("etime garbage is unknown, never fabricated", procs.parseEtime("Tue"), nil)
+local psEtBlob = [[
+1
+total = 9216.00M  used = 7987.06M  free = 1228.94M  (encrypted)
+  PID   UID    RSS     ELAPSED COMM
+  771   502 509728    01:23:45 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)
+  118   502 489904       00:40 claude
+    1     0  18656 01-15:24:11 /sbin/launchd
+]]
+local psEt = procs.parsePsList(psEtBlob)
+check("etime rows parsed", #psEt, 3)
+check("etime age parsed", psEt[2].etimeSec, 40)
+check("etime hour form parsed, not swallowed into comm", psEt[1].etimeSec, 3600 + 23 * 60 + 45)
+check("etime hour-form comm is the path", psEt[1].comm:sub(1, 14), "/Applications/")
+check("etime day form", psEt[3].etimeSec, 86400 + 15 * 3600 + 24 * 60 + 11)
+check("etime comm keeps spaces", procs.friendlyName(psEt[1].comm), "Google Chrome Helper (Renderer)")
+check("legacy four-column rows parse with unknown age", psList[1].etimeSec, nil)
+do
+  -- A young allocator climbing 1 GB per 5 s tick: the runaway carries its
+  -- live age, so the snapshot finally says "40 s old", not nothing.
+  local tr = procs.newTracker()
+  for i = 0, 6 do
+    procs.update(tr, { { pid = 4242, uid = 502, rssMB = 1000 + i * 1000,
+                         etimeSec = 40 + i * 5, comm = "python3" } }, 1000 + i * 5, nil)
+  end
+  local runs = procs.runaways(tr, 1030, "elevated", 36 * 1024)
+  check("runaway is extreme", runs[1] and runs[1].kind, "extreme")
+  check("runaway carries live age", runs[1] and runs[1].ageSec, 70)
+  local ranked = procs.rankByWeight({ { pid = 7, uid = 502, rssMB = 9000,
+                                        etimeSec = 86400, comm = "VirtualMachine" } }, nil, 5)
+  local off = procs.pickOffender({}, ranked, "critical", nil)
+  check("hog fallback carries age", off and off.ageSec, 86400)
+  local trNoAge = procs.newTracker()
+  procs.update(trNoAge, { { pid = 9, uid = 502, rssMB = 100, comm = "x" } }, 1000, nil)
+  check("no etime means no age", trNoAge.procs[9].startedAt, nil)
+end
+
 local topBlob = [[
 PhysMem: 34G used (11G wired, 9279M compressor), 671M unused.
 PID    COMMAND          MEM   CMPRS

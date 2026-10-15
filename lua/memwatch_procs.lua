@@ -56,20 +56,47 @@ M.cfg = {
   absFrac            = 0.40,  -- fraction of total RAM
 }
 
--- Parse `ps -Axo pid,uid,rss,comm -m` rows out of the sampler blob. Lines
+-- ps's elapsed-time column (`etime`, "[[dd-]hh:]mm:ss"; macOS ps has no
+-- `etimes`) to seconds. Returns nil for anything else, so a malformed field
+-- reads as "age unknown", never as a fabricated age.
+function M.parseEtime(s)
+  if type(s) ~= "string" then return nil end
+  local d, h, m, sec = s:match("^(%d+)%-(%d+):(%d+):(%d+)$")
+  if not d then
+    d = 0
+    h, m, sec = s:match("^(%d+):(%d+):(%d+)$")
+    if not h then
+      h = 0
+      m, sec = s:match("^(%d+):(%d+)$")
+      if not m then return nil end
+    end
+  end
+  return tonumber(d) * 86400 + tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(sec)
+end
+
+-- Parse `ps -Axo pid,uid,rss,etime,comm` rows out of the sampler blob. Lines
 -- that do not look like a process row (the sysctl lines, the header) are
--- skipped. rss arrives in KB; comm is the remainder of the line and may
--- contain spaces.
+-- skipped. rss arrives in KB; etime becomes etimeSec (process age); comm is
+-- the remainder of the line and may contain spaces. The four-column shape
+-- without etime still parses (etimeSec nil), so older fixtures and a sampler
+-- that lost the column degrade to "age unknown" rather than to garbage.
 function M.parsePsList(text)
   local list = {}
   for line in (text or ""):gmatch("[^\n]+") do
-    local pid, uid, rss, comm = line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+    local pid, uid, rss, et, comm =
+      line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+([%d%-:]+)%s+(.+)$")
+    local etimeSec = et and M.parseEtime(et) or nil
+    if not pid or not etimeSec then
+      pid, uid, rss, comm = line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+      etimeSec = nil
+    end
     if pid then
       list[#list + 1] = {
-        pid   = tonumber(pid),
-        uid   = tonumber(uid),
-        rssMB = tonumber(rss) / 1024,
-        comm  = comm,
+        pid      = tonumber(pid),
+        uid      = tonumber(uid),
+        rssMB    = tonumber(rss) / 1024,
+        etimeSec = etimeSec,
+        comm     = comm,
       }
     end
   end
@@ -154,7 +181,13 @@ function M.newTracker(cfg)
 end
 
 -- Feed one ps snapshot into the tracker. pid reuse is detected by a comm
--- change (ps has no etimes on this macOS), which resets that pid's history.
+-- change, which resets that pid's history. etime (when the sampler carries
+-- it) fixes each pid's start time, so consumers get a real process age
+-- (ageSec) instead of none. Start time is deliberately NOT used to detect
+-- reuse here: it is estimated from the callback time, and under storm
+-- latency jitter a young runaway could falsely read as a new process and
+-- lose its growth history mid-incident. Signal paths re-validate identity
+-- with lstart anyway.
 --
 -- Rings hold FOOTPRINT WEIGHT (rss + this pid's compressed size from the
 -- most recent top sample, sticky between top refreshes), not raw RSS. A
@@ -185,6 +218,7 @@ function M.update(tr, psList, now, topMap)
       if t then e.cmprsMB = t.cmprsMB end
       local w = p.rssMB + (e.cmprsMB or 0)
       e.uid, e.lastSeen, e.rssMB, e.weightMB = p.uid, now, p.rssMB, w
+      if p.etimeSec then e.startedAt = now - p.etimeSec end
       local ring = e.ring
       ring[#ring + 1] = { t = now, v = w }
       if #ring > cfg.windowSamples then table.remove(ring, 1) end
@@ -305,6 +339,7 @@ function M.runaways(tr, now, systemState, totalMB)
         out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,
                           rssMB = e.rssMB or 0, weightMB = e.weightMB or e.rssMB or 0,
                           slopeMBmin = slope, peakSlopeMBmin = e.peakSlopeMBmin or 0,
+                          ageSec = e.startedAt and math.max(0, math.floor(now - e.startedAt)) or nil,
                           kind = kind }
       end
     end
@@ -331,6 +366,7 @@ function M.rankByWeight(psList, topMap, n)
     rows[#rows + 1] = {
       pid = p.pid, uid = p.uid, comm = p.comm, name = M.friendlyName(p.comm),
       rssMB = p.rssMB, cmprsMB = cmprs, weightMB = p.rssMB + cmprs,
+      ageSec = p.etimeSec and math.floor(p.etimeSec) or nil,
     }
   end
   table.sort(rows, function(a, b) return a.weightMB > b.weightMB end)
@@ -368,7 +404,7 @@ function M.pickOffender(runawayList, ranked, systemState, peakFn)
     local h = ranked[1]
     return { pid = h.pid, name = h.name, comm = h.comm, uid = h.uid,
              rssMB = h.rssMB, weightMB = h.weightMB, kind = "hog",
-             slopeMBmin = 0,
+             slopeMBmin = 0, ageSec = h.ageSec,
              peakSlopeMBmin = peakFn and peakFn(h.pid) or 0 }, nil
   end
   return nil, nil

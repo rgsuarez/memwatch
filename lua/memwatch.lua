@@ -2179,6 +2179,9 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       end
     elseif not reprobe then
       if ours then
+        -- This CONT undoes a STOP that reached the pid's next process (or
+        -- none): it is no signal to the process the freeze verified, so the
+        -- observation ledger does not record it.
         if stopSent then send("CONT", pid) end
         frozen[pid] = nil
         saveFrozen()
@@ -2242,6 +2245,7 @@ function M.resumePid(pid, onUpdate)
     onUpdate(string.format("couldn't send CONT to %s; it stays frozen, try again", e.name or tostring(pid)), true)
     return
   end
+  obs.noteSignal(pid, "resume", proc)
   afterHeld(0.5, guard("resume-verify", function()
     local again, awhy = resolveSignalTarget(pid, e.name, e.lstart)
     if awhy == "unverified" then
@@ -3328,6 +3332,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- wait before SIGKILL. Continue it first so the graceful signal can land.
   local contSent = false
   if frozenEntry or core.isStopped(proc) then contSent = send("CONT", pid) end
+  if contSent then obs.noteSignal(pid, "continue", proc) end
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   if not send("TERM", pid) then
@@ -3335,6 +3340,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
     -- again (its ledger entry still true); if that cannot be sent either, it
     -- runs, its entry goes, and that is said.
     if contSent and send("STOP", pid) then
+      obs.noteSignal(pid, "freeze", proc)
       onUpdate(string.format("couldn't send TERM to %s; it was stopped again", liveName), true, "unverified")
     elseif contSent then
       dropOwnEntry(pid, proc.lstart)

@@ -1883,7 +1883,9 @@ scenario("ledger: freeze then terminate, and menu touches", nil, function(W)
   local fu = followups(W, row.seq)
   check("signals: +60 reports the freeze", fu[1] and fu[1].memwatchSignalSince, "freeze")
   check("signals: +180 reports the terminate after it", fu[3] and fu[3].memwatchSignalSince, "terminate")
-  check("signals: and counts both", fu[3] and fu[3].memwatchSignalCount, 2)
+  -- The freeze, the CONT a Force Quit sends a frozen process before its
+  -- TERM, and the TERM.
+  check("signals: and counts all three", fu[3] and fu[3].memwatchSignalCount, 3)
   check("signals: the HUD click and the menu Force Quit are both touches",
     fu[3] and fu[3].operatorTouchesSince, 2)
 end)

@@ -2126,7 +2126,14 @@ do
     recordedAtSend(freezeBody, 'local stopSent = send("STOP", pid)\n  if stopSent then',
       'obs.noteSignal(pid, "freeze", proc)'), true)
   local _, recordSites = src:gsub('noteSignal%(pid, "', "")
-  check("signals glue: only the two signal sites record", recordSites, 2)
+  check("signals glue: the five signal sites record (freeze, re-freeze, continue, terminate, resume)",
+    recordSites, 5)
+  for _, site in ipairs({ 'if contSent then obs.noteSignal(pid, "continue", proc) end',
+                          'if contSent and send("STOP", pid) then\n      obs.noteSignal(pid, "freeze", proc)',
+                          'obs.noteSignal(pid, "resume", proc)' }) do
+    check("signals glue: recorded after a successful send: " .. site:sub(1, 48),
+      src:find(site, 1, true) ~= nil, true)
+  end
   check("signals glue: no pid-keyed signal record remains", src:find("memwatchSignals", 1, true), nil)
   check("observe glue: follow-ups report the last signal to the observed process by the horizon",
     body:find("local sig = at.signal", 1, true) ~= nil

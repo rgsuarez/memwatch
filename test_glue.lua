@@ -941,6 +941,27 @@ scenario("a toggle that cannot be saved says so", '{"unattended":"off","remoteSe
   check("toggle: the operator is told the setting lasts only until reload", said, true)
 end)
 
+-- ---- narratives: a hold that never ends is released ----
+-- A fork that fails mid-action (here the kill itself) ends the narrative
+-- without its last update. The alert must not stay frozen in that hold.
+scenario("a stuck narrative hold is released", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.killRaises = true               -- the probe answers; the kill itself cannot fork
+  W.click("kill")
+  W.killRaises = false
+  W.run(5)
+  check("hold: the narrative is stuck mid-action", W.hudBody():find("terminating", 1, true) ~= nil, true)
+  check("hold: the alert comes back to live numbers after the deadline",
+    runUntil(W, 60, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end), true)
+  W.click("kill")
+  W.run(10)
+  check("hold: and acts again", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

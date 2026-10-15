@@ -228,9 +228,12 @@ function F.new()
 
   -- ---- the hs table ---------------------------------------------------------
   local hs = {
-    -- forkRaises models io.popen itself failing (hs.execute then raises).
+    -- forkRaises models io.popen itself failing (hs.execute then raises);
+    -- killRaises fails only the signal sends, after the probes succeeded.
     execute = function(cmd)
-      if W.forkRaises and cmd:find("^/bin/") then error("fork: Resource temporarily unavailable") end
+      if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill")) then
+        error("fork: Resource temporarily unavailable")
+      end
       return exec(cmd), true
     end,
     processInfo = { processID = SELF_PID },

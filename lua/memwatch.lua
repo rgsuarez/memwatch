@@ -513,6 +513,8 @@ local function markInteracted(off)
   if k and not off.synthetic then interacted[k] = true end
 end
 local hudHold        = false  -- a kill narrative owns the body text
+local hudHoldUntil   = 0      -- a hold no narrative released by now is released
+local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 3 + 4 s)
 local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
 local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind, lstart } on screen
@@ -759,7 +761,7 @@ local function buildHud()
         return
       end
       markInteracted(target)
-      hudHold = true
+      hudHold, hudHoldUntil = true, hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
       -- The narrative belongs to this run: after a stop, start or
       -- diagnostic it touches nothing (the signal engine still finishes the
       -- action it started on the verified identity).
@@ -1153,10 +1155,6 @@ local function onSample(blob)
   assessProcesses(now)
 end
 
--- Alert surfaces: the HUD is the actionable one, the notification the
--- breadcrumb. One reusable HUD, raise-cooldown gated, a new offender
--- preempts the cooldown, and the body tracks live numbers unless a kill
--- narrative owns it.
 -- End the episode: its banner goes, and every record it kept (the banner
 -- history and cooldown, the snooze, the grace clocks and answered marks,
 -- the pending rebind and the bind throttle) is forgotten, so the next
@@ -1247,7 +1245,7 @@ local function unattendedStep(offender, now)
     end
     return
   end
-  hudHold = true
+  hudHold, hudHoldUntil = true, now + HOLD_MAX_SEC
   local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
   local gen = runGen
   local narrate = function(text, done, outcome)
@@ -1281,7 +1279,18 @@ local function unattendedStep(offender, now)
   end
 end
 
+-- Alert surfaces: the HUD is the actionable one, the notification the
+-- breadcrumb. One reusable HUD, raise-cooldown gated, a new offender
+-- preempts the cooldown, and the body tracks live numbers unless a kill
+-- narrative owns it.
 local function alertSurfaces(state, now)
+  -- A narrative that never finished (a fork failed mid-action, so its last
+  -- update never came) must not hold the alert forever: past the deadline
+  -- the hold is released and the alert stands as it was, retryable.
+  if hudHold and now > hudHoldUntil then
+    hudHold = false
+    M.logSnapshot("hud-hold-expired")
+  end
   if state == "critical" then
     hudBelowCritSince = nil
     local offender = lastOffender

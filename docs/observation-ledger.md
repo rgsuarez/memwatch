@@ -77,8 +77,10 @@ runs after its record stopped collecting still reads its own horizon.
   tick log re-base to the step. A step first seen inside a callback (a ps
   table delivered late, a follow-up) closes the records at once, though the
   callback's other stamps wait for its end to be shifted: nothing it reads
-  after the step is folded.
-- A sampler's launch is read two ways. Its start windows use the raw wall
+  after the step is folded. A record that callback writes after the step was
+  seen (its time still on the old basis) is closed when the callback ends,
+  with the shift.
+- A sampler's launch is recorded three ways. Its start windows use the raw wall
   readings taken at launch and at delivery, which no step moves (they are
   anchored to the kernel's start record). Both are the raw wall clock that
   ps's etime runs on, never a callback's held basis, so a table launched or
@@ -87,7 +89,9 @@ runs after its record stopped collecting still reads its own horizon.
   delivery puts those two readings on two sides of it, and ps read on one
   side or the other, so the window widens by the step's size (a wide window
   can read the identity as unknown, never as a reuse). A process's age is
-  read on the same raw clock as its window. Ordering, and the fold's own
+  read on the same raw clock as its window: a runaway's as of the tick, a
+  process the weight ranking picks as of its table's read, and one dated by
+  the start time the alert bound as of the row. Ordering, and the fold's own
   step check, compare the launch with the observation's time, so they read
   the shifted launch record instead. The unattended-state GC uses the launch record
   the shift moves with the tracker's sightings, so a step between the launch
@@ -95,7 +99,11 @@ runs after its record stopped collecting still reads its own horizon.
   launch that never started leaves no record and no handle, so the next
   tick launches again; the records are bounded to
   the last 16 launches; and a delivery without its record leaves the launch
-  unknown, so the GC prunes nothing.
+  unknown. The GC then prunes nothing, the observations already collecting
+  take no identity evidence from it, and the tracker windows it places
+  widen by every step back so far, a bound on the steps since its launch
+  (none when the clock never stepped), so an observation that takes its
+  start from them reads unknown, never a reuse.
 - Every follow-up reads the clock first, so a step back since the last tick
   closes its record before anything is read from it.
 - Report files (jetsam counts) carry the wall time they were written, which

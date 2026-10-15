@@ -50,7 +50,7 @@ local lastExtreme  = false -- extreme runaway currently on the books
 -- table is whole).
 local sampler = { task = nil, startedAt = 0, at = 0,
                   seq = 0, nextSeq = 0, launchedAt = nil, complete = false,
-                  launches = {} }  -- [seq] = { at }: in-flight launches, moved by a step
+                  launches = {} }  -- [seq] = { at, steps }: in-flight launches; at moves with a step
 -- The wall and monotonic clock readings at the last wall read (clock.now
 -- and clock.shift, below the state they shift, keep waits whole across a
 -- wall clock stepped back), and the step that counts as one.
@@ -313,7 +313,7 @@ end
 -- logged, and the action, or the state it settles, carries on (a kill's
 -- TERM after its progress alert, a rebind after a refusal's alert).
 local function showAlert(text, sec)
-  local ok, err = pcall(hs.alert.show, "memwatch: " .. text, sec or 2.5)
+  local ok, err = pcall(function() hs.alert.show("memwatch: " .. tostring(text), sec or 2.5) end)
   if not ok then logError("alert", err) end
 end
 
@@ -1027,7 +1027,7 @@ end
 -- snoozed, unless a narrative of its own holds it. The episode it routes
 -- to is this run's: after a stop or start, only a verified exit (a fact
 -- about the process, not the episode) is kept.
--- (hs.alert directly: alertUpdate is declared further down the file.)
+-- (showAlert directly: alertUpdate is declared further down the file.)
 local function surfaceUpdate(target, click)
   local gen = runGen
   return function(text, done, outcome)
@@ -1518,14 +1518,15 @@ local function launchSampler(onDone)
     sampler.task = nil
   end
   sampler.startedAt = now
-  -- This task's own launch, read two ways for its callback. For start
+  -- This task's own launch, recorded three ways for its callback. For start
   -- windows, the raw wall reading clock.now just took (ps reads its table,
   -- and etime, on that clock, on one side of a step or the other, so start
   -- windows span both; see procs.startWindow), never this callback's basis,
   -- which a step held to the frame's end leaves on the old one. For the
-  -- unattended-state GC, a record the clock shift moves with the tracker's
-  -- sightings, so the two never sit on two bases whichever way the clock
-  -- steps.
+  -- unattended-state GC and the fold's ordering, a record the clock shift
+  -- moves with the tracker's sightings, so the two never sit on two bases
+  -- whichever way the clock steps. And the step-back total so far, so the
+  -- delivery can widen its windows by any step taken in between.
   local launchedAt = clock.wallAt
   sampler.nextSeq = sampler.nextSeq + 1
   local seq = sampler.nextSeq   -- and its place in launch order
@@ -1623,8 +1624,14 @@ local function onSample(blob, exitCode, launchedAt, seq)
   -- Start windows are anchored to the kernel's start record, and ps's etime
   -- runs on the raw wall clock: a window is placed with raw readings at
   -- launch and delivery (launchedAt, rawDeliveredAt), never this callback's basis,
-  -- which a step held back to the frame's end leaves on the old one.
-  procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, steppedSec or 0)
+  -- which a step held back to the frame's end leaves on the old one. A
+  -- table whose launch record is gone cannot tell how far the clock moved
+  -- since its launch, but every step back so far bounds it: the tracker's
+  -- windows from it widen by that (none when the clock never stepped), so
+  -- an observation that takes its start from them reads unknown, never a
+  -- reuse.
+  local widenSec = steppedSec or -(clock.stepTotal + clock.pending)
+  procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, widenSec)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.
   for i = #lastRanked, 1, -1 do
@@ -1751,13 +1758,14 @@ end
 -- unattended coverage while the crisis continues. Each adjudication stamps
 -- the time; another full grace window must pass before the same offender is
 -- adjudicated again. A freeze or terminate that failed on a process (it
--- survived) is never retried on that same process.
--- This tick's unattended gate (core.unattendedGate), read without side
--- effects: the unattended step and the decision row both ask it. A freeze
--- or terminate that already failed on the bound identity closes it.
+-- survived) is never retried on that same process. (The step itself is
+-- unattendedStep, below; this gate is what it asks first.)
+--
 -- The unattended gate for this tick's offender (core.unattendedGate over the
--- alert's state). The live unattended step and the observation ledger ask
--- the same one, so a decision row marks exactly the ticks the step could act.
+-- alert's state), read without side effects. The live unattended step and
+-- the observation ledger ask the same one, so a decision row marks exactly
+-- the ticks the step could act. A freeze or terminate that already failed
+-- on the bound identity closes it.
 function obs.gateFor(offender, now)
   local grace = hudOffender and recordFor(exposure, hudOffender, false) or nil
   local fired = offender and unattendedFiredFor[offender.pid] or nil
@@ -3589,7 +3597,8 @@ obs.writeObservation = function(point, offender, now, extra)
   local e0 = tracker.procs[pid]
   local start0, identityBasis = observe.startOf(e0), "window"
   if not start0 then
-    start0 = observe.startFromLstart(extra.lstart, now)
+    -- An age on the raw clock, as every age is (lstart is a kernel record).
+    start0 = observe.startFromLstart(extra.lstart, now + clock.pending)
     identityBasis = start0 and "lstart" or "none"
   end
   local row = observe.row({

@@ -229,6 +229,43 @@ function M.startFromLstart(s, now)
   return { lo = epoch, hi = epoch + 1, etimeSec = now - epoch }
 end
 
+-- The stretch of wall time a step back makes the clock run through again,
+-- from the reading that saw it: { lo, hi }. The step fell somewhere after
+-- the previous reading (prevWall, prevMono), so the stretch runs from the
+-- stepped clock as it read then (prevWall + delta) to the old clock as it
+-- would read now (wall - delta). Without a monotonic reading the time since
+-- the previous reading is unknown, and both ends widen by marginSec. Pure.
+function M.replaySpan(prevWall, prevMono, wall, mono, delta, marginSec)
+  if type(prevWall) ~= "number" or type(wall) ~= "number" or type(delta) ~= "number" then return nil end
+  if type(mono) == "number" and type(prevMono) == "number" then
+    return { lo = prevWall + delta, hi = wall - delta }
+  end
+  local m = tonumber(marginSec) or 0
+  return { lo = wall - m, hi = prevWall + m }
+end
+
+-- The stretches that still matter at raw instant `at`: those the clock has
+-- not yet run past (with slackSec for whole-second starts). A process born
+-- after the clock passes a stretch starts after it. Pure.
+function M.replaysAt(spans, at, slackSec)
+  local out = {}
+  for _, r in ipairs(spans or {}) do
+    if type(at) ~= "number" or r.hi >= at - (tonumber(slackSec) or 0) then out[#out + 1] = r end
+  end
+  return out
+end
+
+-- Does a start window overlap one of these stretches? Then it cannot tell
+-- the process it names from the pid's next one. A start before every
+-- stretch (a process older than the step) is untouched. Pure.
+function M.startReplayed(w, spans)
+  if type(w) ~= "table" or type(w.lo) ~= "number" or type(w.hi) ~= "number" then return false end
+  for _, r in ipairs(spans or {}) do
+    if w.hi >= r.lo and w.lo <= r.hi then return true end
+  end
+  return false
+end
+
 -- Is a process with this start epoch (and comm) the observed one?
 -- "different" when the comm differs or the epoch falls outside the
 -- observation's start window. Inside the window it is "same" only when the

@@ -129,13 +129,18 @@ runs after its record stopped collecting still reads its own horizon.
   `none` too. A process that started inside that stretch (one younger than
   the step) carries a start time a process born since the step can carry
   as well, since the stepped clock reaches the same instants a second time,
-  so it cannot tell the observed process from its pid's next one. The clock
-  keeps that stretch as one span over every step since load; a process
-  older than the step keeps its identity. A sample's own window in that
-  stretch is no evidence either: a process born since the step starts
-  there, and an age taken before the step overstates how late the pid's
-  next process could start on the stepped clock, so the sample reads as
-  `identity-uncertain`, never as a sighting.
+  so it cannot tell the observed process from its pid's next one. Each step
+  keeps its own stretch: from the stepped clock as it read at the reading
+  before the step (the step fell after it) to the old clock as it would
+  read at the reading that saw the step. Without a monotonic clock both ends
+  widen by two polls. A stretch matters only until the clock has run past
+  it again: a process born after that starts after it. A process older
+  than the step keeps its identity. A sample's own window in a stretch that
+  mattered when the observation was written is no evidence either: a
+  process born since the step starts there, and an age taken before the
+  step overstates how late the pid's next process could start on the
+  stepped clock, so the sample reads as `identity-uncertain`, never as a
+  sighting.
 - A sample: the same program in an overlapping window that rules out a
   successor is a sighting; another program or a disjoint window is a reuse
   (the observed process is gone); anything else is `identity-uncertain`.
@@ -153,7 +158,11 @@ runs after its record stopped collecting still reads its own horizon.
 ## Deliberately not done
 
 - Advisory rows are not decision points: their `wouldAct` is `none`.
-- Collecting records do not survive a reload.
+- Collecting records do not survive a reload, and neither do the stretches
+  a step back replays: a reload inside one forgets it.
+- A step back during sleep can go unseen: the monotonic clock stops in
+  sleep, so a wake-time step shorter than the sleep reads as time passing,
+  and no stretch is kept for it.
 - Jetsam reports are counted in the window, not attributed to a process.
 - The stored name is a sanitized local basename, never model input, and is
   stripped from any dataset built from the ledger, like the row's `pid`.

@@ -74,7 +74,16 @@ function M.play(ep, decide, cfg)
   local firstWaitT = nil
   local trace = {}
   for _, st in ipairs(ep.steps) do
-    if firstWaitT and (st.t - firstWaitT) >= cfg.deferralSec then
+    -- The deterministic floor: once the deferral bound has elapsed since the
+    -- first wait, freeze. cfg.floorMaxAvailPct (unset = always) is the
+    -- proposed contract variant: the floor fires only while headroom is at
+    -- or below that level, and otherwise the candidate keeps deciding.
+    local floorDue = firstWaitT and (st.t - firstWaitT) >= cfg.deferralSec
+    if floorDue and cfg.floorMaxAvailPct
+       and (st.snapshot and st.snapshot.availPct or 0) > cfg.floorMaxAvailPct then
+      floorDue = false
+    end
+    if floorDue then
       trace[#trace + 1] = { t = st.t, act = "freeze", by = "floor" }
       return { freezeAt = st.t, by = "floor", trace = trace }
     end

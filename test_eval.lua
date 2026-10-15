@@ -94,6 +94,14 @@ do
   local res = sc.play(ep3, function() return "wait" end)
   check("play: waits until the floor freezes at 120", res.freezeAt, 120)
   check("play: the floor is the actor", res.by, "floor")
+  -- The headroom-gated floor variant spares a savable still waiting with room.
+  local ep3r = { id = "e3r", labels = { class = "savable", runaway = false, resolvesBySec = 150 },
+                 steps = { { t = 0, snapshot = { availPct = 30 } }, { t = 60, snapshot = { availPct = 28 } },
+                           { t = 120, snapshot = { availPct = 25 } } } }
+  local gated = { deferralSec = 120, floorMaxAvailPct = 10 }
+  check("play: a headroom-gated floor does not fire with room", sc.play(ep3r, function() return "wait" end, gated).freezeAt, nil)
+  ep3r.steps[3].snapshot.availPct = 9
+  check("play: and fires once headroom is gone", sc.play(ep3r, function() return "wait" end, gated).freezeAt, 120)
   local ep2 = { id = "e2", labels = { class = "savable" }, steps = { { t = 0, snapshot = {} }, { t = 60, snapshot = {} } } }
   check("play: resolved before 120 means no freeze", sc.play(ep2, function() return "wait" end).freezeAt, nil)
   check("play: first freeze ends the episode", sc.play(ep3, function() return "freeze" end).freezeAt, 0)

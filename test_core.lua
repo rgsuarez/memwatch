@@ -1108,6 +1108,8 @@ do
   check("simulate glue: a stale resume is a no-op", sim:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
   local stop = body("function M.stop()")
   check("lifecycle glue: stop orphans pending resumes", stop:find("runGen = runGen + 1", 1, true) ~= nil, true)
+  check("config glue: an undecodable local config is never rewritten",
+    src:find('logError("local-config-save"', 1, true) ~= nil, true)
   local mute = body("function M.setAlertsEnabled(on)")
   check("mute glue: unmuting lets the banner return with the HUD", mute:find("lastNotifyAt = 0", 1, true) ~= nil, true)
 end

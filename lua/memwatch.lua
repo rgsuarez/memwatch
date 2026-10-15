@@ -257,9 +257,16 @@ local function saveLocalConfig()
   local conf = {}
   local rf = io.open(LOCAL_CONFIG_PATH, "r")
   if rf then
-    local existing = lfm.jsonDecode(rf:read("a"))
+    local existing, derr = lfm.jsonDecode(rf:read("a"))
     rf:close()
-    if type(existing) == "table" then conf = existing end
+    if type(existing) ~= "table" then
+      -- A file that exists but does not decode holds settings this toggle
+      -- cannot see; rewriting it from defaults would silently drop them.
+      logError("local-config-save", "not saved: existing file does not decode ("
+        .. tostring(derr) .. ")")
+      return
+    end
+    conf = existing
   end
   conf.unattended = core.cfg.unattended
   conf.alerts = alertsEnabled

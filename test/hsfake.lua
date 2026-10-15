@@ -350,7 +350,9 @@ function F.new()
       secondsSinceEpoch = function() return W.now + (W.wallOffset or 0) end,
       -- The monotonic clock (nanoseconds since boot): wall-clock steps never
       -- move it.
-      absoluteTime = function() return math.floor(W.now * 1e9) end,
+      -- Its origin is not the wall clock's (boot, not the epoch), so a
+      -- duration that mixes the two clocks reads wrong in every scenario.
+      absoluteTime = function() return math.floor((W.now - 990) * 1e9) end,
       -- timersStall: a one-shot callback that never gets to run (a run loop
       -- stalled past it), so a narrative waiting on it never finishes.
       -- timerLag: one-shots run that much late (a run loop blocked in a
@@ -469,7 +471,12 @@ function F.new()
       if not f then return nil end
       return { name = function() return f.name end, pid = function() return f.pid end }
     end },
-    alert = { show = function(text) W.alerts[#W.alerts + 1] = { t = W.now, text = text } end },
+    -- onAlert: something that happens while memwatch shows an on-screen
+    -- alert (a step, or an error that escapes into the callback's frame).
+    alert = { show = function(text)
+      W.alerts[#W.alerts + 1] = { t = W.now, text = text }
+      if W.onAlert then W.onAlert(text) end
+    end },
     -- Every POST is recorded; with httpReply(url, body) -> status, body set,
     -- it is answered after httpDelay (default 0.2 s).
     http = { asyncPost = function(url, body, headers, cb)

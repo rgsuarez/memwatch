@@ -2373,8 +2373,9 @@ do
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
     sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
-  check("observe glue: and its start window, bounded by launch and delivery",
-    sampleBody:find("start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil, true)
+  check("observe glue: and its start window, bounded by launch and delivery (none from a clamped etime)",
+    sampleBody:find("start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil
+      and sampleBody:find("local placeable = row and type(row.etimeSec) == \"number\" and row.etimeSec > 0", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
     sampleBody:find("if seq and seq < sampler.seq then return end", 1, true) ~= nil
       and sampleBody:find("launchedAt < sampler.launchedAt", 1, true) == nil, true)
@@ -2866,34 +2867,48 @@ do
     topCache = "sampler", goneUntil = "gone", fired = "unattended (an unattendedFiredFor record)",
     unattendedFiredFor = "unattended", lfmInFlight = "adjudicator", verdictCache = "verdicts",
     smState = "state", ring = "tracker (its samples)",
-    -- Log rows: an ISO time string written out with the row, never held
-    -- or compared (the decision record, and its follow-up).
-    rec = "not a stamp: a decision record's ISO time",
     sampler = "sampler (its last delivery and its launch)", log = "observation (the tick log, obs.ticks)",
     decisionAt = "observation (obs.decisionAt)", finals = "not held: the GC's own snapshot of final latches, in one call",
     sig = "not held: an action signal, folded at once into the pending records (which a step closes)",
     t = "not held: a touch, folded at once into the pending records (which a step closes)",
     times = "not held: report files' modification times, counted in one call",
     launches = "sampler (its in-flight launch records)",
-    offender = "not a stamp: the follow-up row's ISO time (the row is built inside a call on offender)",
   }
   local function lowerStamps(text)
     local sa = text:find("function clock.shift(delta)", 1, true)
     local sz = sa and text:find("\nend\n", sa, true)
     if sa and sz then text = text:sub(1, sa - 1) .. text:sub(sz) end
-    local miss, ctor = {}, nil
+    local miss, ctor, depth = {}, nil, 0
+    -- A local bound to os.date holds that ISO string: a field set from it
+    -- is the same written-out value.
+    local isoLocals = {}
+    for name in text:gmatch("local%s+([%a_][%w_]*)%s*=%s*os%.date%(") do isoLocals[name] = true end
     for line in text:gmatch("[^\n]+") do
       -- The table a constructor builds: the name right before "= {", or
-      -- before its index ("finals[pid] = {").
+      -- before its index ("finals[pid] = {"). A field line counts toward it
+      -- only while that constructor is still open.
       local open = line:match("([%a_][%w_]*)%s*%b[]%s*=%s*{") or line:match("([%a_][%w_]*)%s*=%s*{")
-      if open then ctor = open end
+      if open then ctor, depth = open, 0 end
+      -- A log row's ISO time (os.date) is a string written out, never a
+      -- held stamp: skipped by its value, not by a holder's name.
+      local iso = line:find("=%s*os%.date%(")
+      local held = line:match("[{,]%s*at%s*=%s*([%a_][%w_]*)%s*[,}]") or line:match("^%s*at%s*=%s*([%a_][%w_]*)%s*[,}]")
+        or line:match("^%s*at%s*=%s*([%a_][%w_]*)%s*$")
+      if held and isoLocals[held] then iso = true end
       local holder = line:match("([%a_][%w_]*)%.at%s*=[^=]") or line:match("([%a_][%w_]*)%.since%s*=[^=]")
         or line:match("([%a_][%w_]*)%.t%s*=[^=]")
-      if not holder and (line:match("[{,]%s*at%s*=[^=]") or line:match("^%s*at%s*=[^=]")
+      if not holder and not iso and (line:match("[{,]%s*at%s*=[^=]") or line:match("^%s*at%s*=[^=]")
           or line:match("[{,]%s*since%s*=[^=]") or line:match("[{,]%s*t%s*=[^=]")) then
-        holder = ctor or "?"
+        holder = (ctor and depth >= 0) and ctor or "?"
       end
       if holder and not lowerHolders[holder] then miss[#miss + 1] = holder end
+      if ctor then
+        local _, opens = line:gsub("{", "")
+        local _, closes = line:gsub("}", "")
+        depth = depth + opens - closes
+        if depth <= 0 and not open then ctor = nil end
+        if open and depth <= 0 then ctor = nil end
+      end
     end
     return miss
   end
@@ -2903,6 +2918,14 @@ do
   check("clock.shift: the scan sees a new holder's at (positive control)", #lowerStamps("  newHolder.at = now\n"), 1)
   check("clock.shift: and one built with it (positive control)",
     #lowerStamps("  local fresh = {\n    pid = 1,\n    at = now,\n  }\n"), 1)
+  check("clock.shift: a field after a closed constructor is not credited to it (positive control)",
+    #lowerStamps("  local topCache = { map = nil }\n  register({\n    at = now,\n  })\n"), 1)
+  check("clock.shift: a log row's ISO time is not a stamp (control)",
+    #lowerStamps("  local row = {\n    at = os.date(\"!%Y\"),\n  }\n"), 0)
+  check("clock.shift: nor is one held in a local bound to os.date (control)",
+    #lowerStamps("  local iso = os.date(\"!%Y\")\n  write({\n    at = iso, seq = 1,\n  })\n"), 0)
+  check("clock.shift: a local holding a wall reading is still a stamp (positive control)",
+    #lowerStamps("  local iso = clock.now()\n  write({\n    at = iso, seq = 1,\n  })\n"), 1)
   check("clock.shift: a constructor is named by the table it builds, not the statement around it",
     table.concat(lowerStamps("  if ok then fresh[pid] = { at = now } end\n"), ","), "fresh")
   -- A name is matched whole: one that appears in the shift only inside a
@@ -2916,7 +2939,7 @@ do
   -- of the same name on another holder (obs.lastAt) does not cover it.
   local function nestedUnshifted(text, shiftBody)
     local miss, seen = {}, {}
-    for chain in text:gmatch("([%a_][%w_]*%.[%a_][%w_]*%.[%a_][%w_]*)%s*=[^=]") do
+    for chain in text:gmatch("([%a_][%w_]*%.[%a_][%w_]*%.[%a_][%w_%.]*)%s*=[^=]") do
       if timeName(chain:match("([%a_][%w_]*)$")) and not seen[chain] then
         seen[chain] = true
         if not shiftBody:find(chain, 1, true) then miss[#miss + 1] = chain end
@@ -2929,6 +2952,8 @@ do
     .. table.concat(n2, ",") .. ")", #n1 + #n2, 0)
   check("clock.shift: a nested stamp is not covered by a namesake (positive control)",
     #nestedUnshifted("obs.stats.lastAt = now\n", "obs.lastAt = sh(obs.lastAt)"), 1)
+  check("clock.shift: a stamp four holders deep is matched by its whole path (positive control)",
+    #nestedUnshifted("cache.entry.offender.lastAt = now\n", "offender.lastAt = sh(offender.lastAt)"), 1)
   check("clock.shift: a nested read is not a stamp (control)",
     #nestedUnshifted("if a.e.frozenAt < b.e.frozenAt then end\n", body), 0)
   -- A wall reading kept in a function's local is out of the shift's reach
@@ -2991,9 +3016,29 @@ do
   -- applied when it ends, and reads inside it stay on its starting basis.
   check("clock frames: guard brackets every callback",
     src:find("    clock.enter()\n    local ok, err = pcall(fn, ...)\n    clock.leave()", 1, true) ~= nil, true)
-  check("clock frames: a step seen after the frame has read the clock waits for its end",
-    reader:find("if clock.depth > 0 and clock.frameRead then\n      clock.pending = clock.pending + delta", 1, true) ~= nil, true)
+  check("clock frames: a step seen anywhere inside a frame waits for its end",
+    reader:find("if clock.depth > 0 then\n      clock.pending = clock.pending + delta", 1, true) ~= nil, true)
   check("clock frames: reads inside the frame stay on its basis", reader:find("return wall - clock.pending", 1, true) ~= nil, true)
+  -- Every entry point is a frame: the top stream's data callback (which
+  -- guard cannot wrap: the stream needs its true back) and the immediate
+  -- first tick at start, as well as every guarded callback.
+  check("clock frames: the top stream's data callback is one",
+    src:find("      clock.enter()\n      local ok, err = pcall(function()\n        local published = procs.feedTopStream", 1, true) ~= nil
+      and src:find("      end)\n      clock.leave()\n      if not ok then logError(\"topstream\", err) end", 1, true) ~= nil, true)
+  local _, rawTicks = src:gsub("\n%s+tick%(%)", "")
+  check("clock frames: no tick runs outside one", rawTicks, 0)
+  local _, everies = src:gsub("hs%.timer%.doEvery%(", "")
+  local _, framedEveries = src:gsub("hs%.timer%.doEvery%([^\n]-guard%(", "")
+  check("clock frames: every repeating timer's callback is guarded (" .. framedEveries .. "/" .. everies .. ")",
+    everies > 0 and framedEveries == everies, true)
+  check("clock frames: the held one-shot and the held poller each run one frame",
+    src:find("    clock.enter()\n    local ok, err = pcall(fn)\n    clock.leave()", 1, true) ~= nil
+      and src:find("    clock.enter()\n    local ok, finished = pcall(poll)\n    clock.leave()", 1, true) ~= nil, true)
+  check("clock frames: the menu's build and every item are frames",
+    src:find("    clock.enter()\n    local ok, items = pcall(buildMenu)\n    clock.leave()", 1, true) ~= nil
+      and src:find('it.fn = guard("menu-item", it.fn)', 1, true) ~= nil, true)
+  check("resume: a stale row's Resume still answers for the process it showed",
+    src:find("if shown then markInteracted(shown, nil, true) end", 1, true) ~= nil, true)
   -- Here the wait streak is a deferral ({ firstAt, count }): its first wait
   -- is a stamp, shifted only where it is a table.
   check("clock.shift: the deferral's first wait is shifted, tables only",
@@ -3005,7 +3050,7 @@ do
   check("clock.shift: the ledger's tick log moves with the step",
     body:find("for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end", 1, true) ~= nil, true)
   check("sampler: the GC's launch is the record the shift moved with the sightings",
-    src:find("sampler.launchedAt = launch and launch.at or launchedAt", 1, true) ~= nil
+    src:find("sampler.launchedAt = launch and launch.at or nil", 1, true) ~= nil
       and body:find("for _, l in pairs(sampler.launches) do l.at = sh(l.at) end", 1, true) ~= nil, true)
   -- One reader of the wall clock: clock.now. clock.mono reads the
   -- monotonic clock, or the wall clock through clock.now when there is

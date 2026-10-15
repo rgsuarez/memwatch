@@ -67,15 +67,17 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    memwatch's escalation reads it. A Resume clicked on a frozen row whose
    entry has gone since the menu opened still answers for the process the
    row showed, and when the pid now holds another frozen process, that one
-   stays frozen. A click that signals nothing because nothing could be
-   verified gives up its own hold, and the veto is withdrawn (memwatch's
-   action carries on) only when no other answer holds it and the action is
-   still in flight. One the backstop has released stays superseded, so a
-   late click that did nothing never revives its escalation. A click that
-   did something, and every answer that needs no signal engine, holds its
-   veto for good. A vetoed action gives up its HUD hold at once, and still
-   owes its receipt: one whose result never comes back is announced at its
-   deadline.
+   stays frozen. A click that signaled nothing (it could not verify its
+   target, or its signal could not be sent) gives up its own hold, and the
+   veto is withdrawn (memwatch's action carries on) only when no other
+   answer holds it and the action is still in flight. One the backstop has
+   released stays superseded, so a late click that did nothing never revives
+   its escalation. A click that did something, and every answer that needs
+   no signal engine, holds its veto for good. A vetoed action gives up its
+   HUD hold at once, and still owes its receipt: one whose result never
+   comes back is announced at its deadline. No on-screen alert can stop an
+   action or the state it settles: a display error is logged, and the action
+   carries on.
 5. **One live receipt per action.** Once a receipt has said the result has
    not come back, the final outcome, whatever it is, replaces it; the old
    receipt is withdrawn only when its replacement is up. An outcome after a

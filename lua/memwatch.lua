@@ -175,6 +175,14 @@ local function logError(label, err)
     os.date("%Y-%m-%d %H:%M:%S"), smState.state, label, tostring(err)))
 end
 
+-- An on-screen alert never breaks what reported it: a display error is
+-- logged, and the action, or the state it settles, carries on (a kill's
+-- TERM after its progress alert, a rebind after a refusal's alert).
+local function showAlert(text, sec)
+  local ok, err = pcall(hs.alert.show, "memwatch: " .. text, sec or 2.5)
+  if not ok then logError("alert", err) end
+end
+
 -- Wrap a callback so an error can never kill the loop that owns it.
 -- Each guarded callback is one frame of the clock (rule 8): a step back
 -- seen in the middle of it is taken out when it ends.
@@ -892,9 +900,10 @@ local function surfaceUpdate(target, click)
         end
       end
     end
-    -- Shown last: what the outcome settles never waits on, or is lost to,
-    -- the on-screen alert.
-    hs.alert.show("memwatch: " .. text, 2.5)
+    -- Shown last, and contained: what the outcome settles never waits on,
+    -- or is lost to, the on-screen alert, and a progress alert that fails
+    -- never stops the action reporting it.
+    showAlert(text)
   end
 end
 
@@ -1186,12 +1195,11 @@ local function buildMenu()
         end
         local target = { pid = off.pid, name = off.name, lstart = lst }
         if not lst then
-          -- (hs.alert directly: alertUpdate is declared further down the file)
-          local msg = (why == "exited") and string.format("%s (pid %d) has exited; nothing signaled",
-              off.name, off.pid)
-            or string.format("can't verify %s (pid %d); nothing signaled", off.name, off.pid)
-          hs.alert.show("memwatch: " .. msg, 2.5)
+          -- The rebind is state, so it comes before the alert.
           if why and why:find("^pid%-reused") then identityRefused(target) end
+          showAlert((why == "exited") and string.format("%s (pid %d) has exited; nothing signaled",
+              off.name, off.pid)
+            or string.format("can't verify %s (pid %d); nothing signaled", off.name, off.pid))
           return
         end
         local click = markInteracted(target, true)
@@ -2055,7 +2063,7 @@ end
 -- Default progress surface for menu-initiated kills (the menu closes on
 -- click, so feedback lands as a brief on-screen alert).
 local function alertUpdate(text)
-  hs.alert.show("memwatch: " .. text, 2.5)
+  showAlert(text)
 end
 
 ------------------------------------------------------------------------------
@@ -2454,9 +2462,10 @@ end
 
 -- Resume: identity re-validated against the ledger entry (a recycled pid is
 -- dropped AND the signal blocked), then SIGCONT with a verified state.
--- shown: the identity a menu row showed, so a Resume clicked after its
--- entry went (resumed or quit elsewhere, or swept) is still the operator's
--- answer about that process, once.
+-- shown: the identity a menu row showed. A Resume clicked after its entry
+-- went (resumed or quit elsewhere, or swept) is still the operator's answer
+-- about that process, once; one clicked after the pid's next process was
+-- frozen in its place answers for the shown process and resumes nothing.
 function M.resumePid(pid, onUpdate, shown)
   onUpdate = onUpdate or alertUpdate
   local e = frozen[pid]
@@ -3336,7 +3345,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- between selection and this call is refused. Same-name pid reuse is
   -- exactly the bystander-kill class this tool was scarred by.
   local expectLstart = opts.expectedLstart or (frozenEntry and frozenEntry.lstart) or nil
-  local proc, twhy = resolveSignalTarget(pid, expectedName, expectLstart)
+  local proc, twhy, holder = resolveSignalTarget(pid, expectedName, expectLstart)
   if not proc then
     if twhy == "exited" then
       M.logSnapshot(string.format("kill-skip:%s(%d)-already-exited", expectedName or "?", pid))
@@ -3348,9 +3357,13 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       onUpdate(string.format("can't verify %s right now; nothing was signaled",
         expectedName or tostring(pid)), true, "unverified")
     else
-      -- Identity mismatch: block the action, and drop the ledger entry when
-      -- the refusal was about that entry's own process (it is gone).
-      if frozenEntry and (opts.expectedLstart == nil or opts.expectedLstart == frozenEntry.lstart) then
+      -- Identity mismatch: block the action, and drop the ledger entry only
+      -- when the pid now holds another process than the entry's (it is
+      -- gone). A refusal over the name alone, with the entry's own process
+      -- still there and stopped, keeps the entry: dropping it would strand
+      -- that process with no row to resume it from.
+      if frozenEntry and (opts.expectedLstart == nil or opts.expectedLstart == frozenEntry.lstart)
+         and not (holder and holder.lstart == frozenEntry.lstart) then
         frozen[pid] = nil
         saveFrozen()
       end
@@ -3831,7 +3844,7 @@ function M.setAlertsEnabled(on)
     lastNotifyAt = 0
   end
   if not saveLocalConfig() then
-    hs.alert.show("memwatch: couldn't save the alerts setting (local config unreadable); it lasts until reload", 4)
+    showAlert("couldn't save the alerts setting (local config unreadable); it lasts until reload", 4)
   end
   M.logSnapshot("alerts-" .. (alertsEnabled and "enabled" or "disabled"))
   return alertsEnabled
@@ -3842,7 +3855,7 @@ end
 function M.setLfmEnabled(on)
   lfm.cfg.enabled = on == true
   if not saveLocalConfig() then
-    hs.alert.show("memwatch: couldn't save the LFM setting (local config unreadable); it lasts until reload", 4)
+    showAlert("couldn't save the LFM setting (local config unreadable); it lasts until reload", 4)
   end
   M.logSnapshot("lfm-" .. (lfm.cfg.enabled and "enabled" or "disabled"))
   return lfm.cfg.enabled

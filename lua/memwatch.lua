@@ -190,8 +190,12 @@ end
 function obs.noteAction()
   obs.operatorActions = obs.operatorActions + 1
   if not next(obs.pending) then return end
-  local now = hs.timer.secondsSinceEpoch()
-  for _, ev in pairs(obs.pending) do observe.foldAction(ev, now) end
+  -- Bookkeeping never stops the operator's action that called it.
+  local ok, err = pcall(function()
+    local now = hs.timer.secondsSinceEpoch()
+    for _, ev in pairs(obs.pending) do observe.foldAction(ev, now) end
+  end)
+  if not ok then M.logSnapshot("observe-action-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
 end
 
 -- The frozen ledger changed (saveFrozen runs after every change): fold, for

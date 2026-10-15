@@ -269,7 +269,9 @@ twice the 4 MB cap rows are refused rather than written.
 
 It never forks, never acts and never leaves the machine. It exists so that
 adjudicators can be judged against real outcomes rather than synthetic
-scenarios alone. Set `"observe": false` in the local config to turn it off.
+scenarios alone. The rules it holds to (each observation's lifecycle, the
+as-of-horizon reads, the clock and identity models, its bounds) are in
+`docs/observation-ledger.md`. Set `"observe": false` in the local config to turn it off.
 `hs -c "memwatch.testObserve()"` writes one synthetic-tagged row to prove the
 path end to end, and says so if the row could not be written.
 

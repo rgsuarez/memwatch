@@ -2305,6 +2305,16 @@ do
   check("signals glue: a freeze is recorded only when its STOP was sent, after the gates",
     recordedAtSend(freezeBody, 'local stopSent = send("STOP", pid)\n  if stopSent then',
       'obs.noteSignal(pid, "freeze", proc)'), true)
+  -- Bookkeeping never interrupts an action or the tick: every fold an
+  -- action or the tick calls runs under pcall.
+  for _, name in ipairs({ "function obs.noteSignal(", "function obs.noteTouch(",
+                          "function obs.noteAction(", "function obs.noteFrozen(" }) do
+    local b = fnBody(name)
+    check("observe glue: " .. name:sub(10) .. " is error-bounded",
+      #b > 50 and b:find("pcall(function()", 1, true) ~= nil, true)
+  end
+  check("observe glue: the tick's log call is error-bounded",
+    src:find("local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state)", 1, true) ~= nil, true)
   local _, recordSites = src:gsub('noteSignal%(pid, "', "")
   check("signals glue: the five signal sites record (freeze, re-freeze, continue, terminate, resume)",
     recordSites, 5)

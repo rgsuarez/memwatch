@@ -22,15 +22,22 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    sent goes at once, because a process stopped by anyone else is not
    memwatch's to resume. A reload keeps a pending entry only if its STOP
    went out, or may have. Every entry carries a start time; one without
-   (written by an older version) is bound at reload by a probe that finds
-   that program stopped, or dropped.
+   (written by an older version) is dropped at reload and named in a
+   notice, in case that program is still stopped.
 3. **Each writer owns only its own entry.** A freeze's verifier changes the
    slot only while it holds that freeze's own entry (or nothing), so a late
    verifier never undoes a newer action on the same process. The entry is
    named by the freeze's own token, written to the ledger with it, so it
-   stays the freeze's after an in-process restart's reconcile rebuilds it. Every other
-   writer owns the entry for the start time it acted on. An entry with no
-   start time is owned by no writer.
+   stays the freeze's after an in-process restart's reconcile rebuilds it.
+   The token is made of durable parts (the pid, the freeze's time in
+   milliseconds and a count of the run's entries), so one left in the ledger
+   by an earlier run names nothing this run made. A verifier settles its
+   freeze's entry where the slot holds it (rebuilt and shifted since), never
+   by putting back the copy it captured. A resume's verifier drops only the
+   entry it resumed, by the same token: a newer freeze of the same process
+   keeps its own. Writers that act on a process found gone own the entry for
+   the start time they acted on. An entry with no start time is owned by no
+   writer.
 4. **An action is in flight until its final outcome, with a backstop.**
    Progress pushes its deadlines out. At the deadline the operator is told
    the result has not come back; one more hold window with no progress
@@ -43,20 +50,32 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    undoes a STOP of its own that reached the pid's next process, under
    rule 1. An operator's answer on the process supersedes memwatch's own
    action in flight on it the same way: Freeze, Force Quit, Ignore, Activity
-   Monitor or closing the alert, from the HUD, the banner or the menu, and
-   Resume or Force Quit from the frozen rows. A veto matches by pid and name
+   Monitor or closing the alert, from the HUD, the banner or the menu's
+   process rows, and Resume or Force Quit from the frozen rows. The menu's
+   own Activity Monitor item names no process, so it answers none. A veto matches by pid and name
    even when the answer could not bind a start time (a menu opened while
    probes failed), because it only ever withholds; two bound start times
    must still agree. A Resume vetoes but leaves the process a candidate,
    since it is meant to run. A click handed to a signal engine (Freeze or
-   Force Quit) answers only once it did something: if it signals nothing,
-   its veto is withdrawn with its mark and memwatch's action carries on. A
-   vetoed action gives up its HUD hold at once, and still owes its receipt:
-   one whose result never comes back is announced at its deadline.
+   Force Quit) answers only once it did something, and each click holds its
+   own veto until then; its outcome settles it the moment it arrives (only
+   the HUD lingers), so a click that did nothing has given its veto up
+   before memwatch's escalation reads it. A click that signals nothing gives
+   up its own hold,
+   and the veto is withdrawn (memwatch's action carries on) only when no
+   other answer holds it and the action is still in flight. One the backstop
+   has released stays superseded, so a late click that did nothing never
+   revives its escalation. A click that did something, and every answer
+   that needs no signal engine, holds its veto for good. A vetoed action
+   gives up its HUD hold at once, and still owes its receipt: one whose
+   result never comes back is announced at its deadline.
 5. **One live receipt per action.** Once a receipt has said the result has
    not come back, the final outcome, whatever it is, replaces it; the old
    receipt is withdrawn only when its replacement is up. An outcome after a
-   signal went out is always announced, whatever it is.
+   signal went out is always announced, whatever it is. Within one run of
+   memwatch: a reload ends an action in flight with its timers, and its
+   receipt goes unannounced (a known limit; the frozen ledger, which says
+   what memwatch stopped, does survive the reload).
 6. **Surfaces retire by state.** A shown HUD whose process has been answered
    (frozen, gone, ignored) goes at the next tick, whichever surface answered
    it. A freeze of that process still inside its pending window is no answer
@@ -76,16 +95,29 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    watchdog, cooldowns, the tracker's sample times and latches), at the
    first read after it and before that read's value is used. So a stamp a
    callback writes between the step and the next tick is shifted once,
-   never twice, and each wait keeps the length it had left; a source scan
-   holds the shift to every time-named stamp. Pure durations (a poller's
-   error run, the language-model server's deadlines, request latency) run
-   on the monotonic clock and need no shift. The shifted frozen ledger is
+   never twice, and each wait keeps the length it had left. A callback is
+   never shifted under: a step seen in the middle of one that has already
+   read the clock is taken out when it ends, and until then its reads stay
+   on the basis it began with, so the stamps it writes move with the rest.
+   Each holder is shifted under its own guard: one that fails is logged by
+   name and costs only its own stamps. A source scan
+   holds the shift to every time-named stamp, matched by its whole path. A
+   wall reading kept in a function's local is out of the shift's reach (a
+   callback that captures it keeps the old basis), so the scan also lists
+   every time-named function local with how it is used. Pure durations (a
+   poller's error run, the language-model server's deadlines and its
+   fast-crash window, request latency, the error log's rate limit) run on
+   the monotonic clock and need no shift. The shifted frozen ledger is
    written out at once. A grace stamp found after now (a step the shift
    could not take out) restarts the grace from now: one grace, never the
    step's length and never none. A pending window persisted ahead of now (a
-   step back across a reload) lasts at most one window more. Without a monotonic
-   clock, memwatch says so at start, and a step back shows only when the
-   wall clock runs backwards between two reads.
+   step back across a reload) lasts at most one window more, and a freeze
+   stamp persisted ahead of now reads as now. Without a
+   monotonic clock, memwatch says so at start, and a step back shows only
+   when the wall clock runs backwards between two reads; durations then run
+   on the wall clock read through the detector, with every step it took out
+   added back, so a step back it saw never lengthens one (a step forward,
+   which it cannot see, shortens a wait).
 
 ## The episode
 
@@ -288,18 +320,12 @@ pending when the window ends, and the sweep then decides it like any other.
 An entry whose size was never measured (a process found holding the pid
 mid-freeze) shows "size unknown" in the menu, never another process's size.
 
-An entry written by an older version without a start time is bound at
-reload to that program if a probe finds it stopped there and it started in
-an earlier whole second than the entry says it was frozen (`ps` prints whole
-seconds), and only while the clock the entry was stamped by agrees with the
-one start times are read by; otherwise it is dropped. One that cannot be told is named in a notice in case
-it is still stopped: its probe could not answer, or that program is stopped
-there with a start time that does not name exactly one instant (text that
-does not parse, or a local time repeated or skipped by a daylight saving
-change), or one that started in the very second of the freeze, which may be
-just after it, or any such process while the two clocks disagree. A bound one is labeled "bound by name" in the menu and in every
-line of the reload notice: the start time that would prove it is the
-process memwatch froze is what the old entry never had.
+An entry written by an older version without a start time is dropped at
+reload and named in a notice, in case that program is still stopped (it
+can be resumed in Activity Monitor). Nothing ties such an entry to the
+process it froze: the pid may hold another process by now, and its freeze
+stamp cannot be dated against this clock, because a step across the reload
+shows nowhere. No entry without a start time is ever signaled through.
 
 ## Banners
 

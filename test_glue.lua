@@ -1913,8 +1913,10 @@ scenario("a mark that growth released stays released", nil, function(W)
   check("released: a plateau does not hide it again", W.hudShowing() and bodyNames(W, "node (pid 4242)"), true)
 end)
 
--- Rule 2: an entry an older version wrote without a start time is bound at
--- reload to that program stopped there, or dropped.
+-- Rule 2: an entry an older version wrote without a start time is dropped
+-- at reload and named in a notice: nothing ties it to the process it froze
+-- (a step across the reload shows nowhere, so its freeze stamp cannot be
+-- dated against this clock), and nothing is ever signaled through it.
 -- frozenAtOffset: when the old entry says it was frozen, relative to the
 -- process's own start (positive: after it started).
 -- opts.lstart: the start time the process shows from then on; opts.probeScript:
@@ -1940,34 +1942,35 @@ local function legacyEntryWorld(W, state, frozenAtOffset, probeFails, opts)
   W.run(3)
   W.probeFails, W.probeScript = false, nil
 end
-scenario("an old entry without a start time is bound when its process is stopped", nil, function(W)
-  legacyEntryWorld(W, "T")
-  check("legacy: a stopped node is kept, bound", frozenRowAction(W, "node", "Resume") ~= nil, true)
-  check("legacy: the bind is logged", logHas(W, "frozen-reconcile-bind:node(4242)"), true)
-  local row = W.menuItem("   node")
-  check("legacy: and labeled as bound by name", row ~= nil and row.title:find("bound by name", 1, true) ~= nil, true)
-  check("legacy: nothing is named as unchecked (control)", #W.notices("memwatch: an old frozen entry could not be checked"), 0)
-end)
-scenario("an old entry is never bound to a process that started after the freeze", nil, function(W)
-  legacyEntryWorld(W, "T", -60)
-  check("legacy-dated: a later process is not adopted", W.menuItem("   node"), nil)
-  check("legacy-dated: and, clearly not it, is not named (control)",
-    #W.notices("memwatch: an old frozen entry could not be checked"), 0)
-end)
-scenario("an old entry is never bound to a process started in the freeze's own second", nil, function(W)
-  legacyEntryWorld(W, "T", 0)
-  check("legacy-same-second: not adopted (it may have started just after)", W.menuItem("   node"), nil)
-  check("legacy-same-second: named in the notice, since it cannot be told",
-    #W.notices("memwatch: an old frozen entry could not be checked"), 1)
-end)
-scenario("an old entry a probe cannot check is named in a notice", nil, function(W)
-  legacyEntryWorld(W, "T", 60, true)
-  check("legacy-unknown: the notice names it", #W.notices("memwatch: an old frozen entry could not be checked"), 1)
-end)
-scenario("an old entry without a start time is dropped when its process runs", nil, function(W)
-  legacyEntryWorld(W, "S")
-  check("legacy: a running node is not listed as frozen", W.menuItem("   node"), nil)
-  check("legacy: the drop is logged", logHas(W, "frozen-reconcile-drop:node(4242):no-start-time"), true)
+for _, case in ipairs({
+  { how = "stopped, frozen after it started", state = "T", offset = 60 },
+  { how = "stopped, frozen before it started", state = "T", offset = -60 },
+  { how = "stopped, in the freeze's own second", state = "T", offset = 0 },
+  { how = "running", state = "S", offset = 60 },
+  { how = "unprobed", state = "T", offset = 60, probeFails = true },
+}) do
+  scenario("an old entry without a start time is dropped and named (" .. case.how .. ")", nil, function(W)
+    legacyEntryWorld(W, case.state, case.offset, case.probeFails)
+    check("legacy (" .. case.how .. "): not listed as frozen", W.menuItem("   node"), nil)
+    check("legacy (" .. case.how .. "): the drop is logged", logHas(W, "frozen-reconcile-drop:node(4242):no-start-time"), true)
+    check("legacy (" .. case.how .. "): the notice names it",
+      #W.notices("memwatch: an old frozen entry could not be checked"), 1)
+    check("legacy (" .. case.how .. "): nothing was signaled", W.signalsTo(4242), "")
+  end)
+end
+scenario("an entry with a start time is kept at reload (control)", nil, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].state = "T"
+  W.run(6)
+  local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+  f:write(string.format('[{"pid":4242,"name":"node","lstart":"%s","weightMB":0,"frozenAt":%d}]\n',
+    W.procs[4242].lstart, math.floor(W.now) - 30))
+  f:close()
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+  check("legacy-control: kept, with its Resume", frozenRowAction(W, "node", "Resume") ~= nil, true)
+  check("legacy-control: nothing named", #W.notices("memwatch: an old frozen entry could not be checked"), 0)
 end)
 
 -- ---- round 7 ----
@@ -2136,6 +2139,29 @@ scenario("a clock stepped back never holds the next unattended attempt off", UNA
   local again = runUntil(W, 100, function() return select(2, W.signalsTo(4242):gsub("STOP", "")) >= 2 end)
   check("clock-step: the next attempt comes within its grace window, not the step's length", again, true)
   check("clock-step: and well before the clock catches up", W.now - first < 100, true)
+end)
+
+-- Rule 8: the grace keeps the length it had left. A step back half-way
+-- through it moves its stamp with the rest, so the next attempt comes when
+-- the grace would have ended, not a whole grace after the step.
+scenario("a clock stepped back mid-grace keeps what the grace had left", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].unstoppable = true
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  local first = W.now
+  W.onSignal = nil
+  W.run(1)
+  W.probeFails = false
+  local grace = 60                    -- the default unattended grace (memwatch_core cfg.cool.autoKillGraceSec)
+  W.run(grace / 2)                    -- half-way through the grace
+  W.wallOffset = -120
+  local again = runUntil(W, grace * 2, function() return select(2, W.signalsTo(4242):gsub("STOP", "")) >= 2 end)
+  check("grace-left: the next attempt comes", again, true)
+  check("grace-left: when the grace would have ended (" .. math.floor(W.now - first) .. " s), not a whole grace after the step",
+    W.now - first <= grace + 8, true)
 end)
 
 -- A HUD hold whose narrative never finishes is still released one hold
@@ -2391,38 +2417,6 @@ do
     check("refreeze-takeover: never that nothing was signaled", said(W, "which was not signaled"), false)
   end)
 
-  -- Rule 2: an old entry whose process's start time cannot be dated is
-  -- named in the notice, never silently dropped.
-  scenario("an old entry whose process's start time cannot be dated is named in a notice", nil, function(W)
-    legacyEntryWorld(W, "T", 60, false, { lstart = "Mon Feb 30 10:00:00 2026" })
-    check("legacy-undated: not adopted", W.menuItem("   node"), nil)
-    check("legacy-undated: the notice names it", #W.notices("memwatch: an old frozen entry could not be checked"), 1)
-  end)
-
-  -- An old entry bound by name says so on every line of the reload notice,
-  -- including when it is kept because the next probe could not answer.
-  scenario("an old entry bound by name says so in the notice when it cannot be re-checked", nil, function(W)
-    legacyEntryWorld(W, "T", 60, false, { probeScript = { "ok", "fail" } })
-    local labeled = false
-    for _, n in ipairs(W.notices("memwatch: frozen processes persist")) do
-      if (n.attrs.subTitle or ""):find("bound by name", 1, true) then labeled = true end
-    end
-    check("legacy-kept: kept, as unverified", logHas(W, "frozen-reconcile-keep:node(4242):unverified"), true)
-    check("legacy-kept: the notice says it is bound by name", labeled, true)
-  end)
-
-  -- The reload says when the clock it stamps freezes with disagrees with
-  -- the one start times are read by.
-  scenario("a reload notes a clock-basis skew, and only then", nil, function(W)
-    -- The fake's os.time() reads its own clock: the two agree at first.
-    check("skew: with the clocks agreeing, nothing is said (control)", logHas(W, "frozen-reconcile-clock-skew"), false)
-    W.wallOffset = 3600             -- Hammerspoon's clock now reads an hour ahead of os.time()
-    W.reloadState()
-    F.load(W, nil, { keepHome = true })
-    W.run(1)
-    check("skew: with the clocks an hour apart, the reload says so", logHas(W, "frozen-reconcile-clock-skew:-3600s"), true)
-  end)
-
   -- ---- round 9: the lifecycle model's design pass ----
   -- Rule 8: a callback that stamps between a step back and the next tick is
   -- shifted once, at its own read, never again at the tick.
@@ -2541,13 +2535,6 @@ do
     check("pending-quit: and resumable", frozenRowAction(W, "node", "Resume") ~= nil, true)
   end)
 
-  -- Rule 2: an old entry is never dated across clocks that disagree.
-  scenario("an old entry is not dated while the two clocks disagree", nil, function(W)
-    legacyEntryWorld(W, "T", 60, false, { wallOffset = 3600 })
-    check("legacy-skew: not adopted", W.menuItem("   node"), nil)
-    check("legacy-skew: named in the notice", #W.notices("memwatch: an old frozen entry could not be checked"), 1)
-  end)
-
   -- Rule 8: a pending window persisted ahead of now (a step back across a
   -- reload) lasts at most one window more.
   scenario("a persisted pending window ahead of now lasts one window at most", nil, function(W)
@@ -2567,6 +2554,29 @@ do
       logHas(W, "frozen-prune:node(4242):resumed-externally"), true)
   end)
 
+  -- Rule 8: so does a freeze stamp persisted ahead of now: it reads as
+  -- frozen from now, never a negative time frozen.
+  scenario("a persisted freeze stamp ahead of now reads as now", nil, function(W)
+    leaker(W, 4242, "node")
+    W.procs[4242].state = "T"
+    W.run(6)
+    local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+    f:write(string.format('[{"pid":4242,"name":"node","lstart":"%s","weightMB":0,"frozenAt":%d,"stopSent":true}]\n',
+      W.procs[4242].lstart, math.floor(W.now) + 3600))
+    f:close()
+    W.reloadState()
+    F.load(W, nil, { keepHome = true })
+    W.run(3)
+    local row = W.menuItem("   node")
+    check("future-frozen: kept", row ~= nil, true)
+    check("future-frozen: never a negative time frozen", row ~= nil and row.title:find("%-%d+ min") == nil, true)
+    local g = io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "r")
+    local raw = g and g:read("a") or ""
+    if g then g:close() end
+    local at = tonumber(raw:match('"frozenAt":(%-?[%d%.]+)'))
+    check("future-frozen: the stamp is now, not an hour ahead", at ~= nil and at <= W.now + 1, true)
+  end)
+
   -- Rule 3: a freeze still owns its entry after an in-process restart's
   -- reconcile rebuilt it, so its undo still reaches the newcomer it stopped.
   scenario("a freeze's verifier keeps its entry across an in-process restart", nil, function(W, mw)
@@ -2583,6 +2593,32 @@ do
     W.run(3)                          -- the freeze's own verifier runs
     check("restart-own: the newcomer the STOP reached was continued", W.procs[4242] and W.procs[4242].state, "S")
     check("restart-own: STOP, then its undo", W.signalsTo(4242), "STOP,CONT")
+  end)
+
+  -- Rule 3 with rule 8: a verifier settles its freeze's entry where the
+  -- slot holds it (rebuilt by a restart's reconcile, then shifted by a step
+  -- back), never by putting back the unshifted copy it captured.
+  scenario("a verifier settles the rebuilt entry, shifted, not its own copy", nil, function(W, mw)
+    leaker(W, 4242, "node")
+    W.run(12)
+    W.kern = 4
+    runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+    W.run(5)
+    local clickedAt = W.now
+    W.click("freeze")
+    W.probeFails = true               -- the restart's reconcile cannot check the entry, so keeps it
+    mw.start()
+    W.probeFails = false
+    W.wallOffset = -120               -- a step back, read before the freeze's own verifier runs
+    mw.debug()
+    W.run(3)
+    local f = io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "r")
+    local raw = f and f:read("a") or ""
+    if f then f:close() end
+    local at = tonumber(raw:match('"frozenAt":(%-?[%d%.]+)'))
+    check("rebuilt-settle: frozen and listed", W.menuItem("   node") ~= nil, true)
+    check("rebuilt-settle: the entry kept the step's shift (" .. tostring(at and math.floor(at - clickedAt)) .. " s)",
+      at ~= nil and math.abs((at - clickedAt) + 120) <= 2, true)
   end)
 
   -- Rule 4: an operator's answer frees the HUD from memwatch's own action:
@@ -2606,7 +2642,32 @@ do
 
   -- Rule 4: a click that signals nothing is no answer: its veto is withdrawn
   -- and memwatch's own kill carries on.
-  scenario("a click that signals nothing does not veto memwatch's own kill", UNATTENDED_KILL, function(W)
+  -- The click's answer settles when its outcome arrives, not when the HUD
+  -- comes down, so it holds however close to memwatch's escalation the
+  -- click lands (here 1 s and 5 s after the TERM).
+  for _, after in ipairs({ 1, 5 }) do
+    scenario("a click that signals nothing does not veto memwatch's own kill (" .. after .. " s)", UNATTENDED_KILL, function(W)
+      W.frontmost = { name = "Terminal", pid = 760 }
+      leaker(W, 4242, "node")
+      W.procs[4242].ignoreTerm = true
+      W.run(12)
+      W.kern = 4
+      runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+      W.run(after)
+      W.probeFailsOnce = 1              -- the click's own probe fails: nothing is signaled
+      W.click("kill")
+      W.run(30)
+      check("no-veto (" .. after .. " s): memwatch's KILL still went out", W.signalsTo(4242), "TERM,KILL")
+      check("no-veto (" .. after .. " s): the veto was withdrawn", logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
+      check("no-veto (" .. after .. " s): no receipt claims the operator answered it",
+        receiptSays(W, "memwatch unattended terminate", "KILL withheld, the operator answered it"), false)
+    end)
+  end
+
+  -- Rule 4: each click holds its own veto. A second click that signals
+  -- nothing gives up only its own: the first click's freeze still stands
+  -- memwatch's KILL down.
+  scenario("a failed second click does not withdraw the first click's veto", UNATTENDED_KILL, function(W)
     W.frontmost = { name = "Terminal", pid = 760 }
     leaker(W, 4242, "node")
     W.procs[4242].ignoreTerm = true
@@ -2614,11 +2675,79 @@ do
     W.kern = 4
     runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
     W.run(1)
-    W.probeFailsOnce = 1              -- the click's own probe fails: nothing is signaled
-    W.click("kill")
+    W.click("freeze")                   -- click 1: its STOP goes out, its outcome is on the way
+    local row = W.menuItem("node ")
+    local again
+    for _, it in ipairs(row and row.menu or {}) do
+      if it.title == "Freeze node" then again = it end
+    end
+    check("two-clicks: the row offers Freeze", again ~= nil, true)
+    W.probeFailsOnce = 1                -- click 2's own probe fails: it signals nothing
+    if again then again.fn() end
     W.run(30)
-    check("no-veto: memwatch's KILL still went out", W.signalsTo(4242), "TERM,KILL")
-    check("no-veto: the veto was withdrawn", logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
+    check("two-clicks: no KILL over the operator's freeze", W.signalsTo(4242), "TERM,STOP")
+    check("two-clicks: the process stays frozen", W.procs[4242] and W.procs[4242].state, "T")
+    check("two-clicks: the veto was never withdrawn", logHas(W, "unattended-veto-withdrawn:node(4242)"), false)
+  end)
+  -- Rule 3: a resume's verifier owns only the entry it resumed. A newer
+  -- freeze of the same process (its STOP still on the way when the resume
+  -- is checked) keeps its own entry, so the process stays resumable.
+  scenario("a resume's check never drops a newer freeze of the same process", nil, function(W)
+    W.frontmost = { name = "Terminal", pid = 760 }
+    leaker(W, 4242, "node")
+    W.run(12)
+    W.kern = 4
+    runUntil(W, 40, function() return bodyNames(W, "node") end)
+    W.run(10)
+    W.click("freeze")
+    runUntil(W, 20, function() return frozenRowAction(W, "node", "Resume") ~= nil end)
+    W.run(5)
+    -- The resume's check comes 0.5 s after its CONT; the newer freeze, 0.3 s
+    -- after the resume, lands its STOP 0.3 s after sending it: after the
+    -- resume's check, before the freeze's own.
+    W.stopDelay = 0.3
+    local resume = frozenRowAction(W, "node", "Resume")
+    check("resume-newer: frozen and resumable", resume ~= nil, true)
+    if resume then resume() end
+    W.run(0.3)
+    local row = W.menuItem("node ")
+    local freeze
+    for _, it in ipairs(row and row.menu or {}) do
+      if it.title == "Freeze node" then freeze = it end
+    end
+    check("resume-newer: the row offers Freeze", freeze ~= nil, true)
+    if freeze then freeze.fn() end      -- a newer freeze, before the resume's check
+    W.run(0.3)                          -- the resume's check has run
+    W.probeFailsOnce = 1                -- the newer freeze's own check cannot answer
+    W.run(15)
+    W.stopDelay = nil
+    check("resume-newer: frozen again", W.procs[4242] and W.procs[4242].state, "T")
+    check("resume-newer: and still resumable", frozenRowAction(W, "node", "Resume") ~= nil, true)
+  end)
+
+  -- The other order: a Force Quit that signals nothing, then a Freeze that
+  -- works, both before the HUD comes down. The failed click's outcome never
+  -- undoes the freeze's veto.
+  scenario("a failed click before a working one does not undo its veto", UNATTENDED_KILL, function(W)
+    W.frontmost = { name = "Terminal", pid = 760 }
+    leaker(W, 4242, "node")
+    W.procs[4242].ignoreTerm = true
+    W.run(12)
+    W.kern = 4
+    runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+    W.run(1)
+    W.probeFailsOnce = 1                -- click 1: Force Quit, its probe fails
+    W.click("kill")
+    local row = W.menuItem("node ")
+    local freeze
+    for _, it in ipairs(row and row.menu or {}) do
+      if it.title == "Freeze node" then freeze = it end
+    end
+    check("failed-first: the row offers Freeze", freeze ~= nil, true)
+    if freeze then freeze.fn() end      -- click 2: Freeze, it works
+    W.run(30)
+    check("failed-first: no KILL over the operator's freeze", W.signalsTo(4242), "TERM,STOP")
+    check("failed-first: the process stays frozen", W.procs[4242] and W.procs[4242].state, "T")
   end)
 
   -- Rule 5: a superseded action still owes its receipt: one whose result
@@ -2635,6 +2764,27 @@ do
     W.run(120)
     check("superseded-receipt: the late receipt was posted",
       receiptSays(W, "memwatch unattended freeze", "result has not come back"), true)
+  end)
+
+  -- Rule 8: a step in the middle of a tick is taken out when the tick ends.
+  -- The tick holds a reading from before the step, so a read later in the
+  -- same tick that shifted every stamp at once would leave the tick
+  -- comparing its old reading with shifted stamps (a fresh sample would read
+  -- as minutes stale).
+  scenario("a step in the middle of a tick is taken out when it ends", UNATTENDED_FREEZE, function(W)
+    W.frontmost = { name = "Terminal", pid = 760 }
+    leaker(W, 4242, "node")
+    W.run(12)
+    W.kern = 4
+    runUntil(W, 60, function() return W.hudShowing() end)
+    W.run(3)
+    W.onVmStat = function() W.wallOffset = -120; W.onVmStat = nil end
+    W.run(4)
+    check("mid-tick: the step was seen", logHas(W, "clock-stepped-back:120s"), true)
+    check("mid-tick: a fresh sample never reads as stale", logHas(W, "sampler-stale"), false)
+    W.run(30)
+    check("mid-tick: nor later", logHas(W, "sampler-stale"), false)
+    check("mid-tick: the shift ran without error", logHas(W, "error:clock-shift"), false)
   end)
 
   -- Rule 8: a forward step (a sleep) is no step back: nothing shifts.

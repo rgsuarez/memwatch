@@ -1330,7 +1330,7 @@ do
   check("banner glue: steps through core.bannerStep", notify:find("core.bannerStep(", 1, true) ~= nil, true)
   check("banner glue: Force Quit passes the bound start time",
     notify:find("local target = { pid = off.pid, name = off.name, lstart = lstart }", 1, true) ~= nil
-      and notify:find("surfaceUpdate(target), { expectedLstart = lstart })", 1, true) ~= nil, true)
+      and notify:find("surfaceUpdate(target, click), { expectedLstart = lstart })", 1, true) ~= nil, true)
   check("banner glue: the button exists only when identity is bound",
     notify:find("hasActionButton   = canAct,", 1, true) ~= nil, true)
   check("banner glue: no unbound kill remains",
@@ -1339,7 +1339,7 @@ do
   -- (round 5) An outcome from the menu or a banner answers only a HUD bound
   -- to its very process; a refusal with no start time withdraws only an
   -- unbound banner.
-  local SURF = "local function surfaceUpdate(target)"
+  local SURF = "local function surfaceUpdate(target, click)"
   check("surface glue: an outcome answers only a HUD bound to its very process",
     body(SURF):find("core.sameIdentity(hudOffender, target)", 1, true) ~= nil
       and forbids(SURF, "core.sameOffender(hudOffender, target)",
@@ -1598,7 +1598,7 @@ do
         for n in (names or ""):gmatch("[%w_]+") do
           if timeName(n) and not seen[n] then
             seen[n] = true
-            if not shiftBody:find(n, 1, true) then miss[#miss + 1] = n end
+            if not shiftBody:find("%f[%w_]" .. n .. "%f[^%w_]") then miss[#miss + 1] = n end
           end
         end
       end
@@ -1606,7 +1606,7 @@ do
     for n in text:gmatch("%.([%a_][%w_]*)") do
       if timeName(n) and not calls[n] and not seen[n] then
         seen[n] = true
-        if not shiftBody:find(n, 1, true) then miss[#miss + 1] = n end
+        if not shiftBody:find("%f[%w_]" .. n .. "%f[^%w_]") then miss[#miss + 1] = n end
       end
     end
     return miss
@@ -1621,6 +1621,90 @@ do
     #unshifted("e.fooUntil = now + 1\n", body), 1)
   check("clock.shift: a function call is not a stamp (control)",
     #unshifted("x = procs.fooSince(t)\n", body), 0)
+  -- Fields named plainly at, since or t are stamps too. Each holder that
+  -- writes one is listed with the shift step that covers it, or the scan
+  -- fails: a new holder is a reviewed decision.
+  local lowerHolders = {
+    topCache = "sampler", goneUntil = "gone", fired = "unattended (an unattendedFiredFor record)",
+    unattendedFiredFor = "unattended", lfmInFlight = "adjudicator", verdictCache = "verdicts",
+    smState = "state", ring = "tracker (its samples)",
+    -- Log rows: an ISO time string written out with the row, never held
+    -- or compared (the decision record, and its follow-up).
+    rec = "not a stamp: a decision record's ISO time",
+    offender = "not a stamp: the follow-up row's ISO time (the row is built inside a call on offender)",
+  }
+  local function lowerStamps(text)
+    local sa = text:find("function clock.shift(delta)", 1, true)
+    local sz = sa and text:find("\nend\n", sa, true)
+    if sa and sz then text = text:sub(1, sa - 1) .. text:sub(sz) end
+    local miss, ctor = {}, nil
+    for line in text:gmatch("[^\n]+") do
+      local open = line:match("([%a_][%w_]*)[^=]-=%s*{")
+      if open then ctor = open == "local" and line:match("local%s+([%a_][%w_]*)") or open end
+      local holder = line:match("([%a_][%w_]*)%.at%s*=[^=]") or line:match("([%a_][%w_]*)%.since%s*=[^=]")
+        or line:match("([%a_][%w_]*)%.t%s*=[^=]")
+      if not holder and (line:match("[{,]%s*at%s*=[^=]") or line:match("^%s*at%s*=[^=]")
+          or line:match("[{,]%s*since%s*=[^=]") or line:match("[{,]%s*t%s*=[^=]")) then
+        holder = ctor or "?"
+      end
+      if holder and not lowerHolders[holder] then miss[#miss + 1] = holder end
+    end
+    return miss
+  end
+  local w1, w2 = lowerStamps(src), lowerStamps(psrc)
+  check("clock.shift: every holder of an at, since or t stamp is reviewed (" .. table.concat(w1, ",")
+    .. table.concat(w2, ",") .. ")", #w1 + #w2, 0)
+  check("clock.shift: the scan sees a new holder's at (positive control)", #lowerStamps("  newHolder.at = now\n"), 1)
+  check("clock.shift: and one built with it (positive control)",
+    #lowerStamps("  local fresh = {\n    pid = 1,\n    at = now,\n  }\n"), 1)
+  -- A name is matched whole: one that appears in the shift only inside a
+  -- longer name is not shifted.
+  check("clock.shift: a name inside a longer one does not count (positive control)",
+    #unshifted("local sampleAt = 0\n", "lastSampleAt = sh(lastSampleAt)"), 1)
+  check("clock.shift: each holder is shifted under its own pcall",
+    body:find("local ok, err = pcall(step[2])", 1, true) ~= nil
+      and body:find('logError("clock-shift:" .. step[1], err)', 1, true) ~= nil, true)
+  -- A stamp written two holders deep is matched by its whole path: a field
+  -- of the same name on another holder (obs.lastAt) does not cover it.
+  local function nestedUnshifted(text, shiftBody)
+    local miss, seen = {}, {}
+    for chain in text:gmatch("([%a_][%w_]*%.[%a_][%w_]*%.[%a_][%w_]*)%s*=[^=]") do
+      if timeName(chain:match("([%a_][%w_]*)$")) and not seen[chain] then
+        seen[chain] = true
+        if not shiftBody:find(chain, 1, true) then miss[#miss + 1] = chain end
+      end
+    end
+    return miss
+  end
+  local n1, n2 = nestedUnshifted(src, body), nestedUnshifted(psrc, body)
+  check("clock.shift: every nested stamp is shifted by its whole path (" .. table.concat(n1, ",")
+    .. table.concat(n2, ",") .. ")", #n1 + #n2, 0)
+  check("clock.shift: a nested stamp is not covered by a namesake (positive control)",
+    #nestedUnshifted("obs.stats.lastAt = now\n", "obs.lastAt = sh(obs.lastAt)"), 1)
+  check("clock.shift: a nested read is not a stamp (control)",
+    #nestedUnshifted("if a.e.frozenAt < b.e.frozenAt then end\n", body), 0)
+  -- A wall reading kept in a function's local is out of the shift's reach
+  -- (a callback that captures it keeps the old basis), so a duration timed
+  -- from one belongs on the monotonic clock. Every time-named local inside
+  -- a function is listed here with how it is used, or the scan fails.
+  local functionLocal = {
+    sentAt = "dispatch: copied into lfmInFlight.at (shifted) in the same call; latency: a monotonic reading",
+  }
+  local function localStamps(text)
+    local miss = {}
+    for line in text:gmatch("[^\n]+") do
+      local names = line:match("^%s+local%s+([%w_,%s]-)%s*=") or line:match("^%s+local%s+([%w_]+)%s*$")
+      for n in (names or ""):gmatch("[%w_]+") do
+        if timeName(n) and not functionLocal[n] then miss[#miss + 1] = n end
+      end
+    end
+    return miss
+  end
+  local l1, l2 = localStamps(src), localStamps(psrc)
+  check("closures: every time-named function local is reviewed (" .. table.concat(l1, ",")
+    .. table.concat(l2, ",") .. ")", #l1 + #l2, 0)
+  check("closures: the scan sees an indented stamp (positive control)",
+    #localStamps("  local spawnAt = lfmSpawnedAt\n"), 1)
   -- Pure durations never need shifting: they run on the monotonic clock.
   check("monotonic: a poller's error run", src:find("core.untilStep(run, ok, done, clock.mono(), UNTIL_GIVEUP_SEC)", 1, true) ~= nil, true)
   check("monotonic: the retire's KILL deadline",
@@ -1629,20 +1713,53 @@ do
     src:find("local healthDeadline = clock.mono() + 60", 1, true) ~= nil
       and src:find("if clock.mono() > healthDeadline then", 1, true) ~= nil, true)
   check("monotonic: request latency", src:find("math.floor((clock.mono() - sentMono) * 1000)", 1, true) ~= nil, true)
+  -- Rule 4: a click's "nothing done" reaches it at the click (its probe),
+  -- so no engine reports it after the backstop has released the action;
+  -- should one ever do so, a released action is still never revived.
+  check("veto: a withdrawal needs the action still in flight",
+    src:find("if openReceipts[owed] and not owed.finished and not owed.vetoFinal", 1, true) ~= nil, true)
+  check("monotonic: the fast-crash window, keyed to this very spawn",
+    src:find("if lfmSpawn == spawn\n         and (clock.mono() - spawn.mono) < 10 then", 1, true) ~= nil, true)
+  check("monotonic: the error log's rate limit", src:find("local now = clock.mono()\n  if lastErrorMono[label]", 1, true) ~= nil, true)
   -- A shift that throws never aborts the read that found the step, and
   -- never runs again for the same step: the readings move first.
   local ra = src:find("function clock.now()", 1, true)
   local rz = ra and src:find("\nend\n", ra, true)
   local reader = (ra and rz) and src:sub(ra, rz) or ""
+  local aa = src:find("function clock.apply(delta)", 1, true)
+  local az = aa and src:find("\nend\n", aa, true)
+  local applier = (aa and az) and src:sub(aa, az) or ""
   local moved = reader:find("clock.wallAt, clock.monoAt = wall, mono", 1, true)
-  local guarded = reader:find("pcall(clock.shift, delta)", 1, true)
-  check("clock.now: the shift runs under pcall, after the readings move",
-    moved ~= nil and guarded ~= nil and moved < guarded, true)
+  local applied = reader:find("clock.apply(delta)", 1, true)
+  check("clock.now: a step is applied only after the readings move",
+    moved ~= nil and applied ~= nil and moved < applied, true)
+  local counted = applier:find("clock.stepTotal = clock.stepTotal + delta", 1, true)
+  local guarded = applier:find("pcall(clock.shift, delta)", 1, true)
+  check("clock.apply: the step is counted, then the shift runs under pcall",
+    counted ~= nil and guarded ~= nil and counted < guarded, true)
+  -- A callback is never shifted under: a step seen mid-callback is held and
+  -- applied when it ends, and reads inside it stay on its starting basis.
+  check("clock frames: guard brackets every callback",
+    src:find("    clock.enter()\n    local ok, err = pcall(fn, ...)\n    clock.leave()", 1, true) ~= nil, true)
+  check("clock frames: a step seen after the frame has read the clock waits for its end",
+    reader:find("if clock.depth > 0 and clock.frameRead then\n      clock.pending = clock.pending + delta", 1, true) ~= nil, true)
+  check("clock frames: reads inside the frame stay on its basis", reader:find("return wall - clock.pending", 1, true) ~= nil, true)
   check("clock.shift: the wait streak is a count, never indexed as a stamp", body:find("unattendedWaitStreak", 1, true), nil)
   check("unattended grace: a future stamp restarts from now (fails closed)",
     src:find("if fired and type(fired.at) == \"number\" and fired.at > now then fired.at = now end", 1, true) ~= nil, true)
+  -- One reader of the wall clock: clock.now. clock.mono reads the
+  -- monotonic clock, or the wall clock through clock.now when there is
+  -- none, and nothing reads os.time.
   local _, raw = src:gsub("hs%.timer%.secondsSinceEpoch%(%)", "")
-  check("wall reads: only the two clock readers read the wall clock raw", raw, 2)
+  check("wall reads: only clock.now reads the wall clock raw", raw, 1)
+  local _, osTime = src:gsub("os%.time%(%)", "")
+  check("wall reads: no os.time", osTime, 0)
+  local ma = src:find("function clock.mono()", 1, true)
+  local mz = ma and src:find("\nend\n", ma, true)
+  local mono = (ma and mz) and src:sub(ma, mz) or ""
+  check("clock.mono: without a monotonic clock, the wall through the detector, steps added back",
+    mono:find("return clock.now() - clock.stepTotal", 1, true) ~= nil, true)
+
 end
 
 if fails == 0 then

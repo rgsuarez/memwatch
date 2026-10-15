@@ -2295,11 +2295,17 @@ local function retireLfmServer(reason)
   -- a pid reused after our server exited is never signaled. No recorded
   -- start time, or a probe that cannot tell: nothing is sent to the pid
   -- (the task handle's own terminate above and the port check below remain).
-  local function trackedIsOurs()
-    if not ident or ident.pid ~= pid then return false end
+  -- "ours": the pid holds the recorded server; "other": it provably does
+  -- not (exited, or another process holds it); "unknown": no recorded
+  -- start time, or a probe that cannot tell.
+  local function trackedState()
+    if not ident or ident.pid ~= pid or ident.lstart == nil then return "unknown" end
     local st, live = probe(pid)
+    if st == "unknown" then return "unknown" end
     return core.identityHolds(ident, st, live and live.lstart, live and procs.friendlyName(live.comm))
+      and "ours" or "other"
   end
+  local function trackedIsOurs() return trackedState() == "ours" end
   -- Signal the tracked pid AND the actual port listener (may be a child),
   -- but only signal the listener if it is CONFIRMED ours: an llama-server
   -- serving OUR model dir, holding our port. In the narrow window after our
@@ -2314,10 +2320,15 @@ local function retireLfmServer(reason)
       and info:find("projects/memwatch/models/", 1, true) ~= nil
   end
   local function signalTargets(sig)
-    local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)
+    local tracked = pid ~= nil and trackedState() or "unknown"
+    local sent = tracked == "ours" and send(sig, pid)
     if port then
       local owner = listenerPid(port)
-      if owner and not (sent and owner == pid) and listenerIsOurs(owner) then
+      -- The listener path covers a child listener, or the tracked pid whose
+      -- identity was never recorded; never the tracked pid once it is
+      -- proven to hold another process (a replacement llama-server on our
+      -- model directory, reusing pid and port, is not ours).
+      if owner and not (owner == pid and (sent or tracked == "other")) and listenerIsOurs(owner) then
         if send(sig, owner) and owner == pid then sent = true end
       end
     end
@@ -2355,7 +2366,10 @@ local function retireLfmServer(reason)
     guard("lfm-retire-wait", function() end),
     1,
     function()
-      -- The predicate kept erroring: one last identity-checked KILL.
+      -- The predicate kept erroring: one last identity-checked KILL. (When
+      -- the deadline's own KILL attempt raised, this give-up, up to
+      -- UNTIL_GIVEUP_SEC later, is the KILL that remains: identity-checked,
+      -- so the worst case is a late KILL, never a wrong one.)
       if pid and trackedIsOurs() then send("KILL", pid) end
     end)
 end
@@ -2366,8 +2380,11 @@ end
 -- and again for the verified listener once /health passes.
 local function recordLfmServer(pid)
   local probed = probePid(pid)
-  lfmServerIdent = { pid = pid, lstart = probed and probed.lstart or nil,
-                     name = probed and procs.friendlyName(probed.comm) or nil }
+  -- A probe that cannot answer never erases what an earlier one verified
+  -- for the same pid.
+  local prev = (lfmServerIdent and lfmServerIdent.pid == pid) and lfmServerIdent or nil
+  lfmServerIdent = { pid = pid, lstart = probed and probed.lstart or (prev and prev.lstart) or nil,
+                     name = probed and procs.friendlyName(probed.comm) or (prev and prev.name) or nil }
   local rec = lfm.jsonEncode({ pid = pid, lstart = lfmServerIdent.lstart })
   if rec then
     local pf = io.open(LFM_PIDFILE, "w")

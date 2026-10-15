@@ -311,6 +311,11 @@ do
   -- A held process whose pages compress: each drop is caught up by one rise.
   local trHeld = series({ 9000, 9000, 8000, 8300, 7500, 7800, 7000, 7300 })
   check("risingSince: a compressing held process never makes a run", procs.risingSince(trHeld, 60, 0) < 3, true)
+  -- (round 5) A held process whose figure catches up on alternate samples:
+  -- rise, flat, rise, flat, rise is no run (growth()'s one-flat grace does
+  -- not apply here).
+  local trAlt = series({ 9000, 9100, 9100, 9200, 9200, 9300 })
+  check("risingSince: alternate catch-ups are not a run", procs.risingSince(trAlt, 60, 0), 1)
   check("risingSince: no samples after the mark", procs.risingSince(trNew, 60, 999), 0)
   check("risingSince: an untracked pid", procs.risingSince(trNew, 61, 0), 0)
 end
@@ -1364,7 +1369,8 @@ do
   local retire = body("local function retireLfmServer(reason)")
   local RETIRE = "local function retireLfmServer(reason)"
   check("lfm glue: the retire TERM and KILL both check the recorded server identity",
-    retire:find("local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)", 1, true) ~= nil
+    retire:find('local sent = tracked == "ours" and send(sig, pid)', 1, true) ~= nil
+      and retire:find('if owner and not (owner == pid and (sent or tracked == "other")) and listenerIsOurs(owner) then', 1, true) ~= nil
       and retire:find("core.identityHolds(ident, st,", 1, true) ~= nil
       and forbids(RETIRE, 'sig == "TERM" or',
         RETIRE .. '\n    if pid and (sig == "TERM" or trackedIsOurs()) then\nend\n'), true)
@@ -1375,6 +1381,9 @@ do
     forbids(RETIRE, "local ident = probePid(pid)", RETIRE .. "\n  local ident = probePid(pid)\nend\n")
       and src:find("recordLfmServer(owner)", 1, true) ~= nil, true)
   local start = body("function M.start()")
+  check("lfm glue: a later probe that cannot answer keeps the recorded start time",
+    body("local function recordLfmServer(pid)"):find(
+      "lstart = probed and probed.lstart or (prev and prev.lstart) or nil", 1, true) ~= nil, true)
   check("lfm glue: the orphan sweep requires the recorded start time",
     start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
       and forbids("function M.start()", "not rec.lstart or",

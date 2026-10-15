@@ -241,12 +241,9 @@ function obs.noteTick(now, availPct, state, mono)
     end
   end
   if stepped then
+    -- (The cadence stamps are shifted with every other stamp by clock.shift,
+    -- earlier in the same tick.)
     for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
-    -- The cadence stamps from before the step re-base to it, so the
-    -- advisory cadence and each process's decision window run on from here
-    -- instead of waiting for the wall clock to catch up.
-    obs.lastAt = math.min(obs.lastAt, now)
-    for _, st in pairs(obs.decisionAt) do st.at = math.min(st.at, now) end
   end
   obs.lastTickAt, obs.lastTickMono = now, mono
   local log = obs.ticks
@@ -1935,6 +1932,11 @@ function clock.shift(delta)
   lastNotifyAt, lastStaleLogAt, lastStaleNotifyAt = sh(lastNotifyAt), sh(lastStaleLogAt), sh(lastStaleNotifyAt)
   unattendedSkipLogAt, lastFrozenSweepAt = sh(unattendedSkipLogAt), sh(lastFrozenSweepAt)
   sampler.at, sampler.startedAt, prevCountersAt = sh(sampler.at), sh(sampler.startedAt), sh(prevCountersAt)
+  -- The observation ledger's cadence moves with the rest, so a decision row
+  -- still lands on the tick the unattended step acts. (Its records are not
+  -- shifted: one that spans a step is closed instead, see obs.noteTick.)
+  obs.lastAt = sh(obs.lastAt)
+  for _, st in pairs(obs.decisionAt) do st.at = sh(st.at) end
   topCache.at, topStartedAt, topRespawnAt, topIdleSince =
     sh(topCache.at), sh(topStartedAt), sh(topRespawnAt), sh(topIdleSince)
   lfmLastAdvisoryAt, lfmRemoteCooldownUntil = sh(lfmLastAdvisoryAt), sh(lfmRemoteCooldownUntil)

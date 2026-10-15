@@ -164,7 +164,11 @@ end
 function M.decisionDue(a)
   if type(a) ~= "table" or a.enabled ~= true or a.gate ~= "open" then return false end
   if type(a.graceSec) ~= "number" then return false end
-  if type(a.sinceLastSec) == "number" and a.sinceLastSec < a.graceSec then return false end
+  -- A stamp after now (the wall clock stepped back since) counts as elapsed,
+  -- as the unattended step's own grace stamp does.
+  if type(a.sinceLastSec) == "number" and a.sinceLastSec >= 0 and a.sinceLastSec < a.graceSec then
+    return false
+  end
   return true
 end
 

@@ -1934,6 +1934,9 @@ do
   check("decisionDue: a closed gate is not", dueWith({ gate = "closed" }), false)
   check("decisionDue: an unbound gate is not (the live step would not act)", dueWith({ gate = "unbound" }), false)
   check("decisionDue: the ledger off is not due", dueWith({ enabled = false }), false)
+  check("decisionDue: a stamp after now (the clock stepped back) counts as elapsed",
+    dueWith({ sinceLastSec = -30 }), true)
+  check("decisionDue: inside the window is not due (control)", dueWith({ sinceLastSec = 30 }), false)
   check("decisionDue: a row within the grace window suppresses", dueWith({ sinceLastSec = 30 }), false)
   check("decisionDue: a row a full window ago does not", dueWith({ sinceLastSec = 60 }), true)
   check("decisionDue: no grace window is not due", dueWith({ graceSec = false }), false)

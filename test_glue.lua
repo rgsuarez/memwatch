@@ -2434,6 +2434,35 @@ scenario("a verdict whose snapshot is not its process's own never acts, in kill 
   check("unverified kill: the decision was not the model's", unattendedRow(W, "lfm"), nil)
 end)
 
+-- Across a clock step, a decision row still lands on the tick the
+-- unattended step acts: one row per attempt after the step.
+scenario("ledger: decision rows stay with the attempts across a clock step", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242)
+  W.procs[4242].unstoppable = true  -- every freeze fails to take, so it is attempted again
+  -- Each STOP's verifier cannot probe (for a second), so each attempt is
+  -- unconfirmed and retried after its grace.
+  W.onSignal = function(sig)
+    if sig == "STOP" then
+      W.probeFails = true
+      W.addTimer("after", 1, nil, function() W.probeFails = false end).world = true
+    end
+  end
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.run(20)
+  local rowsBefore, stopsBefore = 0, select(2, W.signalsTo(4242):gsub("STOP", ""))
+  for _, r in ipairs(ledgerRows(W)) do if r.point == "decision" and r.pid == 4242 then rowsBefore = rowsBefore + 1 end end
+  W.wallOffset = -120
+  W.run(200)
+  W.onSignal = nil
+  local rows = 0
+  for _, r in ipairs(ledgerRows(W)) do if r.point == "decision" and r.pid == 4242 then rows = rows + 1 end end
+  local stops = select(2, W.signalsTo(4242):gsub("STOP", ""))
+  check("aligned: attempts went on after the step", stops - stopsBefore >= 2, true)
+  check("aligned: one decision row per attempt after the step", rows - rowsBefore, stops - stopsBefore)
+end)
+
 -- ---- round 4: interactions the design pass introduced ----
 -- (round 4 P1) The sweep runs in every state now, in the same tick as an
 -- unattended freeze. A STOP that takes effect a moment later must not

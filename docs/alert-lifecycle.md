@@ -75,6 +75,10 @@ the fact:
 | `unconfirmed` | a signal went out, but its result could not be verified | stands as it was; announced |
 | `unverified` | nothing was signaled: the probe failed first, or the signal could not be sent | stands as it was: visible, unanswered, retryable |
 
+The answer applies whichever surface started the action: the HUD's own
+narrative, or a menu or banner action on the process the HUD names (a HUD
+held by a narrative of its own is left to that narrative).
+
 An answered process stops being a candidate by its own state, not by a note
 in a list: memwatch holds it frozen, it is gone, or it is ignored. Nothing
 else is remembered as "handled", so a process that is resumed, or that
@@ -144,7 +148,10 @@ whatever is up stays.
 synthetic offender: never bound, buttons inert, no banner action. Each run
 has its own generation, so a later diagnostic, a stop or a restart orphans
 an earlier one's resume, and an action narrative from an earlier run does
-nothing when it completes.
+nothing to the new run's alert when it completes. The signal engine itself
+finishes an action it started on a verified identity (a Force Quit's KILL
+still goes to the process it verified), and a verified exit is kept: both
+are facts about the process, not about the episode.
 
 ## Held pollers
 

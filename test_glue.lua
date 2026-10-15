@@ -1203,6 +1203,48 @@ scenario("a toggle that cannot be saved says so", '{"unattended":"off","remoteSe
   check("toggle: the operator is told the setting lasts only until reload", said, true)
 end)
 
+-- ---- runs: a menu action's outcome belongs to the run that started it ----
+-- (round 4) The action finishes on its verified identity after a restart,
+-- but its outcome no longer routes to the alert: the new run's alert for
+-- the same process stays up.
+scenario("an earlier run's menu action leaves the new run's alert alone", nil, function(W, mw)
+  W.addProc(4242, "wedged", 2000, { unkillable = true, ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "wedged (pid") end)
+  W.run(5)
+  local row = W.menuItem("wedged")
+  local forceQuit = row and row.menu and row.menu[2]
+  check("runs: the row offers Force Quit", forceQuit ~= nil and forceQuit.disabled == nil, true)
+  forceQuit.fn()                    -- TERM now; KILL and the verdict seconds later
+  W.run(1)
+  mw.stop()
+  mw.start()
+  check("runs: the new run raises its own alert",
+    runUntil(W, 10, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end), true)
+  W.run(20)
+  check("runs: the earlier action still finished on its identity", W.signalsTo(4242), "TERM,KILL")
+  check("runs: its outcome did not take the new run's alert down", W.hudShowing(), true)
+end)
+
+-- (round 4) A menu action the process survives answers the HUD naming it
+-- the way the HUD's own action would: snoozed, back after the cooldown.
+scenario("a menu Force Quit the process survives snoozes its HUD", nil, function(W)
+  W.addProc(4242, "wedged", 2000, { unkillable = true, ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "wedged (pid") end)
+  W.run(5)
+  local row = W.menuItem("wedged")
+  row.menu[2].fn()
+  W.run(20)
+  check("survived: the HUD naming it is snoozed", W.hudShowing(), false)
+  check("survived: and comes back after the cooldown",
+    runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end), true)
+end)
+
 -- ---- narratives: a hold that never ends is released ----
 -- A narrative whose next step never runs (the run loop stalls past its
 -- escalation) ends without its last update. The alert must not stay

@@ -746,21 +746,26 @@ end
 
 -- Progress for an action started from the menu or a banner (no HUD of its
 -- own): a brief on-screen alert per step, and the outcome routed to the
--- episode as the HUD's is. A reused pid rebinds every surface; a process
--- frozen or verified gone is answered, so a HUD still naming it comes down.
+-- episode as the HUD's is (core.answerFor): a reused pid rebinds every
+-- surface, and a HUD still naming the same process comes down as done or
+-- snoozed, unless a narrative of its own holds it. The episode it routes
+-- to is this run's: after a stop or start, only a verified exit (a fact
+-- about the process, not the episode) is kept.
 -- (hs.alert directly: alertUpdate is declared further down the file.)
 local function surfaceUpdate(target)
+  local gen = runGen
   return function(text, done, outcome)
     hs.alert.show("memwatch: " .. text, 2.5)
     if not done then return end
+    local answer = core.answerFor(outcome)
+    if answer == "done" and outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
+    if gen ~= runGen then return end
     settleInteraction(target, outcome)
-    if outcome == "stale" then
+    if answer == "rebind" then
       identityRefused(target)
-    elseif core.answerFor(outcome) == "done" then
-      if outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
-      if hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
-        dismissHud("done", hudOffender)
-      end
+    elseif (answer == "done" or answer == "snooze")
+       and hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
+      dismissHud(answer, hudOffender)
     end
   end
 end

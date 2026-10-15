@@ -50,6 +50,9 @@ local lastExtreme  = false -- extreme runaway currently on the books
 -- table is whole).
 local sampler = { task = nil, startedAt = 0, at = 0,
                   seq = 0, nextSeq = 0, launchedAt = nil, complete = false }
+-- The previous tick's wall and monotonic clock readings (clock.shift, below
+-- the state it shifts, keeps waits whole across a wall clock stepped back).
+local clock = { wall = nil, mono = nil }
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -1664,7 +1667,11 @@ local function unattendedStep(offender, now)
   -- An action still in flight on this process (its outcome has not come
   -- back, say through a stalled run loop) is never followed by another.
   if actionInFlight(hudOffender) then return end
-  if (now - ((fired and fired.at) or 0)) < core.cfg.cool.autoKillGraceSec then return end
+  -- A stamp after now (the wall clock stepped back since: wake-time NTP, a
+  -- VM resume) has no elapsed time to wait out: it counts as elapsed, so a
+  -- step never holds the policy off for its own length.
+  local sinceFired = now - ((fired and fired.at) or 0)
+  if sinceFired >= 0 and sinceFired < core.cfg.cool.autoKillGraceSec then return end
   unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
   local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now)
   M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
@@ -1897,8 +1904,55 @@ end
 -- needs is native (rates and headroom from hs.host.vmStat counters) or
 -- last-known (kernel level, extreme flag), so the state machine, title, and
 -- alert surfaces keep working even while the sampler fork is starving.
+-- A wall clock stepped back (wake-time NTP, a VM resume, a manual change)
+-- leaves every stamp memwatch took before it in the future, so every wait,
+-- cooldown and deadline would last the step's length longer: a hold, a
+-- pending freeze, the grace before the next unattended attempt, the
+-- sampler's watchdog. Each tick compares the wall clock's advance with the
+-- monotonic clock's (a sleep only makes the wall advance more); a step back
+-- shifts every stamp by the step, so each wait keeps the length it had left.
+function clock.shift(delta)
+  local function sh(v) return type(v) == "number" and v + delta or v end
+  for _, f in pairs(unattendedFiredFor) do f.at = sh(f.at) end
+  for _, w in pairs(unattendedWaitStreak) do w.firstAt = sh(w.firstAt) end
+  for owed in pairs(openReceipts) do owed.dueAt, owed.releaseAt = sh(owed.dueAt), sh(owed.releaseAt) end
+  for _, e in pairs(frozen) do e.pendingUntil, e.frozenAt = sh(e.pendingUntil), sh(e.frozenAt) end
+  for _, g in pairs(goneUntil) do g.untilAt, g.at = sh(g.untilAt), sh(g.at) end
+  for _, ig in pairs(ignoredUntil) do ig.untilAt = sh(ig.untilAt) end
+  for _, r in pairs(interacted) do r.pendingUntil = sh(r.pendingUntil) end
+  for pid, at in pairs(bindTriedAt) do bindTriedAt[pid] = at + delta end
+  for k, at in pairs(runawayLogAt) do runawayLogAt[k] = at + delta end
+  for k, at in pairs(lastErrorAt) do lastErrorAt[k] = at + delta end
+  for _, e in pairs(verdictCache) do e.at = sh(e.at) end
+  for _, e in pairs(tracker.procs) do
+    e.lastSeen = sh(e.lastSeen)
+    for _, smp in ipairs(e.ring or {}) do smp.t = sh(smp.t) end
+  end
+  if hudSnooze then hudSnooze.untilAt = sh(hudSnooze.untilAt) end
+  if lfmInFlight then lfmInFlight.at = sh(lfmInFlight.at) end
+  hudHoldUntil, lastHudRaiseAt = sh(hudHoldUntil), sh(lastHudRaiseAt)
+  hudBelowCritSince, exposureTickAt = sh(hudBelowCritSince), sh(exposureTickAt)
+  lastNotifyAt, lastStaleLogAt, lastStaleNotifyAt = sh(lastNotifyAt), sh(lastStaleLogAt), sh(lastStaleNotifyAt)
+  unattendedSkipLogAt, lastFrozenSweepAt = sh(unattendedSkipLogAt), sh(lastFrozenSweepAt)
+  sampler.at, sampler.startedAt, prevCountersAt = sh(sampler.at), sh(sampler.startedAt), sh(prevCountersAt)
+  topCache.at, topStartedAt, topRespawnAt, topIdleSince =
+    sh(topCache.at), sh(topStartedAt), sh(topRespawnAt), sh(topIdleSince)
+  lfmLastAdvisoryAt, lfmRemoteCooldownUntil = sh(lfmLastAdvisoryAt), sh(lfmRemoteCooldownUntil)
+  lfmCalmSince, lfmSpawnedAt = sh(lfmCalmSince), sh(lfmSpawnedAt)
+  smState.since = sh(smState.since)
+end
+
 local function tick()
   local now = hs.timer.secondsSinceEpoch()
+  local mono = hs.timer.absoluteTime and hs.timer.absoluteTime() / 1e9 or nil
+  if mono and clock.wall and clock.mono then
+    local delta = (now - clock.wall) - (mono - clock.mono)
+    if delta < -2 then
+      M.logSnapshot(string.format("clock-stepped-back:%.0fs", -delta))
+      clock.shift(delta)
+    end
+  end
+  clock.wall, clock.mono = now, mono
   local m = readMetrics()   -- native, fork-free
   lastMetrics = m
   -- Activity rates from the cumulative counter deltas.
@@ -1917,7 +1971,6 @@ local function tick()
   -- The reading the observation follow-ups read as of their horizons, with
   -- the monotonic clock beside the wall clock to tell a step back.
   -- Bookkeeping: it never interrupts the tick.
-  local mono = hs.timer.absoluteTime and hs.timer.absoluteTime() / 1e9 or nil
   local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state, mono)
   if not okTick then logError("observe-tick", errTick) end
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)

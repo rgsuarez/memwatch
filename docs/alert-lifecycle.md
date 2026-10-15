@@ -42,6 +42,13 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
 7. **Marks are per process.** A frozen or gone mark never holds for a
    process with another name, and a mark that growth has proved stale stays
    released.
+8. **A wall clock stepped back never lengthens a wait.** Each tick compares
+   the wall clock's advance with the monotonic clock's (a sleep only makes
+   the wall advance more); a step back shifts every stamp memwatch holds
+   (holds, pending freezes, marks, receipts' deadlines, the grace before the
+   next unattended attempt, the sampler's watchdog, cooldowns, the
+   tracker's sample times) by the step, so each wait keeps the length it
+   had left. A grace stamp found after now counts as elapsed.
 
 ## The episode
 

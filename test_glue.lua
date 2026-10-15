@@ -2976,6 +2976,43 @@ scenario("a re-freeze that finds the process gone drops its entry", nil, functio
     W.alerts[#W.alerts] ~= nil and W.alerts[#W.alerts].text:find("couldn't send TERM to node; it has exited", 1, true) ~= nil, true)
 end)
 
+-- A wall clock stepped back between two unattended attempts on the same
+-- process never holds the second off for the length of the step.
+scenario("a clock stepped back never holds the next unattended attempt off", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].unstoppable = true  -- every freeze fails to take, so it is attempted again
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end   -- and is unconfirmed
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal = nil
+  W.run(1)
+  W.probeFails = false
+  local first = W.now
+  W.wallOffset = -120               -- the clock steps back right after the first attempt
+  local again = runUntil(W, 100, function() return select(2, W.signalsTo(4242):gsub("STOP", "")) >= 2 end)
+  check("clock-step: the next attempt comes within its grace window, not the step's length", again, true)
+  check("clock-step: and well before the clock catches up", W.now - first < 100, true)
+end)
+
+-- A HUD hold whose narrative never finishes is still released one hold
+-- window after the action, whatever the wall clock did meanwhile.
+scenario("a clock stepped back never lengthens a stuck hold", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.onSignal = function(sig) if sig == "STOP" then W.timersStall = true end end   -- its verifier never runs
+  W.click("freeze")
+  W.onSignal = nil
+  W.run(2)
+  W.wallOffset = -120
+  local released = runUntil(W, 60, function() return logHas(W, "hud-hold-expired") end)
+  W.timersStall = false
+  check("stuck hold: released within a hold window of the action", released, true)
+end)
+
 os.remove(LFM_KEYFILE)
 if fails == 0 then
   print("\nALL PASS")

@@ -951,7 +951,7 @@ local function alertSurfaces(state, now)
       end
       if (now - ((fired and fired.at) or 0)) >= core.cfg.cool.autoKillGraceSec then
       unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
-      local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
+      local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now)
       M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
         action, offender.name, offender.pid, adjudicator))
       writeDecisionOutcome(offender, action, adjudicator, rationale, rails, extra)
@@ -1465,8 +1465,9 @@ end
 -- Choose the unattended action. A fresh model verdict is refined through
 -- the deterministic rails within the mode ceiling; no verdict means the
 -- deterministic policy acts exactly as the legacy autoKill did (the mode is
--- the action, extreme-only, policy-gated inside the signal path).
-resolveUnattendedAction = function(mode, offender)
+-- the action, extreme-only, policy-gated inside the signal path). now is
+-- the decision tick's clock.
+resolveUnattendedAction = function(mode, offender, now)
   -- The foreground termination rail must fire in the LIVE path, not only in
   -- the advisory snapshot: lastOffender never carries a foreground flag, so
   -- compute it here against the frontmost app before applyVerdict.
@@ -1511,21 +1512,20 @@ resolveUnattendedAction = function(mode, offender)
     -- lfm.cfg.maxDeferSec has elapsed since the FIRST model wait on this
     -- offender at grace expiry, the deterministic policy proceeds. The bound
     -- is time, not a wait count: a 90 s verdict cache against a 60 s grace
-    -- cadence let one cached wait count twice under the old counter.
+    -- cadence let one cached wait count twice under the old counter. It is
+    -- measured on the tick's clock, never on a read after the probe forks
+    -- above, so tick-aligned waits at 0, 60 and 120 s exhaust on the third.
     if eff == "wait" then
-      local nowS = hs.timer.secondsSinceEpoch()
-      local w = unattendedWaitStreak[offender.pid]
-      if type(w) ~= "table" then w = { firstAt = nowS, count = 0 } end
-      w.count = w.count + 1
+      local w, exhausted = lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)
       unattendedWaitStreak[offender.pid] = w
-      if lfm.deferralExhausted(w.firstAt, nowS, lfm.cfg.maxDeferSec) then
+      if exhausted then
         -- The model's wait rationale is SUPERSEDED here, so do not attach it
         -- to the deterministic action (it would mislabel the report card).
         local action = deterministicAction(mode, foreground)
         local drails = { "deterministic", "wait-deferral-exhausted" }
         return action, "deterministic-fallback", nil, drails,
           { model = lfm.cfg.model, deferrals = w.count,
-            deferredSec = math.floor(nowS - w.firstAt),
+            deferredSec = math.floor(now - w.firstAt),
             supersededModelAction = "wait" }
       end
     else
@@ -2253,6 +2253,11 @@ gcUnattendedState = function(now)
   for pid, s in pairs(memwatchSignals) do
     if (now - (s.at or 0)) > MEMWATCH_SIGNAL_KEEP_SEC then memwatchSignals[pid] = nil end
   end
+  -- Absence from lastRuns proves a pid is no longer a runaway only when the
+  -- latest ps sample is fresh and complete: during a sampler stall a live
+  -- runaway can drop off the list, and pruning it then would silently
+  -- restart its deferral clock.
+  if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end
   local liveRun = {}
   for _, r in ipairs(lastRuns) do liveRun[r.pid] = true end
   for pid in pairs(unattendedWaitStreak) do

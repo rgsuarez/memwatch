@@ -1063,6 +1063,30 @@ do
   check("deferral: no first wait is not exhausted", lfm.deferralExhausted(nil, now, 120), false)
   check("deferral bound spans at least two grace windows",
     lfm.cfg.maxDeferSec >= 2 * core.cfg.cool.autoKillGraceSec, true)
+  -- The deferral step folds each wait into { firstAt, count } on the
+  -- decision tick's clock: tick-aligned waits at 0, 60 and 120 s (grace
+  -- 60, bound 120) exhaust exactly on the third.
+  local now0 = 7000
+  local st1, ex1 = lfm.deferralStep(nil, now0, 120)
+  check("deferral step: the first wait starts the clock", st1.firstAt, now0)
+  check("deferral step: the first wait is not exhausted", ex1, false)
+  local st2, ex2 = lfm.deferralStep(st1, now0 + 60, 120)
+  check("deferral step: the second wait keeps the first stamp", st2.firstAt, now0)
+  check("deferral step: the second wait is not exhausted", ex2, false)
+  local st3, ex3 = lfm.deferralStep(st2, now0 + 120, 120)
+  check("deferral step: the third tick-aligned wait exhausts exactly", ex3, true)
+  check("deferral step: waits are counted", st3.count, 3)
+  check("deferral step: the input state is not mutated", st1.count, 1)
+  check("deferral step: a first stamp read late behind a fork would miss the third wait",
+    lfm.deferralExhausted(now0 + 0.4, now0 + 120, 120), false)
+  local reset, exReset = lfm.deferralStep(nil, now0 + 500, 120)
+  check("deferral step: a reset state starts fresh", reset.firstAt .. "/" .. reset.count, (now0 + 500) .. "/1")
+  check("deferral step: a reset state is not exhausted", exReset, false)
+  check("deferral step: a malformed state starts fresh", (lfm.deferralStep({ firstAt = "x" }, now0, 120)).firstAt, now0)
+  local _, exDefault = lfm.deferralStep({ firstAt = now0, count = 1 }, now0 + lfm.cfg.maxDeferSec, nil)
+  check("deferral step: a nil bound falls back to the cfg default", exDefault, true)
+  local _, exEarly = lfm.deferralStep({ firstAt = now0, count = 1 }, now0 + lfm.cfg.maxDeferSec - 1, nil)
+  check("deferral step: the default bound is not exhausted early", exEarly, false)
 end
 
 -- ---- passive observation ledger (pure half) ----
@@ -1544,8 +1568,33 @@ do
   check("glue: dispatch freshness uses verdictUsable",
     src:find("local fresh = lfm.verdictUsable(cached, lastOffender,", 1, true) ~= nil, true)
   check("glue: wait deferral is time-bound",
-    src:find("lfm.deferralExhausted(w.firstAt, nowS, lfm.cfg.maxDeferSec)", 1, true) ~= nil, true)
+    src:find("lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)", 1, true) ~= nil, true)
   check("glue: no wait counter bound remains", src:find("streak >= 3", 1, true), nil)
+  -- The deferral clock is the decision tick's: passed in, never re-read
+  -- after the probe forks inside the decision.
+  local function fnBody(header)
+    local a = src:find(header, 1, true)
+    local z = a and src:find("\nend\n", a, true)
+    return (a and z) and src:sub(a, z) or ""
+  end
+  local resolveBody = fnBody("resolveUnattendedAction = function(mode, offender, now)")
+  check("glue: resolveUnattendedAction takes the tick's clock", #resolveBody > 500, true)
+  check("glue: the decision passes the tick's clock",
+    src:find("resolveUnattendedAction(mode, offender, now)", 1, true) ~= nil, true)
+  check("glue: the decision never re-reads the clock", resolveBody:find("secondsSinceEpoch", 1, true), nil)
+  -- Absent pids are pruned only after a fresh, complete sample; signal
+  -- records age out first, whatever the sampler is doing.
+  local function prunesOnlyWhenFresh(text)
+    local sig = text:find("memwatchSignals[pid] = nil", 1, true)
+    local fresh = text:find("if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end", 1, true)
+    local sweep = text:find("local liveRun = {}", 1, true)
+    return sig ~= nil and fresh ~= nil and sweep ~= nil and sig < fresh and fresh < sweep
+  end
+  check("glue: the prune-order scan refuses a guard after the sweep (positive control)",
+    prunesOnlyWhenFresh("memwatchSignals[pid] = nil\nlocal liveRun = {}\n"
+      .. "if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end\n"), false)
+  check("glue: absent pids are pruned only after a fresh, complete sample",
+    prunesOnlyWhenFresh(fnBody("gcUnattendedState = function(now)")), true)
   check("glue: cache entries record the dispatch kind",
     src:find("kind = offender.kind, snapshot = user,", 1, true) ~= nil, true)
   check("glue: names redacted on both paths",

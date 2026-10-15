@@ -778,6 +778,22 @@ function M.deferralExhausted(firstWaitAt, now, maxDeferSec)
   return (now - firstWaitAt) >= (maxDeferSec or M.cfg.maxDeferSec)
 end
 
+-- One model wait at grace expiry, folded into the per-offender deferral
+-- state { firstAt, count }; a nil (or malformed) state starts at now. The
+-- caller passes the decision tick's own clock to every step: a first stamp
+-- read later than the checks that follow it (behind a slow probe fork)
+-- would keep the wait that should exhaust the bound from exhausting it.
+-- Returns newState, exhausted.
+function M.deferralStep(state, now, maxDeferSec)
+  local s
+  if type(state) == "table" and type(state.firstAt) == "number" then
+    s = { firstAt = state.firstAt, count = (tonumber(state.count) or 0) + 1 }
+  else
+    s = { firstAt = now, count = 1 }
+  end
+  return s, M.deferralExhausted(s.firstAt, now, maxDeferSec)
+end
+
 ------------------------------------------------------------------------------
 -- Snapshot hash: FNV-1a 32-bit over the serialized snapshot. Correlation id
 -- for the ledger and the verdict cache, not a cryptographic hash.

@@ -48,7 +48,7 @@ local lastSampleAt = 0    -- when a sampler callback last landed
 -- and clock.shift, below the state they shift, keep waits whole across a
 -- wall clock stepped back), and the step that counts as one.
 local clock = { wallAt = nil, monoAt = nil, stepSec = 2, stepTotal = 0,
-                depth = 0, frameRead = false, pending = 0 }
+                depth = 0, pending = 0 }
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -199,7 +199,11 @@ local function afterHeld(sec, fn)
   local t
   t = hs.timer.doAfter(sec, function()
     heldTimers[t] = nil
-    fn()
+    -- One clock frame, whatever the caller passed (a guard nests inside).
+    clock.enter()
+    local ok, err = pcall(fn)
+    clock.leave()
+    if not ok then logError("after-held", err) end
   end)
   heldTimers[t] = true
   return t
@@ -215,7 +219,8 @@ local UNTIL_GIVEUP_SEC = 120
 local function untilHeld(pred, action, interval, onGiveUp)
   local t
   local run = {}
-  t = hs.timer.doUntil(function()
+  -- Each poll is one clock frame.
+  local function poll()
     local ok, done = pcall(pred)
     local firstError = (not ok) and run.erroringSince == nil
     -- An error run is a duration: timed on the monotonic clock.
@@ -228,7 +233,14 @@ local function untilHeld(pred, action, interval, onGiveUp)
       if onGiveUp then pcall(onGiveUp) end
     end
     return true
-  end, action, interval)
+  end
+  t = hs.timer.doUntil(function()
+    clock.enter()
+    local ok, finished = pcall(poll)
+    clock.leave()
+    if not ok then logError("until-held", finished); return false end
+    return finished
+  end, action and guard("until-held-action", action) or nil, interval)
   heldTimers[t] = true
   return t
 end
@@ -497,6 +509,9 @@ local function startTopStream()
     end),
     function(_, stdOut)
       if myGen ~= topGen then return false end  -- superseded: stop draining it
+      -- One clock frame, as every callback is (guard cannot wrap this one:
+      -- the stream needs its true back to keep reading).
+      clock.enter()
       local ok, err = pcall(function()
         local published = procs.feedTopStream(topStream, stdOut or "")
         if published then
@@ -507,6 +522,7 @@ local function startTopStream()
           assessProcesses(now)
         end
       end)
+      clock.leave()
       if not ok then logError("topstream", err) end
       return true  -- keep streaming
     end,
@@ -552,10 +568,10 @@ local function applyFlash(state)
   end
   local interval = (state == "critical") and 0.45 or 1.0
   renderTitleNow()
-  flashTimer = hs.timer.doEvery(interval, function()
+  flashTimer = hs.timer.doEvery(interval, guard("flash", function()
     flashLit = not flashLit
     renderTitleNow()
-  end)
+  end))
 end
 
 ------------------------------------------------------------------------------
@@ -828,8 +844,7 @@ end
 -- rebind (the pid holds another process: the next tick surfaces whoever
 -- holds it now as a new alert), or nothing at all (unverified: the alert
 -- stands as it was, still retryable).
-local function settleAction(target, outcome, click)
-  settleInteraction(target, outcome, click)
+local function settleAction(target, outcome)
   local answer = core.answerFor(outcome)
   M.logSnapshot(string.format("answered:%s:%s(%d):%s", answer, target.name or "?",
     target.pid or -1, outcome or "none"))
@@ -865,8 +880,10 @@ local function surfaceUpdate(target, click)
     end
     local answer = core.answerFor(outcome)
     if answer == "done" and outcome ~= "frozen" then markGone(target, clock.now()) end
-    if gen ~= runGen then return end
+    -- The click settles whatever run it ends in: its veto may stand against
+    -- an action of the run before a restart.
     settleInteraction(target, outcome, click)
+    if gen ~= runGen then return end
     if answer == "rebind" then
       identityRefused(target)
     elseif (answer == "done" or answer == "snooze")
@@ -964,6 +981,10 @@ local function buildHud()
       -- action it started on the verified identity).
       local gen = runGen
       local narrate = function(text, done, outcome)
+        -- The click settles whatever run it ends in (its veto may stand
+        -- against an action of the run before a restart); the rest is this
+        -- run's.
+        if done then settleInteraction(target, outcome, click) end
         if gen ~= runGen then return end
         if hud then hud[3].text = text end
         if not done then
@@ -973,10 +994,9 @@ local function buildHud()
           extendInteraction(target)
         end
         if done then
-          -- The click's answer settles at once, so a click that did nothing
-          -- withdraws its veto before memwatch's own escalation reads it;
-          -- only the HUD lingers.
-          settleInteraction(target, outcome, click)
+          -- The click's answer settled at once (above), so a click that did
+          -- nothing withdrew its veto before memwatch's own escalation reads
+          -- it; only the HUD lingers.
           afterHeld(4, guard("hud-close", function()
             if gen == runGen then settleAction(target, outcome) end
           end))
@@ -1121,7 +1141,9 @@ local function buildMenu()
         title = string.format("   %-20s %s \u{00B7} %.0f min", (e.name or "?"):sub(1, 20), held, mins),
         menu = {
           { title = "Resume " .. (e.name or "?"),
-            fn = function() M.resumePid(pid) end },
+            -- The identity the row showed: a Resume answers for it even if
+            -- its entry has gone since the menu opened.
+            fn = function() M.resumePid(pid, nil, { pid = pid, name = e.name, lstart = e.lstart }) end },
           { title = "Force Quit " .. (e.name or "?"),
             -- The identity this row shows: a pid frozen again for another
             -- process since the menu opened is refused, not quit.
@@ -1789,8 +1811,8 @@ end
 -- sampler or top-stream callback, a click), and every stamp memwatch holds
 -- is shifted by it before any reading on the new basis is used: no stamp is
 -- left on the old basis, and none is shifted twice. A callback (one frame:
--- guard) is never shifted under: a step seen by a read in the middle of a
--- callback that has already read the clock is taken out when the callback
+-- guard, and every timer, poller and menu entry) is never shifted under: a
+-- step seen by any read inside a callback is taken out when the callback
 -- ends (clock.leave), and until then every read in it stays on the basis it
 -- began with, so the stamps it writes are shifted with the rest.
 function clock.now()
@@ -1808,13 +1830,12 @@ function clock.now()
   end
   clock.wallAt, clock.monoAt = wall, mono
   if delta < -clock.stepSec then
-    if clock.depth > 0 and clock.frameRead then
+    if clock.depth > 0 then
       clock.pending = clock.pending + delta
     else
       clock.apply(delta)
     end
   end
-  if clock.depth > 0 then clock.frameRead = true end
   return wall - clock.pending
 end
 
@@ -1838,7 +1859,6 @@ end
 -- it ran is taken out as it ends.
 function clock.enter()
   clock.depth = clock.depth + 1
-  if clock.depth == 1 then clock.frameRead = false end
 end
 function clock.leave()
   clock.depth = math.max(0, clock.depth - 1)
@@ -2114,14 +2134,16 @@ local function frozenReconcile()
   local now = clock.now()
   for _, e in ipairs(list) do
     if type(e) == "table" and type(e.pid) == "number" then
-      if e.lstart == nil then
-        -- Written by an older version, with no start time: nothing ties it
-        -- to the process it froze (the pid may hold another by now, and a
-        -- freeze stamp from before a reload cannot be dated against this
-        -- clock: a step across the reload shows nowhere). It is dropped, and
-        -- named in the notice below in case that program is still stopped.
-        -- No entry without a start time is ever signaled through.
-        M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):no-start-time", e.name or "?", e.pid))
+      if e.lstart == nil or e.adopted then
+        -- Written without a start time recorded at the STOP (an older
+        -- version's entry, or one an earlier build bound by name at a
+        -- reload): nothing ties it to the process it froze (the pid may hold
+        -- another by now, and a freeze stamp from before a reload cannot be
+        -- dated against this clock: a step across the reload shows nowhere).
+        -- It is dropped, and named in the notice below in case that program
+        -- is still stopped. No such entry is ever signaled through.
+        M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):%s", e.name or "?", e.pid,
+          e.lstart == nil and "no-start-time" or "bound-by-name"))
         unbound[#unbound + 1] = string.format("%s (pid %d)", e.name or "?", e.pid)
         e = nil
       end
@@ -2165,12 +2187,23 @@ local function frozenReconcile()
       end
     end
   end
+  -- Every kept entry carries a token (rule 3), so a verifier or a resume can
+  -- tell it apart after the next restart rebuilds it.
+  for pid, e in pairs(frozen) do
+    if e.id == nil then e.id = entryIds.new(pid) end
+  end
   saveFrozen()
   if #unbound > 0 then
+    -- Each drop is also its own log line (frozen-reconcile-drop), so a
+    -- notice that cannot name them all still points at every one.
+    local names = table.concat(unbound, ", ")
+    if #names > 100 then names = names:sub(1, 90) .. string.format("... (%d in all)", #unbound) end
     hs.notify.new({
-      title = "memwatch: an old frozen entry could not be checked",
-      subTitle = table.concat(unbound, ", "):sub(1, 100),
-      informativeText = "If it is still stopped, resume it in Activity Monitor.",
+      title = #unbound == 1 and "memwatch: dropped an old frozen entry"
+        or string.format("memwatch: dropped %d old frozen entries", #unbound),
+      subTitle = names,
+      informativeText = "No start time was recorded when they were frozen, so they cannot be checked. "
+        .. "If one is still stopped, resume it in Activity Monitor; each is named in memwatch.log.",
       withdrawAfter = 0,
     }):send()
   end
@@ -2390,7 +2423,13 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
           -- replaced by the copy this verifier captured.
           cur.pendingUntil = nil
         else
+          -- The slot is empty (something dropped the entry meanwhile): the
+          -- verifier puts its own entry back. It may have missed a shift
+          -- while out of the ledger, so a freeze stamp ahead of now reads as
+          -- now (rule 8).
           entry.pendingUntil = nil
+          local t = clock.now()
+          if type(entry.frozenAt) == "number" and entry.frozenAt > t then entry.frozenAt = t end
           frozen[pid] = entry
         end
         saveFrozen()
@@ -2412,10 +2451,14 @@ end
 
 -- Resume: identity re-validated against the ledger entry (a recycled pid is
 -- dropped AND the signal blocked), then SIGCONT with a verified state.
-function M.resumePid(pid, onUpdate)
+-- shown: the identity a menu row showed, so a Resume clicked after its
+-- entry went (resumed or quit elsewhere, or swept) is still the operator's
+-- answer about that process, once.
+function M.resumePid(pid, onUpdate, shown)
   onUpdate = onUpdate or alertUpdate
   local e = frozen[pid]
   if not e then
+    if shown then markInteracted(shown, nil, true) end
     onUpdate(string.format("pid %d is not in the frozen ledger", pid), true)
     return
   end
@@ -3467,9 +3510,20 @@ function M.start()
   if not menu then return M end
   -- Recomputed fresh on every click; a menu-build error must never leave a
   -- dead menu, so it degrades to a pointer at the log instead.
+  -- The build and every item's handler are clock frames, as every callback
+  -- is: a step seen in the middle of one is applied when it ends.
   menu:setMenu(function()
+    local function frameItems(list)
+      for _, it in ipairs(list) do
+        if type(it.fn) == "function" then it.fn = guard("menu-item", it.fn) end
+        if type(it.menu) == "table" then frameItems(it.menu) end
+      end
+      return list
+    end
+    clock.enter()
     local ok, items = pcall(buildMenu)
-    if ok then return items end
+    clock.leave()
+    if ok then return frameItems(items) end
     logError("menu", items)
     return { { title = "memwatch: menu error (see memwatch.log)", disabled = true } }
   end)
@@ -3513,7 +3567,7 @@ function M.start()
   end
   renderTitleNow()
   pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
-  tick()                          -- immediate first sample
+  guard("tick", tick)()           -- immediate first sample, framed as every tick is
   return M
 end
 
@@ -3624,7 +3678,7 @@ function M.test(level, seconds)
     titleSnap = {}
     if pollTimer then pollTimer:stop() end
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
-    tick()                                                -- revert to the real state
+    guard("tick", tick)()                                 -- revert to the real state
   end))
   return string.format("memwatch.test(%s) running for %ds (live sampling paused)%s",
     state, dur, alertsEnabled and "" or " [desktop alerts off: no HUD or banner]")
@@ -3658,7 +3712,7 @@ function M.simulate(seconds)
     titleSnap = {}
     if pollTimer then pollTimer:stop() end
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
-    tick()
+    guard("tick", tick)()
   end))
   return string.format("memwatch.simulate running for %ds (live sampling paused)%s",
     dur, alertsEnabled and "" or " [desktop alerts off: no HUD or banner]")

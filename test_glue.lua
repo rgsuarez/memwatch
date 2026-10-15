@@ -1954,10 +1954,55 @@ for _, case in ipairs({
     check("legacy (" .. case.how .. "): not listed as frozen", W.menuItem("   node"), nil)
     check("legacy (" .. case.how .. "): the drop is logged", logHas(W, "frozen-reconcile-drop:node(4242):no-start-time"), true)
     check("legacy (" .. case.how .. "): the notice names it",
-      #W.notices("memwatch: an old frozen entry could not be checked"), 1)
+      #W.notices("memwatch: dropped "), 1)
     check("legacy (" .. case.how .. "): nothing was signaled", W.signalsTo(4242), "")
   end)
 end
+-- Many old entries: the notice says how many, and each is its own log line.
+scenario("many old entries without a start time are counted in one notice", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(6)
+  local rows = {}
+  for i = 1, 12 do
+    rows[#rows + 1] = string.format('{"pid":%d,"name":"some-long-program-name-%02d","weightMB":0,"frozenAt":%d}',
+      5000 + i, i, math.floor(W.now) - 60)
+  end
+  local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+  f:write("[" .. table.concat(rows, ",") .. "]\n")
+  f:close()
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+  local notes = W.notices("memwatch: dropped 12 old frozen entries")
+  check("legacy-many: one notice, with the count", #notes, 1)
+  local sub = notes[1] and notes[1].attrs.subTitle or ""
+  check("legacy-many: the names are cut to fit, and say how many", sub:find("(12 in all)", 1, true) ~= nil, true)
+  local logged = 0
+  for i = 1, 12 do
+    if logHas(W, string.format("frozen-reconcile-drop:some-long-program-name-%02d(%d):no-start-time", i, 5000 + i)) then
+      logged = logged + 1
+    end
+  end
+  check("legacy-many: each drop is its own log line", logged, 12)
+end)
+-- (round 11) An entry an earlier build bound by name at a reload carries a
+-- start time, but not one recorded at its STOP: it is dropped and named too.
+scenario("an entry an earlier build bound by name is dropped and named", nil, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].state = "T"
+  W.run(6)
+  local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+  f:write(string.format('[{"pid":4242,"name":"node","lstart":"%s","weightMB":0,"frozenAt":%d,"adopted":true}]\n',
+    W.procs[4242].lstart, math.floor(W.now) - 30))
+  f:close()
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+  check("adopted: not listed as frozen", W.menuItem("   node"), nil)
+  check("adopted: the drop is logged as bound by name", logHas(W, "frozen-reconcile-drop:node(4242):bound-by-name"), true)
+  check("adopted: the notice names it", #W.notices("memwatch: dropped "), 1)
+  check("adopted: nothing was signaled", W.signalsTo(4242), "")
+end)
 scenario("an entry with a start time is kept at reload (control)", nil, function(W)
   leaker(W, 4242, "node")
   W.procs[4242].state = "T"
@@ -1970,7 +2015,7 @@ scenario("an entry with a start time is kept at reload (control)", nil, function
   F.load(W, nil, { keepHome = true })
   W.run(3)
   check("legacy-control: kept, with its Resume", frozenRowAction(W, "node", "Resume") ~= nil, true)
-  check("legacy-control: nothing named", #W.notices("memwatch: an old frozen entry could not be checked"), 0)
+  check("legacy-control: nothing named", #W.notices("memwatch: dropped "), 0)
 end)
 
 -- ---- round 7 ----
@@ -2645,7 +2690,10 @@ do
   -- The click's answer settles when its outcome arrives, not when the HUD
   -- comes down, so it holds however close to memwatch's escalation the
   -- click lands (here 1 s and 5 s after the TERM).
-  for _, after in ipairs({ 1, 5 }) do
+  -- 1 s after the TERM, and 2 s before memwatch's escalation (escalateSec
+  -- after it): the case the HUD's 4 s settle used to lose.
+  local escalateSec = require("memwatch_core").cfg.kill.escalateSec
+  for _, after in ipairs({ 1, escalateSec - 2 }) do
     scenario("a click that signals nothing does not veto memwatch's own kill (" .. after .. " s)", UNATTENDED_KILL, function(W)
       W.frontmost = { name = "Terminal", pid = 760 }
       leaker(W, 4242, "node")
@@ -2725,6 +2773,76 @@ do
     check("resume-newer: and still resumable", frozenRowAction(W, "node", "Resume") ~= nil, true)
   end)
 
+  -- (round 11) The writes that keep an answer's veto standing, each pinned:
+  -- a click that did something holds for good; so does an answer that needs
+  -- no signal engine; and a later answer on an action already vetoed is a
+  -- holder too, so an earlier click's late "nothing done" leaves it standing.
+  local function termOut(W)          -- memwatch's own TERM is out; the node ignores it
+    W.frontmost = { name = "Terminal", pid = 760 }
+    leaker(W, 4242, "node")
+    W.procs[4242].ignoreTerm = true
+    W.run(12)
+    W.kern = 4
+    runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  end
+  local function rowItem(W, title)
+    local row = W.menuItem("node ")
+    for _, it in ipairs(row and row.menu or {}) do
+      if it.title == title then return it end
+    end
+  end
+  scenario("a Freeze that worked keeps its veto against a later click that signals nothing", UNATTENDED_KILL, function(W)
+    termOut(W)
+    W.run(1)
+    W.click("freeze")
+    W.run(2)
+    local quit = frozenRowAction(W, "node", "Force Quit")
+    check("final-veto freeze: the frozen row offers Force Quit (control)", quit ~= nil, true)
+    W.probeFailsOnce = 1
+    if quit then quit() end
+    W.run(30)
+    check("final-veto freeze: no KILL over the operator's freeze", W.signalsTo(4242), "TERM,STOP")
+  end)
+  scenario("closing the alert keeps its veto against a later click that signals nothing", UNATTENDED_KILL, function(W)
+    termOut(W)
+    W.run(1)
+    local quit = rowItem(W, "Force Quit node")
+    check("final-veto close: the process row offers Force Quit (control)", quit ~= nil and quit.disabled ~= true, true)
+    W.click("close")
+    W.probeFailsOnce = 1
+    if quit then quit.fn() end
+    W.run(30)
+    check("final-veto close: no KILL after the operator closed the alert", W.signalsTo(4242), "TERM")
+  end)
+  scenario("a later working click holds the veto when an earlier one gives up after the fact", UNATTENDED_KILL, function(W)
+    termOut(W)
+    local freezeB = rowItem(W, "Freeze node")
+    check("final-veto late: the process row offers Freeze (control)", freezeB ~= nil and freezeB.disabled ~= true, true)
+    W.sendFails = { STOP = true }
+    W.click("freeze")                 -- click A: its STOP cannot be sent; it gives up 0.5 s later
+    W.sendFails = nil
+    W.run(0.1)
+    if freezeB then freezeB.fn() end  -- click B: a working freeze
+    W.run(30)
+    check("final-veto late: click A gave up (control)", logHas(W, "freeze-skip:node(4242)-stopped-by-another"), true)
+    check("final-veto late: no KILL over the operator's freeze", W.signalsTo(4242), "TERM,STOP")
+  end)
+  -- (round 11) A click settles whatever run its outcome lands in: a click
+  -- that did nothing, whose outcome lands after an in-process restart, still
+  -- gives up the veto it held against the earlier run's action.
+  scenario("a click that did nothing gives up its veto across a restart", UNATTENDED_KILL, function(W, mw)
+    termOut(W)
+    W.run(1)
+    W.sendFails = { STOP = true }
+    W.click("freeze")                 -- its STOP cannot be sent; it says so 0.5 s later
+    W.sendFails = nil
+    mw.start()                        -- an in-process restart before that outcome lands
+    W.run(30)
+    check("restart-settle: the click gave up its veto after the restart",
+      logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
+    check("restart-settle: memwatch's own KILL still went out", W.signalsTo(4242):find("KILL", 1, true) ~= nil, true)
+  end)
+
   -- The other order: a Force Quit that signals nothing, then a Freeze that
   -- works, both before the HUD comes down. The failed click's outcome never
   -- undoes the freeze's veto.
@@ -2785,6 +2903,40 @@ do
     W.run(30)
     check("mid-tick: nor later", logHas(W, "sampler-stale"), false)
     check("mid-tick: the shift ran without error", logHas(W, "error:clock-shift"), false)
+  end)
+
+  -- Rule 8: a callback that throws while holding a step still ends its
+  -- frame: the step is applied once, and the next step is applied too (the
+  -- frame did not leak).
+  scenario("a callback that throws while holding a step still applies it", nil, function(W, mw)
+    leaker(W, 4242)
+    W.run(12)
+    W.kern = 4
+    runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+    W.run(5)
+    local row = W.menuItem("leaker ")
+    local freeze
+    for _, it in ipairs(row and row.menu or {}) do
+      if type(it.title) == "string" and it.title:find("^Freeze") then freeze = it end
+    end
+    check("frame-error: the row offers Freeze (control)", freeze ~= nil, true)
+    W.onAlert = function()
+      W.onAlert = nil
+      W.wallOffset = -120
+      mw.debug()                       -- a read inside the verifier's frame sees the step: it is held
+      error("thrown inside the verifier")
+    end
+    if freeze then freeze.fn() end
+    W.run(2)                          -- its verifier shows the outcome: the throw lands there
+    check("frame-error: the verifier's error was logged", logHas(W, "error:freeze-verify"), true)
+    check("frame-error: the held step was applied when the frame ended", logHas(W, "clock-stepped-back:120s"), true)
+    W.wallOffset = -240                -- a second step: applied too, so no frame leaked
+    W.run(6)
+    local f = io.open(W.home .. "/projects/memwatch/memwatch.log", "r")
+    local all = f and f:read("a") or ""
+    if f then f:close() end
+    local _, n = all:gsub("clock%-stepped%-back:120s", "")
+    check("frame-error: the next step was applied as well (" .. n .. ")", n, 2)
   end)
 
   -- Rule 8: a forward step (a sleep) is no step back: nothing shifts.

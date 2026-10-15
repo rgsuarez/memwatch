@@ -21,9 +21,10 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    STOP and records whether the STOP went out; one whose STOP could not be
    sent goes at once, because a process stopped by anyone else is not
    memwatch's to resume. A reload keeps a pending entry only if its STOP
-   went out, or may have. Every entry carries a start time; one without
-   (written by an older version) is dropped at reload and named in a
-   notice, in case that program is still stopped.
+   went out, or may have. Every entry carries a start time recorded at its
+   STOP; one without (written by an older version), or one an earlier build
+   bound by name at a reload, is dropped at reload and named in a notice, in
+   case that program is still stopped.
 3. **Each writer owns only its own entry.** A freeze's verifier changes the
    slot only while it holds that freeze's own entry (or nothing), so a late
    verifier never undoes a newer action on the same process. The entry is
@@ -31,9 +32,11 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    stays the freeze's after an in-process restart's reconcile rebuilds it.
    The token is made of durable parts (the pid, the freeze's time in
    milliseconds and a count of the run's entries), so one left in the ledger
-   by an earlier run names nothing this run made. A verifier settles its
-   freeze's entry where the slot holds it (rebuilt and shifted since), never
-   by putting back the copy it captured. A resume's verifier drops only the
+   by an earlier run names nothing this run made, and an entry kept at
+   reload without one is given one. A verifier settles its freeze's entry
+   where the slot holds it (rebuilt and shifted since), never by putting
+   back the copy it captured; if the slot is empty it puts its own entry
+   back, with a freeze stamp ahead of now read as now. A resume's verifier drops only the
    entry it resumed, by the same token: a newer freeze of the same process
    keeps its own. Writers that act on a process found gone own the entry for
    the start time they acted on. An entry with no start time is owned by no
@@ -59,8 +62,10 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    since it is meant to run. A click handed to a signal engine (Freeze or
    Force Quit) answers only once it did something, and each click holds its
    own veto until then; its outcome settles it the moment it arrives (only
-   the HUD lingers), so a click that did nothing has given its veto up
-   before memwatch's escalation reads it. A click that signals nothing gives
+   the HUD lingers), whatever run of memwatch it lands in, so a click that
+   did nothing has given its veto up before memwatch's escalation reads it.
+   A Resume clicked on a frozen row whose entry has gone since the menu
+   opened still answers for the process the row showed. A click that signals nothing gives
    up its own hold,
    and the veto is withdrawn (memwatch's action carries on) only when no
    other answer holds it and the action is still in flight. One the backstop
@@ -96,8 +101,10 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    first read after it and before that read's value is used. So a stamp a
    callback writes between the step and the next tick is shifted once,
    never twice, and each wait keeps the length it had left. A callback is
-   never shifted under: a step seen in the middle of one that has already
-   read the clock is taken out when it ends, and until then its reads stay
+   never shifted under: every entry point is a frame (each guarded callback,
+   the held timers and pollers, the top stream, the menu's build and every
+   item, the first tick), and a step seen anywhere inside one is taken out
+   when it ends, even when it ends by an error. Until then its reads stay
    on the basis it began with, so the stamps it writes move with the rest.
    Each holder is shifted under its own guard: one that fails is logged by
    name and costs only its own stamps. A source scan

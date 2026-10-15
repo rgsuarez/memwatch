@@ -53,7 +53,8 @@ local sampler = { task = nil, startedAt = 0, at = 0,
 -- The wall and monotonic clock readings at the last wall read (clock.now
 -- and clock.shift, below the state they shift, keep waits whole across a
 -- wall clock stepped back), and the step that counts as one.
-local clock = { wallAt = nil, monoAt = nil, stepSec = 2 }
+local clock = { wallAt = nil, monoAt = nil, stepSec = 2, stepTotal = 0,
+                depth = 0, frameRead = false, pending = 0 }
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -118,7 +119,7 @@ local lfmServerPid   = nil
 local lfmServerIdent = nil    -- { pid, lstart, name } recorded when the server started
 local lfmServerPort  = nil
 local lfmServerReady = false
-local lfmSpawnedAt   = nil    -- epoch of the current spawn (fast-crash detection)
+local lfmSpawn       = nil    -- the current spawn { mono }: its identity and monotonic start (fast-crash detection)
 local lfmOffline     = false  -- timeout/self-police latch; clears at an elevated tick
 local lfmCalmSince   = nil    -- retire-on-calm bookkeeping
 local lfmLastAdvisoryAt = 0
@@ -296,20 +297,26 @@ end
 
 -- Failures in timers and task callbacks land here (rate-limited per label)
 -- instead of dying silently in the Hammerspoon console.
-local lastErrorAt = {}
+local lastErrorMono = {}
 local function logError(label, err)
-  local now = os.time()
-  if (now - (lastErrorAt[label] or 0)) < 60 then return end
-  lastErrorAt[label] = now
+  -- The rate limit is a duration: on the monotonic clock, which no wall
+  -- clock step moves (an error right after a step is never hidden).
+  local now = clock.mono()
+  if lastErrorMono[label] and (now - lastErrorMono[label]) < 60 then return end
+  lastErrorMono[label] = now
   -- pcall: the error reporter must never become a second error source.
   pcall(appendLog, string.format("%s state=%s reason=error:%s err=%s\n",
     os.date("%Y-%m-%d %H:%M:%S"), smState.state, label, tostring(err)))
 end
 
 -- Wrap a callback so an error can never kill the loop that owns it.
+-- Each guarded callback is one frame of the clock (rule 8): a step back
+-- seen in the middle of it is taken out when it ends.
 local function guard(label, fn)
   return function(...)
+    clock.enter()
     local ok, err = pcall(fn, ...)
+    clock.leave()
     if not ok then logError(label, err) end
   end
 end
@@ -739,8 +746,11 @@ local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 2 + 2 
 -- nothing (unverified: the probe failed before any signal) is no answer,
 -- any other outcome confirms it, and a pending mark whose outcome never
 -- came back lapses at the hold deadline.
+-- Returns the click a pending answer is settled by (settleInteraction):
+-- each click holds its own vetoes, so one click that signals nothing never
+-- withdraws a veto another answer still holds.
 local function markInteracted(off, pending, supersedeOnly)
-  if not off or off.synthetic then return end
+  if not off or off.synthetic then return nil end
   obs.noteTouch(off)
   -- The operator acting on a process supersedes memwatch's own action in
   -- flight on that very process: its pending KILL escalation is withheld
@@ -752,45 +762,68 @@ local function markInteracted(off, pending, supersedeOnly)
   -- The action keeps its deadline accounting (its result is still owed a
   -- receipt), and gives up the HUD hold it took, which no narrative of its
   -- will touch again.
-  local vetoed = {}
+  -- A veto stands while any answer holds it: a pending click holds it until
+  -- its outcome, any other answer (and a click that did something) for
+  -- good. An action the backstop released is no longer this answer's to
+  -- hold, and one superseded otherwise is left as it is.
+  local click = (pending and not supersedeOnly) and { vetoed = {} } or nil
   for owed in pairs(openReceipts) do
-    if not owed.superseded and core.sameOffender(owed.target, off) then
-      owed.superseded, owed.supersededBy = true, "operator"
-      if owed.heldHud then
-        owed.heldHud = nil
-        hudHold, hudHoldUntil = false, 0
+    if core.sameOffender(owed.target, off)
+       and (not owed.superseded or owed.supersededBy == "operator") then
+      if not owed.superseded then
+        owed.superseded, owed.supersededBy = true, "operator"
+        if owed.heldHud then
+          owed.heldHud = nil
+          hudHold, hudHoldUntil = false, 0
+        end
+        M.logSnapshot(string.format("unattended-superseded-by-operator:%s(%d)", off.name or "?", off.pid))
       end
-      vetoed[#vetoed + 1] = owed
-      M.logSnapshot(string.format("unattended-superseded-by-operator:%s(%d)", off.name or "?", off.pid))
+      if click then
+        owed.vetoHolders = owed.vetoHolders or {}
+        owed.vetoHolders[click] = true
+        click.vetoed[#click.vetoed + 1] = owed
+      else
+        owed.vetoFinal = true
+      end
     end
   end
-  if supersedeOnly then return end
+  if supersedeOnly then return nil end
   local r = recordFor(interacted, off, true)
   if not pending then
-    r.confirmed, r.pendingUntil = true, nil
+    r.confirmed, r.pendingUntil, r.clicks = true, nil, nil
   else
-    -- A click handed to a signal engine answers only once it did something:
-    -- if it signals nothing, its veto is withdrawn with its mark.
-    r.vetoed = r.vetoed or {}
-    for _, owed in ipairs(vetoed) do r.vetoed[#r.vetoed + 1] = owed end
+    r.clicks = r.clicks or {}
+    r.clicks[click] = true
     if not r.confirmed then r.pendingUntil = clock.now() + HOLD_MAX_SEC end
   end
+  return click
 end
-local function settleInteraction(target, outcome)
+-- A pending click's outcome. Unverified (nothing was done): this click is
+-- no answer, and gives up the vetoes it holds; a veto no other answer holds
+-- is withdrawn while its action is still in flight (rule 4). Any other
+-- outcome: the click answered, and its vetoes stand for good.
+local function settleInteraction(target, outcome, click)
+  if not click or click.settled then return end
+  click.settled = true
   local r = recordFor(interacted, target, false)
-  if not r or r.confirmed then return end
   if outcome == "unverified" then
-    -- Nothing was done: no answer, and no veto over memwatch's own action
-    -- still in flight (rule 4).
-    for _, owed in ipairs(r.vetoed or {}) do
-      if not owed.finished and owed.supersededBy == "operator" then
+    for _, owed in ipairs(click.vetoed) do
+      local holders = owed.vetoHolders
+      if holders then holders[click] = nil end
+      if openReceipts[owed] and not owed.finished and not owed.vetoFinal
+         and owed.supersededBy == "operator" and not (holders and next(holders)) then
         owed.superseded, owed.supersededBy = nil, nil
         M.logSnapshot(string.format("unattended-veto-withdrawn:%s(%d)", target.name or "?", target.pid))
       end
     end
-    interacted[target.pid] = nil
+    if r and r.clicks then r.clicks[click] = nil end
+    if r and not r.confirmed and not (r.clicks and next(r.clicks)) then interacted[target.pid] = nil end
   else
-    r.confirmed, r.pendingUntil, r.vetoed = true, nil, nil
+    for _, owed in ipairs(click.vetoed) do
+      if owed.vetoHolders then owed.vetoHolders[click] = nil end
+      owed.vetoFinal = true
+    end
+    if r then r.confirmed, r.pendingUntil, r.clicks = true, nil, nil end
   end
 end
 -- A progress step of the action the mark waits on: its outcome is on the
@@ -942,8 +975,8 @@ end
 -- rebind (the pid holds another process: the next tick surfaces whoever
 -- holds it now as a new alert), or nothing at all (unverified: the alert
 -- stands as it was, still retryable).
-local function settleAction(target, outcome)
-  settleInteraction(target, outcome)
+local function settleAction(target, outcome, click)
+  settleInteraction(target, outcome, click)
   local answer = core.answerFor(outcome)
   M.logSnapshot(string.format("answered:%s:%s(%d):%s", answer, target.name or "?",
     target.pid or -1, outcome or "none"))
@@ -969,7 +1002,7 @@ end
 -- to is this run's: after a stop or start, only a verified exit (a fact
 -- about the process, not the episode) is kept.
 -- (hs.alert directly: alertUpdate is declared further down the file.)
-local function surfaceUpdate(target)
+local function surfaceUpdate(target, click)
   local gen = runGen
   return function(text, done, outcome)
     hs.alert.show("memwatch: " .. text, 2.5)
@@ -980,7 +1013,7 @@ local function surfaceUpdate(target)
     local answer = core.answerFor(outcome)
     if answer == "done" and outcome ~= "frozen" then markGone(target, clock.now()) end
     if gen ~= runGen then return end
-    settleInteraction(target, outcome)
+    settleInteraction(target, outcome, click)
     if answer == "rebind" then
       identityRefused(target)
     elseif (answer == "done" or answer == "snooze")
@@ -1073,7 +1106,7 @@ local function buildHud()
         end
         return
       end
-      markInteracted(target, true)
+      local click = markInteracted(target, true)
       hudHold, hudHoldUntil = true, clock.now() + HOLD_MAX_SEC
       -- The narrative belongs to this run: after a stop, start or
       -- diagnostic it touches nothing (the signal engine still finishes the
@@ -1089,6 +1122,10 @@ local function buildHud()
           extendInteraction(target)
         end
         if done then
+          -- The click's answer settles at once, so a click that did nothing
+          -- withdraws its veto before memwatch's own escalation reads it;
+          -- only the HUD lingers.
+          settleInteraction(target, outcome, click)
           afterHeld(4, guard("hud-close", function()
             if gen == runGen then settleAction(target, outcome) end
           end))
@@ -1198,13 +1235,13 @@ local function buildMenu()
       menu = {
         { title = "Freeze " .. name .. note, disabled = (lst == nil) or nil,
           fn = obs.byOperator(function()
-            markInteracted(target, true)
-            M.freezePid(pid, name, surfaceUpdate(target), { weightMB = wMB, expectedLstart = lst })
+            local click = markInteracted(target, true)
+            M.freezePid(pid, name, surfaceUpdate(target, click), { weightMB = wMB, expectedLstart = lst })
           end) },
         { title = "Force Quit " .. name .. note, disabled = (lst == nil) or nil,
           fn = obs.byOperator(function()
-            markInteracted(target, true)
-            M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
+            local click = markInteracted(target, true)
+            M.killPid(pid, name, surfaceUpdate(target, click), { expectedLstart = lst })
           end) },
         { title = "Ignore for 30 min",
           fn = obs.byOperator(function() M.ignore(pid, name, lst) end) },
@@ -1230,8 +1267,7 @@ local function buildMenu()
       local mins = (clock.now() - (e.frozenAt or 0)) / 60
       local held = e.weightMB and string.format("%4.1f GB held", e.weightMB / 1024) or "size unknown"
       items[#items + 1] = {
-        title = string.format("   %-20s %s \u{00B7} %.0f min%s", (e.name or "?"):sub(1, 20),
-          held, mins, e.adopted and " \u{00B7} bound by name" or ""),
+        title = string.format("   %-20s %s \u{00B7} %.0f min", (e.name or "?"):sub(1, 20), held, mins),
         menu = {
           { title = "Resume " .. (e.name or "?"),
             fn = obs.byOperator(function()
@@ -1243,8 +1279,8 @@ local function buildMenu()
             -- process since the menu opened is refused, not quit.
             fn = obs.byOperator(function()
               local target = { pid = pid, name = e.name, lstart = e.lstart }
-              markInteracted(target, true)   -- an answer; it notes the touch
-              M.killPid(pid, e.name, surfaceUpdate(target), { expectedLstart = e.lstart })
+              local click = markInteracted(target, true)   -- an answer; it notes the touch
+              M.killPid(pid, e.name, surfaceUpdate(target, click), { expectedLstart = e.lstart })
             end) },
         },
       }
@@ -1288,8 +1324,8 @@ local function buildMenu()
           if why and why:find("^pid%-reused") then identityRefused(target) end
           return
         end
-        markInteracted(target, true)
-        M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
+        local click = markInteracted(target, true)
+        M.killPid(off.pid, off.name, surfaceUpdate(target, click), { expectedLstart = lst })
       end) }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
       fn = obs.byOperator(function() M.ignore(off.pid, off.name, bound) end) }
@@ -1395,8 +1431,8 @@ local function notifyCrit(m)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
       obs.noteAction()
       local target = { pid = off.pid, name = off.name, lstart = lstart }
-      markInteracted(target, true)
-      M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lstart })
+      local click = markInteracted(target, true)
+      M.killPid(off.pid, off.name, surfaceUpdate(target, click), { expectedLstart = lstart })
     end
   end), {
     title             = "Memory pressure: CRITICAL",
@@ -1942,65 +1978,96 @@ end
 -- values are not numbers is left as it is, never an error.
 function clock.shift(delta)
   local function sh(v) return type(v) == "number" and v + delta or v end
-  for _, f in pairs(unattendedFiredFor) do f.at = sh(f.at) end
-  -- The deferral of a model's wait counts from its first wait ({ firstAt,
-  -- count }); anything else here is left as it is.
-  for _, w in pairs(unattendedWaitStreak) do
-    if type(w) == "table" then w.firstAt = sh(w.firstAt) end
+  -- One step per holder, each under its own pcall: a holder that throws (a
+  -- malformed record) is logged by name, and every other holder is still
+  -- shifted, so a bad holder costs only its own stamps.
+  local steps = {
+    { "unattended", function()
+      for _, f in pairs(unattendedFiredFor) do f.at = sh(f.at) end
+      -- The deferral of a model's wait counts from its first wait ({ firstAt,
+      -- count }); anything else here is left as it is.
+      for _, w in pairs(unattendedWaitStreak) do
+        if type(w) == "table" then w.firstAt = sh(w.firstAt) end
+      end
+    end },
+    { "receipts", function()
+      for owed in pairs(openReceipts) do owed.dueAt, owed.releaseAt = sh(owed.dueAt), sh(owed.releaseAt) end
+    end },
+    { "frozen", function()
+      for _, e in pairs(frozen) do e.pendingUntil, e.frozenAt = sh(e.pendingUntil), sh(e.frozenAt) end
+    end },
+    { "gone", function() for _, g in pairs(goneUntil) do g.untilAt, g.at = sh(g.untilAt), sh(g.at) end end },
+    { "ignored", function() for _, ig in pairs(ignoredUntil) do ig.untilAt = sh(ig.untilAt) end end },
+    { "interacted", function() for _, r in pairs(interacted) do r.pendingUntil = sh(r.pendingUntil) end end },
+    { "bind", function() for pid, at in pairs(bindTriedAt) do bindTriedAt[pid] = sh(at) end end },
+    { "runaway-log", function() for k, at in pairs(runawayLogAt) do runawayLogAt[k] = sh(at) end end },
+    { "verdicts", function() for _, e in pairs(verdictCache) do e.at = sh(e.at) end end },
+    { "tracker", function()
+      for _, e in pairs(tracker.procs) do
+        e.lastSeen, e.extremeUntil = sh(e.lastSeen), sh(e.extremeUntil)
+        -- (Its start window is not shifted: it is anchored to the kernel's
+        -- start record, which a step does not move; see procs.startWindow.)
+        for _, smp in ipairs(e.ring or {}) do smp.t = sh(smp.t) end
+      end
+    end },
+    { "hud", function()
+      if hudSnooze then hudSnooze.untilAt = sh(hudSnooze.untilAt) end
+      hudHoldUntil, lastHudRaiseAt = sh(hudHoldUntil), sh(lastHudRaiseAt)
+      hudBelowCritSince, exposureTickAt = sh(hudBelowCritSince), sh(exposureTickAt)
+      lastNotifyAt, lastStaleLogAt, lastStaleNotifyAt = sh(lastNotifyAt), sh(lastStaleLogAt), sh(lastStaleNotifyAt)
+      unattendedSkipLogAt, lastFrozenSweepAt = sh(unattendedSkipLogAt), sh(lastFrozenSweepAt)
+    end },
+    { "sampler", function()
+      sampler.at, sampler.startedAt, prevCountersAt = sh(sampler.at), sh(sampler.startedAt), sh(prevCountersAt)
+      sampler.launchedAt = sh(sampler.launchedAt)
+      topCache.at, topStartedAt, topRespawnAt, topIdleSince =
+        sh(topCache.at), sh(topStartedAt), sh(topRespawnAt), sh(topIdleSince)
+    end },
+    -- The observation ledger's cadence and its tick log move with the rest,
+    -- so a decision row still lands on the tick the unattended step acts and
+    -- a record observed after the step reads one basis. Its collecting
+    -- records are not shifted: none can place what arrives against its
+    -- horizons any more, so each stops collecting and says so (clockStep),
+    -- gone or not.
+    { "observation", function()
+      obs.lastAt = sh(obs.lastAt)
+      for _, st in pairs(obs.decisionAt) do st.at = sh(st.at) end
+      for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end
+      for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
+    end },
+    { "adjudicator", function()
+      if lfmInFlight then lfmInFlight.at = sh(lfmInFlight.at) end
+      lfmLastAdvisoryAt, lfmRemoteCooldownUntil = sh(lfmLastAdvisoryAt), sh(lfmRemoteCooldownUntil)
+      lfmCalmSince = sh(lfmCalmSince)
+    end },
+    { "state", function() smState.since = sh(smState.since) end },
+  }
+  for _, step in ipairs(steps) do
+    local ok, err = pcall(step[2])
+    if not ok then logError("clock-shift:" .. step[1], err) end
   end
-  for owed in pairs(openReceipts) do owed.dueAt, owed.releaseAt = sh(owed.dueAt), sh(owed.releaseAt) end
-  for _, e in pairs(frozen) do e.pendingUntil, e.frozenAt = sh(e.pendingUntil), sh(e.frozenAt) end
-  for _, g in pairs(goneUntil) do g.untilAt, g.at = sh(g.untilAt), sh(g.at) end
-  for _, ig in pairs(ignoredUntil) do ig.untilAt = sh(ig.untilAt) end
-  for _, r in pairs(interacted) do r.pendingUntil = sh(r.pendingUntil) end
-  for pid, at in pairs(bindTriedAt) do bindTriedAt[pid] = sh(at) end
-  for k, at in pairs(runawayLogAt) do runawayLogAt[k] = sh(at) end
-  for k, at in pairs(lastErrorAt) do lastErrorAt[k] = sh(at) end
-  for _, e in pairs(verdictCache) do e.at = sh(e.at) end
-  for _, e in pairs(tracker.procs) do
-    e.lastSeen, e.extremeUntil = sh(e.lastSeen), sh(e.extremeUntil)
-    -- (Its start window is not shifted: it is anchored to the kernel's
-    -- start record, which a step does not move; see procs.startWindow.)
-    for _, smp in ipairs(e.ring or {}) do smp.t = sh(smp.t) end
-  end
-  if hudSnooze then hudSnooze.untilAt = sh(hudSnooze.untilAt) end
-  if lfmInFlight then lfmInFlight.at = sh(lfmInFlight.at) end
-  hudHoldUntil, lastHudRaiseAt = sh(hudHoldUntil), sh(lastHudRaiseAt)
-  hudBelowCritSince, exposureTickAt = sh(hudBelowCritSince), sh(exposureTickAt)
-  lastNotifyAt, lastStaleLogAt, lastStaleNotifyAt = sh(lastNotifyAt), sh(lastStaleLogAt), sh(lastStaleNotifyAt)
-  unattendedSkipLogAt, lastFrozenSweepAt = sh(unattendedSkipLogAt), sh(lastFrozenSweepAt)
-  sampler.at, sampler.startedAt, prevCountersAt = sh(sampler.at), sh(sampler.startedAt), sh(prevCountersAt)
-  sampler.launchedAt = sh(sampler.launchedAt)
-  -- The observation ledger's cadence and its tick log move with the rest, so
-  -- a decision row still lands on the tick the unattended step acts and a
-  -- record observed after the step reads one basis. Its collecting records
-  -- are not shifted: none can place what arrives against its horizons any
-  -- more, so each stops collecting and says so (clockStep), gone or not.
-  obs.lastAt = sh(obs.lastAt)
-  for _, st in pairs(obs.decisionAt) do st.at = sh(st.at) end
-  for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end
-  for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
-  topCache.at, topStartedAt, topRespawnAt, topIdleSince =
-    sh(topCache.at), sh(topStartedAt), sh(topRespawnAt), sh(topIdleSince)
-  lfmLastAdvisoryAt, lfmRemoteCooldownUntil = sh(lfmLastAdvisoryAt), sh(lfmRemoteCooldownUntil)
-  lfmCalmSince, lfmSpawnedAt = sh(lfmCalmSince), sh(lfmSpawnedAt)
-  smState.since = sh(smState.since)
 end
 
 -- Seconds on the monotonic clock (since boot), for pure durations: a wall
 -- clock stepped either way never moves it. Without it (an older
--- Hammerspoon), the wall clock stands in.
+-- Hammerspoon), the wall clock stands in, read through the step detector
+-- with every step it took out added back: a duration across a step back it
+-- saw keeps its length (a step forward, which it cannot see, lengthens it).
 function clock.mono()
   local abs = hs.timer.absoluteTime
-  return abs and abs() / 1e9 or hs.timer.secondsSinceEpoch()
+  if abs then return abs() / 1e9 end
+  return clock.now() - clock.stepTotal
 end
 
 -- The wall clock, read through the step detector. A step back is seen on
 -- the first wall read after it, whichever code makes that read (a tick, a
 -- sampler or top-stream callback, a click), and every stamp memwatch holds
--- is shifted by it before this read's value is used: no stamp is left on
--- the old basis, and none is shifted twice. The readings move first, so a
--- shift that throws never runs again for the same step.
+-- is shifted by it before any reading on the new basis is used: no stamp is
+-- left on the old basis, and none is shifted twice. A callback (one frame:
+-- guard) is never shifted under: a step seen by a read in the middle of a
+-- callback that has already read the clock is taken out when the callback
+-- ends (clock.leave), and until then every read in it stays on the basis it
+-- began with, so the stamps it writes are shifted with the rest.
 function clock.now()
   local wall = hs.timer.secondsSinceEpoch()
   local mono = hs.timer.absoluteTime and hs.timer.absoluteTime() / 1e9 or nil
@@ -2016,17 +2083,45 @@ function clock.now()
   end
   clock.wallAt, clock.monoAt = wall, mono
   if delta < -clock.stepSec then
-    M.logSnapshot(string.format("clock-stepped-back:%.0fs", -delta))
-    local ok, err = pcall(clock.shift, delta)
-    if not ok then logError("clock-shift", err) end
-    -- What the shift changed in memory is written out (the frozen ledger),
-    -- so a reload reads it shifted too.
-    if clock.afterShift then
-      local ok2, err2 = pcall(clock.afterShift)
-      if not ok2 then logError("clock-after-shift", err2) end
+    if clock.depth > 0 and clock.frameRead then
+      clock.pending = clock.pending + delta
+    else
+      clock.apply(delta)
     end
   end
-  return wall
+  if clock.depth > 0 then clock.frameRead = true end
+  return wall - clock.pending
+end
+
+-- Take a step back out of every stamp, once. The readings have moved
+-- already and the step is counted first, so a shift that throws never runs
+-- again for the same step.
+function clock.apply(delta)
+  clock.stepTotal = clock.stepTotal + delta
+  M.logSnapshot(string.format("clock-stepped-back:%.0fs", -delta))
+  local ok, err = pcall(clock.shift, delta)
+  if not ok then logError("clock-shift", err) end
+  -- What the shift changed in memory is written out (the frozen ledger),
+  -- so a reload reads it shifted too.
+  if clock.afterShift then
+    local ok2, err2 = pcall(clock.afterShift)
+    if not ok2 then logError("clock-after-shift", err2) end
+  end
+end
+
+-- A callback's frame. Only the outermost one counts: a step held back while
+-- it ran is taken out as it ends.
+function clock.enter()
+  clock.depth = clock.depth + 1
+  if clock.depth == 1 then clock.frameRead = false end
+end
+function clock.leave()
+  clock.depth = math.max(0, clock.depth - 1)
+  if clock.depth == 0 and clock.pending ~= 0 then
+    local delta = clock.pending
+    clock.pending = 0
+    clock.apply(delta)
+  end
 end
 
 -- Decision half: fork-free, runs every tick no matter what. Everything it
@@ -2264,9 +2359,9 @@ function clock.afterShift()
 end
 
 -- A ledger writer changes only its own process's entry: the slot holds
--- nothing, an entry with no start time, or this very start time. An entry
--- for another start time (a newer freeze of the pid's next process, or one
--- a reload adopted) is not the writer's to touch.
+-- nothing, or an entry for this very start time. An entry for another start
+-- time (a newer freeze of the pid's next process) is not the writer's to
+-- touch, and nor is one with no start time.
 local function ownsEntry(pid, lstart)
   local cur = frozen[pid]
   return cur == nil or (cur.lstart ~= nil and cur.lstart == lstart)
@@ -2276,6 +2371,20 @@ local function dropOwnEntry(pid, lstart)
     frozen[pid] = nil
     saveFrozen()
   end
+end
+-- Ledger entry tokens (rule 3).
+local entryIds = { seq = 0 }  -- seq: entries made by this run
+-- Is this slot's entry that very entry: the same object, or the same
+-- freeze's token once a reload's reconcile has rebuilt it?
+function entryIds.same(cur, e)
+  return cur ~= nil and e ~= nil and (cur == e or (e.id ~= nil and cur.id == e.id))
+end
+-- A token for a new entry, from durable parts only (the pid, the time in
+-- milliseconds and a count of this run's entries): one left in the ledger
+-- by an earlier run names nothing this run made.
+function entryIds.new(pid)
+  entryIds.seq = entryIds.seq + 1
+  return string.format("%d/%.0f/%d", pid, clock.now() * 1000, entryIds.seq)
 end
 
 local function loadFrozen()
@@ -2297,50 +2406,18 @@ local function frozenReconcile()
   frozen = {}
   local survivors, unbound = {}, {}
   local now = clock.now()
-  -- Dating an old entry compares a start time read through os.time with a
-  -- freeze stamp from this clock: say so when the two disagree.
-  local skew = os.time() - now
-  local skewed = math.abs(skew) > 5
-  if skewed then
-    M.logSnapshot(string.format("frozen-reconcile-clock-skew:%.0fs", skew))
-  end
-  -- One bound by name says so wherever it is named.
-  local function survivorName(e)
-    return e.adopted and ((e.name or "?") .. " (bound by name; check before resuming)") or e.name
-  end
   for _, e in ipairs(list) do
     if type(e) == "table" and type(e.pid) == "number" then
       if e.lstart == nil then
-        -- Written by an older version, with no start time: bound now to a
-        -- stopped process of that program, or dropped. No entry without a
-        -- start time is ever signaled through; one whose probe could not
-        -- answer is named in the notice below, in case it is still stopped.
-        -- A process that started after the entry was frozen cannot be the
-        -- one frozen. One bound by name is labeled as such: the start time
-        -- that would prove it is what the old entry never had.
-        local st, holder = probe(e.pid)
-        local started = st == "present" and core.lstartEpoch(holder.lstart) or nil
-        local candidate = st == "present" and core.isStopped(holder)
-          and core.sameName(procs.friendlyName(holder.comm), e.name)
-        -- Only while the two clocks agree: otherwise the freeze stamp and the
-        -- start time are not on one basis, and nothing can be dated.
-        local dated = candidate and started ~= nil and type(e.frozenAt) == "number" and not skewed
-        -- Started in an earlier whole second than the freeze (ps prints
-        -- whole seconds), so a process started after it cannot be adopted.
-        if dated and started < math.floor(e.frozenAt) then
-          e.lstart, e.adopted = holder.lstart, true
-          M.logSnapshot(string.format("frozen-reconcile-bind:%s(%d)", e.name or "?", e.pid))
-        else
-          M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):no-start-time", e.name or "?", e.pid))
-          -- Named in the notice whenever it could not be told: a probe that
-          -- could not answer, or that program stopped there with a start time
-          -- that cannot be read or dated, or that falls in the very second of
-          -- the freeze.
-          if st == "unknown" or (candidate and not dated) or (dated and started == math.floor(e.frozenAt)) then
-            unbound[#unbound + 1] = string.format("%s (pid %d)", e.name or "?", e.pid)
-          end
-          e = nil
-        end
+        -- Written by an older version, with no start time: nothing ties it
+        -- to the process it froze (the pid may hold another by now, and a
+        -- freeze stamp from before a reload cannot be dated against this
+        -- clock: a step across the reload shows nowhere). It is dropped, and
+        -- named in the notice below in case that program is still stopped.
+        -- No entry without a start time is ever signaled through.
+        M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):no-start-time", e.name or "?", e.pid))
+        unbound[#unbound + 1] = string.format("%s (pid %d)", e.name or "?", e.pid)
+        e = nil
       end
       -- A wall clock stepped back since the entry was written (while
       -- memwatch ran, or between sessions) leaves its pending window ahead
@@ -2348,6 +2425,10 @@ local function frozenReconcile()
       if e and type(e.pendingUntil) == "number" and e.pendingUntil > now + FREEZE_PENDING_SEC then
         e.pendingUntil = now + FREEZE_PENDING_SEC
       end
+      -- So does a freeze stamp: one ahead of now would read as a negative
+      -- time frozen, and hold the process's marks against samples taken
+      -- after it. It is read as frozen from now.
+      if e and type(e.frozenAt) == "number" and e.frozenAt > now then e.frozenAt = now end
       local proc, why
       if e then proc, why = resolveSignalTarget(e.pid, e.name, e.lstart) end
       if not e then
@@ -2363,18 +2444,18 @@ local function frozenReconcile()
         -- decides once the pending window ends.
         M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):pending", e.name or "?", e.pid))
         frozen[e.pid] = e
-        survivors[#survivors + 1] = survivorName(e)
+        survivors[#survivors + 1] = e.name
       elseif why == "unverified" then
         M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):unverified", e.name or "?", e.pid))
         frozen[e.pid] = e
-        survivors[#survivors + 1] = survivorName(e)
+        survivors[#survivors + 1] = e.name
       elseif not proc then
         M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):%s", e.name or "?", e.pid, why))
       elseif not core.isStopped(proc) then
         M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):resumed-externally", e.name or "?", e.pid))
       else
         frozen[e.pid] = e
-        survivors[#survivors + 1] = survivorName(e)
+        survivors[#survivors + 1] = e.name
       end
     end
   end
@@ -2504,7 +2585,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   -- This freeze's own token, written to the ledger with the entry: an
   -- in-process restart's reconcile rebuilds the entry as a new object, and
   -- the token is what still names it as this freeze's (rule 3).
-  entry.id = string.format("%s/%d/%.0f", tostring(entry):match("0x%x+") or "?", pid, clock.now() * 1000)
+  entry.id = entryIds.new(pid)
   frozen[pid] = entry
   saveFrozen()
   local stopSent = send("STOP", pid)
@@ -2534,7 +2615,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     -- freeze's own entry (or nothing): an entry another action wrote since,
     -- for this process or the pid's next one, is never this freeze's to
     -- touch, so a freeze whose verifier runs late cannot undo a newer one.
-    local function isOurs(e) return e == entry or (e ~= nil and e.id ~= nil and e.id == entry.id) end
+    local function isOurs(e) return entryIds.same(e, entry) end
     local ours = frozen[pid] == nil or isOurs(frozen[pid])
     local function dropOurs()
       if isOurs(frozen[pid]) then
@@ -2569,7 +2650,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
             -- Its size is unknown (the probe row has none), never the size
             -- of the process the freeze meant.
             frozen[pid] = { pid = pid, name = holderName, lstart = holder.lstart, weightMB = nil,
-                            frozenAt = clock.now(), stopSent = true }
+                            frozenAt = clock.now(), stopSent = true, id = entryIds.new(pid) }
             saveFrozen()
             M.logSnapshot(string.format("freeze-abort-cont-failed:%s(%d)", holderName, pid))
             onUpdate(string.format("%s changed identity mid-freeze, and pid %d (%s) may be left stopped; resume it from the menu",
@@ -2599,8 +2680,16 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       -- A process memwatch stopped is always in the ledger: settle the entry
       -- (or restore it, if nothing else took the slot meanwhile).
       if ours then
-        entry.pendingUntil = nil
-        frozen[pid] = entry
+        local cur = frozen[pid]
+        if cur ~= nil and cur ~= entry then
+          -- This freeze's own entry, rebuilt by a restart's reconcile (and
+          -- shifted with every stamp since): settled where it is, never
+          -- replaced by the copy this verifier captured.
+          cur.pendingUntil = nil
+        else
+          entry.pendingUntil = nil
+          frozen[pid] = entry
+        end
         saveFrozen()
       end
       M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
@@ -2663,7 +2752,12 @@ function M.resumePid(pid, onUpdate)
       M.logSnapshot(string.format("resume-drop:%s(%d):%s", e.name, pid, awhy))
       onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name, awhy), true)
     elseif not core.isStopped(again) then
-      dropOwnEntry(pid, e.lstart)
+      -- Resumed: this resume's own entry goes. A newer freeze of the same
+      -- process since (its STOP still on the way) keeps its own.
+      if entryIds.same(frozen[pid], e) then
+        frozen[pid] = nil
+        saveFrozen()
+      end
       M.logSnapshot(string.format("resume-done:%s(%d)", e.name, pid))
       onUpdate(string.format("%s resumed after %.0f min frozen", e.name,
         (clock.now() - (e.frozenAt or 0)) / 60), true)
@@ -2918,7 +3012,7 @@ local function retireLfmServer(reason)
   local pid, port, ident = lfmServerPid, lfmServerPort, lfmServerIdent
   lfmServerReady = false
   lfmServerPid, lfmServerPort, lfmServerIdent = nil, nil, nil
-  lfmSpawnedAt = nil  -- a deliberate retire must not trip the fast-crash latch
+  lfmSpawn = nil  -- a deliberate retire must not trip the fast-crash latch
   os.remove(LFM_PIDFILE)  -- a cleanly retired server is not a crash orphan
   lfmInFlight = nil
   if lfmServerTask then pcall(function() lfmServerTask:terminate() end) end
@@ -3082,8 +3176,10 @@ local function spawnLfmServer()
   end
   lfmServerPort = port
   lfmServerReady = false
-  lfmSpawnedAt = clock.now()
-  local spawnAt = lfmSpawnedAt
+  -- This spawn's own identity, and its start on the monotonic clock: the
+  -- fast-crash window is a duration, which a wall clock step never moves.
+  local spawn = { mono = clock.mono() }
+  lfmSpawn = spawn
   -- taskpolicy -c utility keeps inference threads out of the crisis's way;
   -- the drain callback exists because llama-server logs continuously and an
   -- undrained pipe deadlocks at 64KB.
@@ -3097,10 +3193,10 @@ local function spawnLfmServer()
       -- A FAST crash (died within a few seconds of spawn, before it was ever
       -- ready) latches the adjudicator offline: otherwise the next elevated
       -- tick respawns it and a crash-looping binary thrashes load/exec cycles
-      -- through the pressure episode. A clean retire nils lfmSpawnedAt first,
-      -- so this only fires on an unexpected early exit.
-      if lfmSpawnedAt == spawnAt
-         and (clock.now() - spawnAt) < 10 then
+      -- through the pressure episode. A clean retire clears lfmSpawn first,
+      -- so this only fires on an unexpected early exit of this very spawn.
+      if lfmSpawn == spawn
+         and (clock.mono() - spawn.mono) < 10 then
         lfmOffline = true
         M.logSnapshot("lfm-fast-crash:latched-offline")
       end
@@ -3165,7 +3261,7 @@ local function spawnLfmServer()
         recordLfmServer(owner)
         lfmServerReady = true
         M.logSnapshot(string.format("lfm-ready:%.1fs:pid=%d",
-          clock.now() - lfmSpawnedAt, owner))
+          lfmSpawn and (clock.mono() - lfmSpawn.mono) or -1, owner))
         return true
       end
       return false

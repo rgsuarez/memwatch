@@ -372,6 +372,9 @@ function F.new()
       doUntil = function(pred, action, iv) return addTimer("until", iv or 1, iv or 1, action, pred) end,
     },
     host = { vmStat = function()
+      -- onVmStat: something that happens while memwatch reads the counters
+      -- (a wall clock step in the middle of a tick).
+      if W.onVmStat then W.onVmStat() end
       local total = MEM_BYTES // PAGE
       return { pageSize = PAGE, memSize = MEM_BYTES, pagesFree = math.floor(total * W.availPct / 100),
                pagesSpeculative = 0, pagesPurgeable = 0, fileBackedPages = 0, uncompressedPages = 0,

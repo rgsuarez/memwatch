@@ -2865,8 +2865,10 @@ do
     if sa and sz then text = text:sub(1, sa - 1) .. text:sub(sz) end
     local miss, ctor = {}, nil
     for line in text:gmatch("[^\n]+") do
-      local open = line:match("([%a_][%w_]*)[^=]-=%s*{")
-      if open then ctor = open == "local" and line:match("local%s+([%a_][%w_]*)") or open end
+      -- The table a constructor builds: the name right before "= {", or
+      -- before its index ("finals[pid] = {").
+      local open = line:match("([%a_][%w_]*)%s*%b[]%s*=%s*{") or line:match("([%a_][%w_]*)%s*=%s*{")
+      if open then ctor = open end
       local holder = line:match("([%a_][%w_]*)%.at%s*=[^=]") or line:match("([%a_][%w_]*)%.since%s*=[^=]")
         or line:match("([%a_][%w_]*)%.t%s*=[^=]")
       if not holder and (line:match("[{,]%s*at%s*=[^=]") or line:match("^%s*at%s*=[^=]")
@@ -2883,6 +2885,8 @@ do
   check("clock.shift: the scan sees a new holder's at (positive control)", #lowerStamps("  newHolder.at = now\n"), 1)
   check("clock.shift: and one built with it (positive control)",
     #lowerStamps("  local fresh = {\n    pid = 1,\n    at = now,\n  }\n"), 1)
+  check("clock.shift: a constructor is named by the table it builds, not the statement around it",
+    table.concat(lowerStamps("  if ok then fresh[pid] = { at = now } end\n"), ","), "fresh")
   -- A name is matched whole: one that appears in the shift only inside a
   -- longer name is not shifted.
   check("clock.shift: a name inside a longer one does not count (positive control)",

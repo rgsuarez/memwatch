@@ -72,14 +72,15 @@ function F.new()
   end
 
   -- ---- processes ---------------------------------------------------------
-  local nextStart = 0
-  local function startStamp()
-    nextStart = nextStart + 1
-    return string.format("Mon Oct 12 10:%02d:%02d 2026", (nextStart // 60) % 60, nextStart % 60)
+  -- A process's start time as ps prints it (local time), consistent with
+  -- the etime the sampler reports for it (every fake process is reported
+  -- 120 s older than its bornAt, so identity windows can decide).
+  local function startStamp(bornAt)
+    return os.date("%a %b %e %H:%M:%S %Y", math.floor(bornAt) - 120)
   end
   function W.addProc(pid, name, rssMB, extra)
     local p = { pid = pid, uid = 501, comm = "/usr/local/bin/" .. name, rssKB = math.floor(rssMB * 1024),
-                lstart = startStamp(), state = "S", bornAt = W.now }
+                lstart = startStamp(W.now), state = "S", bornAt = W.now }
     for k, v in pairs(extra or {}) do p[k] = v end
     W.procs[pid] = p
     return p
@@ -110,11 +111,14 @@ function F.new()
     table.sort(pids)
     for _, pid in ipairs(pids) do
       local p = W.procs[pid]
+      -- samplerOmit: rows a cut-off (partial) table is missing.
+      if W.samplerOmit and W.samplerOmit[pid] then goto continue end
       if W.etimeColumn then
         rows[#rows + 1] = string.format("%5d %5d %6d %s %s", pid, p.uid, p.rssKB, etime(p), p.comm)
       else
         rows[#rows + 1] = string.format("%5d %5d %6d %s", pid, p.uid, p.rssKB, p.comm)
       end
+      ::continue::
     end
     return table.concat(rows, "\n") .. "\n"
   end

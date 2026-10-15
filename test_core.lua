@@ -1560,46 +1560,82 @@ do
     observe.identity({ lo = 999, hi = 1003, etimeSec = 20 }, { lo = 999, hi = 1060 }), "unknown")
   check("identity: missing windows are undecidable", observe.identity(nil, { lo = 1, hi = 2 }), "unknown")
 
-  -- Fate: decided only from fresh complete tick data, never guessed.
+  -- Evidence: each observation folds the samples, signals and touches that
+  -- arrive after it; a follow-up reads only that record.
+  local function ev0() return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0,
+                                                    obsAt = 1000, weightMB = 100 }) end
   local same = { lo = 999, hi = 1001 }
-  local base = { sampleAgeSec = 3, sampleComplete = true, comm0 = "/bin/x",
-                 start0 = old0, start1 = same }
-  local function fateOf(over)
-    local a = {}
-    for k, v in pairs(base) do a[k] = v end
-    for k, v in pairs(over) do a[k] = v end
-    return observe.fate(a)
-  end
-  local f1, d1 = fateOf({ sampleAgeSec = 40, psRow = { pid = 1, comm = "/bin/x" } })
-  check("fate: stale sample is unknown", f1, "unknown")
-  check("fate: stale sample detail", d1, "stale-sample")
-  local fi, di = fateOf({ sampleComplete = false })
-  check("fate: absence from a partial table proves nothing", fi, "unknown")
-  check("fate: partial table detail", di, "incomplete-sample")
-  check("fate: completeness must be asserted, never assumed",
-    (observe.fate({ sampleAgeSec = 3 })), "unknown")
-  check("fate: absent from a fresh complete sample", (fateOf({})), "exited")
-  check("fate: present, same process", (fateOf({ psRow = { pid = 1, comm = "/bin/x" } })), "alive")
-  local f2, d2 = fateOf({ psRow = { pid = 1, comm = "/bin/x" }, start1 = { lo = 1500, hi = 1502 } })
-  check("fate: pid now belongs to a newer process", f2, "exited")
-  check("fate: reuse detail", d2, "pid-reused")
-  local f3, d3 = fateOf({ psRow = { pid = 1, comm = "/usr/bin/other" } })
-  check("fate: a changed comm is a reuse", f3, "exited")
-  check("fate: changed comm detail", d3, "pid-reused")
-  check("fate: a delivery stall keeps a live process alive",
-    (fateOf({ psRow = { pid = 1, comm = "/bin/x" }, start1 = { lo = 999, hi = 1060 } })), "alive")
-  local fu, du = fateOf({ psRow = { pid = 1, comm = "/bin/x" },
-                          start0 = { lo = 999, hi = 1003, etimeSec = 20 }, start1 = { lo = 999, hi = 1060 } })
-  check("fate: undecidable identity is unknown", fu, "unknown")
-  check("fate: undecidable identity detail", du, "identity-uncertain")
-  -- The frozen ledger never decides alone: it outlives a frozen process
-  -- killed while pressure stayed up (the sweep runs only when calm).
-  check("fate: frozen and still present",
-    (fateOf({ frozen = true, psRow = { pid = 1, comm = "/bin/x" } })), "frozen")
-  check("fate: frozen but gone from a fresh complete sample", (fateOf({ frozen = true })), "exited")
-  check("fate: frozen but the sample is stale", (fateOf({ frozen = true, sampleAgeSec = 99 })), "unknown")
-  check("fate: frozen but the pid was reused",
-    (fateOf({ frozen = true, psRow = { pid = 1, comm = "/usr/bin/other" } })), "exited")
+  local e = ev0()
+  check("evidence: nothing seen yet is unknown", (observe.fateAt(e, 1060)), "unknown")
+  check("evidence: and says the sample is stale", select(2, observe.fateAt(e, 1060)), "stale-sample")
+  observe.foldSample(e, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                          weightMB = 140, launchedAt = 1050, deliveredAt = 1052 })
+  check("evidence: seen as the same process near the horizon is alive", (observe.fateAt(e, 1060)), "alive")
+  check("evidence: freshness counts from acquisition, not delivery", (observe.fateAt(e, 1066)), "unknown")
+  check("evidence: the frozen ledger's process is frozen", (observe.fateAt(e, 1060, true)), "frozen")
+  check("evidence: weight is the latest sighting", e.lastWeightMB, 140)
+  check("evidence: peak is folded as samples arrive", e.peakMB, 140)
+  -- A late delivery: the table was read at launch, long before it landed.
+  local late = ev0()
+  observe.foldSample(late, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = { lo = 999, hi = 1040 },
+                             weightMB = 120, launchedAt = 1015, deliveredAt = 1055 })
+  check("evidence: a table delivered late is as old as its launch", (observe.fateAt(late, 1060)), "unknown")
+  -- Peaks survive the process leaving the tracker.
+  local pk = ev0()
+  observe.foldSample(pk, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 24000, launchedAt = 1010, deliveredAt = 1011 })
+  observe.foldSample(pk, { complete = true, row = nil, launchedAt = 1020, deliveredAt = 1021 })
+  check("evidence: absent from a complete table is exited", (observe.fateAt(pk, 1060)), "exited")
+  check("evidence: the peak it reached before exiting is kept", pk.peakMB, 24000)
+  observe.foldSample(pk, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 30000, launchedAt = 1030, deliveredAt = 1031 })
+  check("evidence: once gone, later samples change nothing", pk.peakMB, 24000)
+  local partial = ev0()
+  observe.foldSample(partial, { complete = false, row = nil, launchedAt = 1050, deliveredAt = 1051 })
+  local fp, dp = observe.fateAt(partial, 1060)
+  check("evidence: absence from a partial table proves nothing", fp, "unknown")
+  check("evidence: and says so", dp, "incomplete-sample")
+  local reused = ev0()
+  observe.foldSample(reused, { complete = false, row = { pid = 1, comm = "/bin/x" }, start1 = { lo = 1500, hi = 1502 },
+                               launchedAt = 1050, deliveredAt = 1051 })
+  local fr, dr = observe.fateAt(reused, 1060)
+  check("evidence: disjoint start windows prove the pid was reused", fr, "exited")
+  check("evidence: reuse detail", dr, "pid-reused")
+  local other = ev0()
+  observe.foldSample(other, { complete = true, row = { pid = 1, comm = "/usr/bin/other" }, launchedAt = 1050, deliveredAt = 1051 })
+  check("evidence: a changed comm is a reuse", select(2, observe.fateAt(other, 1060)), "pid-reused")
+  local undec = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = { lo = 999, hi = 1003, etimeSec = 20 },
+                                     obsAt = 1000, weightMB = 1 })
+  observe.foldSample(undec, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = { lo = 999, hi = 1060 },
+                              launchedAt = 1050, deliveredAt = 1051 })
+  check("evidence: an undecidable identity is unknown", select(2, observe.fateAt(undec, 1060)), "identity-uncertain")
+  -- Signals and touches count only for the observed process.
+  local sg = ev0()
+  local atStart = os.time({ year = 2026, month = 10, day = 12, hour = 10, min = 0, sec = 1 })
+  local sgEv = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = { lo = atStart - 1, hi = atStart + 1, etimeSec = 900 },
+                                     obsAt = atStart + 900, weightMB = 1 })
+  observe.foldSignal(sgEv, { action = "terminate", at = atStart + 950, comm = "/bin/x",
+                             startEpoch = observe.lstartEpoch("Mon Oct 12 10:00:01 2026") })
+  check("signal: one sent to the observed process counts", sgEv.signals[1] and sgEv.signals[1].action, "terminate")
+  check("signal: and is certain", sgEv.signals[1] and sgEv.signals[1].uncertain, nil)
+  observe.foldSignal(sgEv, { action = "freeze", at = atStart + 960, comm = "/bin/x",
+                             startEpoch = atStart + 600 })
+  check("signal: one sent to a newer process under the pid does not", #sgEv.signals, 1)
+  observe.foldSignal(sg, { action = "freeze", at = 1050, comm = "/bin/x", startEpoch = nil })
+  check("signal: an unbound one is kept, marked uncertain", sg.signals[1] and sg.signals[1].uncertain, true)
+  observe.foldTouch(sgEv, { startEpoch = atStart })
+  observe.foldTouch(sgEv, { startEpoch = atStart + 600 })
+  check("touch: only touches on the observed process count", sgEv.touches, 1)
+  check("lstartEpoch: ps's start time parses", observe.lstartEpoch("Mon Oct 12 10:00:01 2026"), atStart)
+  check("lstartEpoch: a space-padded day parses",
+    observe.lstartEpoch("Mon Oct  5 10:00:01 2026") ~= nil, true)
+  check("lstartEpoch: garbage is nil", observe.lstartEpoch("not a time"), nil)
+  check("frozen: the ledger entry of the observed process matches",
+    observe.frozenMatches({ lstart = "Mon Oct 12 10:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1 }), true)
+  check("frozen: a stale entry of an earlier process does not",
+    observe.frozenMatches({ lstart = "Mon Oct 12 09:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1 }), false)
+  check("frozen: no entry is false", observe.frozenMatches(nil, old0), false)
+  check("frozen: an entry without a start time cannot tell", observe.frozenMatches({ name = "x" }, old0), nil)
 
   -- Follow-ups read the tracker entry only when it is provably the observed
   -- process: the same comm, and start windows identity() calls same.
@@ -1629,22 +1665,38 @@ do
   check("liveStamp: no tracker entry keeps it", observe.liveStamp(stamp, nil), stamp)
   check("liveStamp: no stamp is nil", observe.liveStamp(nil, live), nil)
 
-  -- The decision trigger: the three-case floor, plus mode independence.
-  local due = { enabled = true, kind = "extreme", alertActive = true, hudInteracted = false,
-                hudHold = false, sinceShownSec = 61, graceSec = 60 }
+  -- The unattended gate, shared by the live step and the decision rows.
+  local gate = { kind = "extreme", alertActive = true, hudHold = false, sameAsHud = true,
+                 answered = false, interacted = false, bound = true, exposureSec = 61, graceSec = 60 }
+  local function gateWith(over)
+    local a = {}
+    for k, v in pairs(gate) do a[k] = v end
+    for k, v in pairs(over) do a[k] = v end
+    return core.unattendedGate(a)
+  end
+  check("gate: an unanswered extreme alert past its grace is open", gateWith({}), "open")
+  check("gate: exactly at grace is open", gateWith({ exposureSec = 60 }), "open")
+  check("gate: before grace is closed", gateWith({ exposureSec = 59 }), "closed")
+  check("gate: an operator action closes it", gateWith({ interacted = true }), "closed")
+  check("gate: an answered process (frozen, gone, ignored) closes it", gateWith({ answered = true }), "closed")
+  check("gate: an offender the alert did not surface closes it", gateWith({ sameAsHud = false }), "closed")
+  check("gate: a held narrative closes it", gateWith({ hudHold = true }), "closed")
+  check("gate: a hog is never acted on", gateWith({ kind = "hog" }), "closed")
+  check("gate: no live alert closes it", gateWith({ alertActive = false }), "closed")
+  check("gate: open but unbound says so", gateWith({ bound = false }), "unbound")
+  check("gate: an empty table is closed", core.unattendedGate({}), "closed")
+  check("gate: no input is closed", core.unattendedGate(nil), "closed")
+  -- The decision row: the gate open, once per process per grace window.
+  local due = { enabled = true, gate = "open", graceSec = 60 }
   local function dueWith(over)
     local a = {}
     for k, v in pairs(due) do a[k] = v end
     for k, v in pairs(over) do a[k] = v end
     return observe.decisionDue(a)
   end
-  check("decisionDue: an unanswered extreme alert past grace is due", dueWith({}), true)
-  check("decisionDue: exactly at grace is due", dueWith({ sinceShownSec = 60 }), true)
-  check("decisionDue: before grace is not due", dueWith({ sinceShownSec = 59 }), false)
-  check("decisionDue: an answered alert is not due", dueWith({ hudInteracted = true }), false)
-  check("decisionDue: a held kill narrative is not due", dueWith({ hudHold = true }), false)
-  check("decisionDue: a hog is not a decision point", dueWith({ kind = "hog" }), false)
-  check("decisionDue: no live alert episode is not due", dueWith({ alertActive = false }), false)
+  check("decisionDue: an open gate is due", dueWith({}), true)
+  check("decisionDue: a closed gate is not", dueWith({ gate = "closed" }), false)
+  check("decisionDue: an unbound gate is not (the live step would not act)", dueWith({ gate = "unbound" }), false)
   check("decisionDue: the ledger off is not due", dueWith({ enabled = false }), false)
   check("decisionDue: a row within the grace window suppresses", dueWith({ sinceLastSec = 30 }), false)
   check("decisionDue: a row a full window ago does not", dueWith({ sinceLastSec = 60 }), true)
@@ -1652,13 +1704,11 @@ do
   check("decisionDue: an empty table is not due", observe.decisionDue({}), false)
   check("decisionDue: no input is not due", observe.decisionDue(nil), false)
   -- There is no mode input: the same facts decide under every mode.
-  local dueModes, idleModes = 0, 0
+  local dueModes = 0
   for _, m in ipairs({ "off", "freeze", "kill" }) do
     if dueWith({ mode = m }) then dueModes = dueModes + 1 end
-    if dueWith({ mode = m, hudInteracted = true }) then idleModes = idleModes + 1 end
   end
   check("decisionDue: due under every mode", dueModes, 3)
-  check("decisionDue: not due under any mode", idleModes, 0)
 
   -- Jetsam report names carry their local timestamp.
   local times = observe.jetsamTimes({ "JetsamEvent-2026-10-12-235154.ips",
@@ -1763,33 +1813,34 @@ do
     src:find('pcall(writeObservation, "decision"', 1, true) ~= nil, true)
   check("observe glue: advisory cadence is error-bounded",
     src:find('pcall(writeObservation, "advisory"', 1, true) ~= nil, true)
-  -- Fates come only from a complete sample, through start windows, and the
-  -- operator signal is the monotonic counter, not the resettable HUD flag.
-  check("observe glue: fate is told whether the sample was complete",
-    body:find("sampleComplete = lastSampleComplete", 1, true) ~= nil, true)
-  check("observe glue: follow-up identity uses a start window",
-    body:find("procs.startWindow(psRow.etimeSec, lastSampleLaunchedAt, lastSampleAt)", 1, true) ~= nil, true)
+  -- Fates come only from the observation's own evidence: every sample folds
+  -- in with its completeness and its start window, and the operator signal
+  -- is the monotonic counter, not the resettable HUD flag.
+  local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt)")
+  check("observe glue: onSample located", #sampleBody > 300, true)
+  check("observe glue: each sample folds in with its completeness",
+    sampleBody:find("complete = lastSampleComplete, row = row,", 1, true) ~= nil, true)
+  check("observe glue: and its start window, bounded by launch and delivery",
+    sampleBody:find("start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil, true)
+  check("observe glue: an older sampler's late table never replaces a newer one",
+    sampleBody:find("if launchedAt and lastSampleLaunchedAt and launchedAt < lastSampleLaunchedAt then return end", 1, true) ~= nil, true)
   check("observe glue: no point-estimate start compare remains",
     body:find("psStartedAt", 1, true), nil)
   check("observe glue: operator actions counted across the window",
     body:find("operatorActionsSince = operatorActions - ops0", 1, true) ~= nil, true)
   check("observe glue: the resettable HUD flag is not the operator signal",
     body:find("hudInteracted", 1, true), nil)
-  check("observe glue: the frozen ledger is recorded beside the fate",
-    body:find("frozenLedger = frozen[pid] ~= nil", 1, true) ~= nil, true)
-  -- Weight and peak come only from a provably-same tracker entry, and the
-  -- peak is a running maximum since the observation, not the 60 s ring.
-  check("observe glue: the follow-up reads the tracker only through the identity gate",
-    body:find("local e = observe.sameProcess(tracker.procs[pid], comm0, start0)", 1, true) ~= nil, true)
+  check("observe glue: the frozen ledger counts only for the observed process",
+    body:find("local frozenSame = observe.frozenMatches(frozen[pid], ev.start0)", 1, true) ~= nil
+      and body:find("frozenLedger = frozenSame,", 1, true) ~= nil, true)
+  -- Weight and peak come only from the folded evidence: the follow-up never
+  -- reads the tracker (an entry can expire, or belong to a newer process).
   local _, trackerReads = body:gsub("tracker%.procs%[pid%]", "")
-  check("observe glue: the tracker is read at observation and through the gate, nowhere else",
-    trackerReads, 2)
-  check("observe glue: weight needs presence and proven identity",
-    body:find("local weightNow = (present and e) and e.weightMB or nil", 1, true) ~= nil, true)
-  check("observe glue: the ring counts only samples since the observation",
-    body:find("observe.ringMax(e.ring, obsAt)", 1, true) ~= nil, true)
-  check("observe glue: the peak is the running maximum since the observation",
-    body:find("peakSinceMB = math.floor(peakSince)", 1, true) ~= nil, true)
+  check("observe glue: the tracker is read once, at observation", trackerReads, 1)
+  check("observe glue: weight needs presence",
+    body:find("local weightNow = present and ev.lastWeightMB or nil", 1, true) ~= nil, true)
+  check("observe glue: the peak is folded as samples arrive",
+    body:find("peakSinceMB = ev.peakMB and math.floor(ev.peakMB) or nil", 1, true) ~= nil, true)
   check("observe glue: the 60 s window peak is gone", body:find("windowPeakMB", 1, true), nil)
   -- memwatch's own signals: recorded where each signal is sent, after the
   -- identity and policy gates, and compared with the observation time.
@@ -1812,19 +1863,18 @@ do
   check("signals glue: freezePid located", #freezeBody > 500, true)
   check("signals glue: a terminate is recorded at its TERM, after the gates",
     recordedAtSend(killBody, 'sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))',
-      'memwatchSignals[pid] = { at = hs.timer.secondsSinceEpoch(), action = "terminate" }'), true)
+      'noteSignal(pid, "terminate", proc)'), true)
   check("signals glue: a freeze is recorded at its STOP, after the gates",
     recordedAtSend(freezeBody, 'sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))',
-      'memwatchSignals[pid] = { at = hs.timer.secondsSinceEpoch(), action = "freeze" }'), true)
-  local _, recordSites = src:gsub("memwatchSignals%[pid%] = {", "")
+      'noteSignal(pid, "freeze", proc)'), true)
+  local _, recordSites = src:gsub('noteSignal%(pid, "', "")
   check("signals glue: only the two signal sites record", recordSites, 2)
-  check("observe glue: follow-ups mark memwatch's own signals since the observation",
-    body:find("memwatchSignalSince = (sig and sig.at >= obsAt) and sig.action or nil", 1, true) ~= nil, true)
+  check("signals glue: no pid-keyed signal record remains", src:find("memwatchSignals", 1, true), nil)
+  check("observe glue: follow-ups report the first signal to the observed process",
+    body:find("local sig = ev.signals[1]", 1, true) ~= nil
+      and body:find("memwatchSignalSince = sig and sig.action or nil", 1, true) ~= nil, true)
   local gcBody = fnBody("gcUnattendedState = function(")
   check("signals glue: gcUnattendedState located", #gcBody > 200, true)
-  check("signals glue: signal records age out",
-    gcBody:find("if (now - (s.at or 0)) > MEMWATCH_SIGNAL_KEEP_SEC then memwatchSignals[pid] = nil end",
-      1, true) ~= nil, true)
   check("signals glue: the tick hands the GC its clock", src:find("gcUnattendedState(now)", 1, true) ~= nil, true)
   -- Counters count rows that reached the file: appendObserve reports
   -- success, and every increment is guarded by it.
@@ -1848,7 +1898,11 @@ do
       local a = text:find(inc, i, true)
       if not a then return n, guarded end
       n = n + 1
-      if text:sub(math.max(1, a - 60), a - 1):find("if appendObserve(", 1, true) then guarded = guarded + 1 end
+      local before = text:sub(math.max(1, a - 120), a - 1)
+      if before:find("if appendObserve(", 1, true)
+         or before:find("if not appendObserve(line) then return nil end", 1, true) then
+        guarded = guarded + 1
+      end
       i = a + #inc
     end
   end
@@ -1949,13 +2003,12 @@ do
   -- Absent pids are pruned only after a fresh, complete sample; signal
   -- records age out first, whatever the sampler is doing.
   local function prunesOnlyWhenFresh(text)
-    local sig = text:find("memwatchSignals[pid] = nil", 1, true)
     local fresh = text:find("if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end", 1, true)
     local sweep = text:find("local liveRun = {}", 1, true)
-    return sig ~= nil and fresh ~= nil and sweep ~= nil and sig < fresh and fresh < sweep
+    return fresh ~= nil and sweep ~= nil and fresh < sweep
   end
   check("glue: the prune-order scan refuses a guard after the sweep (positive control)",
-    prunesOnlyWhenFresh("memwatchSignals[pid] = nil\nlocal liveRun = {}\n"
+    prunesOnlyWhenFresh("local liveRun = {}\n"
       .. "if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end\n"), false)
   check("glue: absent pids are pruned only after a fresh, complete sample",
     prunesOnlyWhenFresh(fnBody("gcUnattendedState = function(now)")), true)

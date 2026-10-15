@@ -91,12 +91,38 @@ local observeSeq        = 0
 local observeLastAt     = 0
 local observeDecisionAt = {}   -- [pid] = { at, comm, start } of the last decision observation
 local observeStats      = { rows = 0, followups = 0, lastAt = 0, errors = 0 }
--- The last signal memwatch itself sent per pid ({ at, action =
--- "terminate"|"freeze" }), set where the signal is sent, after the identity
--- and policy gates. Follow-ups compare it with their observation time, so a
--- memwatch kill or freeze never reads as a natural exit.
-local memwatchSignals   = {}
-local MEMWATCH_SIGNAL_KEEP_SEC = 900 -- far past the longest follow-up horizon
+-- The evidence of each observation still awaiting follow-ups ([seq] =
+-- observe.newEvidence), folded forward as ps samples, memwatch's own
+-- signals and operator touches arrive, and dropped after its last horizon.
+-- A follow-up reads only its own record (see observe.foldSample).
+local pendingObs        = {}
+-- Rows carry this load's session id: observation seq restarts at 1 on every
+-- reload, so (session, seq) is the join key between a row and its
+-- follow-ups.
+local observeSession    = string.format("%d-%04x", os.time(), math.random(0, 0xffff))
+
+-- A signal memwatch sent (after its identity and policy gates) folds into
+-- every pending observation of that pid; the verified target's comm and
+-- start time decide whether it was the observed process.
+local function noteSignal(pid, action, proc)
+  if not next(pendingObs) then return end
+  local sig = { action = action, at = hs.timer.secondsSinceEpoch(),
+                comm = proc and proc.comm or nil,
+                startEpoch = proc and observe.lstartEpoch(proc.lstart) or nil }
+  for _, ev in pairs(pendingObs) do
+    if ev.pid == pid then observe.foldSignal(ev, sig) end
+  end
+end
+
+-- An operator touch aimed at a process (its pid, and its bound start time
+-- when known) folds into the pending observations of that pid.
+local function noteTouch(off)
+  if type(off) ~= "table" or not off.pid or not next(pendingObs) then return end
+  local t = { startEpoch = observe.lstartEpoch(off.lstart) }
+  for _, ev in pairs(pendingObs) do
+    if ev.pid == off.pid then observe.foldTouch(ev, t) end
+  end
+end
 -- Forward declarations, assigned in the kill-engine section: alertSurfaces
 -- (defined earlier in the file) calls these at tick time, and a top-level
 -- local referenced above its declaration silently splits into a global.
@@ -544,7 +570,10 @@ local function recordFor(map, off, create)
   return r
 end
 local function markInteracted(off)
-  if off and not off.synthetic then recordFor(interacted, off, true) end
+  if off and not off.synthetic then
+    recordFor(interacted, off, true)
+    noteTouch(off)
+  end
 end
 -- Every operator touch on an alert or a process (HUD click, menu action,
 -- banner button) bumps one monotonic counter. An observation compares it
@@ -1189,6 +1218,9 @@ end
 -- storm), and the verdict must never be hostage to it.
 local function onSample(blob, exitCode, launchedAt)
   local now = hs.timer.secondsSinceEpoch()
+  -- A callback from a sampler launched before the one already applied holds
+  -- an older table: it never replaces a newer one.
+  if launchedAt and lastSampleLaunchedAt and launchedAt < lastSampleLaunchedAt then return end
   lastSampleAt = now
   lastSampleLaunchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
   lastSampleComplete = (exitCode == 0)
@@ -1208,6 +1240,22 @@ local function onSample(blob, exitCode, launchedAt)
     if protectedPids[lastRanked[i].pid] then table.remove(lastRanked, i) end
   end
   assessProcesses(now)
+  -- Every pending observation folds this sample into its evidence: presence
+  -- by acquisition time (this sampler's launch), weight and peak, or proof
+  -- its process is gone.
+  if next(pendingObs) then
+    local rows = {}
+    for _, p in ipairs(lastPsList) do rows[p.pid] = p end
+    for _, ev in pairs(pendingObs) do
+      local row = rows[ev.pid]
+      local e = row and tracker.procs[ev.pid] or nil
+      observe.foldSample(ev, {
+        complete = lastSampleComplete, row = row,
+        start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil,
+        weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
+        launchedAt = launchedAt, deliveredAt = now })
+    end
+  end
 end
 
 -- End the episode: its banner goes, and every record it kept (the banner
@@ -1257,20 +1305,31 @@ end
 -- the time; another full grace window must pass before the same offender is
 -- adjudicated again. A freeze or terminate that failed on a process (it
 -- survived) is never retried on that same process.
+-- This tick's unattended gate (core.unattendedGate), read without side
+-- effects: the unattended step and the decision row both ask it.
+local function gateFor(offender, now)
+  local grace = hudOffender and recordFor(exposure, hudOffender, false) or nil
+  return core.unattendedGate({
+    kind = offender and offender.kind, alertActive = alertActive, hudHold = hudHold,
+    sameAsHud = offender ~= nil and hudOffender ~= nil and core.sameOffender(hudOffender, offender),
+    answered = offender ~= nil and isAnswered(offender, now),
+    interacted = hudOffender ~= nil and recordFor(interacted, hudOffender, false) ~= nil,
+    bound = hudOffender ~= nil and hudOffender.lstart ~= nil,
+    exposureSec = grace and grace.sec or 0, graceSec = core.cfg.cool.autoKillGraceSec,
+  })
+end
+
 local function unattendedStep(offender, now)
   local mode = core.resolveUnattended(core.cfg)
-  if mode == "off" or not offender or offender.kind ~= "extreme" then return end
-  if not alertActive or hudHold then return end
-  if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
-  if recordFor(interacted, hudOffender, false) or isAnswered(offender, now) then return end
-  local grace = recordFor(exposure, hudOffender, false)
-  if not grace or (grace.sec or 0) < core.cfg.cool.autoKillGraceSec then return end
+  if mode == "off" then return end
+  local gate = gateFor(offender, now)
+  if gate == "closed" then return end
   -- Act only on the identity the alert bound and surfaced, never on a name:
   -- without a bound start time (the probe failed) skip this tick and stay
   -- armed; the refresh retries the bind. The same start time keys the
   -- fired/streak state, so a same-name pid reuse starts clean.
   local lstart = hudOffender.lstart
-  if not lstart then
+  if gate == "unbound" then
     if (now - (unattendedSkipLogAt or 0)) > 60 then
       unattendedSkipLogAt = now
       M.logSnapshot(string.format("unattended-skip:identity-unverified:%s(%d)",
@@ -1434,11 +1493,7 @@ local function alertSurfaces(state, now)
     local decEntry = offender and tracker.procs[offender.pid] or nil
     local decStamp = offender and observe.liveStamp(observeDecisionAt[offender.pid], decEntry) or nil
     if observe.decisionDue({
-         enabled = observeEnabled, kind = offender and offender.kind,
-         alertActive = alertActive,
-         hudInteracted = hudOffender ~= nil and recordFor(interacted, hudOffender, false) ~= nil,
-         hudHold = hudHold,
-         sinceShownSec = decGrace and decGrace.sec or 0,
+         enabled = observeEnabled, gate = gateFor(offender, now),
          sinceLastSec = decStamp and (now - decStamp.at) or nil,
          graceSec = core.cfg.cool.autoKillGraceSec,
        }) then
@@ -1808,7 +1863,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   frozen[pid] = entry
   saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
-  memwatchSignals[pid] = { at = hs.timer.secondsSinceEpoch(), action = "freeze" }
+  noteSignal(pid, "freeze", proc)
   afterHeld(0.5, guard("freeze-verify", function()
     -- Re-probe IDENTITY and state in one fork after the signal: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
@@ -2522,7 +2577,7 @@ writeObservation = function(point, offender, now, extra)
     wouldActAtFreeze = deterministicAction("freeze", foreground)
   end
   local row = observe.row({
-    at = obsIso, seq = seq, point = point, synthetic = extra.synthetic,
+    at = obsIso, session = observeSession, seq = seq, point = point, synthetic = extra.synthetic,
     state = smState.state, kern = lastKern,
     availPct = lastMetrics.availPct, swapGB = lastMetrics.swapGB,
     compressorGB = lastMetrics.compGB,
@@ -2537,63 +2592,52 @@ writeObservation = function(point, offender, now, extra)
                  foreground = foreground },
     snapshot = user, snapshotHash = user and lfm.snapshotHash(user) or nil,
   })
-  -- An oversize row drops its snapshot, never the row.
+  -- An oversize row drops its snapshot, never the row. A row that was not
+  -- written gets no follow-ups and no sequence number back.
   local line = observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)
-  if appendObserve(line) then
-    observeStats.rows = observeStats.rows + 1
-    observeStats.lastAt = now
-  end
+  if not appendObserve(line) then return nil end
+  observeStats.rows = observeStats.rows + 1
+  observeStats.lastAt = now
   -- Follow-ups: what actually became of this process, and of the machine.
+  -- Identity at observation time is the tracker's comm and the start
+  -- window of its latest ps sighting; from here on the observation's own
+  -- evidence record collects every sample, signal and touch aimed at that
+  -- same process, so the follow-ups never read back point-in-time state.
   local pid = offender.pid
-  local obsAt = now   -- the observation epoch the follow-ups compare against
-  -- Identity at observation time: the tracker's comm and the start window
-  -- of its latest ps sighting (bounded by that sampler's launch and
-  -- delivery, so callback latency cannot fake a mismatch later).
   local e0 = tracker.procs[pid]
-  local comm0 = e0 and e0.comm or nil
-  local start0 = observe.startOf(e0)
   local weight0 = offender.weightMB or 0
-  -- Peak weight since the observation, shared by its follow-ups: each folds
-  -- in the tracker's ~60 s ring, so the 120 and 180 s horizons keep a peak
-  -- reached early in the window.
-  local peakSince = weight0
+  local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
+                                   start0 = observe.startOf(e0), obsAt = now, weightMB = weight0 })
+  pendingObs[seq] = ev
   local avail0 = lastMetrics.availPct or 0
   local ops0 = operatorActions
-  for _, h in ipairs(extra.horizons or observe.cfg.horizons) do
+  local horizons = extra.horizons or observe.cfg.horizons
+  for i, h in ipairs(horizons) do
     afterHeld(h, guard("observe-followup", function()
+      if i == #horizons then pendingObs[seq] = nil end
       local t = hs.timer.secondsSinceEpoch()
-      local psRow = nil
-      for _, p in ipairs(lastPsList) do
-        if p.pid == pid then psRow = p; break end
-      end
-      local start1 = psRow and procs.startWindow(psRow.etimeSec, lastSampleLaunchedAt, lastSampleAt) or nil
-      local fate, detail = observe.fate({
-        sampleAgeSec = lastSampleAt > 0 and (t - lastSampleAt) or nil,
-        sampleComplete = lastSampleComplete,
-        psRow = psRow, comm0 = comm0, start0 = start0, start1 = start1,
-        frozen = frozen[pid] ~= nil,
-      })
+      local frozenSame = observe.frozenMatches(frozen[pid], ev.start0)
+      local fate, detail = observe.fateAt(ev, t, frozenSame == true)
       local present = fate == "alive" or fate == "frozen"
-      -- The tracker entry only when it is provably the observed process: a
-      -- reused pid's new process must never lend its weight or its peak.
-      local e = observe.sameProcess(tracker.procs[pid], comm0, start0)
-      local weightNow = (present and e) and e.weightMB or nil
-      local ringPeak = e and observe.ringMax(e.ring, obsAt) or nil
-      if ringPeak and ringPeak > peakSince then peakSince = ringPeak end
-      local sig = memwatchSignals[pid]
+      local weightNow = present and ev.lastWeightMB or nil
+      local sig = ev.signals[1]
       local availNow = lastMetrics.availPct or 0
       local fline = lfm.ledgerLine({
-        at = os.date("!%Y-%m-%dT%H:%M:%SZ"), followup_for = seq, observed_at = obsIso,
+        at = os.date("!%Y-%m-%dT%H:%M:%SZ"), session = observeSession,
+        followup_for = seq, observed_at = obsIso,
         horizonSec = h, synthetic = extra.synthetic == true or nil, pid = pid,
         fate = fate, fateDetail = detail,
+        sampleAgeSec = ev.seenAcq and math.floor(t - ev.seenAcq) or nil,
         weightMB = weightNow and math.floor(weightNow) or nil,
         weightDeltaMB = weightNow and math.floor(weightNow - weight0) or nil,
-        peakSinceMB = math.floor(peakSince),
+        peakSinceMB = ev.peakMB and math.floor(ev.peakMB) or nil,
         availPct = math.floor(availNow), availDelta = math.floor(availNow - avail0),
         state = smState.state,
-        frozenLedger = frozen[pid] ~= nil,
+        frozenLedger = frozenSame,
         operatorActionsSince = operatorActions - ops0,
-        memwatchSignalSince = (sig and sig.at >= obsAt) and sig.action or nil,
+        operatorTouchesSince = ev.touches,
+        memwatchSignalSince = sig and sig.action or nil,
+        memwatchSignalUncertain = sig and sig.uncertain or nil,
         jetsamSince = jetsamSince(now),
       })
       if appendObserve(fline) then observeStats.followups = observeStats.followups + 1 end
@@ -2835,11 +2879,7 @@ end
 -- a prior process's streak or fired stamp and trigger a premature action.
 -- The signal path also re-validates identity, but this keeps the DECISION
 -- from ever consuming stale streak state. Runs every tick regardless of LFM.
--- memwatch's own signal records age out on time alone.
 gcUnattendedState = function(now)
-  for pid, s in pairs(memwatchSignals) do
-    if (now - (s.at or 0)) > MEMWATCH_SIGNAL_KEEP_SEC then memwatchSignals[pid] = nil end
-  end
   -- Absence from the runaway set proves a pid is no longer a runaway only
   -- when the latest ps sample is fresh and complete: during a sampler stall
   -- a live runaway can drop off the list, and pruning it then would
@@ -2929,7 +2969,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- The TERM is the signal of record: a KILL escalation below carries out
   -- the same decision.
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
-  memwatchSignals[pid] = { at = hs.timer.secondsSinceEpoch(), action = "terminate" }
+  noteSignal(pid, "terminate", proc)
   afterHeld(k.escalateSec, guard("kill-escalate", function()
     -- Re-validate FULL identity (name AND the start time bound above)
     -- before SIGKILL: between TERM and this escalation the original may

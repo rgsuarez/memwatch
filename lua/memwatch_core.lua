@@ -559,6 +559,28 @@ function M.untilStep(st, ok, done, now, giveUpSec)
   return "poll"
 end
 
+-- The unattended gate, apart from the mode: whether this tick's offender is
+-- one memwatch would act on unattended. The live unattended step and the
+-- observation ledger's decision rows both ask it, so a decision row marks
+-- exactly the ticks where the live gate stands open under any mode.
+-- a: { kind, alertActive, hudHold, sameAsHud (the offender is the process
+--      the alert surfaced), answered (frozen, gone or ignored), interacted
+--      (the operator acted on it since the raise), bound (its start time is
+--      bound), exposureSec (its grace so far), graceSec }
+-- -> "open" | "unbound" (open but for identity: the live step skips and
+--    logs) | "closed"
+function M.unattendedGate(a)
+  if type(a) ~= "table" or a.kind ~= "extreme" then return "closed" end
+  if a.alertActive ~= true or a.hudHold or not a.sameAsHud then return "closed" end
+  if a.answered or a.interacted then return "closed" end
+  if type(a.graceSec) ~= "number" or type(a.exposureSec) ~= "number"
+     or a.exposureSec < a.graceSec then
+    return "closed"
+  end
+  if not a.bound then return "unbound" end
+  return "open"
+end
+
 -- What an action's outcome means for the alert that asked for it (the
 -- signal engines report the outcome; nothing is re-probed after the fact):
 --   done    frozen, terminated, or verified gone before any signal

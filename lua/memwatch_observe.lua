@@ -58,8 +58,13 @@ end
 -- from this ledger. `wouldAct` is what the deterministic policy fires under
 -- the live mode ("none" while it is off, and on every advisory row);
 -- `wouldActAtFreeze`, present only at decision points, is the decision a
--- model would own at grace expiry under the freeze ceiling.
--- a: { at, seq, point = "advisory"|"decision"|"synthetic", synthetic,
+-- model would own at grace expiry under the freeze ceiling. The foreground
+-- flag is the fork-free name match (foregroundBasis "name"); the live
+-- policy also walks the process tree and caps a terminate it cannot rule
+-- out as foreground to a freeze, so under kill mode wouldAct can read
+-- terminate where the live policy would freeze. `session` identifies the
+-- load that wrote the row: (session, seq) is the join key.
+-- a: { at, session, seq, point = "advisory"|"decision"|"synthetic", synthetic,
 --      state, kern, availPct, swapGB, compressorGB, swapoutRate, compRate,
 --      runawayCount, mode, lfmEnabled, wouldAct, wouldActAtFreeze,
 --      graceElapsedSec, category, offender = {pid, name, kind, weightMB,
@@ -68,7 +73,7 @@ end
 function M.row(a)
   local off = type(a.offender) == "table" and a.offender or {}
   return {
-    at = a.at, seq = a.seq, point = a.point,
+    at = a.at, session = a.session, seq = a.seq, point = a.point,
     synthetic = a.synthetic == true or nil,
     state = a.state, kern = a.kern,
     availPct = floorOrNil(a.availPct),
@@ -84,7 +89,7 @@ function M.row(a)
       name = M.sanitizeName(off.name), category = a.category, kind = off.kind,
       weightMB = floorOrNil(off.weightMB), slopeMBmin = floorOrNil(off.slopeMBmin),
       peakSlopeMBmin = floorOrNil(off.peakSlopeMBmin), ageSec = floorOrNil(off.ageSec),
-      foreground = off.foreground == true or nil,
+      foreground = off.foreground == true or nil, foregroundBasis = "name",
     },
     snapshot = a.snapshot, snapshotHash = a.snapshotHash,
   }
@@ -143,19 +148,17 @@ function M.sameProcess(e, comm0, start0)
 end
 
 -- Whether a tick is a would-be decision point that earns a decision row:
--- the ledger is on, an extreme offender's alert episode is live and
--- unanswered (no HUD click, no kill narrative holding it) for the full
--- grace window, and this process has had no decision row within the last
--- grace window (sinceLastSec is nil when it has no live stamp; see
--- liveStamp). The unattended mode is deliberately not an input: the ledger
--- records what an adjudicator would face under every mode, including off.
--- a: { enabled, kind, alertActive, hudInteracted, hudHold, sinceShownSec,
---      sinceLastSec, graceSec }
+-- the ledger is on, the unattended gate (core.unattendedGate, the same one
+-- the live unattended step asks) stands open for this tick's offender, and
+-- this process has had no decision row within the last grace window
+-- (sinceLastSec is nil when it has no live stamp; see liveStamp). The
+-- unattended mode is deliberately not an input: the ledger records what an
+-- adjudicator would face under every mode, including off, and a decision
+-- row marks exactly the ticks where the live gate would act.
+-- a: { enabled, gate ("open" | "unbound" | "closed"), sinceLastSec, graceSec }
 function M.decisionDue(a)
-  if type(a) ~= "table" or a.enabled ~= true or a.kind ~= "extreme" then return false end
-  if a.alertActive ~= true or a.hudInteracted or a.hudHold then return false end
-  if type(a.graceSec) ~= "number" or type(a.sinceShownSec) ~= "number" then return false end
-  if a.sinceShownSec < a.graceSec then return false end
+  if type(a) ~= "table" or a.enabled ~= true or a.gate ~= "open" then return false end
+  if type(a.graceSec) ~= "number" then return false end
   if type(a.sinceLastSec) == "number" and a.sinceLastSec < a.graceSec then return false end
   return true
 end
@@ -175,31 +178,123 @@ function M.liveStamp(stamp, e)
   return stamp
 end
 
--- What became of an observed process at a follow-up horizon, decided only
--- from data the tick already holds, and only from a fresh COMPLETE sample:
--- absence from a truncated table proves nothing. Returns fate, detail.
---   unknown : no fresh complete sample, or identity cannot be decided
---   exited  : absent from a fresh complete sample, or its pid now belongs to
---             a different process (detail "pid-reused")
---   frozen  : present, the same process, and memwatch's frozen ledger holds it
---   alive   : present, the same process
--- The frozen ledger never decides a fate by itself: an entry outlives a
--- frozen process killed meanwhile until the calm-only sweep removes it.
--- a: { sampleAgeSec, sampleComplete, psRow, comm0, start0, start1, frozen }
-function M.fate(a)
-  if type(a.sampleAgeSec) ~= "number" or a.sampleAgeSec > M.cfg.sampleFreshSec then
-    return "unknown", "stale-sample"
+-- A process start time as ps prints it ("Mon Oct  5 10:00:01 2026", local
+-- time) as an epoch; nil when it does not parse. Signal paths bind lstart,
+-- the ledger compares start windows, and this joins the two.
+local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
+                 Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+function M.lstartEpoch(s)
+  if type(s) ~= "string" then return nil end
+  local mon, d, h, mi, sec, y = s:match("^%a+%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)%s+(%d+)$")
+  if not mon or not MONTHS[mon] then return nil end
+  return os.time({ year = tonumber(y), month = MONTHS[mon], day = tonumber(d),
+                   hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) })
+end
+
+-- Is a process with this start epoch (and comm) the observed one? "same"
+-- when the epoch falls inside the observation's start window, "different"
+-- when outside it or the comm differs, "unknown" when either side lacks
+-- the data to tell.
+function M.matchStart(start0, comm0, epoch, comm)
+  if comm0 and comm and comm0 ~= comm then return "different" end
+  if type(start0) ~= "table" or type(epoch) ~= "number" then return "unknown" end
+  local slack = M.cfg.clockSlackSec
+  if epoch >= start0.lo - slack and epoch <= start0.hi + slack then return "same" end
+  return "different"
+end
+
+-- The evidence an observation keeps about its process, folded forward as
+-- events arrive instead of read back from whatever the globals hold at the
+-- follow-up: every ps sample (presence by acquisition time, weight and
+-- peak, or proof it is gone), every memwatch signal and every operator
+-- touch aimed at that same process. A follow-up reads only this record, so
+-- a delivery stall, an expired tracker entry, a reused pid or an event from
+-- before the observation cannot change what it reports.
+-- a: { pid, comm0, start0, obsAt, weightMB }
+function M.newEvidence(a)
+  return { pid = a.pid, comm0 = a.comm0, start0 = a.start0, obsAt = a.obsAt,
+           peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil, gone = nil,
+           lastMiss = nil, signals = {}, touches = 0 }
+end
+
+-- Fold one ps sample. s: { complete, row (the pid's row or nil), start1
+-- (the row's start window), weightMB (the row's weight), launchedAt,
+-- deliveredAt }. Presence counts from the sample's ACQUISITION bound (its
+-- launch: ps read the table between launch and delivery), so a sample
+-- delivered late is exactly as fresh as its launch says. A different
+-- process under the pid (another comm, or disjoint start windows) proves
+-- the observed one gone, as does absence from a complete table; absence
+-- from a partial table proves nothing.
+function M.foldSample(ev, s)
+  if ev.gone then return end
+  if s.row then
+    local diff = (ev.comm0 and s.row.comm and s.row.comm ~= ev.comm0)
+      or M.identity(ev.start0, s.start1) == "reused"
+    if diff then
+      ev.gone = { how = "pid-reused", at = s.deliveredAt }
+      return
+    end
+    if M.identity(ev.start0, s.start1) ~= "same" then
+      ev.lastMiss = "identity-uncertain"
+      return
+    end
+    if type(s.launchedAt) == "number" and (ev.seenAcq == nil or s.launchedAt > ev.seenAcq) then
+      ev.seenAcq = s.launchedAt
+    end
+    if type(s.weightMB) == "number" then
+      ev.lastWeightMB = s.weightMB
+      if ev.peakMB == nil or s.weightMB > ev.peakMB then ev.peakMB = s.weightMB end
+    end
+    ev.lastMiss = nil
+  elseif s.complete then
+    ev.gone = { how = "exited", at = s.deliveredAt }
+  else
+    ev.lastMiss = "incomplete-sample"
   end
-  if a.sampleComplete ~= true then return "unknown", "incomplete-sample" end
-  if not a.psRow then return "exited", nil end
-  if a.comm0 and a.psRow.comm and a.psRow.comm ~= a.comm0 then
-    return "exited", "pid-reused"
+end
+
+-- Fold one signal memwatch sent: sig { action, at, comm, startEpoch } for the
+-- process it verified before signaling. Only a signal to this same process
+-- counts; one whose process cannot be told apart is kept, marked uncertain.
+function M.foldSignal(ev, sig)
+  local m = M.matchStart(ev.start0, ev.comm0, sig.startEpoch, sig.comm)
+  if m == "different" then return end
+  ev.signals[#ev.signals + 1] = { action = sig.action, at = sig.at, uncertain = (m ~= "same") or nil }
+end
+
+-- Fold one operator touch aimed at this pid (t: { comm, startEpoch } when
+-- known): a touch on a different process under the pid does not count.
+function M.foldTouch(ev, t)
+  if M.matchStart(ev.start0, ev.comm0, t and t.startEpoch, t and t.comm) == "different" then return end
+  ev.touches = ev.touches + 1
+end
+
+-- What became of the observed process by follow-up time t, from its
+-- evidence alone. Returns fate, detail.
+--   exited  : proven gone by a sample (detail "pid-reused" when a different
+--             process holds the pid)
+--   alive   : seen, as the same process, in a sample ACQUIRED within
+--             sampleFreshSec of t
+--   frozen  : alive, and memwatch's frozen ledger holds this same process
+--   unknown : no such evidence (detail: stale-sample, incomplete-sample, or
+--             identity-uncertain)
+function M.fateAt(ev, t, frozenSame)
+  if ev.gone then return "exited", (ev.gone.how == "pid-reused") and "pid-reused" or nil end
+  if ev.seenAcq and ev.seenAcq >= t - M.cfg.sampleFreshSec then
+    if frozenSame then return "frozen", nil end
+    return "alive", nil
   end
-  local id = M.identity(a.start0, a.start1)
-  if id == "reused" then return "exited", "pid-reused" end
-  if id == "unknown" then return "unknown", "identity-uncertain" end
-  if a.frozen then return "frozen", nil end
-  return "alive", nil
+  return "unknown", ev.lastMiss or "stale-sample"
+end
+
+-- Does a frozen-ledger entry hold the observed process? From the entry's
+-- bound start time against the observation's start window; nil when that
+-- cannot be told.
+function M.frozenMatches(entry, start0, comm0)
+  if type(entry) ~= "table" then return false end
+  local m = M.matchStart(start0, nil, M.lstartEpoch(entry.lstart), nil)
+  if m == "unknown" then return nil end
+  return m == "same"
 end
 
 -- The kernel writes one report per jetsam event, named with its LOCAL

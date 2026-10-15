@@ -1045,7 +1045,8 @@ end)
 scenario("ledger: a partial process table proves nothing", nil, function(W)
   local row = toDecision(W, 4242)
   if not row then check("ledger partial: decision row", false, true); return end
-  W.samplerExit = 1
+  W.samplerExit = 1                 -- every table from here on is cut off
+  W.samplerOmit = { [4242] = true } -- before it reaches the observed process
   W.run(65)
   local fu = followups(W, row.seq)
   check("ledger partial: absence from a partial table is unknown, not exited",
@@ -1063,6 +1064,83 @@ scenario("ledger: a late sampler delivery is not a pid reuse", nil, function(W)
     if r.fateDetail == "pid-reused" then reused = true end
   end
   check("ledger stall: a 40 s delivery stall never reads as a reused pid", reused, false)
+end)
+
+-- ---- round 2: every follow-up field comes from the observation's own evidence ----
+-- A table read before the process exited, delivered 40 s late, must not
+-- report it alive at +60: freshness counts from acquisition.
+scenario("ledger: a late table cannot vouch for a process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger late: decision row", false, true); return end
+  W.samplerDelay = 40
+  W.run(30)
+  W.procs[4242] = nil               -- it exits 30 s after the decision point
+  W.run(40)
+  local fu = followups(W, row.seq)
+  check("ledger late: +60 does not report a process that is gone as alive",
+    fu[1] ~= nil and fu[1].fate ~= "alive", true)
+end)
+
+-- A signal memwatch sends to a same-name process that later took the pid
+-- is not the observed process's fate.
+scenario("ledger: a signal to the pid's next process is not the observed one's", nil, function(W, mw)
+  local row = toDecision(W, 4242, "node")
+  if not row then check("ledger signal: decision row", false, true); return end
+  W.procs[4242] = nil               -- the observed process exits on its own
+  W.run(8)
+  W.reusePid(4242, "node", 9000)    -- a same-name process takes the pid
+  W.grow(4242, 220)
+  W.run(20)
+  mw.killPid(4242, "node")          -- memwatch terminates the newcomer
+  W.run(50)
+  local fu = followups(W, row.seq)
+  check("ledger signal: the observed process exited", fu[1] and fu[1].fate, "exited")
+  check("ledger signal: memwatch's TERM to the newcomer is not attributed to it",
+    fu[1] ~= nil and fu[1].memwatchSignalSince == nil, true)
+end)
+
+-- A process that grows and exits before the first follow-up keeps the peak
+-- it reached, though the tracker forgets it.
+scenario("ledger: the peak survives the process leaving the tracker", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger peak: decision row", false, true); return end
+  local w0 = row.offender.weightMB
+  W.grow(4242, 600)
+  W.run(20)
+  local peakNow = math.floor(W.procs[4242].rssKB / 1024)
+  W.procs[4242] = nil
+  W.run(50)
+  local fu = followups(W, row.seq)
+  check("ledger peak: the peak since the observation is kept",
+    fu[1] ~= nil and (fu[1].peakSinceMB or 0) > w0 + 5000 and (fu[1].peakSinceMB or 0) <= peakNow, true)
+end)
+
+-- A decision row marks only ticks where the live unattended gate stands
+-- open: a process the operator froze from the menu before its grace ran
+-- out is answered, so it gets none.
+scenario("ledger: a menu freeze before grace leaves no decision row", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") and bodyNames(W, "MB/min") end)
+  W.run(20)
+  local row
+  for _, it in ipairs(W.menuItems()) do
+    if type(it.title) == "string" and it.title:find("(pid 4242)", 1, true) and it.menu then row = it end
+  end
+  if row then row.menu[1].fn() end -- Freeze leaker
+  W.run(5)
+  check("ledger gate: frozen from the menu", W.procs[4242].state, "T")
+  W.run(120)
+  check("ledger gate: no decision row for an answered process", decisionRow(W, 4242), nil)
+end)
+
+scenario("ledger: observe=false writes nothing", '{"observe":false}', function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(150)
+  check("ledger off: no observation ledger at all", #ledgerRows(W), 0)
 end)
 
 scenario("ledger: a pid taken over by another process", nil, function(W)

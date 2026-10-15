@@ -166,6 +166,67 @@ do
   sc.cfg.bootstrap = 2000
 end
 
+-- ---- recorded decisions through the wait rail, and the tau sweep ----
+do
+  -- A runaway stays latched, so it decides at 0 and 60; a savable that
+  -- resolves before 60 decides only at grace expiry, as generated ones do.
+  local mk = function(id, class, ttx, resolves)
+    local steps = { { t = 0, snapshot = {} } }
+    if class == "runaway" then steps[2] = { t = 60, snapshot = {} } end
+    return { id = id, template = "T" .. id, family = "f",
+             labels = { class = class, runaway = class == "runaway", ttxSec = ttx, resolvesBySec = resolves },
+             steps = steps }
+  end
+  local eps = { mk("r1", "runaway", 40), mk("s1", "savable", nil, 50) }
+  local dec = { r1 = { [0] = { action = "wait", pWait = 0.6 } }, s1 = { [0] = { action = "wait", pWait = 0.95 } } }
+  local strict = sc.decisionsCandidate(dec, 0.9)
+  check("decisions: a hesitant wait is overruled by the rail", (strict(eps[1].steps[1], eps[1])), "freeze")
+  check("decisions: a confident wait is honored", (strict(eps[2].steps[1], eps[2])), "wait")
+  check("decisions: an unrecorded step gets the deterministic freeze", (strict(eps[1].steps[2], eps[1])), "freeze")
+  check("decisions: tau 0 honors every recorded wait", (sc.decisionsCandidate(dec, 0)(eps[1].steps[1], eps[1])), "wait")
+  -- loading, plain and through an opaque-id key
+  local tmp = os.tmpname()
+  local f = assert(io.open(tmp, "w"))
+  f:write('{"episode":"r1","t":0,"action":"freeze","pWait":0.1}\n{"episode":"s1","t":0,"action":"wait","pWait":0.9}\n')
+  f:close()
+  local d1, n1 = sc.loadDecisions(tmp)
+  check("decisions: plain rows load", n1, 2)
+  check("decisions: plain row keyed by episode and step", d1.s1[0].pWait, 0.9)
+  local keyTmp = os.tmpname()
+  local kf = assert(io.open(keyTmp, "w"))
+  kf:write('{"rows":{"q1":{"episode":"r1","t":0},"q2":{"episode":"s1","t":60}}}')
+  kf:close()
+  f = assert(io.open(tmp, "w"))
+  f:write('{"qid":"q1","action":"freeze","p_runaway":0.8}\n{"qid":"q2","action":"wait","p_runaway":0.25}\n')
+  f:close()
+  local d2 = sc.loadDecisions(tmp, keyTmp)
+  check("decisions: a judge's row maps through the key", d2.s1[60].action, "wait")
+  check("decisions: P(wait) is 1 - p_runaway", math.abs(d2.s1[60].pWait - 0.75) < 1e-9, true)
+  os.remove(tmp); os.remove(keyTmp)
+  -- The sweep prefers the threshold that keeps every runaway caught. Here
+  -- one runaway in ten waits at P(wait) 0.928, so 0.9 lets seven slip past
+  -- their time to exhaustion; 0.96 catches all and still honors the
+  -- savables' confident waits; 1.01 honors nothing.
+  local manyR, manyS, decs = {}, {}, {}
+  for i = 1, 70 do
+    local e = mk("r" .. i, "runaway", 30); manyR[#manyR + 1] = e
+    decs[e.id] = { [0] = { action = "wait", pWait = 0.55 + (i % 10) * 0.042 } }
+  end
+  for i = 1, 30 do
+    local e = mk("s" .. i, "savable", nil, 40); manyS[#manyS + 1] = e
+    decs[e.id] = { [0] = { action = "wait", pWait = 0.97 } }
+  end
+  local all = {}
+  for _, e in ipairs(manyR) do all[#all + 1] = e end
+  for _, e in ipairs(manyS) do all[#all + 1] = e end
+  local best, rows = sc.chooseTau(all, decs, { 0, 0.5, 0.9, 0.96, 1.01 })
+  check("tau sweep: 0.9 lets runaways slip and misses the bound", rows[3].meets, false)
+  check("tau sweep: honoring nothing meets the bound but freezes every savable", rows[5].wrongful, 30)
+  check("tau sweep: the threshold that catches every runaway wins", best.tau, 0.96)
+  check("tau sweep: it meets the miss bound", best.meets, true)
+  check("tau sweep: and keeps the confident savable waits", best.wrongful, 0)
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

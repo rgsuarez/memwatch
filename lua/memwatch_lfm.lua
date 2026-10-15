@@ -68,6 +68,12 @@ M.cfg = {
   -- make the model episode-fatally inert.
   remoteCooldownSec = 15,     -- backoff after a remote timeout/error before retry
   redactNames = true,         -- send deterministic categories, not raw names (F4.1)
+  -- The wait rail's threshold: a model's wait at grace expiry defers the
+  -- deterministic freeze only when its own P(wait) reaches this. Unset
+  -- means no wait is honored (the deterministic policy acts), which is the
+  -- only safe value until a threshold is chosen on dev data and frozen
+  -- before held-out scoring.
+  tauWait = nil,
 }
 
 ------------------------------------------------------------------------------
@@ -806,6 +812,18 @@ end
 --   4. policy gate       (killAllowed false -> wait; freeze uses the same
 --                         gate as kill: same uid, denylist, protected pids)
 ------------------------------------------------------------------------------
+
+-- The wait rail (grace expiry, an extreme offender, the freeze ceiling): a
+-- model's wait defers the deterministic freeze only when the model is sure
+-- of it, P(wait) >= tauWait, where P(wait) is the model's own distribution
+-- (decision-model option probabilities or token probabilities). A
+-- self-reported confidence is not a probability and never qualifies; nor
+-- does a wait without one, or an unset threshold. Pure.
+function M.waitHonored(verdict, tauWait)
+  if type(verdict) ~= "table" or verdict.action ~= "wait" then return false end
+  if type(verdict.pWait) ~= "number" or type(tauWait) ~= "number" then return false end
+  return verdict.pWait >= tauWait
+end
 
 -- verdict: validated verdict (or nil -> wait). ceiling: "off"|"freeze"|"kill".
 -- actionAllowed: the killAllowed result for the bound target. opts:

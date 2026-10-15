@@ -1031,6 +1031,16 @@ do
   check("held-timer: doUntil only inside untilHeld", untilCount, 1)
 end
 
+-- ---- the wait rail: a model's wait defers only on its own probability ----
+check("wait rail: no threshold set by default", lfm.cfg.tauWait, nil)
+check("wait rail: a confident wait is honored", lfm.waitHonored({ action = "wait", pWait = 0.93 }, 0.9), true)
+check("wait rail: a hesitant wait is not", lfm.waitHonored({ action = "wait", pWait = 0.7 }, 0.9), false)
+check("wait rail: a self-reported confidence never qualifies",
+  lfm.waitHonored({ action = "wait", confidence = 0.99 }, 0.9), false)
+check("wait rail: an unset threshold honors nothing", lfm.waitHonored({ action = "wait", pWait = 1 }, nil), false)
+check("wait rail: a freeze is not a wait", lfm.waitHonored({ action = "freeze", pWait = 0.95 }, 0.9), false)
+check("wait rail: no verdict", lfm.waitHonored(nil, 0.9), false)
+
 -- ---- System One adapter (decision models): body and bounded parse ----
 do
   local snap = { state = "critical", kern = 4, availPct = 7, swapGB = 9.4,

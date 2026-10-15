@@ -21,7 +21,9 @@
 --   lua eval/score-episodes.lua gate --dir <episodes> --fit-dir <dev episodes> \
 --       --candidate <name> [--out result.json]
 --   lua eval/score-episodes.lua controls --dir <episodes> --fit-dir <dev episodes>
--- Candidates: always-freeze | never-act | rule | tree | oracle | noisy-oracle
+--   lua eval/score-episodes.lua tau --dir <dev episodes> --decisions <rows.jsonl> [--key <key.json>]
+-- Candidates: always-freeze | never-act | rule | tree | oracle | noisy-oracle |
+--   decisions (recorded model decisions, --decisions <rows.jsonl> [--key] --tau <x>)
 
 package.path = "lua/?.lua;eval/?.lua;" .. package.path
 local lfm = require("memwatch_lfm")
@@ -227,6 +229,72 @@ function M.noisyOracle(flip, seed)
     if u < flip then truth = not truth end
     return truth and "freeze" or "wait", truth and 1 or 0
   end
+end
+
+-- Recorded model decisions replayed through the production wait rail:
+-- decisions[episodeId][t] = { action, pWait }. A model's wait defers only
+-- when lfm.waitHonored passes at tauWait; a step with no recorded decision
+-- gets the deterministic freeze. tauWait = 0 honors every recorded wait
+-- (a judge's own calls, unthresholded). The score is 1 - P(wait).
+function M.decisionsCandidate(decisions, tauWait)
+  return function(st, ep)
+    local d = decisions[ep.id] and decisions[ep.id][st.t]
+    if not d then return "freeze", 1 end
+    local p = type(d.pWait) == "number" and d.pWait or (d.action == "wait" and 1 or 0)
+    if lfm.waitHonored({ action = d.action, pWait = p }, tauWait) then return "wait", 1 - p end
+    return "freeze", 1 - p
+  end
+end
+
+-- Load recorded decisions from JSONL rows { episode, t, action, pWait }.
+-- With a key file (an independent judge's opaque ids), rows are
+-- { qid, action, p_runaway } and the key maps each qid to its episode and
+-- step; P(wait) is 1 - p_runaway.
+function M.loadDecisions(path, keyPath)
+  local key = nil
+  if keyPath then
+    local kf = assert(io.open(keyPath, "r"))
+    key = assert(lfm.jsonDecode(kf:read("a"))).rows
+    kf:close()
+  end
+  local out, n = {}, 0
+  for line in io.lines(path) do
+    if line:match("%S") then
+      local r = assert(lfm.jsonDecode(line), "bad decisions row")
+      local ep, t, pWait = r.episode, r.t, r.pWait
+      if key then
+        local k = assert(key[r.qid], "decision for an unknown qid")
+        ep, t = k.episode, k.t
+        pWait = type(r.p_runaway) == "number" and (1 - r.p_runaway) or nil
+      end
+      assert(r.action == "freeze" or r.action == "wait", "decision action must be freeze or wait")
+      out[ep] = out[ep] or {}
+      out[ep][t] = { action = r.action, pWait = pWait }
+      n = n + 1
+    end
+  end
+  return out, n
+end
+
+-- The tau sweep on dev: score the replayed decisions at each threshold and
+-- pick the one with the fewest wrongful freezes among those meeting the miss
+-- bound. If none meets it (an underpowered set), the fewest misses wins and
+-- the result says so. Choose on dev, freeze, then score held-out once.
+function M.chooseTau(episodes, decisions, grid, cfg)
+  cfg = cfg or M.cfg
+  local rows, best = {}, nil
+  for _, tau in ipairs(grid) do
+    local s = M.score(episodes, M.decisionsCandidate(decisions, tau), cfg)
+    local r = { tau = tau, misses = s.misses, missUpper = s.missUpper, wrongful = s.wrongful,
+                wrongfulRate = s.wrongfulRate, meets = s.missUpper <= cfg.missBound }
+    rows[#rows + 1] = r
+    local better = best == nil
+      or (r.meets and not best.meets)
+      or (r.meets == best.meets and r.meets and r.wrongful < best.wrongful)
+      or (r.meets == best.meets and not r.meets and r.misses < best.misses)
+    if better then best = r end
+  end
+  return best, rows
 end
 
 ------------------------------------------------------------------------------
@@ -435,6 +503,8 @@ local function parse(argv)
     if k == "--dir" then a.dir = v elseif k == "--fit-dir" then a.fitDir = v
     elseif k == "--candidate" then a.candidate = v elseif k == "--out" then a.out = v
     elseif k == "--tree-depth" then a.depth = tonumber(v)
+    elseif k == "--decisions" then a.decisions = v elseif k == "--key" then a.key = v
+    elseif k == "--tau" then a.tau = tonumber(v)
     else error("unknown argument " .. tostring(k)) end
     i = i + 2
   end
@@ -467,6 +537,10 @@ function M.main(argv)
     local decide
     if name == "noisy-oracle" then decide = M.noisyOracle(M.cfg.noisyFlip, 1)
     elseif name == "tree" then decide = baselines.tree
+    elseif name == "decisions" then
+      assert(a.decisions, "--decisions is required for the decisions candidate")
+      assert(a.tau, "--tau is required for the decisions candidate (choose it on dev)")
+      decide = M.decisionsCandidate((M.loadDecisions(a.decisions, a.key)), a.tau)
     elseif M.candidates[name] then decide = M.candidates[name]()
     else error("unknown candidate " .. name) end
     local g = M.gate(eps, decide, baselines)
@@ -484,6 +558,17 @@ function M.main(argv)
         nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate })), "\n")
       f:close()
     end
+  elseif a.cmd == "tau" then
+    assert(a.decisions, "--decisions is required")
+    local decisions = M.loadDecisions(a.decisions, a.key)
+    local grid = { 0, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 0.99, 1.01 }
+    local best, rows = M.chooseTau(eps, decisions, grid)
+    for _, r in ipairs(rows) do
+      print(string.format("tau %.2f  misses %3d (upper95 %.3f)  wrongful %3d (rate %.3f)  %s", r.tau, r.misses,
+        r.missUpper, r.wrongful, r.wrongfulRate, r.meets and "meets bound" or "misses bound"))
+    end
+    print(string.format("chosen tau %.2f (%s)", best.tau, best.meets and "fewest wrongful within the miss bound"
+      or "no threshold meets the miss bound on this set; fewest misses"))
   elseif a.cmd == "controls" then
     local gF = M.gate(eps, M.candidates["always-freeze"](), baselines)
     local gO = M.gate(eps, M.candidates["oracle"](), baselines)

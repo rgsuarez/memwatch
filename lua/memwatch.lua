@@ -1017,10 +1017,14 @@ local function buildMenu()
     local label = (off.kind == "hog")
       and string.format("Force Quit largest process (%s, pid %d)", off.name, off.pid)
       or  string.format("Force Quit %s (pid %d)", off.name, off.pid)
-    -- The alert's bound start time when it has one; otherwise the click binds
-    -- it, so this item never signals by name alone.
-    local bound = off.lstart or ((hudOffender and hudOffender.pid == off.pid
-      and core.sameName(hudOffender.name, off.name)) and hudOffender.lstart or nil)
+    -- The alert's bound start time when it has one (the HUD's, else the
+    -- banner's, for this process); otherwise the click binds it, so this
+    -- item never signals by name alone. A binding the pid has since
+    -- outlived refuses, and the refusal rebinds every surface.
+    local function bindingOf(s)
+      return (s and s.pid == off.pid and core.sameName(s.name, off.name)) and s.lstart or nil
+    end
+    local bound = off.lstart or bindingOf(hudOffender) or bindingOf(critNotifOff)
     items[#items + 1] = { title = label, disabled = off.synthetic == true or nil,
       fn = function()
         local lst, why = bound, nil

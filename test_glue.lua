@@ -1261,6 +1261,32 @@ scenario("an elevated self-test ends the live episode", nil, function(W, mw)
     runUntil(W, 60, function() return #W.liveBanners() == 1 end), true)
 end)
 
+-- (round 4) With the HUD closed, the menu's offender Force Quit acts on
+-- the banner's binding, as the banner's own button would: a same-name
+-- process that took the pid since is refused, and the refusal rebinds.
+scenario("the menu offender acts on the banner's binding", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(6)
+  local b = W.liveBanners()[1]
+  check("menu-banner: the banner is bound", b ~= nil and b.attrs.hasActionButton == true, true)
+  W.click("close")                  -- the HUD is down; the banner stays
+  W.reusePid(4242, "node", 9000)
+  W.grow(4242, 220)
+  W.run(6)                          -- a sample: a fresh offender table, unbound
+  local item = W.menuItem("Force Quit node")
+  check("menu-banner: the offender item is offered", item ~= nil and item.fn ~= nil, true)
+  item.fn()
+  W.run(2)
+  check("menu-banner: a pid reused since the banner bound is refused", W.signalsTo(4242), "")
+  item = W.menuItem("Force Quit node")
+  item.fn()
+  W.run(10)
+  check("menu-banner: once rebound, the next click acts", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
+end)
+
 -- ---- narratives: a hold that never ends is released ----
 -- A narrative whose next step never runs (the run loop stalls past its
 -- escalation) ends without its last update. The alert must not stay

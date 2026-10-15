@@ -63,6 +63,14 @@ function F.new()
     W.now = stop
   end
 
+  function W.releaseStalled()
+    W.timersStall = false
+    for _, t in ipairs(W.stalled or {}) do
+      if not t.stopped then t.at = W.now + (t.stalledDelay or 0) end
+    end
+    W.stalled = {}
+  end
+
   function W.liveTimers(kind)
     local n = 0
     for _, t in ipairs(W.timers) do
@@ -158,6 +166,16 @@ function F.new()
         local old = W.procs[tk]
         W.reusePid(tk, (old.comm:match("([^/]+)$") or "proc"), old.rssKB / 1024)
       end
+      -- vanishBeforeProbe: that process exits just before this probe runs
+      -- (one shot).
+      if W.vanishBeforeProbe and W.procs[W.vanishBeforeProbe] then
+        W.procs[W.vanishBeforeProbe], W.vanishBeforeProbe = nil, nil
+      end
+      -- probeScript: per-probe outcomes in order ("ok" or "fail"), consumed
+      -- one per probe, so a sequence of answers and failures can be staged.
+      if W.probeScript and #W.probeScript > 0 then
+        if table.remove(W.probeScript, 1) == "fail" then return "" end
+      end
       local rows, seen, order = {}, {}, {}
       for ps in list:gmatch("%d+") do order[#order + 1] = tonumber(ps) end
       table.sort(order)                -- ps lists processes in pid order
@@ -181,11 +199,14 @@ function F.new()
       -- reuseAfterProbe: that process exits right after this probe saw it,
       -- and a same-name process takes the pid, so the signal that follows
       -- reaches the newcomer (one shot).
+      -- (A table { pid = n, extra = { ... } } gives the newcomer traits.)
       local ra = W.reuseAfterProbe
-      if ra and W.procs[ra] then
+      local raPid = type(ra) == "table" and ra.pid or ra
+      if raPid and W.procs[raPid] then
         W.reuseAfterProbe = nil
-        local old = W.procs[ra]
-        W.reusePid(ra, (old.comm:match("([^/]+)$") or "proc"), old.rssKB / 1024)
+        local old = W.procs[raPid]
+        local nu = W.reusePid(raPid, (old.comm:match("([^/]+)$") or "proc"), old.rssKB / 1024)
+        for k, v in pairs(type(ra) == "table" and ra.extra or {}) do nu[k] = v end
       end
       return table.concat(rows, "\n") .. "\n"
     end
@@ -249,12 +270,22 @@ function F.new()
 
   local Notif = {}
   Notif.__index = Notif
+  -- send() returns a handle the way Hammerspoon does: a userdata, not the
+  -- notification table (a closed temp file given a metatable of its own),
+  -- so glue that tests a handle's type is caught here as it would be live.
   function Notif:send()
     self.sentAt = W.now
     W.notifs[#W.notifs + 1] = self
     local wa = self.attrs.withdrawAfter
     if wa and wa > 0 then addTimer("after", wa, nil, function() self.withdrawn = true end) end
-    return self
+    local ud = io.tmpfile()
+    ud:close()
+    local n = self
+    debug.setmetatable(ud, { __index = {
+      withdraw = function() n.withdrawn = true; return ud end,
+      activationType = function() return W.activation end,
+    } })
+    return ud
   end
   function Notif:withdraw() self.withdrawn = true; return self end
   function Notif:activationType() return W.activation end
@@ -313,9 +344,19 @@ function F.new()
       -- timersStall: a one-shot callback that never gets to run (a run loop
       -- stalled past it), so a narrative waiting on it never finishes.
       -- timerLag: one-shots run that much late (a run loop blocked in a
-      -- probe during a storm), so a follow-up or an outcome arrives after later evidence.
+      -- probe during a storm), so a follow-up or an outcome arrives after later
+      -- evidence or after a deadline. A timer stalled this way can be released
+      -- later (W.releaseStalled): it then runs its remaining delay from that
+      -- moment, as a run loop that unblocks does.
       doAfter = function(sec, fn)
-        return addTimer("after", W.timersStall and math.huge or (sec + (W.timerLag or 0)), nil, fn)
+        if W.timersStall then
+          local t = addTimer("after", math.huge, nil, fn)
+          t.stalledDelay = sec
+          W.stalled = W.stalled or {}
+          W.stalled[#W.stalled + 1] = t
+          return t
+        end
+        return addTimer("after", sec + (W.timerLag or 0), nil, fn)
       end,
       doEvery = function(iv, fn) return addTimer("every", iv, iv, fn) end,
       doUntil = function(pred, action, iv) return addTimer("until", iv or 1, iv or 1, action, pred) end,

@@ -12,8 +12,8 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    the action. A compensating signal is a new action and verifies again: the
    STOP that re-freezes a process whose quit could not be sent is a freeze,
    with a freeze's verifier, and the CONT that undoes a STOP that reached the
-   pid's next process goes only to a process seen stopped. Nothing is
-   signaled on a probe that could not answer.
+   pid's next process goes only to a process the verifier's own probe saw
+   stopped. Nothing is signaled on a probe that could not answer.
 2. **The ledger says what was sent.** A freeze writes its entry before its
    STOP and records whether the STOP went out. A reload keeps a pending
    entry only if its STOP went out, or may have. Every entry carries a start
@@ -24,14 +24,21 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
 4. **An action is in flight until its final outcome, with a backstop.**
    Progress pushes its deadlines out. At the deadline the operator is told
    the result has not come back; one more hold window with no progress
-   releases the in-flight hold, so the process can be acted on again. A late
-   outcome still replaces the receipt.
+   releases the in-flight hold, so the process can be acted on again. The
+   released action is superseded: it sends no further signal (no KILL
+   escalation over the newer action) and touches nothing the newer action
+   owns (HUD, hold, retry state); its late outcome only replaces its own
+   receipt.
 5. **One live receipt per action.** Once a receipt has said the result has
    not come back, the final outcome, whatever it is, replaces it; the old
    receipt is withdrawn only when its replacement is up.
 6. **Surfaces retire by state.** A shown HUD whose process has been answered
    (frozen, gone, ignored) goes at the next tick, whichever surface answered
-   it.
+   it. A freeze of that process still inside its pending window is no answer
+   yet; the sweep settles a freeze once it sees the process stopped. Names
+   compare by the prefix rule, so a process whose truncated name is a
+   prefix of another's can be read as answered by that one's freeze while
+   unbound, a known limit of truncated names.
 7. **Marks are per process.** A frozen or gone mark never holds for a
    process with another name, and a mark that growth has proved stale stays
    released.
@@ -205,12 +212,15 @@ start time they acted on, never an entry for the pid's next process. An
 entry with no start time is owned by no writer.
 
 An entry is written before its STOP and records whether the STOP went out;
-if it could not be sent, the entry goes. A freeze still being verified when
-memwatch reloads keeps its entry (its STOP may land after the reload) until
-the sweep can decide, unless its STOP was never sent. If the freeze's
-verifier finds the pid taken over, the STOP reached the newcomer: it is
-continued if seen stopped, and if that CONT cannot be sent it stays in the
-ledger, bound to its own start time, so the menu can resume it.
+if it could not be sent, the entry goes, and a reload at any later time
+drops an entry whose STOP never went out, whatever state the process is in
+by then. A freeze still being verified when memwatch reloads keeps its
+entry (its STOP may land after the reload) until the sweep can decide. If
+the freeze's verifier finds the pid taken over, the STOP reached the
+newcomer its own probe found: it is continued if that probe saw it
+stopped, and if that CONT cannot be sent a fresh probe decides whether it
+stays in the ledger, bound to its own start time, so the menu can resume
+it.
 
 A frozen process continued for a Force Quit whose TERM cannot be sent is
 frozen again as a new freeze: verified afresh, so a newcomer that took the
@@ -218,9 +228,12 @@ pid is never stopped, and pending until its own verifier settles it, so a
 reload in between keeps it.
 
 An entry written by an older version without a start time is bound at
-reload to that program, if a probe finds it stopped there, or dropped; one
-whose probe could not answer is named in a notice in case it is still
-stopped.
+reload to that program if a probe finds it stopped there and it started
+before the entry says it was frozen, or dropped; one whose probe could not
+answer is named in a notice in case it is still stopped. A bound one is
+labeled "bound by name" in the menu and the reload notice: the start time
+that would prove it is the process memwatch froze is what the old entry
+never had.
 
 ## Banners
 

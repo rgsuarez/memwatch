@@ -1074,6 +1074,18 @@ do
   check("prune: once its verify window passes it is checked like any other", k4[600], nil)
   local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
+  -- A freeze its own verifier could not confirm is settled once a probe
+  -- past its window sees the same process stopped.
+  local unconf = { [700] = { pid = 700, name = "unconfirmed", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
+  local k5, d5, n5 = core.pruneFrozen(unconf, function()
+    return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
+  check("prune: a stopped entry past its window is kept", k5[700] ~= nil and #d5 == 0, true)
+  check("prune: and settled (no longer pending)", k5[700] and k5[700].pendingUntil, nil)
+  check("prune: the settle is counted", n5, 1)
+  local k6, _, n6 = core.pruneFrozen({ [701] = { pid = 701, lstart = "Wed Jul  8 14:00:00 2026" } },
+    function() return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
+  check("prune: an already settled entry counts no settle (control)", n6, 0)
+  check("prune: and is kept", k6[701] ~= nil, true)
 end
 
 -- ---- plateaued-runaway evidence: peak slope (2026-07-13 live-drill finding) ----
@@ -1443,6 +1455,8 @@ do
   check("lfm glue: a later probe that cannot answer keeps the recorded start time",
     body("local function recordLfmServer(pid)"):find(
       "lstart = probed and probed.lstart or (prev and prev.lstart) or nil", 1, true) ~= nil, true)
+  check("ledger glue: an entry with no start time is owned by no writer",
+    src:find("return cur == nil or (cur.lstart ~= nil and cur.lstart == lstart)", 1, true) ~= nil, true)
   local rls = body("local function recordLfmServer(pid)")
   check("lfm glue: only the start time carries over a failed probe, never the name",
     rls:find("name = probed and procs.friendlyName(probed.comm) or nil", 1, true) ~= nil

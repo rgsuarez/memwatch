@@ -2658,26 +2658,185 @@ end)
 
 -- Rule 2: an entry an older version wrote without a start time is bound at
 -- reload to that program stopped there, or dropped.
-local function legacyEntryWorld(W, state)
+-- frozenAtOffset: when the old entry says it was frozen, relative to the
+-- process's own start (positive: after it started).
+local function legacyEntryWorld(W, state, frozenAtOffset, probeFails)
   leaker(W, 4242, "node")
   W.procs[4242].state = state
   W.run(6)
+  local started = require("memwatch_core").lstartEpoch(W.procs[4242].lstart)
   local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
-  f:write('[{"pid":4242,"name":"node","weightMB":0,"frozenAt":1}]\n')
+  f:write(string.format('[{"pid":4242,"name":"node","weightMB":0,"frozenAt":%d}]\n',
+    started + (frozenAtOffset or 60)))
   f:close()
   W.reloadState()
+  W.probeFails = probeFails
   F.load(W, nil, { keepHome = true })
   W.run(3)
+  W.probeFails = false
 end
 scenario("an old entry without a start time is bound when its process is stopped", nil, function(W)
   legacyEntryWorld(W, "T")
   check("legacy: a stopped node is kept, bound", frozenRowAction(W, "node", "Resume") ~= nil, true)
   check("legacy: the bind is logged", logHas(W, "frozen-reconcile-bind:node(4242)"), true)
+  local row = W.menuItem("   node")
+  check("legacy: and labeled as bound by name", row ~= nil and row.title:find("bound by name", 1, true) ~= nil, true)
+end)
+scenario("an old entry is never bound to a process that started after the freeze", nil, function(W)
+  legacyEntryWorld(W, "T", -60)
+  check("legacy-dated: a later process is not adopted", W.menuItem("   node"), nil)
+end)
+scenario("an old entry a probe cannot check is named in a notice", nil, function(W)
+  legacyEntryWorld(W, "T", 60, true)
+  check("legacy-unknown: the notice names it", #W.notices("memwatch: an old frozen entry could not be checked"), 1)
 end)
 scenario("an old entry without a start time is dropped when its process runs", nil, function(W)
   legacyEntryWorld(W, "S")
   check("legacy: a running node is not listed as frozen", W.menuItem("   node"), nil)
   check("legacy: the drop is logged", logHas(W, "frozen-reconcile-drop:node(4242):no-start-time"), true)
+end)
+
+-- ---- round 7 ----
+-- Rule 1: the undo is decided from the verifier's own probe row, so a later
+-- probe failing cannot strand the newcomer the STOP reached.
+scenario("the undo of a STOP that reached a newcomer needs no second probe", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.reuseAfterProbe = 4242
+  W.probeScript = { "ok", "ok", "fail", "fail", "fail" }   -- the freeze's probe and the verifier's answer; later ones fail
+  W.click("freeze")
+  W.run(3)
+  W.probeScript = nil
+  check("undo: the newcomer was continued", W.procs[4242] and W.procs[4242].state, "S")
+  check("undo: STOP then CONT", W.signalsTo(4242), "STOP,CONT")
+end)
+
+scenario("the undo goes only to a newcomer seen stopped", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.reuseAfterProbe = { pid = 4242, extra = { unstoppable = true } }   -- the STOP does nothing to it
+  W.click("freeze")
+  W.run(3)
+  check("seen-stopped: a newcomer that never stopped gets no CONT", W.signalsTo(4242), "STOP")
+end)
+
+-- Rule 4: an action released by the backstop never escalates over the
+-- newer action that took the process.
+scenario("a released action's late escalation never overrides a newer action", UNATTENDED_KILL, function(W)
+  W.frontmost = { name = "Terminal", pid = 760 }
+  leaker(W, 4242, "node")
+  W.procs[4242].ignoreTerm = true
+  W.onSignal = function(sig) if sig == "TERM" then W.timersStall = true end end
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal = nil
+  -- The process comes to the front: the next action is capped to a freeze.
+  W.frontmost = { name = "node", pid = 4242 }
+  runUntil(W, 300, function() return W.signalsTo(4242):find("STOP", 1, true) ~= nil end)
+  check("supersede: the newer action froze it", W.signalsTo(4242), "TERM,STOP")
+  W.releaseStalled()                -- the first action's escalation finally runs
+  W.run(30)
+  check("supersede: the first action sent no KILL over it", W.signalsTo(4242):find("KILL", 1, true), nil)
+  check("supersede: the process stays frozen", W.procs[4242] and W.procs[4242].state, "T")
+  check("supersede: the skipped escalation is logged", logHas(W, "kill-escalate-superseded:node(4242)"), true)
+  check("supersede: the first action's late outcome does not write over the HUD",
+    W.hudBody():find("ignored TERM", 1, true), nil)
+end)
+
+-- Rule 6: a freeze its own verifier could not confirm is settled by the
+-- sweep once it sees the process stopped, and the HUD then goes.
+scenario("a freeze the sweep verifies retires the HUD", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  W.click("freeze")
+  W.run(1)
+  W.onSignal, W.probeFails = nil, false
+  check("settle: the process is stopped", W.procs[4242] and W.procs[4242].state, "T")
+  local gone = runUntil(W, 150, function() return not W.hudShowing() end)
+  check("settle: the HUD goes once the sweep has verified it", gone, true)
+end)
+
+-- With probes failing throughout, the sweep cannot settle it; the freeze
+-- stops counting as pending when its window ends, and a stopped process
+-- (no growth) is then answered.
+scenario("a freeze past its window no longer holds the HUD as pending", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  W.click("freeze")
+  W.onSignal = nil
+  W.run(10)
+  check("expiry: still pending inside its window, the HUD stands", W.hudShowing(), true)
+  local gone = runUntil(W, 60, function() return not W.hudShowing() end)
+  W.probeFails = false
+  check("expiry: after the window the stopped process is answered", gone, true)
+end)
+
+-- Rule 2: a freeze whose STOP never went out is never adopted at a reload,
+-- even after its window, and even if something else has stopped it.
+scenario("an entry whose STOP never went out is dropped at any later reload", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.sendFails = { STOP = true }
+  W.click("freeze")
+  W.run(0.1)
+  W.reloadState()                   -- memwatch dies before the verifier runs
+  W.sendFails = nil
+  W.procs[4242].state = "T"         -- something else stops the process
+  W.run(60)                         -- past the freeze's pending window
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+  check("never-sent: not listed as frozen by memwatch", W.menuItem("   node"), nil)
+end)
+
+-- The nested re-freeze's own outcomes, named for the right process.
+scenario("a re-freeze that cannot verify says the process may be running", nil, function(W)
+  check("refreeze-unverified: the node is frozen", frozenNode(W), "T")
+  local quit = frozenRowAction(W, "node", "Force Quit")
+  W.sendFails = { TERM = true }
+  W.onSignal = function(sig) if sig == "CONT" then W.probeFailsOnce = 1 end end
+  local before = #W.alerts
+  quit()
+  W.onSignal = nil
+  W.run(3)
+  W.sendFails = nil
+  local said = false
+  for i = before + 1, #W.alerts do
+    if W.alerts[i].text:find("can't verify it now; it was continued and may be running", 1, true) then said = true end
+  end
+  check("refreeze-unverified: the alert says it may be running", said, true)
+end)
+
+scenario("a re-freeze that finds the process gone drops its entry", nil, function(W)
+  check("refreeze-exited: the node is frozen", frozenNode(W), "T")
+  local quit = frozenRowAction(W, "node", "Force Quit")
+  W.sendFails = { TERM = true }
+  W.onSignal = function(sig) if sig == "CONT" then W.vanishBeforeProbe = 4242 end end   -- it exits once continued
+  quit()
+  W.onSignal = nil
+  -- At once, before any sweep could have pruned it.
+  check("refreeze-exited: its entry is gone at once", W.menuItem("   node"), nil)
+  W.run(3)
+  W.sendFails = nil
+  check("refreeze-exited: and the alert says it exited",
+    W.alerts[#W.alerts] ~= nil and W.alerts[#W.alerts].text:find("couldn't send TERM to node; it has exited", 1, true) ~= nil, true)
 end)
 
 os.remove(LFM_KEYFILE)

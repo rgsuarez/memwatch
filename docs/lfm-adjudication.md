@@ -87,19 +87,23 @@ The model is an advisor inside hard rails, never an autonomous authority.
   any decision, the next one waits out the grace again unless the floor
   holds the wait again, so an action that fails is never retried every
   tick (a refused one is tried again at the grace cadence, as without the
-  floor). Each such act is a decision point
-  the observation ledger records on its own tick. The step and the ledger
-  ask one predicate for it (unattended on, the alert's gate open, the wait
-  bound to the alert's start time, no final latch, no action in flight),
-  so the ledger never records an act the step did not take.
+  floor). Each such act is a decision point the observation ledger records
+  on its own tick, with the floor's reason (`floorAct`). The step and the
+  ledger ask one predicate for it (unattended on, the alert's gate open, the
+  wait bound to the alert's start time, no final latch, no action in
+  flight, and the grace not yet run), so the ledger never records an act
+  the step did not take. Once the grace has run, the decision is the
+  grace's own, and nothing in it is credited to the floor unless the floor
+  ends a wait the decision consumed.
 - **The records say why.** A held wait's decision record carries the rail
   `deferral-floor-held-by-headroom`. An act past the bound carries
   `deferral-floor-fired-by-headroom`, `-by-unknown-headroom` or
   `-by-hold-cap`. Both carry the threshold, the hold cap, the deferred
   seconds and the headroom read: `headroomPct`, or `headroomKnown: false`
-  and no reading when it could not be read. An act the every-tick check
-  brings forward after the held wait's verdict has expired says so too,
-  with `no-fresh-verdict` beside the floor's rail. `floorAvailPct` 0
+  and no reading when it could not be read. Every act the every-tick check
+  brings forward carries the floor's rail and record, whatever answered it:
+  the held wait's verdict, a fresh verdict of another action (the model's
+  own rails ride beside), or none (with `no-fresh-verdict`). `floorAvailPct` 0
   restores the old floor: the policy acts at the bound regardless, with no
   floor rail. A `maxHoldSec` of 0 holds nothing past the bound: the policy
   acts there, as it does for any cap at or under the bound.

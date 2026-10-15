@@ -96,6 +96,9 @@ function M.row(a)
     -- wouldAct cannot miss it.
     wouldActBasis = (a.mode == "kill" and a.wouldAct ~= nil and a.wouldAct ~= "none") and "name" or nil,
     graceElapsedSec = floorOrNil(a.graceElapsedSec),
+    -- Why the deferral floor brought this decision forward, on the row it
+    -- forced ahead of the grace window (lfm.floorActs); nil otherwise.
+    floorAct = type(a.floorAct) == "string" and a.floorAct or nil,
     pid = floorOrNil(off.pid),
     offender = {
       name = M.sanitizeName(off.name), category = a.category, kind = off.kind,

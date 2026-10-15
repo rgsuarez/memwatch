@@ -856,6 +856,23 @@ function M.floorRecord(state, metrics, now, cfg)
              and math.max(0, math.floor(now - first)) or nil }
 end
 
+-- A decision the floor's every-tick check brought forward says so, whatever
+-- answered it (the held wait's own verdict, a fresh verdict of another
+-- action, or none): the floor's rail (unless the floor is off) and its
+-- record's fields, where the decision's own record leaves them unset.
+-- Returns new tables; neither argument is changed. Pure.
+function M.withFloorRecord(rails, extra, why, rec)
+  local out, seen = {}, {}
+  for _, r in ipairs(rails or {}) do out[#out + 1] = r; seen[r] = true end
+  if why and why ~= "no-floor" and not seen["deferral-floor-fired-by-" .. why] then
+    out[#out + 1] = "deferral-floor-fired-by-" .. why
+  end
+  local x = {}
+  for k, v in pairs(extra or {}) do x[k] = v end
+  for k, v in pairs(rec or {}) do if x[k] == nil then x[k] = v end end
+  return out, x
+end
+
 -- Does the floor act this tick, ahead of the grace window, on a wait the last
 -- decision held past its bound (state.exhausted)? Only while the adjudicator
 -- is enabled: with it off, the base system decides at its own cadence.

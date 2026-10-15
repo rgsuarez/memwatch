@@ -538,6 +538,7 @@ local function scratchDir()
   end
   error("no writable scratch directory (set HSFAKE_ROOT)")
 end
+F.scratchDir = scratchDir
 
 -- opts.keepHome reloads into the world's existing home (a Hammerspoon
 -- reload: the config, the frozen ledger and the logs survive).

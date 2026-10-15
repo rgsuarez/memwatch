@@ -2242,7 +2242,14 @@ do
 
   -- The daylight-saving fold, in a zone that has one whatever this
   -- machine's: a child Lua with TZ fixed runs the fold cases and prints them.
-  local lua = (arg and arg[-1]) or "lua"
+  -- The interpreter is the lowest arg index (options sit between it and
+  -- the script).
+  local lua = "lua"
+  if arg then
+    local i = -1
+    while arg[i - 1] ~= nil do i = i - 1 end
+    lua = arg[i] or lua
+  end
   local child = [[
 package.path = "lua/?.lua;" .. package.path
 local o = require("memwatch_observe")
@@ -2263,12 +2270,11 @@ print("frozen", tostring(o.frozenMatches({ lstart = twice }, win)))
 print("source", o.sameSource({ comm = "/bin/x", startLo = win.lo, startHi = win.hi, etimeSec = 9000 },
   { comm = "/bin/x", lstart = twice }))
 ]]
-  local cf = os.tmpname()
-  local fh = assert(io.open(cf, "w")); fh:write(child); fh:close()
-  local p = io.popen("TZ=America/New_York " .. lua .. " " .. cf .. " 2>&1")
+  -- Passed with -e, so the check needs no temp file.
+  local quoted = "'" .. (child:gsub("'", "'\\''")) .. "'"
+  local p = io.popen("TZ=America/New_York " .. lua .. " -e " .. quoted .. " 2>&1")
   local out = p and p:read("a") or ""
   if p then p:close() end
-  os.remove(cf)
   check("fold (TZ=America/New_York): the zone has a fold to test", out:find("NOFOLD", 1, true), nil)
   check("fold: a repeated time is refused, an ordinary one read", out:find("strict\ttrue\ttrue", 1, true) ~= nil, true)
   check("fold: no window is seeded from it", out:find("seed\ttrue", 1, true) ~= nil, true)
@@ -2694,7 +2700,14 @@ do
   -- The daylight saving fold and gap, in a child with a fixed zone (this
   -- process cannot change its own). A child that does not answer fails the
   -- checks: a silent child is never read as a pass.
-  local lua = arg and arg[-1] or "lua"
+  -- The interpreter is the lowest arg index (options sit between it and
+  -- the script).
+  local lua = "lua"
+  if arg then
+    local i = -1
+    while arg[i - 1] ~= nil do i = i - 1 end
+    lua = arg[i] or lua
+  end
   local code = 'package.path = "lua/?.lua;" .. package.path; local c = require("memwatch_core"); '
     .. 'local function s(v) return v == nil and "nil" or "num" end; '
     .. 'print("ctl " .. s(c.lstartEpoch("Sun Nov  1 03:00:00 2026")) .. " fold " .. s(c.lstartEpoch("Sun Nov  1 01:30:00 2026")) '

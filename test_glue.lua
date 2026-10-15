@@ -2223,7 +2223,9 @@ end)
 -- A remote adjudicator in the fake: the key is a throwaway file, the
 -- endpoint is never reached (the fake records each request and answers it
 -- with a canned verdict).
-local LFM_KEYFILE = os.tmpname()
+-- In the fake's own scratch tree, so the suite needs no system temp file.
+local LFM_KEYDIR = F.scratchDir()
+local LFM_KEYFILE = LFM_KEYDIR .. "/lfm-key"
 do
   local kf = assert(io.open(LFM_KEYFILE, "w"))
   kf:write("fake-key-for-tests\n")
@@ -3345,6 +3347,7 @@ do
 end
 
 os.remove(LFM_KEYFILE)
+os.remove(LFM_KEYDIR)
 
 if fails == 0 then
   print("\nALL PASS")

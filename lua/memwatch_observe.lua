@@ -20,6 +20,8 @@
 -- and memwatch's own frozen ledger, and exit-cause evidence from a directory
 -- listing of the kernel's jetsam reports.
 
+local core = require("memwatch_core")
+
 local M = {}
 
 M.cfg = {
@@ -207,29 +209,11 @@ function M.lstartEpoch(s)
   return f and os.time(f) or nil
 end
 
--- The same, but nil in the hour a daylight-saving fold repeats, where the
--- local time names two epochs an hour apart: read as standard time and as
--- daylight time, both convert back to the same clock reading. Outside the
--- fold only one reading converts back.
-function M.lstartEpochUnambiguous(s)
-  local f = lstartFields(s)
-  if not f then return nil end
-  local function readAs(isdst)
-    local t = { year = f.year, month = f.month, day = f.day, hour = f.hour,
-                min = f.min, sec = f.sec, isdst = isdst }
-    local ok, e = pcall(os.time, t)
-    if not ok or type(e) ~= "number" then return nil end
-    local back = os.date("*t", e)
-    if back.year == f.year and back.month == f.month and back.day == f.day
-       and back.hour == f.hour and back.min == f.min and back.sec == f.sec then
-      return e
-    end
-    return nil
-  end
-  local std, dst = readAs(false), readAs(true)
-  if std and dst and std ~= dst then return nil end
-  return std or dst
-end
+-- The same, but nil unless the local time names exactly one instant: the
+-- hour a daylight-saving fold repeats names two epochs an hour apart, and
+-- the hour it skips names none. It is the frozen ledger's own parse
+-- (core.lstartEpoch), so the ledger and the signal paths never disagree.
+function M.lstartEpochUnambiguous(s) return core.lstartEpoch(s) end
 
 -- A start window from a bound start time (ps prints whole seconds, so the
 -- start lies in [epoch, epoch + 1]), for an observation whose tracker entry

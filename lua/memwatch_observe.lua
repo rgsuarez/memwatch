@@ -142,6 +142,39 @@ function M.sameProcess(e, comm0, start0)
   return e
 end
 
+-- Whether a tick is a would-be decision point that earns a decision row:
+-- the ledger is on, an extreme offender's alert episode is live and
+-- unanswered (no HUD click, no kill narrative holding it) for the full
+-- grace window, and this process has had no decision row within the last
+-- grace window (sinceLastSec is nil when it has no live stamp; see
+-- liveStamp). The unattended mode is deliberately not an input: the ledger
+-- records what an adjudicator would face under every mode, including off.
+-- a: { enabled, kind, alertActive, hudInteracted, hudHold, sinceShownSec,
+--      sinceLastSec, graceSec }
+function M.decisionDue(a)
+  if type(a) ~= "table" or a.enabled ~= true or a.kind ~= "extreme" then return false end
+  if a.alertActive ~= true or a.hudInteracted or a.hudHold then return false end
+  if type(a.graceSec) ~= "number" or type(a.sinceShownSec) ~= "number" then return false end
+  if a.sinceShownSec < a.graceSec then return false end
+  if type(a.sinceLastSec) == "number" and a.sinceLastSec < a.graceSec then return false end
+  return true
+end
+
+-- A decision stamp ({ at, comm, start }) still holds for the process the
+-- tracker now has under its pid unless that is provably a different
+-- process: a different comm, or start windows identity() calls reused. So
+-- a same-comm pid reuse within the grace window cannot suppress the new
+-- process's decision row. An undecidable identity keeps the stamp, so at
+-- worst a new process's row waits out one grace window. Returns the stamp
+-- or nil.
+function M.liveStamp(stamp, e)
+  if type(stamp) ~= "table" then return nil end
+  if type(e) ~= "table" then return stamp end
+  if stamp.comm and e.comm and stamp.comm ~= e.comm then return nil end
+  if M.identity(stamp.start, M.startOf(e)) == "reused" then return nil end
+  return stamp
+end
+
 -- What became of an observed process at a follow-up horizon, decided only
 -- from data the tick already holds, and only from a fresh COMPLETE sample:
 -- absence from a truncated table proves nothing. Returns fate, detail.

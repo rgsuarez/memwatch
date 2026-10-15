@@ -1243,6 +1243,49 @@ do
     observe.sameProcess({ startLo = 999, startHi = 1001, etimeSec = 9060 }, nil, old0), nil)
   check("sameProcess: no entry is absent", observe.sameProcess(nil, "/bin/x", old0), nil)
 
+  -- A decision stamp holds only for the process it was taken from.
+  local stamp = { at = 100, comm = "/bin/x", start = old0 }
+  check("liveStamp: the same process keeps its stamp", observe.liveStamp(stamp, live), stamp)
+  check("liveStamp: a different comm drops it",
+    observe.liveStamp(stamp, { comm = "/bin/y", startLo = 999, startHi = 1001, etimeSec = 9060 }), nil)
+  check("liveStamp: a same-comm pid reuse drops it",
+    observe.liveStamp(stamp, { comm = "/bin/x", startLo = 1500, startHi = 1502, etimeSec = 60 }), nil)
+  local youngStamp = { at = 100, comm = "/bin/x", start = { lo = 999, hi = 1003, etimeSec = 1 } }
+  check("liveStamp: an undecidable identity keeps it", observe.liveStamp(youngStamp, live), youngStamp)
+  check("liveStamp: no tracker entry keeps it", observe.liveStamp(stamp, nil), stamp)
+  check("liveStamp: no stamp is nil", observe.liveStamp(nil, live), nil)
+
+  -- The decision trigger: the three-case floor, plus mode independence.
+  local due = { enabled = true, kind = "extreme", alertActive = true, hudInteracted = false,
+                hudHold = false, sinceShownSec = 61, graceSec = 60 }
+  local function dueWith(over)
+    local a = {}
+    for k, v in pairs(due) do a[k] = v end
+    for k, v in pairs(over) do a[k] = v end
+    return observe.decisionDue(a)
+  end
+  check("decisionDue: an unanswered extreme alert past grace is due", dueWith({}), true)
+  check("decisionDue: exactly at grace is due", dueWith({ sinceShownSec = 60 }), true)
+  check("decisionDue: before grace is not due", dueWith({ sinceShownSec = 59 }), false)
+  check("decisionDue: an answered alert is not due", dueWith({ hudInteracted = true }), false)
+  check("decisionDue: a held kill narrative is not due", dueWith({ hudHold = true }), false)
+  check("decisionDue: a hog is not a decision point", dueWith({ kind = "hog" }), false)
+  check("decisionDue: no live alert episode is not due", dueWith({ alertActive = false }), false)
+  check("decisionDue: the ledger off is not due", dueWith({ enabled = false }), false)
+  check("decisionDue: a row within the grace window suppresses", dueWith({ sinceLastSec = 30 }), false)
+  check("decisionDue: a row a full window ago does not", dueWith({ sinceLastSec = 60 }), true)
+  check("decisionDue: no grace window is not due", dueWith({ graceSec = false }), false)
+  check("decisionDue: an empty table is not due", observe.decisionDue({}), false)
+  check("decisionDue: no input is not due", observe.decisionDue(nil), false)
+  -- There is no mode input: the same facts decide under every mode.
+  local dueModes, idleModes = 0, 0
+  for _, m in ipairs({ "off", "freeze", "kill" }) do
+    if dueWith({ mode = m }) then dueModes = dueModes + 1 end
+    if dueWith({ mode = m, hudInteracted = true }) then idleModes = idleModes + 1 end
+  end
+  check("decisionDue: due under every mode", dueModes, 3)
+  check("decisionDue: not due under any mode", idleModes, 0)
+
   -- Jetsam report names carry their local timestamp.
   local times = observe.jetsamTimes({ "JetsamEvent-2026-10-12-235154.ips",
     "JetsamEvent-2026-10-12-023117.ips", "not-a-report.ips", "JetsamEvent-garbage.ips" })
@@ -1269,10 +1312,27 @@ do
   local f = assert(io.open("lua/memwatch.lua", "r"))
   local src = f:read("a")
   f:close()
-  local s = src:find("writeObservation = function(", 1, true)
-  local e = s and src:find("\nend\n", s, true)
-  local body = (s and e) and src:sub(s, e) or ""
-  check("observe glue: writeObservation located", #body > 200, true)
+  -- A top-level function's text, from its header to its closing column-0 end.
+  local function fnBody(header)
+    local a = src:find(header, 1, true)
+    local z = a and src:find("\nend\n", a, true)
+    return (a and z) and src:sub(a, z) or ""
+  end
+  local body = fnBody("writeObservation = function(")
+  -- The whole observation path is fork-free: the writer and its follow-ups,
+  -- every glue helper it calls, and the decision trigger in alertSurfaces.
+  local alertBody = fnBody("local function alertSurfaces(state, now)")
+  -- The decision trigger is everything between the banner and the mode
+  -- lookup: only comments and the observation block live there.
+  local _, da = alertBody:find("notifyCrit(lastMetrics)", 1, true)
+  local dz = alertBody:find("local mode = core.resolveUnattended(core.cfg)", 1, true)
+  local observePath = {
+    { "writeObservation", body },
+    { "jetsamSince", fnBody("local function jetsamSince(since)") },
+    { "appendObserve", fnBody("local function appendObserve(line)") },
+    { "buildLfmSnapshot", fnBody("local function buildLfmSnapshot(offender)") },
+    { "the decision trigger", (da and dz and da < dz) and alertBody:sub(da + 1, dz - 1) or "" },
+  }
   -- Frontier patterns: a bare sh( call, not the tail of snapshotHash(.
   local forkers = { "%f[%w_]sh%(", "pidAlive%(", "pidState%(", "probePid%(",
                     "hs%.execute", "io%.popen", "hs%.task" }
@@ -1280,10 +1340,35 @@ do
     ("local out = sh(cmd)"):find(forkers[1]) ~= nil, true)
   check("observe glue: fork scan ignores snapshotHash( (negative control)",
     ("lfm.snapshotHash(user)"):find(forkers[1]), nil)
-  for _, forker in ipairs(forkers) do
-    check("observe glue: no fork via " .. forker, body:find(forker), nil)
+  for _, part in ipairs(observePath) do
+    check("observe glue: " .. part[1] .. " located", #part[2] > 150, true)
+    for _, forker in ipairs(forkers) do
+      check("observe glue: no fork in " .. part[1] .. " via " .. forker, part[2]:find(forker), nil)
+    end
   end
   check("observe glue: follow-ups use held timers", body:find("afterHeld(h,", 1, true) ~= nil, true)
+  -- The decision trigger is the pure predicate, evaluated ahead of and
+  -- independently of the unattended mode.
+  local dd = alertBody:find("observe.decisionDue({", 1, true)
+  local ru = alertBody:find("core.resolveUnattended(core.cfg)", 1, true)
+  check("observe glue: alertSurfaces decides through observe.decisionDue", dd ~= nil, true)
+  check("observe glue: the decision trigger precedes the mode lookup", dd ~= nil and ru ~= nil and dd < ru, true)
+  local function triggerTakesNoMode(text)
+    local a = text:find("observe.decisionDue({", 1, true)
+    local z = a and text:find("})", a, true)
+    local args = (a and z) and text:sub(a, z) or nil
+    return args ~= nil and args:find("resolveUnattended", 1, true) == nil
+      and args:find("%f[%w_]mode%f[^%w_]") == nil
+  end
+  check("observe glue: the mode scan sees a mode input (positive control)",
+    triggerTakesNoMode("observe.decisionDue({ enabled = x, mode = core.resolveUnattended(core.cfg) })"), false)
+  check("observe glue: the decision trigger takes no mode", triggerTakesNoMode(alertBody), true)
+  check("observe glue: an existing stamp counts only for the same process",
+    alertBody:find("observe.liveStamp(observeDecisionAt[offender.pid], decEntry)", 1, true) ~= nil, true)
+  local stampAt = alertBody:find("observeDecisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,", 1, true)
+  local writeAt = alertBody:find('pcall(writeObservation, "decision"', 1, true)
+  check("observe glue: the stamp carries the process identity", stampAt ~= nil, true)
+  check("observe glue: the stamp is set before the write", stampAt ~= nil and writeAt ~= nil and stampAt < writeAt, true)
   -- wouldAct is what fires under the live mode; the freeze ceiling is a
   -- separate counterfactual, and every row is bounded before it is written.
   check("observe glue: wouldAct follows the live mode",
@@ -1294,9 +1379,7 @@ do
     body:find('and deterministicAction("freeze", foreground) or "wait"', 1, true), nil)
   check("observe glue: the row is bounded before it is appended",
     body:find("observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)", 1, true) ~= nil, true)
-  local ds = src:find("writeDecisionOutcome = function(", 1, true)
-  local de = ds and src:find("\nend\n", ds, true)
-  local dbody = (ds and de) and src:sub(ds, de) or ""
+  local dbody = fnBody("writeDecisionOutcome = function(")
   check("decision ledger glue: writeDecisionOutcome located", #dbody > 200, true)
   check("decision ledger glue: the stored name is sanitized",
     dbody:find("name = observe.sanitizeName(offender.name)", 1, true) ~= nil, true)
@@ -1305,8 +1388,6 @@ do
     src:find('pcall(writeObservation, "decision"', 1, true) ~= nil, true)
   check("observe glue: advisory cadence is error-bounded",
     src:find('pcall(writeObservation, "advisory"', 1, true) ~= nil, true)
-  check("observe glue: decision observation does not require an unattended mode",
-    src:find('if observeEnabled and offender and offender.kind == "extreme"', 1, true) ~= nil, true)
   -- Fates come only from a complete sample, through start windows, and the
   -- operator signal is the monotonic counter, not the resettable HUD flag.
   check("observe glue: fate is told whether the sample was complete",
@@ -1337,11 +1418,6 @@ do
   check("observe glue: the 60 s window peak is gone", body:find("windowPeakMB", 1, true), nil)
   -- memwatch's own signals: recorded where each signal is sent, after the
   -- identity and policy gates, and compared with the observation time.
-  local function fnBody(header)
-    local a = src:find(header, 1, true)
-    local z = a and src:find("\nend\n", a, true)
-    return (a and z) and src:sub(a, z) or ""
-  end
   local function recordedAtSend(text, send, record)
     local gate = text:find("core.killAllowed(", 1, true)
     local s0, s1 = text:find(send, 1, true)

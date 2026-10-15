@@ -81,7 +81,7 @@ local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, 
 local observeEnabled    = true -- local-only outcome record; config key "observe"
 local observeSeq        = 0
 local observeLastAt     = 0
-local observeDecisionAt = {}   -- [pid] = epoch of the last would-be decision observation
+local observeDecisionAt = {}   -- [pid] = { at, comm, start } of the last decision observation
 local observeStats      = { rows = 0, followups = 0, lastAt = 0, errors = 0 }
 -- The last signal memwatch itself sent per pid ({ at, action =
 -- "terminate"|"freeze" }), set where the signal is sent, after the identity
@@ -912,13 +912,23 @@ local function alertSurfaces(state, now)
     -- before the same offender is adjudicated again.
     -- Passive observation at every WOULD-BE decision point, whatever the
     -- unattended mode (including off): the record of exactly what an
-    -- adjudicator would have faced, once per offender per grace window.
-    -- Error boundary: the observation layer may never break alerting.
-    if observeEnabled and offender and offender.kind == "extreme"
-       and alertActive and not hudInteracted and not hudHold
-       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec
-       and (now - (observeDecisionAt[offender.pid] or 0)) >= core.cfg.cool.autoKillGraceSec then
-      observeDecisionAt[offender.pid] = now
+    -- adjudicator would have faced, once per offender process per grace
+    -- window (observe.decisionDue). The stamp carries the process's comm and
+    -- start window, so a pid reused within the window cannot suppress the
+    -- new process's row. Fork-free. Error boundary: the observation layer
+    -- may never break alerting.
+    local decEntry = offender and tracker.procs[offender.pid] or nil
+    local decStamp = offender and observe.liveStamp(observeDecisionAt[offender.pid], decEntry) or nil
+    if observe.decisionDue({
+         enabled = observeEnabled, kind = offender and offender.kind,
+         alertActive = alertActive, hudInteracted = hudInteracted, hudHold = hudHold,
+         sinceShownSec = now - hudShownAt,
+         sinceLastSec = decStamp and (now - decStamp.at) or nil,
+         graceSec = core.cfg.cool.autoKillGraceSec,
+       }) then
+      -- Stamped before the write on purpose: a throwing write must not retry every tick.
+      observeDecisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,
+                                          start = observe.startOf(decEntry) }
       local okObs, errObs = pcall(writeObservation, "decision", offender, now,
         { graceElapsedSec = now - hudShownAt })
       if not okObs then logError("observe-decision", errObs) end

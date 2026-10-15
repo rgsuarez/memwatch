@@ -541,6 +541,21 @@ function M.bannerStep(a)
   return { withdraw = false, post = mayPost(), replace = false }
 end
 
+-- One poll of a held predicate (the glue's untilHeld): "done" when it ran
+-- and reported done, "giveup" once it has errored continuously for
+-- giveUpSec (never a success), else "poll" again. An erroring poll keeps
+-- polling because escalations live inside predicates; a poll that runs
+-- ends the error run. st carries the run across polls.
+function M.untilStep(st, ok, done, now, giveUpSec)
+  if ok then
+    st.erroringSince = nil
+    return (done == true) and "done" or "poll"
+  end
+  st.erroringSince = st.erroringSince or now
+  if (now - st.erroringSince) >= giveUpSec then return "giveup" end
+  return "poll"
+end
+
 -- What an action's outcome means for the alert that asked for it (the
 -- signal engines report the outcome; nothing is re-probed after the fact):
 --   done    frozen, terminated, or verified gone before any signal

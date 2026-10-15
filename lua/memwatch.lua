@@ -159,25 +159,26 @@ end
 -- An erroring predicate is polled again, not treated as done: escalations
 -- live inside predicates (the retire poller's SIGKILL, the health poll's
 -- timeout retire), and one failed probe must not skip them. A run of errors
--- is logged once; a predicate that has errored continuously for
--- UNTIL_GIVEUP_SEC is ended so a broken one cannot poll forever.
+-- is logged once. A predicate that has errored continuously for
+-- UNTIL_GIVEUP_SEC is ended so a broken one cannot poll forever, and the
+-- give-up is not success: it is logged, and onGiveUp (when given) lets the
+-- owner clean up what the predicate would have handled.
 local UNTIL_GIVEUP_SEC = 120
-local function untilHeld(pred, action, interval)
+local function untilHeld(pred, action, interval, onGiveUp)
   local t
-  local erroringSince = nil
+  local run = {}
   t = hs.timer.doUntil(function()
     local ok, done = pcall(pred)
-    local now = hs.timer.secondsSinceEpoch()
-    if ok then
-      erroringSince = nil
-    elseif not erroringSince then
-      erroringSince = now
-      logError("until-held", done)
+    local firstError = (not ok) and run.erroringSince == nil
+    local step = core.untilStep(run, ok, done, hs.timer.secondsSinceEpoch(), UNTIL_GIVEUP_SEC)
+    if firstError then logError("until-held", done) end
+    if step == "poll" then return false end
+    heldTimers[t] = nil
+    if step == "giveup" then
+      logError("until-held-giveup", done)
+      if onGiveUp then pcall(onGiveUp) end
     end
-    done = (ok and done == true)
-      or (erroringSince ~= nil and (now - erroringSince) >= UNTIL_GIVEUP_SEC)
-    if done then heldTimers[t] = nil end
-    return done
+    return true
   end, action, interval)
   heldTimers[t] = true
   return t
@@ -1997,6 +1998,15 @@ local function retireLfmServer(reason)
   protectedPids = { [selfPid] = true }
   if not pid then return end
   M.logSnapshot(string.format("lfm-retire:%s:pid=%d", reason or "?", pid))
+  -- The tracked pid's identity, captured before any signal (and again on a
+  -- later poll if this probe cannot run): KILL goes to it only while it
+  -- still holds that process, so a pid reused after our server exits is
+  -- never signaled.
+  local ident = probePid(pid)
+  local function trackedIsOurs()
+    if not ident then ident = probePid(pid); return false end
+    return resolveSignalTarget(pid, procs.friendlyName(ident.comm), ident.lstart) ~= nil
+  end
   -- Signal the tracked pid AND the actual port listener (may be a child),
   -- but only signal the listener if it is CONFIRMED ours: our tracked pid,
   -- or an llama-server serving OUR model dir. In the narrow window after our
@@ -2010,7 +2020,11 @@ local function retireLfmServer(reason)
       and info:find("projects/memwatch/models/", 1, true) ~= nil
   end
   local function signalTargets(sig)
-    if pid then sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, pid)) end
+    if pid and (sig == "TERM" or trackedIsOurs()) then
+      sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
+    elseif pid then
+      M.logSnapshot(string.format("lfm-retire-%s-skip:pid=%d:unverified-or-gone", sig, pid))
+    end
     if port then
       local owner = listenerPid(port)
       if owner and owner ~= pid and listenerIsOurs(owner) then
@@ -2036,16 +2050,21 @@ local function retireLfmServer(reason)
       if hs.timer.secondsSinceEpoch() > deadline then
         local okKill, kerr = pcall(signalTargets, "KILL")
         if not okKill then
-          -- The listener lookup failed: KILL the tracked pid directly.
+          -- The listener lookup failed: KILL the tracked pid directly, but
+          -- only while it still holds our server.
           logError("lfm-retire-kill", kerr)
-          if pid then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
+          if pid and trackedIsOurs() then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
         end
         return hs.timer.secondsSinceEpoch() > deadline + 3
       end
       return false
     end,
     guard("lfm-retire-wait", function() end),
-    1)
+    1,
+    function()
+      -- The predicate kept erroring: one last identity-checked KILL.
+      if pid and trackedIsOurs() then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
+    end)
 end
 
 local function spawnLfmServer()
@@ -2191,7 +2210,16 @@ local function spawnLfmServer()
       return false
     end,
     guard("lfm-health-poll", function() end),
-    1)
+    1,
+    function()
+      -- The health poll kept erroring: never leave a server that never got
+      -- ready resident. Retire it and latch offline, as a timeout would.
+      if myTask and lfmServerTask == myTask then
+        M.logSnapshot("lfm-health-giveup")
+        retireLfmServer("health-giveup")
+        lfmOffline = true
+      end
+    end)
 end
 
 -- Is this offender the user's frontmost app? A name match against the

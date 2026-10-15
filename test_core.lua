@@ -865,6 +865,20 @@ do
   check("memory: another pid never matches", core.sameRecord(bound, { pid = 8, name = "node", lstart = "L1" }), false)
 end
 
+-- ---- held pollers: a give-up is never a success ----
+do
+  local st = {}
+  check("until: a poll that reports done is done", core.untilStep(st, true, true, 0, 120), "done")
+  check("until: a poll that runs but is not done polls again", core.untilStep(st, true, false, 1, 120), "poll")
+  check("until: an error polls again (escalations live in predicates)", core.untilStep(st, false, "boom", 10, 120), "poll")
+  check("until: still polling just under the budget", core.untilStep(st, false, "boom", 129, 120), "poll")
+  check("until: a continuous error run gives up at the budget", core.untilStep(st, false, "boom", 130, 120), "giveup")
+  local st2 = {}
+  core.untilStep(st2, false, "boom", 0, 120)
+  core.untilStep(st2, true, false, 100, 120)
+  check("until: a poll that runs ends the error run", core.untilStep(st2, false, "boom", 150, 120), "poll")
+end
+
 -- ---- an action's outcome is the alert's answer ----
 do
   check("answer: frozen is done",            core.answerFor("frozen"), "done")
@@ -1221,12 +1235,20 @@ do
     (select(2, ("M.hideHud()"):gsub("M%.hideHud%(%)", ""))) == 1 and bareHides == 0, true)
   check("hud glue: a click acts only on a bound identity",
     clicks:find("if not target.lstart then", 1, true) ~= nil, true)
-  local poll = body("local function untilHeld(pred, action, interval)")
+  local poll = body("local function untilHeld(pred, action, interval, onGiveUp)")
   check("poller glue: untilHeld located", #poll > 200, true)
+  check("poller glue: a give-up calls the owner's handler, never the success action",
+    poll:find('if step == "giveup" then', 1, true) ~= nil and poll:find("pcall(onGiveUp)", 1, true) ~= nil, true)
   check("poller glue: an error no longer ends the poller (control: old shape caught)",
     ("done = done == true or not ok"):find("or not ok", 1, true) ~= nil
       and poll:find("or not ok", 1, true) == nil, true)
   check("poller glue: a continuous error run gives up", poll:find("UNTIL_GIVEUP_SEC", 1, true) ~= nil, true)
+  local retire = body("local function retireLfmServer(reason)")
+  check("lfm glue: the retire KILL checks the tracked server's identity",
+    retire:find('if pid and (sig == "TERM" or trackedIsOurs()) then', 1, true) ~= nil
+      and retire:find('if pid then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end', 1, true) == nil, true)
+  check("lfm glue: the health poll's give-up retires the server",
+    src:find('retireLfmServer("health-giveup")', 1, true) ~= nil, true)
   check("poller glue: the retire probe cannot skip the KILL deadline",
     src:find("local okGone, gone = pcall(function()", 1, true) ~= nil, true)
   local police = src:find('"memwatch: adjudicator over budget"', 1, true)

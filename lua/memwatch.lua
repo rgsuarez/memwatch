@@ -2751,16 +2751,15 @@ function obs.appendObserve(line)
   end
   if f:seek("end") > observe.cfg.maxBytes then
     f:close()
-    for _, step in ipairs(observe.rotationPlan(obs.path, observe.cfg.keep)) do
-      -- An older generation that does not exist yet is not a failure; a
-      -- rename of one that does exist must succeed or be logged.
-      local src = io.open(step[1], "r")
-      if src then
-        src:close()
-        local ok, err = os.rename(step[1], step[2])
-        if not ok then logError("observe-rotate", err) end
-      end
-    end
+    -- A rotation that cannot finish stops, and the row goes on the live
+    -- file (over its cap) rather than a generation being overwritten.
+    local rotated, rerr = observe.rotate(observe.rotationPlan(obs.path, observe.cfg.keep),
+      function(path)
+        local h = io.open(path, "r")
+        if h then h:close() end
+        return h ~= nil
+      end, os.rename)
+    if not rotated then logError("observe-rotate", rerr) end
     f, err = io.open(obs.path, "a")
     if not f then
       obs.stats.errors = obs.stats.errors + 1
@@ -2769,10 +2768,10 @@ function obs.appendObserve(line)
     end
   end
   local wrote, werr = f:write(line)
-  local closed = f:close()
+  local closed, cerr = f:close()
   if not (wrote and closed) then
     obs.stats.errors = obs.stats.errors + 1
-    logError("observe-write", werr)
+    logError("observe-write", werr or cerr)   -- a full disk often fails only the flush at close
     return false
   end
   return true

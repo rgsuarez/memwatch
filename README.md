@@ -194,7 +194,8 @@ Each row holds:
 
 `offender.foreground` is a fork-free name match (`foregroundBasis: "name"`).
 The live policy also walks the process tree, so under kill mode `wouldAct`
-can read terminate where the live policy would freeze. `offender.name` is a
+can read terminate where the live policy would freeze; such rows say so at
+top level (`wouldActBasis: "name"`). `offender.name` is a
 sanitized local basename kept only to re-derive categories: like the row's
 `pid`, it is never model input and is stripped from any dataset built from
 the ledger. Rows carry a `session` id. The sequence number restarts on every

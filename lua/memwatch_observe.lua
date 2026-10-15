@@ -84,6 +84,10 @@ function M.row(a)
     runawayCount = floorOrNil(a.runawayCount),
     mode = a.mode, lfmEnabled = a.lfmEnabled == true,
     wouldAct = a.wouldAct, wouldActAtFreeze = a.wouldActAtFreeze,
+    -- Under kill mode the deterministic action rests on the fork-free name
+    -- match for foreground (see above): said at top level, so a filter on
+    -- wouldAct cannot miss it.
+    wouldActBasis = (a.mode == "kill" and a.wouldAct ~= nil and a.wouldAct ~= "none") and "name" or nil,
     graceElapsedSec = floorOrNil(a.graceElapsedSec),
     pid = floorOrNil(off.pid),
     offender = {
@@ -141,17 +145,6 @@ function M.startOf(e)
   return { lo = e.startLo, hi = e.startHi, etimeSec = e.etimeSec }
 end
 
--- The tracker entry for an observed pid, only when it is provably the
--- observed process: the same comm, and start windows identity() calls
--- "same". A reused pid's new process, or an identity that cannot be
--- decided, reads as absent, so a follow-up never takes weight or peak from
--- a different process.
-function M.sameProcess(e, comm0, start0)
-  if type(e) ~= "table" or comm0 == nil or e.comm ~= comm0 then return nil end
-  if M.identity(start0, M.startOf(e)) ~= "same" then return nil end
-  return e
-end
-
 -- Whether a tick is a would-be decision point that earns a decision row:
 -- the ledger is on, the unattended gate (core.unattendedGate, the same one
 -- the live unattended step asks) stands open for this tick's offender, and
@@ -185,7 +178,10 @@ end
 
 -- A process start time as ps prints it ("Mon Oct  5 10:00:01 2026", local
 -- time) as an epoch; nil when it does not parse. Signal paths bind lstart,
--- the ledger compares start windows, and this joins the two.
+-- the ledger compares start windows, and this joins the two. In the hour a
+-- daylight-saving fold repeats, a local time is ambiguous by an hour: a
+-- signal sent to a process started then can miss its observation (it is
+-- left unrecorded, never attributed to another process).
 local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
                  Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
 function M.lstartEpoch(s)
@@ -358,22 +354,8 @@ function M.countSince(times, since, untilT)
   return n
 end
 
--- Largest value in a growth ring (the tracker's 60 s footprint window).
--- With `since`, only samples taken at or after it count: a peak since an
--- observation must not include the ring's older samples.
-function M.ringMax(ring, since)
-  local best = nil
-  for _, s in ipairs(ring or {}) do
-    if type(s.v) == "number" and (since == nil or (type(s.t) == "number" and s.t >= since))
-       and (best == nil or s.v > best) then
-      best = s.v
-    end
-  end
-  return best
-end
-
 -- Rename steps that rotate `path` keeping `keep` generations, oldest first,
--- so no generation is overwritten before it has moved.
+-- so no generation is overwritten before it has moved (see rotate).
 function M.rotationPlan(path, keep)
   local plan = {}
   for i = keep - 1, 1, -1 do
@@ -381,6 +363,22 @@ function M.rotationPlan(path, keep)
   end
   plan[#plan + 1] = { path, path .. ".1" }
   return plan
+end
+
+-- Run a rotation plan: exists(path) and rename(from, to) are the file
+-- operations (os.rename's contract). A generation that does not exist yet
+-- is skipped; the first rename that fails stops the rotation, because every
+-- later step would overwrite the generation that did not move (the live
+-- file onto .1, when .1 could not become .2). Returns true, or false and
+-- the failed rename's error.
+function M.rotate(plan, exists, rename)
+  for _, step in ipairs(plan) do
+    if exists(step[1]) then
+      local ok, err = rename(step[1], step[2])
+      if not ok then return false, err end
+    end
+  end
+  return true
 end
 
 return M

@@ -1800,15 +1800,6 @@ do
   check("startOf: no window, nil", observe.startOf({ comm = "/bin/x" }), nil)
   check("startOf: no entry, nil", observe.startOf(nil), nil)
   local live = { comm = "/bin/x", startLo = 999, startHi = 1001, etimeSec = 9060, weightMB = 5 }
-  check("sameProcess: same comm and window", observe.sameProcess(live, "/bin/x", old0), live)
-  check("sameProcess: a different comm is absent", observe.sameProcess(live, "/bin/y", old0), nil)
-  check("sameProcess: a same-comm pid reuse is absent",
-    observe.sameProcess({ comm = "/bin/x", startLo = 1500, startHi = 1502, etimeSec = 60 }, "/bin/x", old0), nil)
-  check("sameProcess: an undecidable identity is absent",
-    observe.sameProcess(live, "/bin/x", { lo = 999, hi = 1003, etimeSec = 1 }), nil)
-  check("sameProcess: no comm at observation proves nothing",
-    observe.sameProcess({ startLo = 999, startHi = 1001, etimeSec = 9060 }, nil, old0), nil)
-  check("sameProcess: no entry is absent", observe.sameProcess(nil, "/bin/x", old0), nil)
 
   -- A decision stamp holds only for the process it was taken from.
   local stamp = { at = 100, comm = "/bin/x", start = old0 }
@@ -1881,16 +1872,46 @@ do
   local small = observe.boundLine({ seq = 7, at = "t", pid = 1, point = "decision", big = true }, enc, 100)
   check("boundLine: a row over the cap without a snapshot is reduced to its keys", #small, 10)
 
-  check("observe: ring max", observe.ringMax({ { v = 3 }, { v = 9 }, { v = 4 } }), 9)
-  check("observe: empty ring", observe.ringMax({}), nil)
-  local ringT = { { t = 10, v = 50 }, { t = 20, v = 30 }, { t = 30, v = 40 } }
-  check("observe: ring max since an instant skips older samples", observe.ringMax(ringT, 15), 40)
-  check("observe: ring max without an instant takes every sample", observe.ringMax(ringT), 50)
-  check("observe: ring max with nothing since the instant is nil", observe.ringMax(ringT, 31), nil)
   local plan = observe.rotationPlan("/tmp/x.jsonl", 3)
   check("rotation: oldest moves first", plan[1][1] .. ">" .. plan[1][2], "/tmp/x.jsonl.2>/tmp/x.jsonl.3")
   check("rotation: live file moves last", plan[#plan][1] .. ">" .. plan[#plan][2], "/tmp/x.jsonl>/tmp/x.jsonl.1")
   check("rotation: step count", #plan, 3)
+end
+
+  -- (round 3) A rename that fails stops the rotation: the live file must
+  -- not be moved onto a generation that could not move on.
+do
+  local observe = require("memwatch_observe")
+  local plan = observe.rotationPlan("/tmp/x.jsonl", 3)
+  local function runRotate(failOn, present)
+    local done = {}
+    local ok, err = observe.rotate(plan,
+      function(p) return present[p] == true end,
+      function(from, to)
+        if from == failOn then return nil, "denied" end
+        done[#done + 1] = from .. ">" .. to
+        return true
+      end)
+    return ok, err, table.concat(done, ",")
+  end
+  local all = { ["/tmp/x.jsonl"] = true, ["/tmp/x.jsonl.1"] = true, ["/tmp/x.jsonl.2"] = true }
+  local ok1, _, done1 = runRotate(nil, all)
+  check("rotate: every step runs when every rename succeeds", ok1 and done1,
+    "/tmp/x.jsonl.2>/tmp/x.jsonl.3,/tmp/x.jsonl.1>/tmp/x.jsonl.2,/tmp/x.jsonl>/tmp/x.jsonl.1")
+  local ok2, err2, done2 = runRotate("/tmp/x.jsonl.1", all)
+  check("rotate: a failed rename stops the rotation", ok2, false)
+  check("rotate: and says why", err2, "denied")
+  check("rotate: the live file is not moved onto the generation that stayed", done2, "/tmp/x.jsonl.2>/tmp/x.jsonl.3")
+  local _, _, done3 = runRotate(nil, { ["/tmp/x.jsonl"] = true })
+  check("rotate: generations that do not exist yet are skipped", done3, "/tmp/x.jsonl>/tmp/x.jsonl.1")
+
+  -- (round 3) Under kill mode wouldAct rests on the name match: said at top level.
+  local killRow = observe.row({ mode = "kill", wouldAct = "terminate", offender = { pid = 1 } })
+  check("row: a kill-mode action says its foreground basis", killRow.wouldActBasis, "name")
+  check("row: an advisory row has no action basis",
+    observe.row({ mode = "kill", wouldAct = "none", offender = { pid = 1 } }).wouldActBasis, nil)
+  check("row: freeze mode has no name-match caveat",
+    observe.row({ mode = "freeze", wouldAct = "freeze", offender = { pid = 1 } }).wouldActBasis, nil)
 end
 
 -- ---- observation glue: fork-free, error-bounded, mode-independent ----
@@ -2062,8 +2083,11 @@ do
   local _, trueReturns = appendBody:gsub("return true", "")
   check("observe glue: only a written line reports success",
     trueReturns == 1 and appendBody:find("return true\n$") ~= nil, true)
-  check("observe glue: a failed rotation rename is logged",
-    appendBody:find('if not ok then logError("observe-rotate", err) end', 1, true) ~= nil, true)
+  check("observe glue: rotation runs through observe.rotate, and a failure is logged",
+    appendBody:find("local rotated, rerr = observe.rotate(observe.rotationPlan(obs.path, observe.cfg.keep),", 1, true) ~= nil
+      and appendBody:find('if not rotated then logError("observe-rotate", rerr) end', 1, true) ~= nil, true)
+  check("observe glue: a write that fails at close logs the close's error",
+    appendBody:find('logError("observe-write", werr or cerr)', 1, true) ~= nil, true)
   local function guardedIncrements(text, counter)
     local inc = "obs.stats." .. counter .. " = obs.stats." .. counter .. " + 1"
     local n, guarded, i = 0, 0, 1

@@ -147,9 +147,13 @@ function M.identity(w0, w1)
 end
 
 -- The start window a tracker entry carries from its latest ps sighting
--- (procs.update), in the shape identity() compares; nil without one.
+-- (procs.update), in the shape identity() compares; nil without one. An
+-- etime of 0 places no start (a process in its first second, or one younger
+-- than a step back, whose clamped etime makes its window follow the clock
+-- instead of the kernel's start record), so it carries no window either.
 function M.startOf(e)
   if type(e) ~= "table" or type(e.startLo) ~= "number" then return nil end
+  if type(e.etimeSec) == "number" and e.etimeSec <= 0 then return nil end
   return { lo = e.startLo, hi = e.startHi, etimeSec = e.etimeSec }
 end
 

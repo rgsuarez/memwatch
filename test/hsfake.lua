@@ -350,7 +350,9 @@ function F.new()
       secondsSinceEpoch = function() return W.now + (W.wallOffset or 0) end,
       -- The monotonic clock (nanoseconds since boot): wall-clock steps never
       -- move it.
-      absoluteTime = function() return math.floor(W.now * 1e9) end,
+      -- Its origin is not the wall clock's (boot, not the epoch), so a
+      -- duration that mixes the two clocks reads wrong in every scenario.
+      absoluteTime = function() return math.floor((W.now - 990) * 1e9) end,
       -- timersStall: a one-shot callback that never gets to run (a run loop
       -- stalled past it), so a narrative waiting on it never finishes.
       -- timerLag: one-shots run that much late (a run loop blocked in a

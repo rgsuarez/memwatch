@@ -1490,8 +1490,11 @@ local function launchSampler(onDone)
   local launchedAt = now
   sampler.nextSeq = sampler.nextSeq + 1
   local seq = sampler.nextSeq   -- and its place in launch order
+  -- Records of launches delivered or overtaken go, and so does any older
+  -- than the last 16 launches (a table that never came back), so the set
+  -- stays bounded whatever happens to the tables.
   for old in pairs(sampler.launches) do
-    if old <= sampler.seq then sampler.launches[old] = nil end   -- delivered or overtaken
+    if old <= sampler.seq or old < seq - 16 then sampler.launches[old] = nil end
   end
   sampler.launches[seq] = { at = now }
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
@@ -1523,7 +1526,8 @@ local function launchSampler(onDone)
     end,
     { "-c", SAMPLER_CMD })
   sampler.task = task
-  if task then task:start() end
+  -- A launch that never started gets no callback: its record goes now.
+  if not (task and task:start()) then sampler.launches[seq] = nil end
 end
 
 -- Enrichment half: runs when the sampler fork returns. Refreshes the kernel
@@ -1543,8 +1547,10 @@ local function onSample(blob, exitCode, launchedAt, seq)
   sampler.seq = seq or sampler.seq
   sampler.at = now
   -- What the unattended-state GC compares with the tracker's sightings:
-  -- the launch record the clock shift moved with them. (nil: launch unknown.)
-  sampler.launchedAt = launch and launch.at or launchedAt
+  -- the launch record the clock shift moved with them. Without one the
+  -- launch is unknown (nil), and the GC prunes nothing: never the unshifted
+  -- wall reading, which would put the two on two bases.
+  sampler.launchedAt = launch and launch.at or nil
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -1578,9 +1584,15 @@ local function onSample(blob, exitCode, launchedAt, seq)
     for _, ev in pairs(obs.pending) do
       local row = rows[ev.pid]
       local e = row and tracker.procs[ev.pid] or nil
+      -- An etime of 0 places no start: it is either a process in its first
+      -- second, or one younger than a step back, whose etime the clamp holds
+      -- at 0 so its window would follow the clock rather than the kernel's
+      -- start record (and read as a reuse). Either way the sample is no
+      -- evidence of identity.
+      local placeable = row and type(row.etimeSec) == "number" and row.etimeSec > 0
       observe.foldSample(ev, {
         complete = sampler.complete, row = row,
-        start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil,
+        start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, now) or nil,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
         seq = seq, launchedAt = launchedAt, deliveredAt = now })
     end
@@ -2034,6 +2046,10 @@ function clock.shift(delta)
     -- horizons any more, so each stops collecting and says so (clockStep),
     -- gone or not.
     { "observation", function()
+      -- Report files written before the step keep their pre-step times, up
+      -- to the step's size ahead of the new basis: an observation written
+      -- before the new clock catches up with them cannot place them.
+      obs.jetsamBlindUntil = math.max(sh(obs.jetsamBlindUntil) or 0, (clock.wallAt or 0) - delta)
       obs.lastAt = sh(obs.lastAt)
       for _, st in pairs(obs.decisionAt) do st.at = sh(st.at) end
       for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end
@@ -3410,6 +3426,7 @@ end
 -- name parsing and no daylight-saving shift): no fork. nil means "could not
 -- look", never zero.
 function obs.jetsamSince(since, untilT)
+  if obs.jetsamBlindUntil and type(since) == "number" and since < obs.jetsamBlindUntil then return nil end
   local times = {}
   local ok = pcall(function()
     for name in hs.fs.dir(obs.jetsamDir) do
@@ -3503,6 +3520,9 @@ obs.writeObservation = function(point, offender, now, extra)
   local avail0 = lastMetrics.availPct or 0
   for i, h in ipairs(horizons) do
     afterHeld(h, guard("observe-followup", function()
+      -- Read the clock first: a step back since the last read is seen here,
+      -- and closes the record, before anything is read from it.
+      clock.now()
       if i == #horizons then obs.pending[seq] = nil end
       -- Read as of the horizon instant, however late this timer ran.
       local tH = now + h
@@ -3609,12 +3629,13 @@ local function dispatchAdjudication(offender, why)
   lfmReqNonce = lfmReqNonce + 1
   local nonce = lfmReqNonce
   local hash = lfm.snapshotHash(user)
-  -- boundLstart: the start time the alert had bound when it was asked (nil
-  -- while unbound). A verdict asked about one binding is asked again once
-  -- the alert binds another (a first binding, or a pid reused since), never
-  -- every tick.
+  -- boundLstart: the start time the alert had bound when it was asked (the
+  -- offender's own, else the HUD's binding of the same pid, the one the
+  -- source check above used; nil while unbound). A verdict asked about one
+  -- binding is asked again once the alert binds another (a first binding,
+  -- or a pid reused since), never every tick.
   local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart,
-                  verified = source == "same", boundLstart = offender.lstart }
+                  verified = source == "same", boundLstart = offender.lstart or bound }
   local pid = offender.pid
   local sentAt, sentMono = clock.now(), clock.mono()
   lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
@@ -3783,9 +3804,12 @@ lfmTick = function(state, now, interesting)
     local usable = lfm.verdictUsable(cached, lastOffender, now, lfm.cfg.verdictFreshSec)
     -- The alert has bound a start time other than the one the verdict was
     -- asked about (a first binding, or a pid reused since): the verdict is
-    -- about another binding, so it is neither fresh nor kept.
+    -- about another binding, so it is neither fresh nor kept (it goes from
+    -- the cache; consumption re-checks the live process against the
+    -- verdict's own start time as well).
     local rebound = usable and lastOffender.lstart ~= nil
       and lastOffender.lstart ~= (cached.ident and cached.ident.boundLstart)
+    if rebound then verdictCache[lastOffender.pid] = nil end
     local fresh = usable and not rebound and cached.ident ~= nil and cached.ident.verified == true
     local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
     -- An unverified verdict never acts, and asking again verifies nothing
@@ -4321,19 +4345,27 @@ end
 -- synthetic (excluded from any dataset built from the ledger) for a fake
 -- extreme offender and schedules its follow-ups at 2, 4 and 6 s, with NO
 -- real process and NO memory load. Usage: hs -c "memwatch.testObserve()".
+-- A console call is one clock frame, as every callback is: a step seen in
+-- the middle of the probe is applied when it ends.
 function M.testObserve()
-  if not obs.enabled then return "observation ledger disabled (observe=false)" end
-  local now = clock.now()
-  local fake = { pid = -1, name = "memwatch-observe-probe", kind = "extreme",
-                 weightMB = 9200, slopeMBmin = 11000, peakSlopeMBmin = 12000,
-                 ageSec = 40, foreground = false }
-  local seq = obs.writeObservation("synthetic", fake, now,
-    { synthetic = true, horizons = { 2, 4, 6 } })
-  if not seq then
-    return "memwatch.testObserve could NOT write its row (see memwatch.debug().observe.errors and memwatch.log)"
-  end
-  return string.format("memwatch.testObserve wrote synthetic row %d; follow-ups land in ~6 s in %s",
-    seq, obs.path)
+  clock.enter()
+  local ok, out = pcall(function()
+    if not obs.enabled then return "observation ledger disabled (observe=false)" end
+    local now = clock.now()
+    local fake = { pid = -1, name = "memwatch-observe-probe", kind = "extreme",
+                   weightMB = 9200, slopeMBmin = 11000, peakSlopeMBmin = 12000,
+                   ageSec = 40, foreground = false }
+    local seq = obs.writeObservation("synthetic", fake, now,
+      { synthetic = true, horizons = { 2, 4, 6 } })
+    if not seq then
+      return "memwatch.testObserve could NOT write its row (see memwatch.debug().observe.errors and memwatch.log)"
+    end
+    return string.format("memwatch.testObserve wrote synthetic row %d; follow-ups land in ~6 s in %s",
+      seq, obs.path)
+  end)
+  clock.leave()
+  if not ok then error(out, 0) end
+  return out
 end
 
 -- Render the value report from the local ledgers and open it.

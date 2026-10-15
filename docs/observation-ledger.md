@@ -79,12 +79,25 @@ runs after its record stopped collecting still reads its own horizon.
   reading taken at launch, which no step moves (they are anchored to the
   kernel's start record). The unattended-state GC uses the launch record
   the shift moves with the tracker's sightings, so a step between the launch
-  and the delivery, back or forward, never puts the two on two bases.
+  and the delivery, back or forward, never puts the two on two bases. A
+  launch that never started leaves no record; the records are bounded to
+  the last 16 launches; and a delivery without its record leaves the launch
+  unknown, so the GC prunes nothing.
+- Every follow-up reads the clock first, so a step back since the last tick
+  closes its record before anything is read from it.
+- Report files (jetsam counts) carry the wall time they were written, which
+  no shift moves. After a step back, an observation written before the new
+  clock catches up with the pre-step times reads the count as unknown.
 - Durations run on the monotonic clock: a record's life after its last
   horizon, and the age of the last row written (`debug().observe`).
 
 ## Identity model
 
+- An etime of 0 places no start: a process in its first second, or one
+  younger than a step back, whose clamped etime makes its window follow the
+  clock instead of the kernel's start record. Such a sample, or an
+  observation whose reference sample is one, carries no window, so identity
+  reads unknown, never a reuse.
 - The observed process: the start window of its latest process sample
   (`identityBasis: window`); for a process only the top stream named, the
   start time the alert bound (on decision and advisory rows alike), unless

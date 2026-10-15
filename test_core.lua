@@ -2373,8 +2373,9 @@ do
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
     sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
-  check("observe glue: and its start window, bounded by launch and delivery",
-    sampleBody:find("start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil, true)
+  check("observe glue: and its start window, bounded by launch and delivery (none from a clamped etime)",
+    sampleBody:find("start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil
+      and sampleBody:find("local placeable = row and type(row.etimeSec) == \"number\" and row.etimeSec > 0", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
     sampleBody:find("if seq and seq < sampler.seq then return end", 1, true) ~= nil
       and sampleBody:find("launchedAt < sampler.launchedAt", 1, true) == nil, true)
@@ -3005,7 +3006,7 @@ do
   check("clock.shift: the ledger's tick log moves with the step",
     body:find("for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end", 1, true) ~= nil, true)
   check("sampler: the GC's launch is the record the shift moved with the sightings",
-    src:find("sampler.launchedAt = launch and launch.at or launchedAt", 1, true) ~= nil
+    src:find("sampler.launchedAt = launch and launch.at or nil", 1, true) ~= nil
       and body:find("for _, l in pairs(sampler.launches) do l.at = sh(l.at) end", 1, true) ~= nil, true)
   -- One reader of the wall clock: clock.now. clock.mono reads the
   -- monotonic clock, or the wall clock through clock.now when there is

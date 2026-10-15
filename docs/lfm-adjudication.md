@@ -59,8 +59,10 @@ The model is an advisor inside hard rails, never an autonomous authority.
   not counted as fresh, so the offender is asked again once the alert has
   bound it. A verdict records the start time the alert had bound when it
   was asked: once the alert binds another (a newcomer that took the pid),
-  that verdict is neither fresh nor kept, and the newcomer is asked about
-  once (one request is in flight at a time).
+  that verdict is evicted from the cache, and the newcomer is asked about
+  once (one request is in flight at a time). Consumption also re-checks the
+  live process against the verdict's own start time, so a verdict about one
+  process never acts on another.
 - **A clock stepped back never extends a wait.** A verdict or a first model
   wait stamped after now reads as stale, or as spent.
 - **A model wait is bounded in time.** A model wait defers the

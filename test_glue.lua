@@ -1876,6 +1876,64 @@ scenario("ledger: jetsam reports in the window are counted", nil, function(W)
   check("ledger jetsam: the report written after the observation is counted", fu[1] and fu[1].jetsamSince, 1)
 end)
 
+-- (round 8) The age of the last row written is a duration on the
+-- monotonic clock: -1 before any row, then the seconds since the last one,
+-- whatever the wall clock does.
+scenario("ledger: the last row's age reads as a duration", nil, function(W, mw)
+  check("age: -1 before any row", mw.debug().observe.lastAgeSec, -1)
+  local row = toDecision(W, 4242)
+  if not row then check("age: decision row", false, true); return end
+  local a = mw.debug().observe.lastAgeSec
+  check("age: small and non-negative after a row (" .. tostring(a) .. ")", type(a) == "number" and a >= 0 and a <= 30, true)
+  W.wallOffset = -300
+  W.run(1)
+  local b = mw.debug().observe.lastAgeSec
+  check("age: a step back does not move it (" .. tostring(b) .. ")", type(b) == "number" and b >= 0 and b <= 31, true)
+end)
+
+-- (round 8) A report written before a step back keeps its pre-step time,
+-- ahead of the new clock: an observation written before the clock catches
+-- up cannot place it, so its count is unknown, never a false 1.
+scenario("ledger: a report from before a step back is not placed after it", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.jetsam = { ["JetsamEvent-before-step.ips"] = W.now + (W.wallOffset or 0) }  -- written now
+  W.wallOffset = -120
+  local row
+  runUntil(W, 120, function() row = decisionRow(W, 4242); return row ~= nil end)
+  check("jetsam-step: a decision row after the step", row ~= nil, true)
+  if not row then return end
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("jetsam-step: the report from before the step is unknown, not counted", fu[1] and fu[1].jetsamSince, nil)
+end)
+
+-- (round 8) A step back longer than a process's age clamps ps's etime at
+-- 0, so its start windows would follow the clock instead of the kernel's
+-- start record, and read as a reuse. A clamped sample places no start: the
+-- ledger says it cannot tell, never that a live process exited.
+scenario("ledger: a step back longer than the process's age never reads as an exit", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(20)
+  W.wallOffset = -300                -- longer than the process's age: etime clamps at 0
+  local row
+  runUntil(W, 120, function() row = decisionRow(W, 4242); return row ~= nil end)
+  check("clamp: a decision row after the step", row ~= nil, true)
+  if not row then return end
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("clamp: three follow-ups", #fu, 3)
+  local exited = 0
+  for _, f in ipairs(fu) do if f.fate == "exited" then exited = exited + 1 end end
+  check("clamp: none reads a live process as exited (" .. exited .. ")", exited, 0)
+  check("clamp: and it is alive (control)", W.procs[4242] ~= nil, true)
+end)
+
 -- (round 3) A ps table read before the observation and delivered after it
 -- lacks a process born in between. It is no proof that process exited.
 scenario("ledger: a table read before the observation does not end it", nil, function(W, mw)

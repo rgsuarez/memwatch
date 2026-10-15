@@ -309,7 +309,20 @@ function F.new()
     application = { launchOrFocus = function() end, frontmostApplication = function() return nil end },
     alert = { show = function(text) W.alerts[#W.alerts + 1] = { t = W.now, text = text } end },
     http = { asyncPost = function() end },
-    fs = { dir = function() return function() return nil end end },
+    -- W.jetsam: { [name] = modification epoch } of kernel jetsam reports.
+    fs = {
+      dir = function()
+        local names = {}
+        for n in pairs(W.jetsam or {}) do names[#names + 1] = n end
+        local i = 0
+        return function() i = i + 1; return names[i] end
+      end,
+      attributes = function(path, key)
+        local m = (W.jetsam or {})[path:match("[^/]+$")]
+        if key == "modification" then return m end
+        return m and { modification = m } or nil
+      end,
+    },
   }
   W.hs = hs
 

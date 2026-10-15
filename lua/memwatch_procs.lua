@@ -85,8 +85,10 @@ function M.parsePsList(text)
   for line in (text or ""):gmatch("[^\n]+") do
     local pid, uid, rss, et, comm =
       line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+([%d%-:]+)%s+(.+)$")
+    -- A five-column row keeps its shape even when its elapsed time does not
+    -- parse (age unknown): the bad token never becomes part of the command.
     local etimeSec = et and M.parseEtime(et) or nil
-    if not pid or not etimeSec then
+    if not pid then
       pid, uid, rss, comm = line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
       etimeSec = nil
     end

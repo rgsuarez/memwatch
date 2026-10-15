@@ -38,15 +38,16 @@ end
 
 -- A raw process basename is attacker-controlled: it can carry control bytes
 -- or invalid UTF-8, which make a malformed JSONL line for strict readers.
--- Keep ASCII letters, digits and . _ - + space, replace every other byte
--- with "?", and cap at 64 bytes. That makes the name safe to store, not safe
--- to show a model: instruction-like text survives, which is why the name is
--- never model input. The class is spelled as ASCII ranges rather than %w so
--- a locale change in the host process can never widen it. Returns nil for
--- anything that is not a string.
+-- Keep ASCII letters, digits, . _ - + space and ( ) [ ] (helper names such
+-- as "Code Helper (GPU)" carry their category in the parentheses), replace
+-- every other byte with "?", and cap at 64 bytes. That makes the name safe
+-- to store, not safe to show a model: instruction-like text survives, which
+-- is why the name is never model input. The class is spelled as ASCII
+-- ranges rather than %w so a locale change in the host process can never
+-- widen it. Returns nil for anything that is not a string.
 function M.sanitizeName(s)
   if type(s) ~= "string" then return nil end
-  return (s:sub(1, 64):gsub("[^A-Za-z0-9%._%-%+ ]", "?"))
+  return (s:sub(1, 64):gsub("[^A-Za-z0-9%._%-%+ %(%)%[%]]", "?"))
 end
 
 -- Build one observation row as a plain table (the glue encodes and appends
@@ -95,18 +96,22 @@ function M.row(a)
   }
 end
 
--- Encode a row as one ledger line under `cap` bytes when the snapshot is
--- what makes it large: the shared decoder rejects lines over 64 KB, so an
--- oversize row would be silently skipped by every reader. The snapshot is
--- dropped (its hash stays) and snapshotDropped marks the row; a row that is
--- oversize without a snapshot is returned as encoded. encode is
--- lfm.ledgerLine in the glue.
+-- Encode a row as one ledger line under `cap` bytes: the shared decoder
+-- rejects lines over 64 KB, so an oversize row would be silently skipped by
+-- every reader. The snapshot is dropped first (its hash stays) and
+-- snapshotDropped marks the row; a row still over the cap is reduced to
+-- its join keys and point, marked encodingDropped, so the observation is
+-- never lost silently. encode is lfm.ledgerLine in the glue.
 function M.boundLine(row, encode, cap)
   cap = cap or M.cfg.maxLineBytes
   local line = encode(row)
   if line and #line > cap and row.snapshot ~= nil then
     row.snapshot, row.snapshotDropped = nil, true
     line = encode(row)
+  end
+  if line and #line > cap then
+    line = encode({ at = row.at, session = row.session, seq = row.seq, point = row.point,
+                    pid = row.pid, encodingDropped = true })
   end
   return line
 end
@@ -295,22 +300,6 @@ function M.frozenMatches(entry, start0, comm0)
   local m = M.matchStart(start0, nil, M.lstartEpoch(entry.lstart), nil)
   if m == "unknown" then return nil end
   return m == "same"
-end
-
--- The kernel writes one report per jetsam event, named with its LOCAL
--- timestamp: JetsamEvent-YYYY-MM-DD-HHMMSS.ips. Parse names into epochs;
--- anything that does not match is skipped, never counted.
-function M.jetsamTimes(names)
-  local out = {}
-  for _, n in ipairs(names or {}) do
-    local y, mo, d, h, mi, s = tostring(n):match(
-      "^JetsamEvent%-(%d%d%d%d)%-(%d%d)%-(%d%d)%-(%d%d)(%d%d)(%d%d)")
-    if y then
-      out[#out + 1] = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
-                                hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
-    end
-  end
-  return out
 end
 
 -- How many epochs fall inside [since, untilT].

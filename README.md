@@ -179,36 +179,62 @@ metric operationally defined:
 
 Independently of adjudication, memwatch keeps a passive observation ledger,
 `memwatch-observe.jsonl` (local and gitignored). It writes a row at each
-grace-expiry decision point (an extreme runaway whose alert has gone
-unanswered for the grace window, under any unattended mode) and every 45 s
-while pressure is up. Each row holds the exact redacted, pid-free snapshot a
-model would have received (a row that would exceed 60 KB drops it and
-carries `snapshotDropped`); `wouldAct`, the action the deterministic policy
-fires under the live mode (`none` while unattended is off, and on every
-45 s row); and at decision points `wouldActAtFreeze`, the freeze-ceiling
-counterfactual a model would own at grace expiry. `offender.name` is a
+grace-expiry decision point, and every 45 s while pressure is up and an
+offender is named. A decision point is a tick where the live unattended gate
+stands open, whatever the unattended mode: an extreme runaway, surfaced by
+the alert, unanswered for its grace window, and not frozen, gone or ignored.
+
+Each row holds:
+- the exact redacted, pid-free snapshot a model would have received (a row
+  that would exceed 60 KB drops it and carries `snapshotDropped`);
+- `wouldAct`, the action the deterministic policy fires under the live mode
+  (`none` while unattended is off, and on every 45 s row);
+- at decision points, `wouldActAtFreeze`, the freeze-ceiling counterfactual
+  a model would own at grace expiry.
+
+`offender.foreground` is a fork-free name match (`foregroundBasis: "name"`).
+The live policy also walks the process tree, so under kill mode `wouldAct`
+can read terminate where the live policy would freeze. `offender.name` is a
 sanitized local basename kept only to re-derive categories: like the row's
 `pid`, it is never model input and is stripped from any dataset built from
-the ledger.
+the ledger. Rows carry a `session` id. The sequence number restarts on every
+reload, so `(session, seq)` joins a row to its follow-ups.
 
 Follow-ups at 60, 120 and 180 s record what actually became of the process
-and the machine. The fate is `alive`, `exited` (detail `pid-reused` when the
-pid now belongs to another process), `frozen`, or `unknown` (details
-`stale-sample`, `incomplete-sample`, `identity-uncertain`), decided only from
-a fresh, complete process sample and never guessed. Each follow-up also
-carries the weight (taken only from the provably same process),
-`peakSinceMB` (the peak weight since the observation), available memory,
-kernel jetsam reports, `frozenLedger` (whether memwatch's frozen ledger
-lists the pid), `operatorActionsSince` (operator actions since the
-observation) and `memwatchSignalSince` (a terminate or freeze memwatch
-itself sent since the observation, so its own actions never read as
-natural exits).
+and the machine. Each observation keeps its own evidence, folded in as
+events arrive: every process sample, every signal memwatch sends and every
+operator action aimed at that same process (matched by its start time, so a
+process that later takes the pid is never mistaken for it). A follow-up
+reads only that record.
+
+The fate is one of:
+- `alive`: seen as the same process in a sample read within 15 s of the
+  horizon (freshness counts from when the table was read, not when it
+  arrived);
+- `exited`: proven gone by a sample (detail `pid-reused` when another
+  process holds the pid);
+- `frozen`: alive, and memwatch's frozen ledger holds this same process;
+- `unknown`: details `stale-sample`, `incomplete-sample` or
+  `identity-uncertain`.
+
+Each follow-up also carries:
+- the weight, and `peakSinceMB` (kept even if the process leaves the
+  tracker);
+- `sampleAgeSec`;
+- available memory, and kernel jetsam reports by file time;
+- `frozenLedger`;
+- `operatorActionsSince` (any operator action) and `operatorTouchesSince`
+  (actions on this process);
+- `memwatchSignalSince`, a terminate or freeze memwatch itself sent to this
+  process, so its own actions never read as natural exits.
+
+Pending follow-ups do not survive a reload.
 
 It never forks, never acts and never leaves the machine. It exists so that
 adjudicators can be judged against real outcomes rather than synthetic
 scenarios alone. Set `"observe": false` in the local config to turn it off.
 `hs -c "memwatch.testObserve()"` writes one synthetic-tagged row to prove the
-path end to end.
+path end to end, and says so if the row could not be written.
 
 ## Layout
 
@@ -218,7 +244,7 @@ path end to end.
   lua/memwatch_procs.lua  pure: ps/top parsers, growth rings, runaway detection, ranking
   lua/memwatch_lfm.lua    pure: LFM JSON codec, prompt, serializer, validator, rails (opt-in)
   lua/memwatch_report.lua pure: the value report renderer (opt-in)
-  lua/memwatch_observe.lua pure: observation-ledger rows, follow-up fates, jetsam report parsing
+  lua/memwatch_observe.lua pure: observation-ledger rows, per-observation evidence and fates
   lua/memwatch.lua        Hammerspoon glue: timers, async sampling, HUD, menu, kill/freeze, LFM lifecycle, log
   test_core.lua           unit tests for the pure modules (lua test_core.lua)
   test_report.lua         unit tests for the report renderer (lua test_report.lua)

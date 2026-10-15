@@ -2514,8 +2514,12 @@ local JETSAM_DIR = "/Library/Logs/DiagnosticReports"
 -- write or close failure each count as an error and return false.
 local function appendObserve(line)
   if not line then observeStats.errors = observeStats.errors + 1; return false end
-  local f = io.open(OBSERVE_PATH, "a")
-  if not f then observeStats.errors = observeStats.errors + 1; return false end
+  local f, err = io.open(OBSERVE_PATH, "a")
+  if not f then
+    observeStats.errors = observeStats.errors + 1
+    logError("observe-open", err)
+    return false
+  end
   if f:seek("end") > observe.cfg.maxBytes then
     f:close()
     for _, step in ipairs(observe.rotationPlan(OBSERVE_PATH, observe.cfg.keep)) do
@@ -2528,27 +2532,39 @@ local function appendObserve(line)
         if not ok then logError("observe-rotate", err) end
       end
     end
-    f = io.open(OBSERVE_PATH, "a")
-    if not f then observeStats.errors = observeStats.errors + 1; return false end
+    f, err = io.open(OBSERVE_PATH, "a")
+    if not f then
+      observeStats.errors = observeStats.errors + 1
+      logError("observe-open", err)
+      return false
+    end
   end
-  local wrote = f:write(line)
+  local wrote, werr = f:write(line)
   local closed = f:close()
-  if not (wrote and closed) then observeStats.errors = observeStats.errors + 1; return false end
+  if not (wrote and closed) then
+    observeStats.errors = observeStats.errors + 1
+    logError("observe-write", werr)
+    return false
+  end
   return true
 end
 
 -- Jetsam reports written since `since` (epoch), from a native directory
--- listing: no fork. nil means "could not look", never zero.
+-- listing and each report's modification time (an epoch, so no local-time
+-- name parsing and no daylight-saving shift): no fork. nil means "could not
+-- look", never zero.
 local function jetsamSince(since)
-  local names = {}
+  local times = {}
   local ok = pcall(function()
     for name in hs.fs.dir(JETSAM_DIR) do
-      if name:sub(1, 12) == "JetsamEvent-" then names[#names + 1] = name end
+      if name:sub(1, 12) == "JetsamEvent-" then
+        local m = hs.fs.attributes(JETSAM_DIR .. "/" .. name, "modification")
+        if type(m) == "number" then times[#times + 1] = m end
+      end
     end
   end)
   if not ok then return nil end
-  return observe.countSince(observe.jetsamTimes(names), since - 5,
-    hs.timer.secondsSinceEpoch() + 5)
+  return observe.countSince(times, since - 5, hs.timer.secondsSinceEpoch() + 5)
 end
 
 -- Write one observation row and schedule its follow-ups. point is
@@ -3291,8 +3307,11 @@ function M.testObserve()
                  ageSec = 40, foreground = false }
   local seq = writeObservation("synthetic", fake, now,
     { synthetic = true, horizons = { 2, 4, 6 } })
-  return string.format("memwatch.testObserve wrote synthetic row %s; follow-ups land in ~6 s in %s",
-    tostring(seq), OBSERVE_PATH)
+  if not seq then
+    return "memwatch.testObserve could NOT write its row (see memwatch.debug().observe.errors and memwatch.log)"
+  end
+  return string.format("memwatch.testObserve wrote synthetic row %d; follow-ups land in ~6 s in %s",
+    seq, OBSERVE_PATH)
 end
 
 -- Render the value report from the local ledgers and open it.

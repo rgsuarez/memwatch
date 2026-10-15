@@ -1143,6 +1143,16 @@ scenario("ledger: observe=false writes nothing", '{"observe":false}', function(W
   check("ledger off: no observation ledger at all", #ledgerRows(W), 0)
 end)
 
+scenario("ledger: jetsam reports in the window are counted", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger jetsam: decision row", false, true); return end
+  W.jetsam = { ["JetsamEvent-2026-10-15-010203.ips"] = W.now + 10,
+               ["JetsamEvent-2026-10-14-010203.ips"] = W.now - 3600 }
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("ledger jetsam: the report written after the observation is counted", fu[1] and fu[1].jetsamSince, 1)
+end)
+
 scenario("ledger: a pid taken over by another process", nil, function(W)
   local row = toDecision(W, 4242)
   if not row then check("ledger reuse: decision row", false, true); return end

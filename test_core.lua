@@ -233,6 +233,13 @@ check("etime day form", psEt[3].etimeSec, 86400 + 15 * 3600 + 24 * 60 + 11)
 check("etime comm keeps spaces", procs.friendlyName(psEt[1].comm), "Google Chrome Helper (Renderer)")
 check("legacy four-column rows parse with unknown age", psList[1].etimeSec, nil)
 do
+  -- An elapsed token that does not parse leaves the age unknown; it never
+  -- becomes part of the command name.
+  local bad = procs.parsePsList("  555   502  4096   1-2-3 /usr/local/bin/tool\n")
+  check("etime: an unparseable token keeps the row's shape", bad[1] and bad[1].comm, "/usr/local/bin/tool")
+  check("etime: and leaves the age unknown", bad[1] and bad[1].etimeSec, nil)
+end
+do
   -- A young allocator climbing 1 GB per 5 s tick: the runaway carries its
   -- live age, so the snapshot finally says "40 s old", not nothing.
   local tr = procs.newTracker()
@@ -1710,14 +1717,18 @@ do
   end
   check("decisionDue: due under every mode", dueModes, 3)
 
-  -- Jetsam report names carry their local timestamp.
-  local times = observe.jetsamTimes({ "JetsamEvent-2026-10-12-235154.ips",
-    "JetsamEvent-2026-10-12-023117.ips", "not-a-report.ips", "JetsamEvent-garbage.ips" })
-  check("jetsam: only well-formed names parse", #times, 2)
-  check("jetsam: local timestamp", times[1],
-    os.time({ year = 2026, month = 10, day = 12, hour = 23, min = 51, sec = 54 }))
-  check("jetsam: window count", observe.countSince(times, times[1] - 1, times[1] + 1), 1)
-  check("jetsam: empty window", observe.countSince(times, times[1] + 10, times[1] + 20), 0)
+  -- Jetsam reports are counted by their files' modification epochs.
+  local times = { 1000, 1100, 1300 }
+  check("jetsam: window count", observe.countSince(times, 999, 1101), 2)
+  check("jetsam: empty window", observe.countSince(times, 1110, 1200), 0)
+  -- Names keep the parentheses and brackets their categories depend on.
+  check("name: helper parentheses are kept", observe.sanitizeName("Code Helper (GPU)"), "Code Helper (GPU)")
+  check("name: brackets are kept", observe.sanitizeName("worker [3]"), "worker [3]")
+  -- A row still over the cap without its snapshot is reduced, never lost.
+  local enc = function(r) local n = 0; for _ in pairs(r) do n = n + 1 end
+    return string.rep("x", (r.encodingDropped and 10) or 200) end
+  local small = observe.boundLine({ seq = 7, at = "t", pid = 1, point = "decision", big = true }, enc, 100)
+  check("boundLine: a row over the cap without a snapshot is reduced to its keys", #small, 10)
 
   check("observe: ring max", observe.ringMax({ { v = 3 }, { v = 9 }, { v = 4 } }), 9)
   check("observe: empty ring", observe.ringMax({}), nil)

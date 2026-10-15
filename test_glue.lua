@@ -2071,6 +2071,36 @@ for _, case in ipairs({ { how = "Resume" }, { how = "Resume all", all = true } }
   end)
 end
 
+-- (round 8) A frozen row's Resume answers for the process the row showed,
+-- even when its entry has gone since the menu was built (the process was
+-- resumed outside memwatch and the sweep dropped it): still a touch on that
+-- process, and nothing is signaled.
+scenario("ledger: a stale frozen row's Resume is still a touch", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("stale resume: decision row", false, true); return end
+  local decidedAt = W.now
+  W.click("freeze")                 -- one touch: the HUD's freeze
+  W.run(5)
+  local resume
+  local frow = W.menuItem("   leaker")
+  for _, it in ipairs(frow and frow.menu or {}) do
+    if type(it.title) == "string" and it.title:find("Resume", 1, true) then resume = it.fn end
+  end
+  check("stale resume: offered while frozen", resume ~= nil, true)
+  W.procs[4242].state = "S"         -- resumed outside memwatch
+  local pruned = runUntil(W, 150, function()
+    return logHas(W, "frozen-prune:leaker(4242):resumed-externally")
+  end)
+  check("stale resume: the sweep drops the entry first", pruned, true)
+  check("stale resume: the row is stale before the last follow-up", W.now - decidedAt < 170, true)
+  if resume then resume() end       -- the second touch, on the stale row
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("stale resume: nothing is signaled but the freeze", W.signalsTo(4242), "STOP")
+  check("stale resume: the freeze and the stale Resume, two touches",
+    fu[3] and fu[3].operatorTouchesSince, 2)
+end)
+
 -- (round 3) A ledger that cannot be written is counted and logged, not
 -- reported as written.
 scenario("ledger: a write that fails is counted and logged", nil, function(W, mw)

@@ -106,7 +106,9 @@ runs after its record stopped collecting still reads its own horizon.
 - A sample: the same program in an overlapping window that rules out a
   successor is a sighting; another program or a disjoint window is a reuse
   (the observed process is gone); anything else is `identity-uncertain`.
-- A signal or touch: matched by the target's program and start time.
+- A signal or touch: matched by the target's program and start time. A
+  touch names the process the surface showed, so a Resume on a frozen row
+  whose entry has gone since the menu opened still counts on that process.
 - The frozen ledger: matched by the entry's start time; an entry that cannot
   be told apart makes a living process `frozen-uncertain`. `frozen` means
   the ledger held the process at the horizon, including a freeze still

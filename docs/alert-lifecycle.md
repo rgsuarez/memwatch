@@ -144,7 +144,8 @@ whatever is up stays.
 
 ## Diagnostics
 
-`memwatch.test()` and `memwatch.simulate()` start a fresh episode with a
+`memwatch.test()` (at either level) and `memwatch.simulate()` end the live
+episode and start a fresh one; a critical test and a simulation show a
 synthetic offender: never bound, buttons inert, no banner action. Each run
 has its own generation, so a later diagnostic, a stop or a restart orphans
 an earlier one's resume, and an action narrative from an earlier run does

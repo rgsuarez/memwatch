@@ -1245,6 +1245,22 @@ scenario("a menu Force Quit the process survives snoozes its HUD", nil, function
     runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end), true)
 end)
 
+-- (round 4) A diagnostic at any level is a run boundary: an elevated
+-- self-test during a real critical episode ends that episode, so its banner
+-- and history do not outlive the run that posted them.
+scenario("an elevated self-test ends the live episode", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  check("elevated-test: the real episode has its banner",
+    runUntil(W, 40, function() return #W.liveBanners() == 1 end), true)
+  mw.test("elevated", 5)
+  check("elevated-test: the live episode's banner is withdrawn", #W.liveBanners(), 0)
+  check("elevated-test: and its history cleared", mw.debug().bannerRecords, 0)
+  check("elevated-test: the real episode posts afresh after the test",
+    runUntil(W, 60, function() return #W.liveBanners() == 1 end), true)
+end)
+
 -- ---- narratives: a hold that never ends is released ----
 -- A narrative whose next step never runs (the run loop stalls past its
 -- escalation) ends without its last update. The alert must not stay

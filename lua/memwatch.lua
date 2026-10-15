@@ -3039,11 +3039,12 @@ function M.test(level, seconds)
     and { offenderName = "FakeProc", offenderGB = 22, causeTag = "SWAP" }
     or  { watchName = "FakeProc" }
   applyFlash(state)
+  -- A diagnostic is a run boundary at every level: the live episode ends
+  -- here (its banner withdrawn, its memory cleared), or a real banner and
+  -- its history would outlive the run that posted them, and a back-to-back
+  -- self-test would see its own stale banner and post nothing.
+  resetEpisode()
   if state == "critical" then
-    -- A fresh episode: clear any banner and HUD memory an earlier run left,
-    -- or a back-to-back self-test would see its own stale banner and post
-    -- nothing.
-    resetEpisode()
     -- A synthetic offender: its surfaces never signal, whatever process may
     -- really hold pid 99999 (no binding, no banner action, inert buttons).
     lastOffender = { pid = 99999, name = "FakeProc", weightMB = 22 * 1024,

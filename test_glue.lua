@@ -392,7 +392,8 @@ scenario("menu offender quit binds or refuses", nil, function(W)
   W.run(12)
   W.probeFails = true
   W.kern = 4
-  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  -- Wait for the runaway reading (the first sample can name it as the hog).
+  runUntil(W, 40, function() return bodyNames(W, "leaker") and bodyNames(W, "MB/min") end)
   local item = W.menuItem("Force Quit leaker")
   check("menu: the offender's Force Quit is listed", item ~= nil, true)
   if item then item.fn() end
@@ -404,6 +405,118 @@ scenario("menu offender quit binds or refuses", nil, function(W)
   if item then item.fn() end
   W.run(10)
   check("menu: once it can bind, it acts on that identity", W.signalsTo(4242), "TERM")
+end)
+
+-- ---- observation ledger: what was faced, and what became of it ----
+local function ledgerRows(W)
+  local lfm = require("memwatch_lfm")
+  local rows = {}
+  local f = io.open(W.home .. "/projects/memwatch/memwatch-observe.jsonl", "r")
+  if not f then return rows end
+  for line in f:lines() do
+    local r = lfm.jsonDecode(line)
+    if r then rows[#rows + 1] = r end
+  end
+  f:close()
+  return rows
+end
+local function decisionRow(W, pid)
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.point == "decision" and r.pid == pid then return r end
+  end
+end
+local function followups(W, seq)
+  local out = {}
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.followup_for == seq then out[#out + 1] = r end
+  end
+  table.sort(out, function(a, b) return (a.horizonSec or 0) < (b.horizonSec or 0) end)
+  return out
+end
+-- Drive one leaker to its grace-expiry decision point; returns its row.
+local function toDecision(W, pid, name)
+  leaker(W, pid, name)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, name or "leaker") end)
+  runUntil(W, 90, function() return decisionRow(W, pid) ~= nil end)
+  return decisionRow(W, pid)
+end
+
+scenario("ledger: a decision point and its follow-ups", nil, function(W)
+  local row = toDecision(W, 4242)
+  check("ledger: a decision row is written at grace expiry", row ~= nil, true)
+  if not row then return end
+  check("ledger: with unattended off nothing would have fired", row.wouldAct, "none")
+  check("ledger: the freeze-ceiling counterfactual is freeze", row.wouldActAtFreeze, "freeze")
+  check("ledger: the exact model input rides along", type(row.snapshot), "string")
+  check("ledger: the model input carries no pid", row.snapshot:find('"pid"', 1, true), nil)
+  W.run(190)
+  local fu = followups(W, row.seq)
+  check("ledger: three follow-ups", #fu, 3)
+  check("ledger: the process is still alive at +60", fu[1] and fu[1].fate, "alive")
+  check("ledger: nobody touched it", fu[3] and fu[3].operatorActionsSince, 0)
+  check("ledger: memwatch sent it nothing", fu[3] and fu[3].memwatchSignalSince, nil)
+  check("ledger: the peak since the observation only grows",
+    fu[3] ~= nil and fu[1] ~= nil and fu[3].peakSinceMB >= fu[1].peakSinceMB, true)
+end)
+
+scenario("ledger: an operator's quit is recorded as such", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger quit: decision row", false, true); return end
+  W.click("kill")
+  W.run(190)
+  local fu = followups(W, row.seq)
+  local last = fu[#fu]
+  check("ledger quit: the process is recorded as exited", last and last.fate, "exited")
+  check("ledger quit: an operator action is counted", last ~= nil and (last.operatorActionsSince or 0) >= 1, true)
+  check("ledger quit: memwatch's own TERM is recorded", last and last.memwatchSignalSince, "terminate")
+end)
+
+scenario("ledger: memwatch's freeze is recorded as such", UNATTENDED_FREEZE, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger freeze: decision row", false, true); return end
+  check("ledger freeze: the live mode would have frozen", row.wouldAct, "freeze")
+  W.run(190)
+  local fu = followups(W, row.seq)
+  local last = fu[#fu]
+  check("ledger freeze: the process is recorded as frozen", last and last.fate, "frozen")
+  check("ledger freeze: memwatch's STOP is recorded", last and last.memwatchSignalSince, "freeze")
+  check("ledger freeze: the frozen ledger agrees", last and last.frozenLedger, true)
+  check("ledger freeze: no operator action", last and last.operatorActionsSince, 0)
+end)
+
+scenario("ledger: a partial process table proves nothing", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger partial: decision row", false, true); return end
+  W.samplerExit = 1
+  W.run(65)
+  local fu = followups(W, row.seq)
+  check("ledger partial: absence from a partial table is unknown, not exited",
+    fu[1] and fu[1].fate, "unknown")
+  check("ledger partial: and says why", fu[1] and fu[1].fateDetail, "incomplete-sample")
+end)
+
+scenario("ledger: a late sampler delivery is not a pid reuse", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger stall: decision row", false, true); return end
+  W.samplerDelay = 40
+  W.run(190)
+  local reused = false
+  for _, r in ipairs(followups(W, row.seq)) do
+    if r.fateDetail == "pid-reused" then reused = true end
+  end
+  check("ledger stall: a 40 s delivery stall never reads as a reused pid", reused, false)
+end)
+
+scenario("ledger: a pid taken over by another process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger reuse: decision row", false, true); return end
+  W.reusePid(4242, "somethingelse", 500)
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("ledger reuse: the observed process is recorded as exited", fu[1] and fu[1].fate, "exited")
+  check("ledger reuse: with the pid reuse named", fu[1] and fu[1].fateDetail, "pid-reused")
 end)
 
 if fails == 0 then

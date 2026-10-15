@@ -230,9 +230,12 @@ function F.new()
       local t = { path = path }
       function t:start()
         if path == "/bin/sh" then
+          -- ps reads the table when it runs, at launch; a starved callback
+          -- delivers that reading late (samplerDelay), as a real storm does.
+          local blob = samplerBlob()
           addTimer("after", W.samplerDelay or 0.05, nil, function()
-            if streamCb then streamCb(t, samplerBlob()) end
-            exitCb(0, "", "")
+            if streamCb then streamCb(t, blob) end
+            exitCb(W.samplerExit or 0, "", "")   -- nonzero: ps failed or was cut off mid-table
           end)
         end
         return t

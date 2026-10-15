@@ -691,8 +691,8 @@ local function notifyCrit(m)
   -- One banner per critical episode per offender: post on entry or when the
   -- named offender changes, replace the previous banner instead of stacking
   -- a new one, never re-post after a manual dismissal, and let alertSurfaces
-  -- withdraw it once the state settles below critical. The cooldown survives
-  -- only to damp offender flap.
+  -- withdraw it once the state settles below critical. The cooldown damps
+  -- offender flap within one episode; the episode's end resets it.
   if not alertsEnabled then return end
   local pid = lastOffender and lastOffender.pid or 0
   if critNotif and pid == critNotifPid then return end
@@ -930,9 +930,14 @@ local function alertSurfaces(state, now)
     if alertActive and settled and not hudHold then M.hideHud() end
     -- The critical banner lives exactly as long as the episode: withdraw it
     -- once the state settles below critical, even if the HUD went earlier.
-    if critNotif and settled then
-      pcall(function() critNotif:withdraw() end)
-      critNotif, critNotifPid = nil, nil
+    -- The episode's end also ends its cooldown, so the next episode posts
+    -- on entry instead of inheriting the last banner's quiet period.
+    if settled then
+      if critNotif then
+        pcall(function() critNotif:withdraw() end)
+        critNotif, critNotifPid = nil, nil
+      end
+      lastNotifyAt = 0
     end
   end
 end

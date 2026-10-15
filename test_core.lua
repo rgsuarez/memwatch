@@ -988,6 +988,38 @@ do
   check("held-timer: doUntil only inside untilHeld", untilCount, 1)
 end
 
+-- ---- episode banner: the cooldown ends with the episode ----
+-- A cooldown carried past recovery silenced the next episode's banner when
+-- it began within notifyCooldownSec of the last one. The settle branch must
+-- reset it whether or not a banner is still up.
+do
+  -- True when the settle branch resets the cooldown under the settle gate
+  -- itself, not under a live-banner condition that skips it.
+  local function resetsOnSettle(body)
+    local gate = body:find("if settled then", 1, true)
+    local reset = body:find("lastNotifyAt = 0", 1, true)
+    return gate ~= nil and reset ~= nil and gate < reset
+  end
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local s = src:find("local settled = (now - hudBelowCritSince) >= 10", 1, true)
+  local e = s and src:find("\nend\n", s, true)
+  local body = (s and e) and src:sub(s, e) or ""
+  check("episode banner: settle branch located", #body > 100, true)
+  check("episode banner: settle resets the cooldown", resetsOnSettle(body), true)
+  -- Positive control: the same scan rejects the pre-fix shape, where the
+  -- banner was withdrawn and the cooldown kept.
+  local preFix = table.concat({
+    "local settled = (now - hudBelowCritSince) >= 10",
+    "if critNotif and settled then",
+    "  pcall(function() critNotif:withdraw() end)",
+    "  critNotif, critNotifPid = nil, nil",
+    "end" }, "\n")
+  check("episode banner: scan rejects the pre-fix shape (positive control)",
+    resetsOnSettle(preFix), false)
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

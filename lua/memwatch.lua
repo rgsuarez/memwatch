@@ -1353,16 +1353,21 @@ end
 ------------------------------------------------------------------------------
 
 local LFM_LEDGER_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-lfm.jsonl"
-local LFM_LEDGER_MAX_BYTES = 2e6
+-- Rows carry their serialized snapshot (about four times the old row), and
+-- the value report reads only the live generation, so it is sized to hold
+-- as many rows as before.
+local LFM_LEDGER_MAX_BYTES = 8e6
 
+-- An unwritable ledger is logged, never silent; logError's per-label limit
+-- keeps a persistently failing path to one line a minute.
 local function appendLedger(line)
-  local f = io.open(LFM_LEDGER_PATH, "a")
-  if not f then return end
+  local f, err = io.open(LFM_LEDGER_PATH, "a")
+  if not f then logError("lfm-ledger-open", err); return end
   if f:seek("end") > LFM_LEDGER_MAX_BYTES then
     f:close()
     os.rename(LFM_LEDGER_PATH, LFM_LEDGER_PATH .. ".1")
-    f = io.open(LFM_LEDGER_PATH, "a")
-    if not f then return end
+    f, err = io.open(LFM_LEDGER_PATH, "a")
+    if not f then logError("lfm-ledger-open", err); return end
   end
   f:write(line)
   f:close()
@@ -1851,20 +1856,32 @@ end
 local OBSERVE_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-observe.jsonl"
 local JETSAM_DIR = "/Library/Logs/DiagnosticReports"
 
+-- Append one line; true only when it reached the file, so the counters
+-- count written rows. A nil line (an encode failure), an open failure and a
+-- write or close failure each count as an error and return false.
 local function appendObserve(line)
-  if not line then return end
+  if not line then observeStats.errors = observeStats.errors + 1; return false end
   local f = io.open(OBSERVE_PATH, "a")
-  if not f then observeStats.errors = observeStats.errors + 1; return end
+  if not f then observeStats.errors = observeStats.errors + 1; return false end
   if f:seek("end") > observe.cfg.maxBytes then
     f:close()
     for _, step in ipairs(observe.rotationPlan(OBSERVE_PATH, observe.cfg.keep)) do
-      os.rename(step[1], step[2])
+      -- An older generation that does not exist yet is not a failure; a
+      -- rename of one that does exist must succeed or be logged.
+      local src = io.open(step[1], "r")
+      if src then
+        src:close()
+        local ok, err = os.rename(step[1], step[2])
+        if not ok then logError("observe-rotate", err) end
+      end
     end
     f = io.open(OBSERVE_PATH, "a")
-    if not f then observeStats.errors = observeStats.errors + 1; return end
+    if not f then observeStats.errors = observeStats.errors + 1; return false end
   end
-  f:write(line)
-  f:close()
+  local wrote = f:write(line)
+  local closed = f:close()
+  if not (wrote and closed) then observeStats.errors = observeStats.errors + 1; return false end
+  return true
 end
 
 -- Jetsam reports written since `since` (epoch), from a native directory
@@ -1925,9 +1942,10 @@ writeObservation = function(point, offender, now, extra)
   })
   -- An oversize row drops its snapshot, never the row.
   local line = observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)
-  appendObserve(line)
-  observeStats.rows = observeStats.rows + 1
-  observeStats.lastAt = now
+  if appendObserve(line) then
+    observeStats.rows = observeStats.rows + 1
+    observeStats.lastAt = now
+  end
   -- Follow-ups: what actually became of this process, and of the machine.
   local pid = offender.pid
   local obsAt = now   -- the observation epoch the follow-ups compare against
@@ -1967,7 +1985,7 @@ writeObservation = function(point, offender, now, extra)
       if ringPeak and ringPeak > peakSince then peakSince = ringPeak end
       local sig = memwatchSignals[pid]
       local availNow = lastMetrics.availPct or 0
-      appendObserve(lfm.ledgerLine({
+      local fline = lfm.ledgerLine({
         at = os.date("!%Y-%m-%dT%H:%M:%SZ"), followup_for = seq, observed_at = obsIso,
         horizonSec = h, synthetic = extra.synthetic == true or nil, pid = pid,
         fate = fate, fateDetail = detail,
@@ -1980,8 +1998,8 @@ writeObservation = function(point, offender, now, extra)
         operatorActionsSince = operatorActions - ops0,
         memwatchSignalSince = (sig and sig.at >= obsAt) and sig.action or nil,
         jetsamSince = jetsamSince(now),
-      }))
-      observeStats.followups = observeStats.followups + 1
+      })
+      if appendObserve(fline) then observeStats.followups = observeStats.followups + 1 end
     end))
   end
   return seq

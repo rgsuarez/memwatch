@@ -1375,6 +1375,48 @@ do
     gcBody:find("if (now - (s.at or 0)) > MEMWATCH_SIGNAL_KEEP_SEC then memwatchSignals[pid] = nil end",
       1, true) ~= nil, true)
   check("signals glue: the tick hands the GC its clock", src:find("gcUnattendedState(now)", 1, true) ~= nil, true)
+  -- Counters count rows that reached the file: appendObserve reports
+  -- success, and every increment is guarded by it.
+  local appendBody = fnBody("local function appendObserve(line)")
+  check("observe glue: appendObserve located", #appendBody > 200, true)
+  check("observe glue: a nil line counts as an error",
+    appendBody:find("if not line then observeStats.errors = observeStats.errors + 1; return false end", 1, true) ~= nil, true)
+  local _, falseReturns = appendBody:gsub("return false", "")
+  check("observe glue: nil line, both opens and the write each report failure", falseReturns, 4)
+  check("observe glue: write and close are both checked",
+    appendBody:find("if not (wrote and closed) then", 1, true) ~= nil, true)
+  local _, trueReturns = appendBody:gsub("return true", "")
+  check("observe glue: only a written line reports success",
+    trueReturns == 1 and appendBody:find("return true\n$") ~= nil, true)
+  check("observe glue: a failed rotation rename is logged",
+    appendBody:find('if not ok then logError("observe-rotate", err) end', 1, true) ~= nil, true)
+  local function guardedIncrements(text, counter)
+    local inc = "observeStats." .. counter .. " = observeStats." .. counter .. " + 1"
+    local n, guarded, i = 0, 0, 1
+    while true do
+      local a = text:find(inc, i, true)
+      if not a then return n, guarded end
+      n = n + 1
+      if text:sub(math.max(1, a - 60), a - 1):find("if appendObserve(", 1, true) then guarded = guarded + 1 end
+      i = a + #inc
+    end
+  end
+  local cn, cg = guardedIncrements("appendObserve(line)\nobserveStats.rows = observeStats.rows + 1\n", "rows")
+  check("observe glue: the guard scan sees an unguarded increment (positive control)", cn - cg, 1)
+  local rn, rg = guardedIncrements(src, "rows")
+  local fn, fg = guardedIncrements(src, "followups")
+  check("observe glue: one row increment, guarded by a written line", rn .. "/" .. rg, "1/1")
+  check("observe glue: one follow-up increment, guarded by a written line", fn .. "/" .. fg, "1/1")
+  -- The decision ledger: room for snapshot rows, and loud when unwritable.
+  check("decision ledger glue: sized for rows that carry their snapshot",
+    src:find("local LFM_LEDGER_MAX_BYTES = 8e6", 1, true) ~= nil, true)
+  local ledgerBody = fnBody("local function appendLedger(line)")
+  check("decision ledger glue: appendLedger located", #ledgerBody > 100, true)
+  local _, openLogs = ledgerBody:gsub('if not f then logError%("lfm%-ledger%-open", err%); return end', "")
+  check("decision ledger glue: both opens log a failure", openLogs, 2)
+  check("decision ledger glue: no silent open failure remains", ledgerBody:find("if not f then return end", 1, true), nil)
+  check("decision ledger glue: logError limits each label to one line a minute",
+    src:find("if (now - (lastErrorAt[label] or 0)) < 60 then return end", 1, true) ~= nil, true)
   -- The sampler tells its consumer how it ended and when it was launched.
   check("sampler glue: callback forwards exit code and launch time",
     src:find("onDone(table.concat(acc), exitCode, launchedAt)", 1, true) ~= nil, true)

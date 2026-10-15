@@ -107,13 +107,16 @@ separately from memwatch's MIT code under the LFM Open License v1.0; see
 Every adjudication (advisory or acting) lands in an append-only decision
 ledger (`memwatch-lfm.jsonl`, gitignored). Each row holds:
 
-- the exact serialized snapshot the model was given, and its hash;
+- the exact serialized snapshot the model was given, and its hash (a row
+  that would exceed 60 KB drops the snapshot, keeps the hash and carries
+  `snapshotDropped = true`);
 - the model, latency and validated verdict;
 - the detector kind the verdict answered;
 - the rails applied and the effective action;
 - a 60-second outcome follow-up.
 
-That makes every row replayable through a different model.
+That makes every row that keeps its snapshot replayable through a
+different model.
 
 The **Open value report** menu item renders the ledger into a
 self-contained dashboard. Nothing in the ledger or report leaves the

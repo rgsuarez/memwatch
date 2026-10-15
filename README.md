@@ -81,23 +81,43 @@ SIGKILL after 7s if the target refuses to die, verifies death, and reports the
 memory actually reclaimed. Safety rails, enforced in pure logic
 (`core.killAllowed`): same-uid processes only, a curated denylist
 (WindowServer, loginwindow, Finder, Dock, Hammerspoon itself, and friends),
-never pid 1, never memwatch's own host. The target's identity is re-validated
-by comm before TERM and again before KILL, so a recycled pid can never be
-signaled. Every action and refusal is logged.
+never pid 1, never memwatch's own host. Every alert action acts on an
+identity, never a name: when an alert first shows a process it binds that
+process's start time, and the target is re-validated against it before TERM
+and again before KILL, so a recycled pid is refused rather than signaled. If
+the binding fails (the probe forks starve under pressure), the HUD's buttons
+refuse and the binding is retried; unattended action waits for it too.
+Every action and refusal is logged.
 
-A notification breadcrumb accompanies the HUD: one banner per critical
-episode, replaced in place if the named offender changes, never re-posted
-after a manual dismissal, and withdrawn on its own once the state settles
-below critical (its Force Quit action button renders reliably only when
-Hammerspoon notifications are set to the Alerts style; the HUD is the
-dependable surface).
+Each alert answers for one process. If a different process takes over as the
+offender while the HUD is up, the HUD switches to it as a new alert with its
+own grace window. The close button means "not now": the same process returns
+after the raise cooldown, as a new alert, or at once if it escalates (a quiet
+hog turning into a runaway). Freeze, Force Quit and **Ignore 30m** answer the
+alert for the episode: that process is not raised again, and memwatch never
+acts on it unattended. An ignored process also stays off the HUD and banner
+as the largest-process fallback.
+
+A notification breadcrumb accompanies the HUD: one banner per offender per
+critical episode, never re-posted for the same offender within the episode
+(even after a manual dismissal), and withdrawn on its own once the state
+settles below critical. A generic banner (no offender identified yet) is
+replaced in place as soon as one is named. When the named offender changes,
+the stale banner is withdrawn at once and its replacement follows after a
+cooldown that damps offender flap. Its Force Quit action button appears only
+once the offender's start time is bound (the banner is upgraded in place when
+it binds), and renders reliably only when Hammerspoon notifications are set
+to the Alerts style; the HUD is the dependable surface.
 
 **Desktop alerts: on/off** in the menu mutes both surfaces at will
 (persisted as `"alerts": false` in `memwatch-local.json`; CLI:
 `hs -c "memwatch.setAlertsEnabled(false)"`). Muting hides the HUD and the
 banners only: the menu-bar state icon, logging, and the unattended engine
 stay live, and action receipts (an autonomous freeze/quit, frozen processes
-surviving a reload) still notify.
+surviving a reload, the adjudicator killed for exceeding its memory budget)
+still notify, as does the page that says per-process detection has gone
+stale while pressure is up. Unmuting during an episode restores its HUD and
+banner.
 
 The dropdown menu shows the state and its cause, kernel level, live rates,
 headroom, top-5 processes by true weight (each with Force Quit / Ignore
@@ -187,6 +207,8 @@ path end to end.
   lua/memwatch.lua        Hammerspoon glue: timers, async sampling, HUD, menu, kill/freeze, LFM lifecycle, log
   test_core.lua           unit tests for the pure modules (lua test_core.lua)
   test_report.lua         unit tests for the report renderer (lua test_report.lua)
+  test_glue.lua           behavioral tests of the alert glue in a fake Hammerspoon (lua test_glue.lua)
+  test/hsfake.lua         that fake: virtual clock, timers, process table, HUD, banners, menu
   eval/                   the model bake-off: corpus, runner, gates, methodology
   install.sh              idempotent wiring into ~/.hammerspoon/init.lua (with backup); --with-lfm adds adjudication
   memwatch.log            state transitions, runaways, kills, errors; rotates at 1 MB
@@ -220,10 +242,13 @@ Appends a `BEGIN memwatch / END memwatch` block to `~/.hammerspoon/init.lua`
 
 ## Test
 
-Pure-logic unit tests (state machine, detector, kill policy, parsers):
+Pure-logic unit tests (state machine, detector, kill policy, parsers), and
+behavioral tests that run the real Hammerspoon glue against a fake
+Hammerspoon with a virtual clock (alert episodes, identity binding, snooze
+and answers, banners, diagnostics):
 
 ```sh
-cd ~/projects/memwatch && lua test_core.lua
+cd ~/projects/memwatch && lua test_core.lua && lua test_glue.lua
 ```
 
 The public-tree firewall refuses to scan without the maintainer's local term
@@ -231,7 +256,8 @@ list, so a public clone runs it as
 `MEMWATCH_PUBLIC_CLONE=1 bash eval/checks/no-internal-refs.sh`.
 
 Visual self-test and full-surface simulation (no real process involved; the
-fake offender probes as already exited, so clicking Force Quit is safe):
+fake offender is synthetic, so its buttons never signal anything, whatever
+process may really hold its pid):
 
 ```sh
 hs -c "memwatch.test('elevated')"    # amber title for 12s

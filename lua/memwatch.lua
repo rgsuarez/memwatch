@@ -60,7 +60,7 @@ local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adj
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
 local lastFrozenSweepAt = 0 -- calm-state liveness sweep bookkeeping
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
-local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
+local unattendedWaitStreak = {} -- [pid] = { firstAt, count } of model waits at grace expiry
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
 local lfmServerPort  = nil
@@ -1317,7 +1317,10 @@ writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails,
     action = action,
     offender = { name = offender.name, kind = offender.kind or "?",
                  weightMB = math.floor(offender.weightMB or 0),
-                 slopeMBmin = math.floor(offender.slopeMBmin or 0) },
+                 slopeMBmin = math.floor(offender.slopeMBmin or 0),
+                 peakSlopeMBmin = math.floor(offender.peakSlopeMBmin or 0),
+                 ageSec = offender.ageSec,
+                 category = lfm.categorize(offender.name, nil) },
     state = smState.state,
     availPct = math.floor(lastMetrics.availPct or 0),
     rationale = rationale,
@@ -1327,6 +1330,13 @@ writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails,
     for k, v in pairs(extra) do rec[k] = v end
   end
   local line = lfm.ledgerLine(rec)
+  -- The serialized snapshot is what makes a row replayable; it is also the
+  -- only large field. Keep every line well under the decoder's 64 KB cap
+  -- (an oversize line would be silently skipped by every reader).
+  if line and #line > 60000 and rec.snapshot then
+    rec.snapshot, rec.snapshotDropped = nil, true
+    line = lfm.ledgerLine(rec)
+  end
   if line then appendLedger(line) end
   -- 60s outcome follow-up: what actually happened to the process and the
   -- availability trajectory after the action.
@@ -1349,12 +1359,14 @@ writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails,
 end
 
 -- Consume the freshest cached verdict for the bound offender: pid keyed,
--- identity re-validated live, age-bounded. The snapshot hash in the entry is
--- ledger correlation, never a consumption predicate.
+-- identity re-validated live, age-bounded, and computed for the SAME
+-- detector kind this decision sees (lfm.verdictUsable). The snapshot hash in
+-- the entry is ledger correlation, never a consumption predicate.
 local function consumeVerdict(offender)
   local e = verdictCache[offender.pid]
-  if not e or not e.verdict then return nil end
-  if (hs.timer.secondsSinceEpoch() - (e.at or 0)) > lfm.cfg.verdictFreshSec then return nil end
+  if not lfm.verdictUsable(e, offender, hs.timer.secondsSinceEpoch(), lfm.cfg.verdictFreshSec) then
+    return nil
+  end
   local proc = resolveSignalTarget(offender.pid,
     e.ident and e.ident.name or offender.name,
     e.ident and e.ident.lstart or nil)
@@ -1417,26 +1429,33 @@ resolveUnattendedAction = function(mode, offender)
     -- a model wait DEFERS the deterministic policy, protecting a
     -- false-positive extreme (a build burst resolves within a window or
     -- two), but an inert or over-conservative model must not capture the
-    -- decision forever while a true runaway grinds the machine down. After
-    -- three consecutive model-wait outcomes on the same offender at grace
-    -- expiry, the deterministic policy proceeds.
+    -- decision forever while a true runaway grinds the machine down. Once
+    -- lfm.cfg.maxDeferSec has elapsed since the FIRST model wait on this
+    -- offender at grace expiry, the deterministic policy proceeds. The bound
+    -- is time, not a wait count: a 90 s verdict cache against a 60 s grace
+    -- cadence let one cached wait count twice under the old counter.
     if eff == "wait" then
-      local streak = (unattendedWaitStreak[offender.pid] or 0) + 1
-      unattendedWaitStreak[offender.pid] = streak
-      if streak >= 3 then
+      local nowS = hs.timer.secondsSinceEpoch()
+      local w = unattendedWaitStreak[offender.pid]
+      if type(w) ~= "table" then w = { firstAt = nowS, count = 0 } end
+      w.count = w.count + 1
+      unattendedWaitStreak[offender.pid] = w
+      if lfm.deferralExhausted(w.firstAt, nowS, lfm.cfg.maxDeferSec) then
         -- The model's wait rationale is SUPERSEDED here, so do not attach it
         -- to the deterministic action (it would mislabel the report card).
         local action = deterministicAction(mode, foreground)
         local drails = { "deterministic", "wait-deferral-exhausted" }
         return action, "deterministic-fallback", nil, drails,
-          { model = lfm.cfg.model, deferrals = streak,
+          { model = lfm.cfg.model, deferrals = w.count,
+            deferredSec = math.floor(nowS - w.firstAt),
             supersededModelAction = "wait" }
       end
     else
-      unattendedWaitStreak[offender.pid] = 0
+      unattendedWaitStreak[offender.pid] = nil
     end
     return eff, "lfm", e.verdict.rationale, rails,
-      { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence }
+      { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence,
+        verdictKind = e.kind, snapshot = e.snapshot }
   end
   return deterministicAction(mode, foreground), "deterministic-fallback", nil, { "deterministic" }, nil
 end
@@ -1780,11 +1799,13 @@ local function dispatchAdjudication(offender, why)
   local proc = probePid(offender.pid)
   if not proc then return end
   local snap, foreground = buildLfmSnapshot(offender)
-  -- Redact raw process names to deterministic categories for a remote
-  -- frontier model (panel F4.1): a capable model reading an attacker-
-  -- controlled name is a real injection vector; the local path keeps names
-  -- (the 230M is not steerable and the config default follows lfm.cfg).
-  local user, serr = lfm.serializeSnapshot(snap, { redactNames = remote and lfm.cfg.redactNames })
+  -- Redact raw process names to deterministic categories (panel F4.1) on
+  -- BOTH paths: a capable model reading an attacker-controlled name is a
+  -- real injection vector whether it is served remotely or on loopback. The
+  -- local path used to keep raw names because the inert 230M could not be
+  -- steered; that assumption breaks the moment a capable local model (a
+  -- fine-tuned or decision model) takes the seat. lfm.cfg.redactNames rules.
+  local user, serr = lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })
   if not user then
     M.logSnapshot("lfm-serialize-error:" .. tostring(serr))
     return
@@ -1809,7 +1830,7 @@ local function dispatchAdjudication(offender, why)
   local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart }
   local pid = offender.pid
   local sentAt = hs.timer.secondsSinceEpoch()
-  lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
+  lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt, kind = offender.kind }
   M.logSnapshot(string.format("lfm-dispatch:%s:%s(%d):nonce=%d", why, ident.name, pid, nonce))
   hs.http.asyncPost(
     remote and (lfm.cfg.remoteServer .. "/v1/chat/completions")
@@ -1836,19 +1857,25 @@ local function dispatchAdjudication(offender, why)
         return
       end
       local latencyMs = math.floor((hs.timer.secondsSinceEpoch() - sentAt) * 1000)
+      -- kind: the DISPATCH-time detector kind this verdict answers (the
+      -- closure's offender table is replaced, never mutated, each tick), so
+      -- consumption can refuse a verdict whose premise has since changed.
+      -- snapshot: the exact serialized input, carried into the acting row.
       verdictCache[pid] = {
         verdict = verdict, snapshotHash = hash, reqNonce = nonce,
         at = hs.timer.secondsSinceEpoch(), ident = ident,
+        kind = offender.kind, snapshot = user,
       }
       M.logSnapshot(string.format("lfm-verdict:%s(%d):%s:conf=%.2f:%dms",
         ident.name, pid, verdict.action, verdict.confidence, latencyMs))
       writeDecisionOutcome(
         { name = ident.name, kind = offender.kind, pid = pid,
           weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
+          peakSlopeMBmin = offender.peakSlopeMBmin, ageSec = offender.ageSec,
           foreground = foreground },
         verdict.action, "lfm-advisory", verdict.rationale, nil,
         { model = remote and lfm.cfg.remoteModel or lfm.cfg.model, snapshotHash = hash,
-          confidence = verdict.confidence, latencyMs = latencyMs })
+          confidence = verdict.confidence, latencyMs = latencyMs, snapshot = user })
     end))
   -- Unified timeout policy: any request still in flight at the watchdog
   -- latches the adjudicator offline until calm. The local path also retires
@@ -1962,8 +1989,11 @@ lfmTick = function(state, now, interesting)
   -- consumer needs a verdict to consume).
   if ((lfmServerReady) or (lfmRemoteActive() and not lfmOffline))
      and interesting and lastOffender then
+    -- "Fresh" is the consumer's own predicate: an entry computed for a
+    -- different detector kind is not fresh, so a hog-to-extreme promotion
+    -- re-adjudicates at critical instead of waiting out the old verdict.
     local cached = verdictCache[lastOffender.pid]
-    local fresh = cached and (now - (cached.at or 0)) <= lfm.cfg.verdictFreshSec
+    local fresh = lfm.verdictUsable(cached, lastOffender, now, lfm.cfg.verdictFreshSec)
     local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
     if (lfm.cfg.advisory and due) or (state == "critical" and not fresh and not lfmInFlight) then
       lfmLastAdvisoryAt = now

@@ -1029,6 +1029,50 @@ do
   check("held-timer: doUntil only inside untilHeld", untilCount, 1)
 end
 
+-- ---- decision-point predicates: kind-bound verdicts, time-bound deferral ----
+-- A verdict computed for kind=hog must never drive a decision about the same
+-- pid once the detector says kind=extreme (2026-10-14 ledger audit: every
+-- acting-path wait in the remote model's tenure was this race).
+do
+  local v = { action = "wait", process_class = "hog", confidence = 0.8, rationale = "" }
+  local now = 5000
+  local entry = { verdict = v, at = now - 30, kind = "extreme" }
+  check("verdict usable: same kind, fresh", (lfm.verdictUsable(entry, { kind = "extreme" }, now, 90)), true)
+  local ok, why = lfm.verdictUsable({ verdict = v, at = now - 30, kind = "hog" }, { kind = "extreme" }, now, 90)
+  check("verdict refused: kind changed since dispatch", ok, false)
+  check("verdict refused reason: kind-changed", why, "kind-changed")
+  local ok2, why2 = lfm.verdictUsable({ verdict = v, at = now - 30 }, { kind = "extreme" }, now, 90)
+  check("verdict refused: legacy entry without kind", ok2, false)
+  check("verdict refused reason: no-kind", why2, "no-kind")
+  check("verdict refused: stale", (lfm.verdictUsable({ verdict = v, at = now - 91, kind = "extreme" }, { kind = "extreme" }, now, 90)), false)
+  check("verdict refused: no entry", (lfm.verdictUsable(nil, { kind = "extreme" }, now, 90)), false)
+  check("deferral: first wait not exhausted", lfm.deferralExhausted(now, now, 120), false)
+  check("deferral: one window later not exhausted", lfm.deferralExhausted(now - 60, now, 120), false)
+  check("deferral: exhausted at the bound", lfm.deferralExhausted(now - 120, now, 120), true)
+  check("deferral: no first wait is not exhausted", lfm.deferralExhausted(nil, now, 120), false)
+  check("deferral bound spans at least two grace windows",
+    lfm.cfg.maxDeferSec >= 2 * core.cfg.cool.autoKillGraceSec, true)
+end
+
+-- ---- glue pins: the live path must use the predicates above ----
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  check("glue: consumeVerdict uses verdictUsable",
+    src:find("if not lfm.verdictUsable(e, offender,", 1, true) ~= nil, true)
+  check("glue: dispatch freshness uses verdictUsable",
+    src:find("local fresh = lfm.verdictUsable(cached, lastOffender,", 1, true) ~= nil, true)
+  check("glue: wait deferral is time-bound",
+    src:find("lfm.deferralExhausted(w.firstAt, nowS, lfm.cfg.maxDeferSec)", 1, true) ~= nil, true)
+  check("glue: no wait counter bound remains", src:find("streak >= 3", 1, true), nil)
+  check("glue: cache entries record the dispatch kind",
+    src:find("kind = offender.kind, snapshot = user,", 1, true) ~= nil, true)
+  check("glue: names redacted on both paths",
+    src:find("lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })", 1, true) ~= nil, true)
+  check("glue: no remote-only redaction remains", src:find("redactNames = remote and", 1, true), nil)
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

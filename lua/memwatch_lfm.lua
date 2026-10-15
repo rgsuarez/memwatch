@@ -41,6 +41,10 @@ M.cfg = {
   minConfFreeze = 0.50,
   promptVariant = "taxonomy",  -- bake-off winner over baseline/fewshot
   verdictFreshSec = 90,     -- cached verdict age a decision point may consume
+  -- Wait-deferral bound in SECONDS from the first model wait at grace expiry
+  -- (see deferralExhausted). 120 s = two further grace windows at the 60 s
+  -- default, the same reach the old three-wait count had at that cadence.
+  maxDeferSec = 120,
   maxServerMB = 2048,       -- self-police circuit: server above this is killed
   spawnMinAvailPct = 10,    -- spawn floor: no server spawn below this
   -- Remote adjudicator (an OpenAI-compatible cloud endpoint). When
@@ -734,6 +738,44 @@ function M.applyVerdict(verdict, ceiling, actionAllowed, opts)
   end
 
   return action, rails
+end
+
+------------------------------------------------------------------------------
+-- Decision-point predicates (pure; the glue consumes them at grace expiry).
+------------------------------------------------------------------------------
+
+-- A cached verdict may drive a decision only while it is fresh AND was
+-- computed for the detector kind the decision sees now. The cache is filled
+-- ahead of the decision point and the detector can promote an offender in
+-- between: a verdict the model gave on a kind=hog snapshot ("prefer wait for
+-- a bystander") must never be consumed after the gate has seen kind=extreme.
+-- A ledger audit (2026-10-14) found that every acting-path wait during the
+-- remote model's tenure was exactly this race. An entry with no recorded
+-- kind (written before this rule) is unusable. The caller re-validates the
+-- process identity (pid plus start time) separately.
+-- Returns usable (boolean), reason.
+function M.verdictUsable(entry, offender, now, freshSec)
+  if type(entry) ~= "table" or type(entry.verdict) ~= "table" then return false, "no-verdict" end
+  if type(offender) ~= "table" then return false, "no-offender" end
+  if type(entry.at) ~= "number" or type(now) ~= "number"
+     or (now - entry.at) > (freshSec or M.cfg.verdictFreshSec) then
+    return false, "stale"
+  end
+  if entry.kind == nil then return false, "no-kind" end
+  if entry.kind ~= offender.kind then return false, "kind-changed" end
+  return true, "usable"
+end
+
+-- The wait-deferral bound, in SECONDS since the first model wait at grace
+-- expiry. A model wait defers the deterministic policy (protecting a
+-- false-positive extreme such as a build burst), but must never capture the
+-- decision indefinitely while a true runaway grinds the machine down. The
+-- old bound counted waits; with verdicts cached for 90 s against a 60 s
+-- grace cadence, one cached wait could count twice and stretch the bound to
+-- about 240 s. Elapsed time cannot double-count.
+function M.deferralExhausted(firstWaitAt, now, maxDeferSec)
+  if type(firstWaitAt) ~= "number" or type(now) ~= "number" then return false end
+  return (now - firstWaitAt) >= (maxDeferSec or M.cfg.maxDeferSec)
 end
 
 ------------------------------------------------------------------------------

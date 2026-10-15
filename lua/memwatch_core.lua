@@ -387,24 +387,63 @@ function M.topStreamStale(alive, lastPublishAt, startedAt, lastRespawnAt, now, s
   return true
 end
 
+-- Parse one `ps -p <pids>,<self> -o pid=,uid=,state=,lstart=,comm=` reply.
+-- memwatch's own pid is always in the list as a positive control: without
+-- its row the probe did not run (a fork failed under pressure, or the reply
+-- is cut short), so nothing in the reply may be read as a process being
+-- gone. Returns pid -> { pid, uid, state, lstart, comm }, or nil (unknown).
+function M.parseProbeRows(out, selfPid)
+  if type(out) ~= "string" then return nil end
+  local rows = {}
+  for line in out:gmatch("[^\n]+") do
+    local pid, uid, state, lstart, comm = line:match(
+      "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
+    if pid then
+      pid = tonumber(pid)
+      rows[pid] = { pid = pid, uid = tonumber(uid), state = state, lstart = lstart, comm = comm }
+    end
+  end
+  if selfPid == nil or rows[selfPid] == nil then return nil end
+  return rows
+end
+
+-- One pid's probe result: "present", proc | "absent" | "unknown". Absent
+-- needs the control row; a probe that did not run is never an exit.
+function M.probeResult(rows, pid)
+  if rows == nil then return "unknown" end
+  local p = rows[pid]
+  if p then return "present", p end
+  return "absent"
+end
+
+-- A probed process is stopped (SIGSTOP): its state starts with T.
+function M.isStopped(proc)
+  return proc ~= nil and type(proc.state) == "string" and proc.state:sub(1, 1) == "T"
+end
+
 -- Frozen-ledger liveness decision (pure): given the persisted frozen map
--- ([pid] = entry carrying lstart) and probe(pid) -> { lstart, state } | nil,
--- partition into entries still identity-valid AND stopped versus dead wood,
+-- ([pid] = entry carrying lstart) and probe(pid) -> "present", { lstart,
+-- state } | "absent" | "unknown", partition into entries still
+-- identity-valid AND stopped versus dead wood,
 -- with a named reason per drop. The startup reconcile validates at load;
 -- this is the same decision for the calm-state sweep, because a frozen
 -- process that exits BETWEEN reloads must not haunt the ledger (2026-07-09
 -- field finding: a dead VM pid held frozenCount=1 for two days).
+-- Unknown keeps the entry: a probe that could not run proves nothing, and
+-- dropping a live entry would strand a stopped process with no way back.
 function M.pruneFrozen(entries, probe)
   local kept, dropped = {}, {}
   for pid, e in pairs(entries or {}) do
-    local p = probe(pid)
+    local st, p = probe(pid)
     local why = nil
-    if not p then
+    if st == "absent" then
       why = "exited"
-    elseif e.lstart and p.lstart and e.lstart ~= p.lstart then
-      why = "pid-recycled"
-    elseif p.state ~= "T" then
-      why = "resumed-externally"
+    elseif st == "present" then
+      if e.lstart and p.lstart and e.lstart ~= p.lstart then
+        why = "pid-recycled"
+      elseif not M.isStopped(p) then
+        why = "resumed-externally"
+      end
     end
     if why then
       dropped[#dropped + 1] = { entry = e, why = why }

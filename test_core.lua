@@ -812,33 +812,68 @@ local function earlyRefs(path)
   return bad
 end
 
+-- ---- tri-state process probe: a failed probe is never an exit ----
+-- memwatch's own pid rides in every probe as the positive control, so a
+-- missing row means "gone" only when the control row came back.
+do
+  local SELF = 777
+  local out = table.concat({
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon",
+    " 4242   501 T    Mon Oct  5 10:00:01 2026 /usr/local/bin/node",
+    " 5151   501 R+   Tue Oct 13 11:22:33 2026 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)",
+  }, "\n") .. "\n"
+  local rows = core.parseProbeRows(out, SELF)
+  check("probe: the reply parses", rows ~= nil, true)
+  local st, p = core.probeResult(rows, 4242)
+  check("probe: a listed pid is present", st, "present")
+  check("probe: its start time is kept", p and p.lstart, "Mon Oct  5 10:00:01 2026")
+  check("probe: its state is kept", p and p.state, "T")
+  check("probe: a T state is stopped", core.isStopped(p), true)
+  local _, chrome = core.probeResult(rows, 5151)
+  check("probe: a comm with spaces is kept whole", chrome and chrome.comm,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)")
+  check("probe: R+ is not stopped", core.isStopped(chrome), false)
+  check("probe: a missing pid with the control row present is absent", (core.probeResult(rows, 9999)), "absent")
+  check("probe: an empty reply is unknown, not absent",
+    (core.probeResult(core.parseProbeRows("", SELF), 4242)), "unknown")
+  check("probe: a reply without the control row is unknown",
+    (core.probeResult(core.parseProbeRows(" 4242   501 S    Mon Oct  5 10:00:01 2026 /usr/local/bin/node\n", SELF), 4242)),
+    "unknown")
+  check("probe: a nil reply (the fork raised) is unknown", (core.probeResult(core.parseProbeRows(nil, SELF), 4242)), "unknown")
+  check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
+end
+
 -- ---- frozen-ledger prune (calm-state liveness sweep, 2026-07-09 field fix) ----
 -- Three-case floor: exited / identity-changed / healthy-kept, plus the
--- resumed-externally drop and the empty no-op.
+-- resumed-externally drop, the unknown keep and the empty no-op.
 do
   local entries = {
     [100] = { pid = 100, name = "vm-host", lstart = "Tue Jul  7 07:24:43 2026" },
     [200] = { pid = 200, name = "leaky",   lstart = "Wed Jul  8 10:00:00 2026" },
     [300] = { pid = 300, name = "runner",  lstart = "Wed Jul  8 11:00:00 2026" },
     [400] = { pid = 400, name = "steady",  lstart = "Wed Jul  8 12:00:00 2026" },
+    [500] = { pid = 500, name = "held",    lstart = "Wed Jul  8 13:00:00 2026" },
   }
   local probes = {
-    -- [100] absent: exited
-    [200] = { lstart = "Thu Jul  9 09:00:00 2026", state = "T" }, -- pid recycled
-    [300] = { lstart = "Wed Jul  8 11:00:00 2026", state = "R" }, -- resumed externally
-    [400] = { lstart = "Wed Jul  8 12:00:00 2026", state = "T" }, -- still frozen
+    [100] = { "absent" },                                                        -- exited
+    [200] = { "present", { lstart = "Thu Jul  9 09:00:00 2026", state = "T" } },  -- pid recycled
+    [300] = { "present", { lstart = "Wed Jul  8 11:00:00 2026", state = "R" } },  -- resumed externally
+    [400] = { "present", { lstart = "Wed Jul  8 12:00:00 2026", state = "T" } },  -- still frozen
+    [500] = { "unknown" },                                                       -- probe could not run
   }
-  local kept, dropped = core.pruneFrozen(entries, function(pid) return probes[pid] end)
+  local kept, dropped = core.pruneFrozen(entries, function(pid) return table.unpack(probes[pid]) end)
   check("prune: exited dropped",       kept[100], nil)
   check("prune: recycled dropped",     kept[200], nil)
   check("prune: resumed dropped",      kept[300], nil)
   check("prune: live frozen kept",     kept[400] ~= nil, true)
+  check("prune: an unknown probe keeps the entry", kept[500] ~= nil, true)
   local whys = {}
   for _, d in ipairs(dropped) do whys[d.entry.pid] = d.why end
   check("prune: exited reason",        whys[100], "exited")
   check("prune: recycled reason",      whys[200], "pid-recycled")
   check("prune: resumed reason",       whys[300], "resumed-externally")
-  local k2, d2 = core.pruneFrozen({}, function() return nil end)
+  check("prune: nothing dropped for the unknown one", whys[500], nil)
+  local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
 end
 

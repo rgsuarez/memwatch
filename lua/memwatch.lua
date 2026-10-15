@@ -587,7 +587,8 @@ end
 -- After an action's narrative ends: the process is gone, or memwatch holds it
 -- frozen -> handled; it survived the action -> snoozed, back after the
 -- cooldown; the pid turned out to hold another process -> neither, so the
--- next tick surfaces whoever holds it now as a new alert.
+-- next tick surfaces whoever holds it now as a new alert. A probe that
+-- cannot run proves nothing: the alert stands as it was, still retryable.
 local function settleAction(target, refused)
   if refused then
     hudStalePid = target.pid
@@ -595,7 +596,11 @@ local function settleAction(target, refused)
     M.hideHud()
     return
   end
-  local still = resolveSignalTarget(target.pid, target.name, target.lstart)
+  local still, why = resolveSignalTarget(target.pid, target.name, target.lstart)
+  if why == "unverified" then
+    hudHold = false
+    return
+  end
   if (not still) or frozen[target.pid] then
     dismissHud("handled", target)
   else
@@ -821,15 +826,18 @@ local function buildMenu()
       and hudOffender.name == off.name) and hudOffender.lstart or nil)
     items[#items + 1] = { title = label, disabled = off.synthetic == true or nil,
       fn = function()
-        local lst = bound
+        local lst, why = bound, nil
         if not lst then
-          local p = resolveSignalTarget(off.pid, off.name, nil)
+          local p
+          p, why = resolveSignalTarget(off.pid, off.name, nil)
           lst = p and p.lstart or nil
         end
         if not lst then
           -- (hs.alert directly: alertUpdate is declared further down the file)
-          hs.alert.show(string.format("memwatch: can't verify %s (pid %d); nothing signaled",
-            off.name, off.pid), 2.5)
+          local msg = (why == "exited") and string.format("%s (pid %d) has exited; nothing signaled",
+              off.name, off.pid)
+            or string.format("can't verify %s (pid %d); nothing signaled", off.name, off.pid)
+          hs.alert.show("memwatch: " .. msg, 2.5)
           return
         end
         M.killPid(off.pid, off.name, nil, { expectedLstart = lst })
@@ -1291,34 +1299,48 @@ local ownUid  = tonumber(sh("/usr/bin/id -u")) or -1
 local selfPid = hs.processInfo.processID
 protectedPids[selfPid] = true
 
--- Look up a live process; returns { pid, uid, comm, lstart } or nil if gone.
--- lstart (process start time) is the identity component a recycled pid
--- cannot fake; the frozen ledger persists it across reloads. Forward-declared
--- at the top: the HUD raise and the unattended path (both earlier in the
--- file) capture identity through it.
+-- Probe one or more pids in a single ps fork, with memwatch's own pid as the
+-- positive control (core.parseProbeRows): nil means the probe is unknown,
+-- never that the processes are gone. Under memory pressure a fork can fail
+-- or hs.execute can raise, and both read as unknown.
+local function probeRows(pids)
+  local list = {}
+  for _, p in ipairs(pids) do list[#list + 1] = string.format("%d", p) end
+  list[#list + 1] = string.format("%d", selfPid)
+  local ok, out = pcall(hs.execute, string.format(
+    "/bin/ps -p %s -o pid=,uid=,state=,lstart=,comm= 2>/dev/null", table.concat(list, ",")))
+  if not ok then return nil end
+  return core.parseProbeRows(out, selfPid)
+end
+
+-- One pid: "present", { pid, uid, state, lstart, comm } | "absent" | "unknown".
+local function probe(pid)
+  return core.probeResult(probeRows({ pid }), pid)
+end
+
+-- A live process, or nil when it is gone OR the probe could not tell
+-- (callers that fail closed). lstart (process start time) is the identity
+-- component a recycled pid cannot fake; the frozen ledger persists it
+-- across reloads. Forward-declared at the top: the HUD raise and the
+-- unattended path (both earlier in the file) capture identity through it.
 probePid = function(pid)
-  local out = sh(string.format("/bin/ps -p %d -o uid=,lstart=,comm= 2>/dev/null", pid))
-  local uid, lstart, comm = out:match("^%s*(%d+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
-  if not uid then return nil end
-  return { pid = pid, uid = tonumber(uid), comm = comm, lstart = lstart }
-end
-
-local function pidAlive(pid)
-  return sh(string.format("/bin/ps -p %d -o pid= 2>/dev/null", pid)):match("%d") ~= nil
-end
-
-local function pidState(pid)
-  return (sh(string.format("/bin/ps -p %d -o state= 2>/dev/null", pid)):match("%a") or "")
+  local st, proc = probe(pid)
+  if st == "present" then return proc end
+  return nil
 end
 
 -- The single identity gate every signal path goes through (kill, freeze,
 -- resume, and the frozen-ledger reconcile), so probe discipline never
 -- drifts between them. Names sourced from the top stream are truncated at
 -- ~16 chars, so a long expected name may be a prefix of the live one; short
--- names must match exactly. Returns proc (with .liveName) or nil, reason.
+-- names must match exactly. Returns proc (with .liveName and .state) or nil
+-- plus why: "exited" (verified gone), "pid-reused:<why>" (the pid holds
+-- another process), or "unverified" (the probe could not run: never read
+-- as an exit, and never as a reason to signal).
 resolveSignalTarget = function(pid, expectedName, expectedLstart)
-  local proc = probePid(pid)
-  if not proc then return nil, "exited" end
+  local st, proc = probe(pid)
+  if st == "unknown" then return nil, "unverified" end
+  if st == "absent" then return nil, "exited" end
   local liveName = procs.friendlyName(proc.comm)
   local nameMatches = (liveName == expectedName)
     or (expectedName ~= nil and #expectedName >= 15
@@ -1373,7 +1395,9 @@ end
 
 -- Re-probe every persisted entry: identity-confirmed and still stopped stays
 -- managed; anything exited, recycled, or externally resumed is dropped with
--- a log line, never managed. A one-time notification surfaces survivors.
+-- a log line, never managed. An entry the probe cannot verify is kept (a
+-- dropped entry for a still-stopped process would strand it with no Resume)
+-- and re-checked by the sweep. A one-time notification surfaces survivors.
 local function frozenReconcile()
   local list = loadFrozen()
   frozen = {}
@@ -1381,9 +1405,13 @@ local function frozenReconcile()
   for _, e in ipairs(list) do
     if type(e) == "table" and type(e.pid) == "number" then
       local proc, why = resolveSignalTarget(e.pid, e.name, e.lstart)
-      if not proc then
+      if why == "unverified" then
+        M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):unverified", e.name or "?", e.pid))
+        frozen[e.pid] = e
+        survivors[#survivors + 1] = e.name
+      elseif not proc then
         M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):%s", e.name or "?", e.pid, why))
-      elseif pidState(e.pid) ~= "T" then
+      elseif not core.isStopped(proc) then
         M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):resumed-externally", e.name or "?", e.pid))
       else
         frozen[e.pid] = e
@@ -1416,10 +1444,12 @@ frozenSweep = function(now)
   if not next(frozen) then return end
   if (now - lastFrozenSweepAt) < core.cfg.cool.frozenSweepSec then return end
   lastFrozenSweepAt = now
+  -- One fork for every entry; a probe that cannot run keeps them all.
+  local pids = {}
+  for pid in pairs(frozen) do pids[#pids + 1] = pid end
+  local rows = probeRows(pids)
   local kept, dropped = core.pruneFrozen(frozen, function(pid)
-    local b = probePid(pid)
-    if not b then return nil end
-    return { lstart = b.lstart, state = pidState(pid) }
+    return core.probeResult(rows, pid)
   end)
   if #dropped == 0 then return end
   for _, d in ipairs(dropped) do
@@ -1443,6 +1473,12 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     if twhy == "exited" then
       M.logSnapshot(string.format("freeze-skip:%s(%d)-already-exited", expectedName or "?", pid))
       onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+    elseif twhy == "unverified" then
+      -- The probe could not run: nothing is signaled, and nothing is
+      -- concluded about the process. The action can be retried.
+      M.logSnapshot(string.format("freeze-skip:%s(%d)-unverified", expectedName or "?", pid))
+      onUpdate(string.format("can't verify %s right now; nothing was signaled",
+        expectedName or tostring(pid)), true)
     else
       M.logSnapshot(string.format("freeze-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
       if opts.onRefused then pcall(opts.onRefused, twhy) end
@@ -1474,27 +1510,37 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
   afterHeld(0.5, guard("freeze-verify", function()
-    -- Re-probe IDENTITY after the signal, not just the stop state: if the
+    -- Re-probe IDENTITY and state in one fork after the signal: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
     -- would have stopped the WRONG (new) process. If it stopped but its
     -- identity no longer matches, CONTINUE it (undo our SIGSTOP) and drop
-    -- the ledger entry - never strand a bystander stopped.
-    local reprobe = resolveSignalTarget(pid, proc.liveName, proc.lstart)
-    if not reprobe then
+    -- the ledger entry - never strand a bystander stopped. A probe that
+    -- cannot run keeps the entry: the STOP may have landed, and the
+    -- reconcile and the sweep re-check it.
+    local reprobe, rwhy = resolveSignalTarget(pid, proc.liveName, proc.lstart)
+    if rwhy == "unverified" then
+      M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
+      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true)
+    elseif not reprobe then
       sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
       frozen[pid] = nil
       saveFrozen()
-      M.logSnapshot(string.format("freeze-abort:%s(%d)-identity-changed", proc.liveName, pid))
-      onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true)
-    elseif pidState(pid) == "T" then
+      if rwhy == "exited" then
+        M.logSnapshot(string.format("freeze-abort:%s(%d)-exited", proc.liveName, pid))
+        onUpdate(string.format("%s exited during the freeze", proc.liveName), true)
+      else
+        M.logSnapshot(string.format("freeze-abort:%s(%d)-identity-changed", proc.liveName, pid))
+        onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true)
+      end
+    elseif core.isStopped(reprobe) then
       M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
       onUpdate(string.format(
         "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true)
     else
       frozen[pid] = nil
       saveFrozen()
-      M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, pidState(pid)))
-      onUpdate(string.format("%s did not stop (state %s)", proc.liveName, pidState(pid)), true)
+      M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
+      onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true)
     end
   end))
 end
@@ -1509,6 +1555,14 @@ function M.resumePid(pid, onUpdate)
     return
   end
   local proc, twhy = resolveSignalTarget(pid, e.name, e.lstart)
+  if twhy == "unverified" then
+    -- Keep the entry: dropping it while the process may still be stopped
+    -- would strand it with no way to resume it from the menu.
+    M.logSnapshot(string.format("resume-skip:%s(%d):unverified", e.name or "?", pid))
+    onUpdate(string.format("can't verify %s right now; it stays frozen, try again",
+      e.name or tostring(pid)), true)
+    return
+  end
   if not proc then
     frozen[pid] = nil
     saveFrozen()
@@ -1518,7 +1572,16 @@ function M.resumePid(pid, onUpdate)
   end
   sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
   afterHeld(0.5, guard("resume-verify", function()
-    if pidState(pid) ~= "T" then
+    local again, awhy = resolveSignalTarget(pid, e.name, e.lstart)
+    if awhy == "unverified" then
+      M.logSnapshot(string.format("resume-unverified:%s(%d)", e.name, pid))
+      onUpdate(string.format("sent CONT to %s; can't verify it resumed, check the menu again", e.name), true)
+    elseif not again then
+      frozen[pid] = nil
+      saveFrozen()
+      M.logSnapshot(string.format("resume-drop:%s(%d):%s", e.name, pid, awhy))
+      onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name, awhy), true)
+    elseif not core.isStopped(again) then
       frozen[pid] = nil
       saveFrozen()
       M.logSnapshot(string.format("resume-done:%s(%d)", e.name, pid))
@@ -1580,9 +1643,12 @@ writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails,
   local pid = offender.pid
   local availBefore = math.floor(lastMetrics.availPct or 0)
   afterHeld(60, guard("ledger-outcome", function()
+    -- unknown: the probe could not run, which says nothing about the fate.
     local fate
-    if not pidAlive(pid) then fate = "exited"
-    elseif pidState(pid) == "T" then fate = "frozen"
+    local again, why = resolveSignalTarget(pid, offender.name, offender.lstart)
+    if why == "unverified" then fate = "unknown"
+    elseif not again then fate = "exited"
+    elseif core.isStopped(again) then fate = "frozen"
     else fate = "running" end
     local out = lfm.ledgerLine({
       at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
@@ -1784,7 +1850,7 @@ local function retireLfmServer(reason)
       -- still runs.
       local okGone, gone = pcall(function()
         local portReleased = (not port) or portFree(port) or not listenerIsOurs(listenerPid(port))
-        return not pidAlive(pid) and portReleased
+        return probe(pid) == "absent" and portReleased
       end)
       if okGone and gone then return true end
       if hs.timer.secondsSinceEpoch() > deadline then
@@ -2274,6 +2340,12 @@ function M.killPid(pid, expectedName, onUpdate, opts)
     if twhy == "exited" then
       M.logSnapshot(string.format("kill-skip:%s(%d)-already-exited", expectedName or "?", pid))
       onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+    elseif twhy == "unverified" then
+      -- The probe could not run: nothing is signaled and the frozen ledger
+      -- is left as it was. The action can be retried.
+      M.logSnapshot(string.format("kill-skip:%s(%d)-unverified", expectedName or "?", pid))
+      onUpdate(string.format("can't verify %s right now; nothing was signaled",
+        expectedName or tostring(pid)), true)
     else
       -- Identity mismatch: drop any stale ledger entry AND block the action.
       if frozenEntry then frozen[pid] = nil; saveFrozen() end
@@ -2306,32 +2378,37 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- A SIGSTOPped process cannot handle SIGTERM until it is continued, so a
   -- TERM to a frozen target would just pend and force the full escalation
   -- wait before SIGKILL. Continue it first so the graceful signal can land.
-  if frozenEntry or pidState(pid) == "T" then
+  if frozenEntry or core.isStopped(proc) then
     sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
   end
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
   afterHeld(k.escalateSec, guard("kill-escalate", function()
-    if pidAlive(pid) then
-      -- Re-validate FULL identity (name AND the start time bound above)
-      -- before SIGKILL: between TERM and this escalation the original may
-      -- have exited and the pid been reused by another same-name process;
-      -- name alone would not catch that, start time does.
-      local again = resolveSignalTarget(pid, liveName, proc.lstart)
-      if again then
-        M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
-        onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
-        sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
-      else
-        M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
-      end
+    -- Re-validate FULL identity (name AND the start time bound above)
+    -- before SIGKILL: between TERM and this escalation the original may
+    -- have exited and the pid been reused by another same-name process;
+    -- name alone would not catch that, start time does. A probe that
+    -- cannot run sends nothing: KILL never goes to an unverified pid.
+    local again, awhy = resolveSignalTarget(pid, liveName, proc.lstart)
+    if again then
+      M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
+      onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
+      sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
+    elseif awhy == "unverified" then
+      M.logSnapshot(string.format("kill-escalate-skip:%s(%d)-unverified", liveName, pid))
+    elseif awhy ~= "exited" then
+      M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
     end
     afterHeld(k.verifySec + k.settleSec, guard("kill-verify", function()
-      local gone = not pidAlive(pid)
+      local still, vwhy = resolveSignalTarget(pid, liveName, proc.lstart)
       local m = readMetrics()
       local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
-      if gone then
+      if vwhy == "unverified" then
+        M.logSnapshot(string.format("kill-unverified:%s(%d)", liveName, pid))
+        onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true)
+      elseif not still then
+        -- Gone, or the pid now holds another process: the original exited.
         if frozen[pid] then frozen[pid] = nil; saveFrozen() end
         local footTxt = footBeforeGB and string.format("-footprint=%.1fGB", footBeforeGB) or ""
         M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB%s", liveName, pid, reclaimedGB, footTxt))

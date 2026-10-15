@@ -406,6 +406,131 @@ scenario("menu offender quit binds or refuses", nil, function(W)
   check("menu: once it can bind, it acts on that identity", W.signalsTo(4242), "TERM")
 end)
 
+-- ---- probes: a probe that cannot run is never read as an exit ----
+-- (round-3 P1) An already-bound offender, then ps stops answering: the
+-- click must not send anything, and must not record the process as
+-- answered, so it acts once the probes come back.
+scenario("a failed probe at the click is not an exit", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)                          -- bound at the raise
+  W.probeFails = true
+  W.click("freeze")
+  W.run(8)
+  check("probe-fail: Freeze sends nothing it cannot verify", W.signalsTo(4242), "")
+  check("probe-fail: the alert stands, still up", W.hudShowing(), true)
+  W.click("kill")
+  W.run(30)
+  check("probe-fail: Force Quit sends nothing either", W.signalsTo(4242), "")
+  check("probe-fail: the alert is still up", W.hudShowing(), true)
+  W.probeFails = false
+  W.run(5)
+  W.click("freeze")
+  W.run(3)
+  check("probe-fail: once probes answer, the same alert acts", W.signalsTo(4242), "STOP")
+end)
+
+scenario("a raising fork is not an exit", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.forkRaises = true
+  W.click("freeze")
+  W.run(8)
+  W.forkRaises = false
+  check("fork-raise: nothing was signaled", W.signalsTo(4242), "")
+  check("fork-raise: the alert stands", W.hudShowing(), true)
+  W.click("freeze")
+  W.run(3)
+  check("fork-raise: the retry acts", W.signalsTo(4242), "STOP")
+end)
+
+scenario("unattended survives a failed probe", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)                          -- bound
+  W.probeFails = true
+  W.run(80)                         -- grace expires while ps cannot answer
+  check("unattended-probe: nothing is signaled unverified", W.signalsTo(4242), "")
+  W.probeFails = false
+  check("unattended-probe: it acts once the probe answers",
+    runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+end)
+
+-- ---- probes: a TERM sent, then the verify cannot run ----
+scenario("kill escalation never signals an unverified pid", nil, function(W)
+  W.addProc(4242, "stubborn", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "stubborn") end)
+  W.run(5)
+  W.click("kill")
+  W.run(0.5)
+  check("escalate: TERM went out", W.signalsTo(4242), "TERM")
+  W.probeFails = true
+  W.run(20)
+  check("escalate: no KILL to a pid it cannot verify", W.signalsTo(4242), "TERM")
+  W.probeFails = false
+  W.run(5)
+  W.click("kill")
+  W.run(20)
+  check("escalate: with probes back, the retry escalates", W.signalsTo(4242), "TERM,TERM,KILL")
+end)
+
+-- ---- frozen ledger: a probe that cannot run never strands a frozen process ----
+scenario("resume keeps the entry when it cannot verify", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(5)
+  check("strand: frozen", W.procs[4242].state, "T")
+  W.probeFails = true
+  local row = W.menuItem("   leaker")
+  local resume = row and row.menu and row.menu[1]
+  check("strand: the frozen row offers Resume", resume ~= nil and resume.title:find("Resume", 1, true) ~= nil, true)
+  if resume then resume.fn() end
+  W.run(3)
+  check("strand: Resume sends nothing it cannot verify", W.signalsTo(4242), "STOP")
+  check("strand: the process is still listed as frozen", W.menuItem("   leaker") ~= nil, true)
+  W.probeFails = false
+  row = W.menuItem("   leaker")
+  resume = row and row.menu and row.menu[1]
+  if resume then resume.fn() end
+  W.run(3)
+  check("strand: once probes answer, Resume continues it", W.signalsTo(4242), "STOP,CONT")
+  check("strand: and it is running again", W.procs[4242].state, "S")
+end)
+
+scenario("a reload keeps a frozen process it cannot verify", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(5)
+  W.reloadState()
+  W.probeFails = true
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+  check("reload: the unverifiable entry stays in the menu", W.menuItem("   leaker") ~= nil, true)
+  W.probeFails = false
+  W.kern = 1
+  W.availPct = 45
+  W.run(130)                        -- calm: the sweep re-checks it
+  check("reload: the sweep keeps it once verified frozen", W.menuItem("   leaker") ~= nil, true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

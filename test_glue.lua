@@ -1904,6 +1904,17 @@ scenario("ledger: a menu Ignore is a touch on the process", nil, function(W)
   check("menu touch: and as a touch on this process", fu[1] and fu[1].operatorTouchesSince, 1)
 end)
 
+-- An Ignore from the HUD marks the operator's answer through the ignore
+-- itself, as every surface's does: one touch, never two.
+scenario("ledger: a HUD Ignore is one touch on the process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("hud touch: decision row", false, true); return end
+  W.click("ignore")
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("hud touch: one touch on this process", fu[1] and fu[1].operatorTouchesSince, 1)
+end)
+
 -- (round 3) A ledger that cannot be written is counted and logged, not
 -- reported as written.
 scenario("ledger: a write that fails is counted and logged", nil, function(W, mw)
@@ -3211,6 +3222,12 @@ do
     { how = "the menu's Ignore", act = function(W)
         local it = W.menuItem("Ignore node")
         if it then it.fn() end
+      end, want = "TERM", state = "S" },
+    { how = "the process row's Ignore", act = function(W)
+        local row = W.menuItem("node ")
+        for _, it in ipairs(row and row.menu or {}) do
+          if it.title == "Ignore for 30 min" and it.fn then it.fn() end
+        end
       end, want = "TERM", state = "S" },
   }) do
     scenario(case.how .. " supersedes memwatch's own kill in flight", UNATTENDED_KILL, function(W)

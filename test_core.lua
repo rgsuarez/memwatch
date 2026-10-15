@@ -1443,6 +1443,12 @@ do
   check("lfm glue: a later probe that cannot answer keeps the recorded start time",
     body("local function recordLfmServer(pid)"):find(
       "lstart = probed and probed.lstart or (prev and prev.lstart) or nil", 1, true) ~= nil, true)
+  local rls = body("local function recordLfmServer(pid)")
+  check("lfm glue: only the start time carries over a failed probe, never the name",
+    rls:find("name = probed and procs.friendlyName(probed.comm) or nil", 1, true) ~= nil
+      and rls:find("prev and prev.name", 1, true) == nil, true)
+  check("lfm glue: no pidfile is written without a start time",
+    rls:find("local rec = lfmServerIdent.lstart and lfm.jsonEncode(", 1, true) ~= nil, true)
   check("lfm glue: the orphan sweep requires the recorded start time",
     start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
       and forbids("function M.start()", "not rec.lstart or",
@@ -2298,8 +2304,8 @@ do
   -- Recorded only once the signal went out: a TERM send that failed returns
   -- before the record, and a STOP is recorded only when it was sent.
   check("signals glue: a terminate is recorded after a TERM that went out, after the gates",
-    recordedAtSend(killBody, 'nothing was signaled", liveName), true, "unverified")\n'
-      .. '    end\n    return\n  end\n  -- The TERM is the signal of record: a KILL escalation below carries out\n'
+    recordedAtSend(killBody, 'weightMB = frozenEntry and frozenEntry.weightMB or 0 })\n'
+      .. '    return\n  end\n  -- The TERM is the signal of record: a KILL escalation below carries out\n'
       .. '  -- the same decision.',
       'obs.noteSignal(pid, "terminate", proc)'), true)
   check("signals glue: a freeze is recorded only when its STOP was sent, after the gates",
@@ -2316,10 +2322,11 @@ do
   check("observe glue: the tick's log call is error-bounded",
     src:find("local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state)", 1, true) ~= nil, true)
   local _, recordSites = src:gsub('noteSignal%(pid, "', "")
-  check("signals glue: the five signal sites record (freeze, re-freeze, continue, terminate, resume)",
-    recordSites, 5)
+  -- (A quit whose TERM cannot be sent re-freezes through M.freezePid, so
+  -- that STOP is recorded at the freeze site.)
+  check("signals glue: the four signal sites record (freeze, continue, terminate, resume)",
+    recordSites, 4)
   for _, site in ipairs({ 'if contSent then obs.noteSignal(pid, "continue", proc) end',
-                          'if contSent and send("STOP", pid) then\n      obs.noteSignal(pid, "freeze", proc)',
                           'obs.noteSignal(pid, "resume", proc)' }) do
     check("signals glue: recorded after a successful send: " .. site:sub(1, 48),
       src:find(site, 1, true) ~= nil, true)

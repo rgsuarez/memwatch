@@ -178,6 +178,15 @@ function F.new()
       if W.vanishAfterProbe and W.procs[W.vanishAfterProbe] then
         W.procs[W.vanishAfterProbe], W.vanishAfterProbe = nil, nil
       end
+      -- reuseAfterProbe: that process exits right after this probe saw it,
+      -- and a same-name process takes the pid, so the signal that follows
+      -- reaches the newcomer (one shot).
+      local ra = W.reuseAfterProbe
+      if ra and W.procs[ra] then
+        W.reuseAfterProbe = nil
+        local old = W.procs[ra]
+        W.reusePid(ra, (old.comm:match("([^/]+)$") or "proc"), old.rssKB / 1024)
+      end
       return table.concat(rows, "\n") .. "\n"
     end
     if cmd:find("^/bin/ps %-o ppid= %-p %d+") then return "1\n" end
@@ -399,7 +408,13 @@ function F.new()
     screen = { mainScreen = function()
       return { fullFrame = function() return { x = 0, y = 0, w = 1440, h = 900 } end }
     end },
-    application = { launchOrFocus = function() end, frontmostApplication = function() return nil end },
+    -- frontmost: { name, pid } of the frontmost app (nil: undeterminable,
+    -- which the unattended policy treats as foreground).
+    application = { launchOrFocus = function() end, frontmostApplication = function()
+      local f = W.frontmost
+      if not f then return nil end
+      return { name = function() return f.name end, pid = function() return f.pid end }
+    end },
     alert = { show = function(text) W.alerts[#W.alerts + 1] = { t = W.now, text = text } end },
     -- Every POST is recorded; with httpReply(url, body) -> status, body set,
     -- it is answered after httpDelay (default 0.2 s).

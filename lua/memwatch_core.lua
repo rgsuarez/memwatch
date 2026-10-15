@@ -504,6 +504,26 @@ function M.sameRecord(rec, cand)
   return rec.lstart == cand.lstart
 end
 
+-- Exact identity, for routing an action's outcome to a surface ("is this
+-- the very process the action was on?"): pid, name, and both start times
+-- bound and equal. A missing start time never matches here: an outcome
+-- must not answer a surface that might name another process.
+function M.sameIdentity(a, b)
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  if a.pid ~= b.pid or not M.sameName(a.name, b.name) then return false end
+  return a.lstart ~= nil and a.lstart == b.lstart
+end
+
+-- A per-process record (a grace clock, an interaction mark) describes this
+-- process only when it was made for it: the same name, and the same start
+-- time, bound or not. A record made while unbound never transfers to the
+-- process once it binds (the pid may hold a newcomer by then), and one
+-- made for a bound process never serves an unbound reading of the pid.
+function M.recordDescribes(rec, off)
+  if type(rec) ~= "table" or type(off) ~= "table" then return false end
+  return M.sameName(rec.name, off.name) and rec.lstart == off.lstart
+end
+
 -- Severity of an offender kind, for escalation: a process that moves up
 -- this ladder is new information even if it is the same process.
 local KIND_RANK = { hog = 1, absolute = 2, sustained = 3, extreme = 4 }
@@ -600,8 +620,10 @@ end
 -- What an action's outcome means for the alert that asked for it (the
 -- signal engines report the outcome; nothing is re-probed after the fact):
 --   done    frozen, terminated, or verified gone before any signal
---   rebind  the pid holds another process: forget the binding, and treat
---           whoever holds the pid now as a new question
+--   rebind  the pid holds another process (stale: refused before any
+--           signal; replaced: the target was terminated and another
+--           process holds the pid): forget the binding, and treat whoever
+--           holds the pid now as a new question
 --   snooze  refused by policy, or signaled but survived: ask again later
 --   stand   unverified (or unknown): nothing is concluded, and the alert
 --           stays as it was, visible and retryable
@@ -609,7 +631,7 @@ end
 --   stands; unlike unverified, something may have changed, so it is
 --   announced)
 local ANSWER = { frozen = "done", terminated = "done", exited = "done",
-                 stale = "rebind", refused = "snooze", failed = "snooze" }
+                 stale = "rebind", replaced = "rebind", refused = "snooze", failed = "snooze" }
 function M.answerFor(outcome) return ANSWER[outcome] or "stand" end
 
 -- Should the HUD raise now? Never while the episode's alert is already up

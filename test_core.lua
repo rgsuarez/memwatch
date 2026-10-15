@@ -370,6 +370,11 @@ do
   -- A held process whose pages compress: each drop is caught up by one rise.
   local trHeld = series({ 9000, 9000, 8000, 8300, 7500, 7800, 7000, 7300 })
   check("risingSince: a compressing held process never makes a run", procs.risingSince(trHeld, 60, 0) < 3, true)
+  -- (round 5) A held process whose figure catches up on alternate samples:
+  -- rise, flat, rise, flat, rise is no run (growth()'s one-flat grace does
+  -- not apply here).
+  local trAlt = series({ 9000, 9100, 9100, 9200, 9200, 9300 })
+  check("risingSince: alternate catch-ups are not a run", procs.risingSince(trAlt, 60, 0), 1)
   check("risingSince: no samples after the mark", procs.risingSince(trNew, 60, 999), 0)
   check("risingSince: an untracked pid", procs.risingSince(trNew, 61, 0), 0)
 end
@@ -951,6 +956,31 @@ do
     core.identityHolds({ pid = 4100, lstart = "L" }, "present", "L", "anything"), true)
 end
 
+-- ---- identity: exact identity, and records that never transfer ----
+do
+  local A  = { pid = 7, name = "node", lstart = "L1" }
+  local A2 = { pid = 7, name = "node", lstart = "L1" }
+  local B  = { pid = 7, name = "node", lstart = "L2" }
+  local U  = { pid = 7, name = "node" }
+  check("exact: the same bound process", core.sameIdentity(A, A2), true)
+  check("exact: another start time on the pid is not it", core.sameIdentity(A, B), false)
+  check("exact: an unbound side never matches", core.sameIdentity(A, U), false)
+  check("exact: two unbound readings do not match either", core.sameIdentity(U, { pid = 7, name = "node" }), false)
+  check("exact: a truncated name of the same bound process matches",
+    core.sameIdentity({ pid = 7, name = "Google Chrome He", lstart = "L1" },
+                      { pid = 7, name = "Google Chrome Helper (Renderer)", lstart = "L1" }), true)
+  check("exact: nil is never a match", core.sameIdentity(nil, A), false)
+  check("record: made for this bound process", core.recordDescribes({ name = "node", lstart = "L1" }, A), true)
+  check("record: made while unbound does not transfer once it binds",
+    core.recordDescribes({ name = "node" }, A), false)
+  check("record: made for a bound process does not serve an unbound reading",
+    core.recordDescribes({ name = "node", lstart = "L1" }, U), false)
+  check("record: made while unbound serves the unbound reading", core.recordDescribes({ name = "node" }, U), true)
+  check("record: another process's record does not", core.recordDescribes({ name = "node", lstart = "L1" }, B), false)
+  check("record: two names sharing 15 characters are different processes",
+    core.recordDescribes({ name = "Chrome Helper (GPU)" }, { pid = 7, name = "Chrome Helper (Renderer)" }), false)
+end
+
 -- ---- identity: continuity versus memory ----
 do
   local full = "Google Chrome Helper (Renderer)"
@@ -1338,6 +1368,19 @@ do
   check("banner glue: no unbound kill remains",
     forbids("local function notifyCrit(m)", "M.killPid(off.pid, off.name)\n",
       "local function notifyCrit(m)\n  critNotif = hs.notify.new(function()\n    M.killPid(off.pid, off.name)\n  end)\nend\n"), true)
+  -- (round 5) An outcome from the menu or a banner answers only a HUD bound
+  -- to its very process; a refusal with no start time withdraws only an
+  -- unbound banner.
+  local SURF = "local function surfaceUpdate(target)"
+  check("surface glue: an outcome answers only a HUD bound to its very process",
+    body(SURF):find("core.sameIdentity(hudOffender, target)", 1, true) ~= nil
+      and forbids(SURF, "core.sameOffender(hudOffender, target)",
+        SURF .. "\n    if hudOffender and core.sameOffender(hudOffender, target) then end\nend\n"), true)
+  local REFUSED = "local function identityRefused(target)"
+  check("refusal glue: an unbound refusal never withdraws a bound banner",
+    body(REFUSED):find("(critNotifOff.lstart == nil or (target.lstart ~= nil and critNotifOff.lstart == target.lstart))", 1, true) ~= nil
+      and forbids(REFUSED, "target.lstart == nil or critNotifOff.lstart == nil",
+        REFUSED .. "\n     and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then\nend\n"), true)
   local surfaces = body("local function alertSurfaces(state, now)")
   check("hud glue: alertSurfaces located", #surfaces > 400, true)
   check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)
@@ -1385,7 +1428,8 @@ do
   local retire = body("local function retireLfmServer(reason)")
   local RETIRE = "local function retireLfmServer(reason)"
   check("lfm glue: the retire TERM and KILL both check the recorded server identity",
-    retire:find("local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)", 1, true) ~= nil
+    retire:find('local sent = tracked == "ours" and send(sig, pid)', 1, true) ~= nil
+      and retire:find('if owner and not (owner == pid and (sent or tracked == "other")) and listenerIsOurs(owner) then', 1, true) ~= nil
       and retire:find("core.identityHolds(ident, st,", 1, true) ~= nil
       and forbids(RETIRE, 'sig == "TERM" or',
         RETIRE .. '\n    if pid and (sig == "TERM" or trackedIsOurs()) then\nend\n'), true)
@@ -1396,6 +1440,9 @@ do
     forbids(RETIRE, "local ident = probePid(pid)", RETIRE .. "\n  local ident = probePid(pid)\nend\n")
       and src:find("recordLfmServer(owner)", 1, true) ~= nil, true)
   local start = body("function M.start()")
+  check("lfm glue: a later probe that cannot answer keeps the recorded start time",
+    body("local function recordLfmServer(pid)"):find(
+      "lstart = probed and probed.lstart or (prev and prev.lstart) or nil", 1, true) ~= nil, true)
   check("lfm glue: the orphan sweep requires the recorded start time",
     start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
       and forbids("function M.start()", "not rec.lstart or",
@@ -2009,12 +2056,12 @@ do
   local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt, seq)")
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
-    sampleBody:find("complete = lastSample.complete, row = row,", 1, true) ~= nil, true)
+    sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
   check("observe glue: and its start window, bounded by launch and delivery",
     sampleBody:find("start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
-    sampleBody:find("if seq and seq < lastSample.seq then return end", 1, true) ~= nil
-      and sampleBody:find("launchedAt < lastSample.launchedAt", 1, true) == nil, true)
+    sampleBody:find("if seq and seq < sampler.seq then return end", 1, true) ~= nil
+      and sampleBody:find("launchedAt < sampler.launchedAt", 1, true) == nil, true)
   check("observe glue: no point-estimate start compare remains",
     body:find("psStartedAt", 1, true), nil)
   check("observe glue: operator actions counted from the observation through the horizon",
@@ -2130,7 +2177,7 @@ do
   check("sampler glue: callback forwards exit code and launch time",
     src:find("onDone(table.concat(acc), exitCode, launchedAt, seq)", 1, true) ~= nil, true)
   check("sampler glue: completeness comes from the exit code",
-    src:find("lastSample.complete = (exitCode == 0)", 1, true) ~= nil, true)
+    src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time",
     src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt)", 1, true) ~= nil, true)
 end
@@ -2209,9 +2256,9 @@ do
   -- Absent pids are pruned only on a complete table taken after the pid
   -- was last seen alive (the stale-table behavior itself is driven in
   -- test_glue: "a stalled ps table does not prune a top-fed offender").
-  local GUARD = "if not lastSample.complete or not lastSample.launchedAt then return end"
+  local GUARD = "if not sampler.complete or not sampler.launchedAt then return end"
   local SWEEP = "for _, p in ipairs(lastPsList) do alive[p.pid] = true end"
-  local LATER = "return not (e and e.lastSeen and e.lastSeen > lastSample.launchedAt)"
+  local LATER = "return not (e and e.lastSeen and e.lastSeen > sampler.launchedAt)"
   local function prunesOnlyOnProof(text)
     local guard, sweep = text:find(GUARD, 1, true), text:find(SWEEP, 1, true)
     return guard ~= nil and sweep ~= nil and guard < sweep and text:find(LATER, 1, true) ~= nil

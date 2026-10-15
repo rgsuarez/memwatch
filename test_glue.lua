@@ -386,8 +386,67 @@ scenario("unattended needs identity", UNATTENDED_FREEZE, function(W)
   W.run(80)
   check("identity: no unattended signal while identity cannot be bound", W.signalsTo(4242), "")
   W.probeFails = false
+  local recoveredAt = W.now
   check("identity: once it binds, the unattended freeze lands",
-    runUntil(W, 40, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+    runUntil(W, 100, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+  -- (round 5) Grace earned while unbound does not carry over to the bound
+  -- process: the pid could hold a newcomer by then. A full grace from the
+  -- bind (within one bind retry of recovery).
+  check("identity: after a full grace of its own, none carried over from while unbound",
+    W.sigs[#W.sigs] ~= nil and W.sigs[#W.sigs].t - recoveredAt >= 59, true)
+end)
+
+-- (round 5) While probes fail, an unbound runaway accrues grace; it exits
+-- and a same-name process takes its pid. When probes recover and the HUD
+-- binds the newcomer, none of that grace is its.
+scenario("unbound grace does not pass to a newcomer on the pid", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(50)                         -- about 50 s of grace accrues while unbound
+  W.reusePid(4242, "node", 2000)
+  W.grow(4242, 220)
+  W.probeFails = false
+  local recoveredAt = W.now
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  check("unbound-grace: the newcomer is frozen in the end", W.signalsTo(4242), "STOP")
+  check("unbound-grace: only after a full grace of its own",
+    W.sigs[#W.sigs] ~= nil and W.sigs[#W.sigs].t - recoveredAt >= 59, true)
+end)
+
+-- (round 5) An operator answer given while unbound (here, opening
+-- Activity Monitor) does not stand a bound newcomer on the pid down.
+scenario("an unbound answer does not stand a newcomer down", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.click("monitor")
+  W.run(5)
+  W.reusePid(4242, "node", 2000)
+  W.grow(4242, 220)
+  W.probeFails = false
+  check("unbound-answer: the newcomer is acted on once its own grace passes",
+    runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+end)
+
+-- (round 5) Two helpers whose names share their first 15 characters are
+-- different processes: an ignore of one never hides the other on its pid.
+scenario("an ignore names one process, not a name prefix", nil, function(W)
+  W.addProc(4242, "Chrome Helper (GPU)", 2000)
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "Chrome Helper (GPU) (pid") end)
+  W.click("ignore")
+  W.run(3)
+  W.reusePid(4242, "Chrome Helper (Renderer)", 2000)
+  W.grow(4242, 220)
+  check("prefix: the other helper on the pid is alerted",
+    runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "Chrome Helper (Renderer) (pid") end), true)
 end)
 
 -- ---- self-test surfaces never signal a real process ----
@@ -749,8 +808,8 @@ scenario("an unattended action with no result still posts a receipt", '{"unatten
   W.run(50)
   local n = W.notices("memwatch unattended freeze")
   check("no-result: one receipt at the deadline, though alerts are muted", #n, 1)
-  check("no-result: it says the result never came back",
-    n[1] ~= nil and (n[1].attrs.informativeText or ""):find("never came back", 1, true) ~= nil, true)
+  check("no-result: it says the result has not come back",
+    n[1] ~= nil and (n[1].attrs.informativeText or ""):find("has not come back", 1, true) ~= nil, true)
 end)
 
 -- (round 3) A freeze that did not stop the process is a snooze, not a
@@ -1308,6 +1367,159 @@ scenario("the menu offender acts on the banner's binding", nil, function(W)
   item.fn()
   W.run(10)
   check("menu-banner: once rebound, the next click acts", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
+end)
+
+-- (round 5) A kill that refuses (the process exited between the identity
+-- check and the TERM) sent nothing, and nothing is claimed: no
+-- "terminated" for an exit memwatch did not cause.
+scenario("a TERM that kill refuses is not claimed", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+  W.run(5)
+  W.vanishAfterProbe = 4242         -- it exits right after the click's probe
+  W.click("kill")
+  W.run(1)
+  check("refused-send: the narrative says nothing was signaled",
+    W.hudBody():find("nothing was signaled", 1, true) ~= nil, true)
+  W.run(20)                         -- past any escalation and verify
+  check("refused-send: no termination is claimed", logHas(W, "kill-done:leaker(4242)"), false)
+end)
+
+-- ---- actions in flight ----
+-- (round 5) A run loop that stalls past the hold deadline: the deadline
+-- receipt goes out, but the action is still in flight, so no second action
+-- starts on the process, and when the outcome arrives it replaces that
+-- receipt: one live receipt for one action.
+scenario("a late outcome replaces its deadline receipt", '{"unattended":"freeze","alerts":false}', function(W)
+  W.onSignal = function(sig) if sig == "STOP" then W.timerLag = 70 end end
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal, W.timerLag = nil, 0
+  W.run(50)
+  local function live()
+    local out = {}
+    for _, n in ipairs(W.notices("memwatch unattended")) do
+      if not n.withdrawn then out[#out + 1] = n end
+    end
+    return out
+  end
+  check("late: the deadline receipt is up while the outcome is late", #live(), 1)
+  W.run(40)                         -- the verifier finally runs
+  local l = live()
+  check("late: one live receipt in the end", #l, 1)
+  check("late: and it is the real outcome",
+    l[1] ~= nil and (l[1].attrs.informativeText or ""):find("frozen", 1, true) ~= nil, true)
+  check("late: no second action while the first was in flight", W.signalsTo(4242), "STOP")
+end)
+
+-- ---- the frozen ledger: each writer owns only its own entry ----
+-- (round 5) A STOP that could not be sent leaves no ledger entry: nothing
+-- to protect, and a pending one would swallow the retry.
+scenario("a STOP that was never sent leaves no entry", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+  W.run(5)
+  W.killRaises = true               -- the STOP send fails
+  W.click("freeze")
+  W.killRaises, W.probeFails = false, true   -- and its verifier cannot probe
+  W.run(1)
+  W.probeFails = false
+  W.run(5)
+  check("unsent: no ledger entry is left", W.menuItem("   leaker"), nil)
+  W.click("freeze")
+  W.run(2)
+  check("unsent: the retry sends its STOP", W.signalsTo(4242), "STOP")
+end)
+
+-- (round 5) A reload while a freeze is still being verified keeps its
+-- entry: the STOP lands after the reload, and Resume must be there.
+scenario("a reload keeps a freeze still being verified", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+  W.run(5)
+  W.stopDelay = 5                   -- the STOP lands 5 s after it is sent
+  W.click("freeze")
+  W.run(0.2)
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.run(8)
+  check("pending-reload: the process stopped after the reload", W.procs[4242].state, "T")
+  check("pending-reload: and the menu still offers its Resume", W.menuItem("   leaker") ~= nil, true)
+end)
+
+-- (round 5) A resume's verifier, finding the pid taken over, drops only
+-- the resumed process's entry, never a newer freeze of the pid's next
+-- process.
+scenario("a resume never drops a newer process's freeze", nil, function(W, mw)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(6)
+  local row = W.menuItem("   node")
+  local resume = row and row.menu and row.menu[1]
+  check("resume-race: the frozen row offers Resume", resume ~= nil and resume.fn ~= nil, true)
+  resume.fn()                       -- CONT now; its verifier in 0.5 s
+  W.reusePid(4242, "node", 2000)    -- the resumed process exits; a newcomer takes the pid
+  W.run(0.2)
+  mw.freezePid(4242, "node")        -- and is frozen
+  W.run(0.4)                        -- the resume verifier finds the pid taken over
+  W.probeFails = true               -- and the newcomer's freeze verifier cannot probe
+  W.run(0.5)
+  W.probeFails = false
+  check("resume-race: the newcomer is stopped", W.procs[4242].state, "T")
+  check("resume-race: and keeps its ledger entry (Resume offered)", W.menuItem("   node") ~= nil, true)
+end)
+
+-- (round 5) A kill whose target exits while another process takes its
+-- pid is "replaced": the newcomer is a new question, never marked gone.
+scenario("a kill whose pid is taken over rebinds", nil, function(W)
+  W.addProc(4242, "node", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.click("kill")                   -- TERM is ignored; the escalation waits 7 s
+  W.run(2)
+  W.reusePid(4242, "node", 2000)    -- it exits, and a newcomer takes the pid
+  W.grow(4242, 220)
+  W.run(20)
+  check("replaced: the outcome is a rebind, not done", logHas(W, "answered:rebind:node(4242):replaced"), true)
+  check("replaced: no KILL to the newcomer", W.signalsTo(4242), "TERM")
+  check("replaced: the newcomer is alerted at once",
+    runUntil(W, 6, function() return W.hudShowing() and bodyNames(W, "node (pid") end), true)
+end)
+
+-- (round 5) A frozen process continued for a Force Quit whose TERM cannot
+-- be sent is stopped again: its ledger entry stays true.
+scenario("a failed TERM after CONT stops the process again", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(6)
+  local row = W.menuItem("   leaker")
+  local fq = row and row.menu and row.menu[2]
+  W.sendFails = { TERM = true }
+  fq.fn()
+  W.sendFails = nil
+  W.run(2)
+  check("re-stop: CONT then STOP went out, no TERM", W.signalsTo(4242), "STOP,CONT,STOP")
+  check("re-stop: it is stopped again", W.procs[4242].state, "T")
+  check("re-stop: its ledger entry stays", W.menuItem("   leaker") ~= nil, true)
 end)
 
 -- ---- narratives: a hold that never ends is released ----

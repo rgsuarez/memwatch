@@ -43,11 +43,13 @@ local lastRanked   = {}   -- top hogs by RSS+CMPRS weight (menu rows)
 local lastRuns     = {}   -- current runaway list, ignores applied
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
-local lastSampleAt = 0    -- when a sampler callback last landed
--- The sampler run behind lastPsList: its launch order (seq: an integer,
--- immune to wall-clock steps), when it was launched (nil: unknown, start
--- windows unbounded), and whether it exited 0 (its table is whole).
-local lastSample = { seq = 0, nextSeq = 0, launchedAt = nil, complete = false }
+-- The sampler fork: the task in flight and when it launched; when a
+-- callback last landed (at); and the run behind lastPsList: its launch
+-- order (seq: an integer, immune to wall-clock steps), when it was launched
+-- (nil: unknown, start windows unbounded), and whether it exited 0 (its
+-- table is whole).
+local sampler = { task = nil, startedAt = 0, at = 0,
+                  seq = 0, nextSeq = 0, launchedAt = nil, complete = false }
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -60,15 +62,20 @@ local runGen        = 0     -- bumped by start/stop: a held resume from an older
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
-local ignoredUntil = {}   -- [answerKey] = epoch when the ignore expires
-local goneUntil    = {}   -- [answerKey] = { untilAt, at, lstart }: verified gone, kept
+local ignoredUntil = {}   -- [pid] = { pid, name, lstart, untilAt }: ignored for its window
+local goneUntil    = {}   -- [pid] = { pid, name, lstart, untilAt, at }: verified gone, kept
                           -- off the candidates while its last samples age out
 local GONE_SEC     = 20   -- runawayFreshSec plus a sample period
 local REVEAL_RISES = 3    -- rises after a frozen or gone mark that only a running process makes
--- The ignore and gone lists' key: the pid and the name's first 15
--- characters (core.sameName's rule), so a name top truncated and the full
--- name ps fills in later key the same process.
-local function answerKey(pid, name) return pid .. "|" .. (name or ""):sub(1, 15) end
+-- An ignore or gone mark names one process: kept per pid with the name
+-- (and start time, when bound) it was made for, and matched by
+-- core.sameOffender, so a name top truncated and the full name ps fills in
+-- later are one process, and two names that share a prefix are not.
+local function markFor(map, off)
+  local m = off and off.pid and map[off.pid]
+  if m and core.sameOffender(m, off) then return m end
+  return nil
+end
 local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
@@ -79,7 +86,7 @@ local lastFrozenSweepAt = 0 -- liveness sweep bookkeeping
 -- A verified exit keeps the process off the candidates while its last
 -- samples age out. The mark carries the start time when one was bound.
 local function markGone(off, now)
-  goneUntil[answerKey(off.pid, off.name)] = { untilAt = now + GONE_SEC, at = now, lstart = off.lstart }
+  goneUntil[off.pid] = { pid = off.pid, name = off.name, lstart = off.lstart, untilAt = now + GONE_SEC, at = now }
 end
 -- Does a frozen or gone mark still describe the process at its pid? Not
 -- when that process has another bound start time, and not when it has
@@ -410,13 +417,22 @@ local function sh(cmd)
   return out or ""
 end
 
--- Send one signal to a pid the caller has verified. A fork that fails
--- (hs.execute raises) sent nothing: the send returns false and is logged,
--- so the action reports that instead of dying before its outcome.
+-- Send one signal to a pid the caller has verified. It is sent only when
+-- kill(1) ran and exited 0: a fork that fails (hs.execute raises) sent
+-- nothing, and neither did a kill that refused (no such process any more,
+-- or not permitted). Either way the send returns false and is logged, so
+-- the action reports it instead of claiming, or recording, a signal.
 local function send(sig, pid)
-  local ok = pcall(sh, string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
-  if not ok then M.logSnapshot(string.format("signal-send-failed:%s:%d", sig, pid)) end
-  return ok
+  local ok, _, status = pcall(hs.execute, string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
+  if not ok then
+    M.logSnapshot(string.format("signal-send-failed:%s:%d", sig, pid))
+    return false
+  end
+  if status ~= true then
+    M.logSnapshot(string.format("signal-send-refused:%s:%d", sig, pid))
+    return false
+  end
+  return true
 end
 
 -- Sample memory metrics. Native hs.host.vmStat() first (no fork, and it
@@ -453,9 +469,9 @@ local function assessProcesses(now)
   -- gone mark yields as soon as the pid shows growth since the mark: that
   -- is a newcomer (or a process running again), never the one marked.
   local function heldBack(p)
-    local key = answerKey(p.pid, p.name)
-    if (ignoredUntil[key] or 0) >= now or protectedPids[p.pid] then return true end
-    local g = goneUntil[key]
+    local ig = markFor(ignoredUntil, p)
+    if (ig and ig.untilAt >= now) or protectedPids[p.pid] then return true end
+    local g = markFor(goneUntil, p)
     if g and g.untilAt >= now and markHolds(g, g.at, p.pid, nil) then return true end
     local f = frozen[p.pid]
     return f ~= nil and markHolds(f, f.frozenAt or 0, p.pid, nil)
@@ -610,28 +626,28 @@ end
 local hud            = nil
 -- The grace clock and the answered mark are per process, so a handoff, an
 -- alternation or a newly named offender never borrows another process's
--- clock. Records are filed under pid and the name's first 15 characters
--- (which top's truncation preserves) and carry the start time they were
--- made for: a record made for one bound process never serves another (a
--- same-name process that reused the pid starts over), and one made while
--- unbound is adopted when its process binds. Both start over at every raise.
-local exposure       = {}     -- [key] = { sec, lstart }: time it headed the active alert as extreme
-local interacted     = {}     -- [key] = { lstart }: the operator acted on it since the raise
+-- clock. Records are filed under the pid and carry the name and start time
+-- they were made for (core.recordDescribes): a record made for one process
+-- never serves another, and one made while unbound never transfers to the
+-- process once it binds (the pid may hold a newcomer by then): that
+-- process's grace and answers start over. Both start over at every raise.
+local exposure       = {}     -- [pid] = { name, lstart, sec }: time it headed the active alert as extreme
+local interacted     = {}     -- [pid] = { name, lstart, confirmed, pendingUntil }: the operator acted on it
 local exposureTickAt = nil    -- the previous critical tick (nil: none yet)
 local exposureHead   = nil    -- the record whose process headed the alert since that tick
 local EXPOSURE_STEP_MAX = 15  -- a stalled tick counts at most this much grace
-local function procKey(off)
-  return off and off.pid and answerKey(off.pid, off.name) or nil
-end
--- The record in `map` for this process, or nil: a record made for a
--- different bound process does not count (create replaces it).
+-- The record in `map` (kept per pid) for this process, or nil: a record
+-- made for another identity does not count (core.recordDescribes), and
+-- create replaces it with a fresh one. Nothing made while unbound carries
+-- over to the bound process: its grace and answers start over.
 local function recordFor(map, off, create)
-  local k = procKey(off)
-  if not k then return nil end
-  local r = map[k]
-  if r and r.lstart and off.lstart and r.lstart ~= off.lstart then r = nil end
-  if not r and create then r = {}; map[k] = r end
-  if r and r.lstart == nil and off.lstart then r.lstart = off.lstart end
+  if not off or not off.pid then return nil end
+  local r = map[off.pid]
+  if r and not core.recordDescribes(r, off) then r = nil end
+  if not r and create then
+    r = { name = off.name, lstart = off.lstart }
+    map[off.pid] = r
+  end
   return r
 end
 -- Every operator touch on an alert or a process (HUD click, menu action,
@@ -667,9 +683,17 @@ local function settleInteraction(target, outcome)
   local r = recordFor(interacted, target, false)
   if not r or r.confirmed then return end
   if outcome == "unverified" then
-    interacted[procKey(target)] = nil
+    interacted[target.pid] = nil
   else
     r.confirmed, r.pendingUntil = true, nil
+  end
+end
+-- A progress step of the action the mark waits on: its outcome is on the
+-- way, so the mark's deadline moves out with it.
+local function extendInteraction(target)
+  local r = recordFor(interacted, target, false)
+  if r and not r.confirmed and r.pendingUntil then
+    r.pendingUntil = hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
   end
 end
 -- Does the operator's answer stand this process's unattended action down?
@@ -739,12 +763,12 @@ end
 -- never probes.
 local function isAnswered(off, now)
   if not off or not off.pid then return false end
-  local key = answerKey(off.pid, off.name)
   local f = frozen[off.pid]
   if f and markHolds(f, f.frozenAt or 0, off.pid, off.lstart) then return true end
-  local g = goneUntil[key]
+  local g = markFor(goneUntil, off)
   if g and g.untilAt > now and markHolds(g, g.at, off.pid, off.lstart) then return true end
-  return (ignoredUntil[key] or 0) > now
+  local ig = markFor(ignoredUntil, off)
+  return ig ~= nil and ig.untilAt > now
 end
 
 local HUD_W, HUD_H = 380, 176
@@ -792,15 +816,15 @@ local function identityRefused(target)
   hudStalePid = target.pid
   -- Only the refused process's own records go: a record already made for
   -- the process now holding the pid is that process's, not this one's.
-  local k = procKey(target)
-  if recordFor(exposure, target, false) then exposure[k] = nil end
-  if recordFor(interacted, target, false) then interacted[k] = nil end
+  if recordFor(exposure, target, false) then exposure[target.pid] = nil end
+  if recordFor(interacted, target, false) then interacted[target.pid] = nil end
   -- The banner goes only when it names the refused process: the same pid
-  -- and name, and its start time when both are known. A banner already
-  -- bound to the process now holding the pid stays.
+  -- and name, and either it never bound or it bound that very start time.
+  -- A refusal with no start time takes down only an unbound banner, never
+  -- one already bound to whatever holds the pid now.
   if critNotif and critNotifOff and critNotifOff.pid == target.pid
      and core.sameName(critNotifOff.name, target.name)
-     and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then
+     and (critNotifOff.lstart == nil or (target.lstart ~= nil and critNotifOff.lstart == target.lstart)) then
     pcall(function() critNotif:withdraw() end)
     critNotif, critNotifOff = nil, nil
   end
@@ -844,7 +868,10 @@ local function surfaceUpdate(target)
   local gen = runGen
   return function(text, done, outcome)
     hs.alert.show("memwatch: " .. text, 2.5)
-    if not done then return end
+    if not done then
+      if gen == runGen then extendInteraction(target) end
+      return
+    end
     local answer = core.answerFor(outcome)
     if answer == "done" and outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
     if gen ~= runGen then return end
@@ -852,7 +879,9 @@ local function surfaceUpdate(target)
     if answer == "rebind" then
       identityRefused(target)
     elseif (answer == "done" or answer == "snooze")
-       and hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
+       and core.sameIdentity(hudOffender, target) and not hudHold then
+      -- Only a HUD bound to this very process: an outcome never answers a
+      -- HUD that might name another process (unbound, or rebound).
       dismissHud(answer, hudOffender)
     end
   end
@@ -948,6 +977,12 @@ local function buildHud()
       local narrate = function(text, done, outcome)
         if gen ~= runGen then return end
         if hud then hud[3].text = text end
+        if not done then
+          -- Progress: the action is alive, so its hold and pending mark
+          -- move out with it (only a narrative that stopped moving lapses).
+          hudHoldUntil = hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
+          extendInteraction(target)
+        end
         if done then
           afterHeld(4, guard("hud-close", function()
             if gen == runGen then settleAction(target, outcome) end
@@ -963,7 +998,7 @@ local function buildHud()
     elseif id == "ignore" or id == "ignore-label" then
       markInteracted(hudOffender)
       if hudOffender and not hudOffender.synthetic then
-        M.ignore(hudOffender.pid, hudOffender.name)
+        M.ignore(hudOffender.pid, hudOffender.name, hudOffender.lstart)
       end
       dismissHud("done")
     elseif id == "monitor" or id == "monitor-label" then
@@ -1022,7 +1057,7 @@ local function buildMenu()
     { title = string.format("Compressor (info) %.1f GB", m.compGB), disabled = true },
     { title = "-" },
   }
-  local sinceSample = lastSampleAt > 0 and (hs.timer.secondsSinceEpoch() - lastSampleAt) or 0
+  local sinceSample = sampler.at > 0 and (hs.timer.secondsSinceEpoch() - sampler.at) or 0
   if sinceSample > 15 then
     items[#items + 1] = {
       title = string.format("\u{26A0} process data %.0fs stale (system under load)", sinceSample),
@@ -1067,10 +1102,12 @@ local function buildMenu()
             M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
           end) },
         { title = "Ignore for 30 min",
-          fn = obs.byOperator(function() obs.noteTouch(target); M.ignore(pid, name) end) },
+          fn = obs.byOperator(function() obs.noteTouch(target); M.ignore(pid, name, lst) end) },
         { title = "Show in Activity Monitor",
+          -- Opening Activity Monitor on this process answers it, as the
+          -- HUD's button does (markInteracted also notes the touch).
           fn = obs.byOperator(function()
-            obs.noteTouch(target)
+            markInteracted(target)
             hs.application.launchOrFocus("Activity Monitor")
           end) },
       },
@@ -1096,10 +1133,12 @@ local function buildMenu()
               M.resumePid(pid)
             end) },
           { title = "Force Quit " .. (e.name or "?"),
+            -- The identity this row shows: a pid frozen again for another
+            -- process since the menu opened is refused, not quit.
             fn = obs.byOperator(function()
               local target = { pid = pid, name = e.name, lstart = e.lstart }
               obs.noteTouch(target)
-              M.killPid(pid, e.name, surfaceUpdate(target))
+              M.killPid(pid, e.name, surfaceUpdate(target), { expectedLstart = e.lstart })
             end) },
         },
       }
@@ -1149,7 +1188,7 @@ local function buildMenu()
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
       fn = obs.byOperator(function()
         obs.noteTouch({ pid = off.pid, name = off.name, lstart = bound })
-        M.ignore(off.pid, off.name)
+        M.ignore(off.pid, off.name, bound)
       end) }
     items[#items + 1] = { title = "-" }
   end
@@ -1297,29 +1336,28 @@ local SAMPLER_CMD = "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level vm.
 local SAMPLE_WATCHDOG_SEC = 20
 local SAMPLE_STALE_SEC    = 30
 
-local sampleTask, sampleStartedAt = nil, 0
 local lastPsBlob = ""     -- consumed by the process tracker
 
 local function launchSampler(onDone)
   local now = hs.timer.secondsSinceEpoch()
-  if sampleTask then
-    if (now - sampleStartedAt) < SAMPLE_WATCHDOG_SEC then return end
-    pcall(function() sampleTask:terminate() end)
-    sampleTask = nil
+  if sampler.task then
+    if (now - sampler.startedAt) < SAMPLE_WATCHDOG_SEC then return end
+    pcall(function() sampler.task:terminate() end)
+    sampler.task = nil
   end
-  sampleStartedAt = now
+  sampler.startedAt = now
   local launchedAt = now   -- this task's own launch time, for its callback
-  lastSample.nextSeq = lastSample.nextSeq + 1
-  local seq = lastSample.nextSeq   -- and its place in launch order
+  sampler.nextSeq = sampler.nextSeq + 1
+  local seq = sampler.nextSeq   -- and its place in launch order
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
   -- without a streaming drain hs.task never reads the pipe, ps blocks
   -- mid-write, and the task deadlocks until the watchdog TERMs it (observed
   -- live as intermittent sampler death that tracked the process count).
   -- The streaming callback exists purely to drain; assembly happens at exit.
   local acc = {}
-  sampleTask = hs.task.new("/bin/sh",
+  sampler.task = hs.task.new("/bin/sh",
     guard("sampler", function(exitCode)
-      sampleTask = nil
+      sampler.task = nil
       -- Keep partial output even on a nonzero exit: under memory pressure ps
       -- can fail mid-table, and a partial process list beats a blank one.
       -- The parsers treat garbage as calm, never as alarm. The exit code
@@ -1335,7 +1373,7 @@ local function launchSampler(onDone)
       return true
     end,
     { "-c", SAMPLER_CMD })
-  if sampleTask then sampleTask:start() end
+  if sampler.task then sampler.task:start() end
 end
 
 -- Enrichment half: runs when the sampler fork returns. Refreshes the kernel
@@ -1349,11 +1387,11 @@ local function onSample(blob, exitCode, launchedAt, seq)
   -- an older table: it never replaces a newer one. Launch order, not the
   -- wall clock, decides: a clock stepped back (wake-time NTP, a VM resume)
   -- must not discard every table until real time catches up.
-  if seq and seq < lastSample.seq then return end
-  lastSample.seq = seq or lastSample.seq
-  lastSampleAt = now
-  lastSample.launchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
-  lastSample.complete = (exitCode == 0)
+  if seq and seq < sampler.seq then return end
+  sampler.seq = seq or sampler.seq
+  sampler.at = now
+  sampler.launchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
+  sampler.complete = (exitCode == 0)
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -1380,7 +1418,7 @@ local function onSample(blob, exitCode, launchedAt, seq)
       local row = rows[ev.pid]
       local e = row and tracker.procs[ev.pid] or nil
       observe.foldSample(ev, {
-        complete = lastSample.complete, row = row,
+        complete = sampler.complete, row = row,
         start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
         launchedAt = launchedAt, deliveredAt = now })
@@ -1417,7 +1455,7 @@ end
 -- happened. A freeze or terminate that changed a process always notifies,
 -- even with desktop alerts muted (silence there turns a muted alert into a
 -- mystery hang); an action that signaled nothing is logged, not announced.
-local RECEIPT_OUTCOMES = { frozen = true, terminated = true, failed = true, unconfirmed = true }
+local RECEIPT_OUTCOMES = { frozen = true, terminated = true, replaced = true, failed = true, unconfirmed = true }
 local function unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
   if not RECEIPT_OUTCOMES[outcome] then return end
   local why = (adjudicator == "lfm")
@@ -1425,7 +1463,7 @@ local function unattendedReceipt(action, target, adjudicator, rationale, outcome
     or "Extreme runaway, no response to the alert."
   local tail = (outcome == "unconfirmed")
     and "Check the memwatch menu (Frozen by memwatch) or Activity Monitor." or why
-  hs.notify.new({ title = "memwatch unattended " .. action,
+  return hs.notify.new({ title = "memwatch unattended " .. action,
                   subTitle = string.format("%s (pid %d)", target.name, target.pid),
                   informativeText = string.format("%s \u{00B7} %s", text or outcome, tail),
                   withdrawAfter = 0 }):send()
@@ -1434,16 +1472,26 @@ end
 -- An unattended action whose outcome never arrived by the hold deadline
 -- (a step of its narrative never ran) still owes its receipt: a signal may
 -- have gone out, so the operator is told, never left with silence.
+-- The record stays (the action is still in flight: no second action
+-- starts on that process); if the outcome arrives after all, it replaces
+-- this receipt, so one action never leaves two.
 local function settleOpenReceipts(now)
   for owed in pairs(openReceipts) do
-    if now > owed.dueAt then
-      openReceipts[owed] = nil
+    if now > owed.dueAt and not owed.lateReceipt then
       M.logSnapshot(string.format("unattended-no-result:%s:%s(%d)", owed.action,
         owed.target.name or "?", owed.target.pid or -1))
-      unattendedReceipt(owed.action, owed.target, owed.adjudicator, owed.rationale, "unconfirmed",
-        string.format("%s started, but its result never came back", owed.action))
+      owed.lateReceipt = unattendedReceipt(owed.action, owed.target, owed.adjudicator, owed.rationale,
+        "unconfirmed", string.format("%s started, but its result has not come back", owed.action)) or true
     end
   end
+end
+-- Is an unattended action still in flight on this very process? Its
+-- record goes only when its final outcome arrives.
+local function actionInFlight(off)
+  for owed in pairs(openReceipts) do
+    if core.sameIdentity(owed.target, off) then return true end
+  end
+  return false
 end
 
 -- Unattended action: opt-in, extreme growers only, the alert episode
@@ -1503,6 +1551,9 @@ local function unattendedStep(offender, now)
     fired = nil
   end
   if fired and fired.final then return end
+  -- An action still in flight on this process (its outcome has not come
+  -- back, say through a stalled run loop) is never followed by another.
+  if actionInFlight(hudOffender) then return end
   if (now - ((fired and fired.at) or 0)) < core.cfg.cool.autoKillGraceSec then return end
   unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
   local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now)
@@ -1523,27 +1574,39 @@ local function unattendedStep(offender, now)
   end
   hudHold, hudHoldUntil = true, now + HOLD_MAX_SEC
   local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
-  -- The receipt is owed from here (settleOpenReceipts covers an outcome
-  -- that never arrives).
+  -- The action is in flight, and its receipt owed, from here until its
+  -- final outcome (settleOpenReceipts covers an outcome that is late). Each
+  -- progress step pushes the deadlines out: a slow narrative is not a lost
+  -- one.
   local owed = { action = action, target = target, adjudicator = adjudicator,
                  rationale = rationale, dueAt = now + HOLD_MAX_SEC }
   openReceipts[owed] = true
   local gen = runGen
+  local function receipt(outcome, text)
+    -- One live receipt per action: a "has not come back" receipt posted at
+    -- the deadline gives way to the real outcome.
+    if type(owed.lateReceipt) == "table" then pcall(function() owed.lateReceipt:withdraw() end) end
+    unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
+  end
   local narrate = function(text, done, outcome)
-    if done then openReceipts[owed] = nil end
+    local t = hs.timer.secondsSinceEpoch()
+    if done then openReceipts[owed] = nil else owed.dueAt = t + HOLD_MAX_SEC end
     if gen ~= runGen then
       -- The run ended mid-action: still say what memwatch did, but leave
       -- the new run's alert alone.
-      if done then unattendedReceipt(action, target, adjudicator, rationale, outcome, text) end
+      if done then receipt(outcome, text) end
       return
     end
     if hud then hud[3].text = "AUTO: " .. text end
-    if not done then return end
+    if not done then
+      if hudHold then hudHoldUntil = t + HOLD_MAX_SEC end
+      return
+    end
     if outcome == "failed" then
       local f = unattendedFiredFor[target.pid]
       if f and f.lstart == target.lstart then f.final = true end
     end
-    unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
+    receipt(outcome, text)
     -- memwatch's own action answers the alert like an operator's would.
     afterHeld(6, guard("hud-close", function()
       if gen == runGen then settleAction(target, outcome) end
@@ -1743,10 +1806,10 @@ local function tick()
   -- and say it LOUDLY when it coincides with real pressure. The 2026-07-07
   -- near-crash sat at 9% headroom with the sampler frozen and only a quiet
   -- amber dot; degraded plus pressured must page the human.
-  if lastSampleAt > 0 and (now - lastSampleAt) > SAMPLE_STALE_SEC then
+  if sampler.at > 0 and (now - sampler.at) > SAMPLE_STALE_SEC then
     if (now - lastStaleLogAt) > 60 then
       lastStaleLogAt = now
-      M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
+      M.logSnapshot(string.format("sampler-stale:%.0fs", now - sampler.at))
     end
     -- Not muted: with desktop alerts off, this page is the only sign that
     -- memwatch has gone blind while pressure is up.
@@ -1758,7 +1821,7 @@ local function tick()
       staleNotif = hs.notify.new({
         title           = "memwatch degraded during pressure",
         subTitle        = string.format("process attribution stale %.0fs \u{00B7} avail %.0f%%",
-                                        now - lastSampleAt, m.availPct),
+                                        now - sampler.at, m.availPct),
         informativeText = "The system gauge is live but per-process detection is not. Open Activity Monitor if pressure climbs.",
         withdrawAfter   = 0,
       }):send()
@@ -1909,6 +1972,21 @@ local function saveFrozen()
   f:close()
 end
 
+-- A ledger writer changes only its own process's entry: the slot holds
+-- nothing, an entry with no start time, or this very start time. An entry
+-- for another start time (a newer freeze of the pid's next process, or one
+-- a reload adopted) is not the writer's to touch.
+local function ownsEntry(pid, lstart)
+  local cur = frozen[pid]
+  return cur == nil or cur.lstart == nil or cur.lstart == lstart
+end
+local function dropOwnEntry(pid, lstart)
+  if frozen[pid] ~= nil and ownsEntry(pid, lstart) then
+    frozen[pid] = nil
+    saveFrozen()
+  end
+end
+
 local function loadFrozen()
   local f = io.open(FROZEN_PATH, "r")
   if not f then return {} end
@@ -1927,10 +2005,19 @@ local function frozenReconcile()
   local list = loadFrozen()
   frozen = {}
   local survivors = {}
+  local now = hs.timer.secondsSinceEpoch()
   for _, e in ipairs(list) do
     if type(e) == "table" and type(e.pid) == "number" then
       local proc, why = resolveSignalTarget(e.pid, e.name, e.lstart)
-      if why == "unverified" then
+      if e.pendingUntil and now < e.pendingUntil and (proc or why == "unverified") then
+        -- A freeze still being verified when memwatch reloaded: its STOP may
+        -- land after this probe (a process in a syscall stops on return to
+        -- user space). Its verifier died with the reload, so the sweep
+        -- decides once the pending window ends.
+        M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):pending", e.name or "?", e.pid))
+        frozen[e.pid] = e
+        survivors[#survivors + 1] = e.name
+      elseif why == "unverified" then
         M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):unverified", e.name or "?", e.pid))
         frozen[e.pid] = e
         survivors[#survivors + 1] = e.name
@@ -2085,6 +2172,9 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       if stopSent then
         onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
       else
+        -- No STOP went out: there is nothing to protect, and a pending
+        -- entry would only hide a running process and swallow a retry.
+        dropOwnEntry(pid, proc.lstart)
         onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
       end
     elseif not reprobe then
@@ -2143,8 +2233,7 @@ function M.resumePid(pid, onUpdate)
     return
   end
   if not proc then
-    frozen[pid] = nil
-    saveFrozen()
+    dropOwnEntry(pid, e.lstart)
     M.logSnapshot(string.format("resume-drop:%s(%d):%s", e.name or "?", pid, twhy))
     onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name or tostring(pid), twhy), true)
     return
@@ -2159,13 +2248,13 @@ function M.resumePid(pid, onUpdate)
       M.logSnapshot(string.format("resume-unverified:%s(%d)", e.name, pid))
       onUpdate(string.format("sent CONT to %s; can't verify it resumed, check the menu again", e.name), true)
     elseif not again then
-      frozen[pid] = nil
-      saveFrozen()
+      -- The resumed process is gone; an entry for whatever holds the pid now
+      -- (frozen meanwhile) is not this resume's to drop.
+      dropOwnEntry(pid, e.lstart)
       M.logSnapshot(string.format("resume-drop:%s(%d):%s", e.name, pid, awhy))
       onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name, awhy), true)
     elseif not core.isStopped(again) then
-      frozen[pid] = nil
-      saveFrozen()
+      dropOwnEntry(pid, e.lstart)
       M.logSnapshot(string.format("resume-done:%s(%d)", e.name, pid))
       onUpdate(string.format("%s resumed after %.0f min frozen", e.name,
         (hs.timer.secondsSinceEpoch() - (e.frozenAt or 0)) / 60), true)
@@ -2431,11 +2520,17 @@ local function retireLfmServer(reason)
   -- a pid reused after our server exited is never signaled. No recorded
   -- start time, or a probe that cannot tell: nothing is sent to the pid
   -- (the task handle's own terminate above and the port check below remain).
-  local function trackedIsOurs()
-    if not ident or ident.pid ~= pid then return false end
+  -- "ours": the pid holds the recorded server; "other": it provably does
+  -- not (exited, or another process holds it); "unknown": no recorded
+  -- start time, or a probe that cannot tell.
+  local function trackedState()
+    if not ident or ident.pid ~= pid or ident.lstart == nil then return "unknown" end
     local st, live = probe(pid)
+    if st == "unknown" then return "unknown" end
     return core.identityHolds(ident, st, live and live.lstart, live and procs.friendlyName(live.comm))
+      and "ours" or "other"
   end
+  local function trackedIsOurs() return trackedState() == "ours" end
   -- Signal the tracked pid AND the actual port listener (may be a child),
   -- but only signal the listener if it is CONFIRMED ours: an llama-server
   -- serving OUR model dir, holding our port. In the narrow window after our
@@ -2450,10 +2545,15 @@ local function retireLfmServer(reason)
       and info:find("projects/memwatch/models/", 1, true) ~= nil
   end
   local function signalTargets(sig)
-    local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)
+    local tracked = pid ~= nil and trackedState() or "unknown"
+    local sent = tracked == "ours" and send(sig, pid)
     if port then
       local owner = listenerPid(port)
-      if owner and not (sent and owner == pid) and listenerIsOurs(owner) then
+      -- The listener path covers a child listener, or the tracked pid whose
+      -- identity was never recorded; never the tracked pid once it is
+      -- proven to hold another process (a replacement llama-server on our
+      -- model directory, reusing pid and port, is not ours).
+      if owner and not (owner == pid and (sent or tracked == "other")) and listenerIsOurs(owner) then
         if send(sig, owner) and owner == pid then sent = true end
       end
     end
@@ -2491,7 +2591,10 @@ local function retireLfmServer(reason)
     guard("lfm-retire-wait", function() end),
     1,
     function()
-      -- The predicate kept erroring: one last identity-checked KILL.
+      -- The predicate kept erroring: one last identity-checked KILL. (When
+      -- the deadline's own KILL attempt raised, this give-up, up to
+      -- UNTIL_GIVEUP_SEC later, is the KILL that remains: identity-checked,
+      -- so the worst case is a late KILL, never a wrong one.)
       if pid and trackedIsOurs() then send("KILL", pid) end
     end)
 end
@@ -2502,8 +2605,11 @@ end
 -- and again for the verified listener once /health passes.
 local function recordLfmServer(pid)
   local probed = probePid(pid)
-  lfmServerIdent = { pid = pid, lstart = probed and probed.lstart or nil,
-                     name = probed and procs.friendlyName(probed.comm) or nil }
+  -- A probe that cannot answer never erases what an earlier one verified
+  -- for the same pid.
+  local prev = (lfmServerIdent and lfmServerIdent.pid == pid) and lfmServerIdent or nil
+  lfmServerIdent = { pid = pid, lstart = probed and probed.lstart or (prev and prev.lstart) or nil,
+                     name = probed and procs.friendlyName(probed.comm) or (prev and prev.name) or nil }
   local rec = lfm.jsonEncode({ pid = pid, lstart = lfmServerIdent.lstart })
   if rec then
     local pf = io.open(LFM_PIDFILE, "w")
@@ -3137,13 +3243,13 @@ gcUnattendedState = function(now)
   -- after the last evidence it was alive. A table from a stalled sampler
   -- predates what the top stream has seen since, so a pid top saw after
   -- that table was launched is not gone, however long ps stays stalled.
-  if not lastSample.complete or not lastSample.launchedAt then return end
+  if not sampler.complete or not sampler.launchedAt then return end
   local alive = {}
   for _, p in ipairs(lastPsList) do alive[p.pid] = true end
   local function gone(pid)
     if alive[pid] then return false end
     local e = tracker.procs[pid]
-    return not (e and e.lastSeen and e.lastSeen > lastSample.launchedAt)
+    return not (e and e.lastSeen and e.lastSeen > sampler.launchedAt)
   end
   for pid in pairs(unattendedWaitStreak) do
     if gone(pid) then unattendedWaitStreak[pid] = nil end
@@ -3225,10 +3331,14 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   if not send("TERM", pid) then
-    -- Nothing terminated it. A process continued for its TERM may be
-    -- running again, and that is said.
-    if contSent then
-      onUpdate(string.format("couldn't send TERM to %s; it was continued and may be running", liveName),
+    -- Nothing terminated it. A process continued for its TERM is stopped
+    -- again (its ledger entry still true); if that cannot be sent either, it
+    -- runs, its entry goes, and that is said.
+    if contSent and send("STOP", pid) then
+      onUpdate(string.format("couldn't send TERM to %s; it was stopped again", liveName), true, "unverified")
+    elseif contSent then
+      dropOwnEntry(pid, proc.lstart)
+      onUpdate(string.format("couldn't send TERM to %s; it was continued and is running", liveName),
         true, "unconfirmed")
     else
       onUpdate(string.format("couldn't send TERM to %s; nothing was signaled", liveName), true, "unverified")
@@ -3251,12 +3361,18 @@ function M.killPid(pid, expectedName, onUpdate, opts)
         -- Gone, or the pid now holds another process: the original exited.
         -- Only its own frozen-ledger entry goes; one for a newer process
         -- at this pid is not this kill's to touch.
-        local fe = frozen[pid]
-        if fe and (fe.lstart == nil or fe.lstart == proc.lstart) then frozen[pid] = nil; saveFrozen() end
+        dropOwnEntry(pid, proc.lstart)
         local footTxt = footBeforeGB and string.format("-footprint=%.1fGB", footBeforeGB) or ""
         M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB%s", liveName, pid, reclaimedGB, footTxt))
-        onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
-          footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or ""), true, "terminated")
+        local how = string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
+          footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or "")
+        if vwhy == "exited" then
+          onUpdate(how, true, "terminated")
+        else
+          -- Another process holds the pid now: a new question for every
+          -- surface (rebind), never one marked gone with the old process.
+          onUpdate(how .. string.format("; pid %d now holds another process", pid), true, "replaced")
+        end
       elseif killSent then
         M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
         onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true, "failed")
@@ -3298,8 +3414,9 @@ function M.killPid(pid, expectedName, onUpdate, opts)
 end
 
 -- Silence alerts for one process for the standard window.
-function M.ignore(pid, name)
-  ignoredUntil[answerKey(pid, name)] = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec
+function M.ignore(pid, name, lstart)
+  ignoredUntil[pid] = { pid = pid, name = name, lstart = lstart,
+                        untilAt = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec }
   M.logSnapshot(string.format("ignore:%s(%d)", name, pid))
   if lastOffender and lastOffender.pid == pid then
     lastOffender = nil
@@ -3377,7 +3494,7 @@ function M.stop()
   lfmInFlight = nil     -- a late reply from this run is discarded, not cached
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
-  if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
+  if sampler.task then pcall(function() sampler.task:terminate() end); sampler.task = nil end
   stopTopStream()
   if lfmServerTask then retireLfmServer("stop") end
   flashState = nil
@@ -3395,7 +3512,7 @@ function M.debug()
     rates          = { swapOut = lastRates.swapOut, comp = lastRates.comp },
     streamAlive    = topTask ~= nil,
     topCacheAgeSec = topCache.at > 0 and math.floor(now - topCache.at) or -1,
-    sampleAgeSec   = lastSampleAt > 0 and math.floor(now - lastSampleAt) or -1,
+    sampleAgeSec   = sampler.at > 0 and math.floor(now - sampler.at) or -1,
     tracked        = tracked,
     runs           = #lastRuns,
     ranked         = #lastRanked,

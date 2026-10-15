@@ -334,8 +334,15 @@ function M.risingSince(tr, pid, since)
   for _, s in ipairs(e.ring) do
     if s.t > since then after[#after + 1] = s end
   end
-  local _, rising = growth(after, tr.cfg.risingEpsMB)
-  return rising
+  -- Strict: consecutive rises at the tail, any flat sample ends the run.
+  -- (growth() tolerates one flat tick for live runaway detection; here a
+  -- stopped process whose compressed figure catches up on alternate
+  -- samples, rise, flat, rise, must not read as a run.)
+  local eps, n = tr.cfg.risingEpsMB, 0
+  for i = #after, 2, -1 do
+    if after[i].v - after[i - 1].v > eps then n = n + 1 else break end
+  end
+  return n
 end
 
 -- Classify runaways. Returns a sorted array of

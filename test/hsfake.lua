@@ -92,10 +92,12 @@ function F.new()
   end
   -- Grow a process by mbPerSec while it runs (a stopped process holds still).
   function W.grow(pid, mbPerSec)
-    return addTimer("every", 1, 1, function()
+    local t = addTimer("every", 1, 1, function()
       local p = W.procs[pid]
       if p and p.state == "S" then p.rssKB = p.rssKB + math.floor(mbPerSec * 1024) end
     end)
+    t.world = true   -- the process's own behavior: a Hammerspoon reload does not stop it
+    return t
   end
 
   local function etime(p)
@@ -147,6 +149,11 @@ function F.new()
           end
         end
       end
+      -- vanishAfterProbe: that process exits right after this probe saw it
+      -- (between an engine's identity check and its signal).
+      if W.vanishAfterProbe and W.procs[W.vanishAfterProbe] then
+        W.procs[W.vanishAfterProbe], W.vanishAfterProbe = nil, nil
+      end
       return table.concat(rows, "\n") .. "\n"
     end
     if cmd:find("^/bin/ps %-o ppid= %-p %d+") then return "1\n" end
@@ -165,9 +172,10 @@ function F.new()
         if sig == "STOP" then
           if not p.unstoppable then
             if W.stopDelay then
+              -- The kernel applies the STOP whatever memwatch does meanwhile.
               addTimer("after", W.stopDelay, nil, function()
                 if W.procs[kp] == p then p.state = "T" end
-              end)
+              end).world = true
             else
               p.state = "T"
             end
@@ -175,8 +183,9 @@ function F.new()
         elseif sig == "CONT" then p.state = "S"
         elseif sig == "TERM" and p.state ~= "T" and not p.ignoreTerm then W.procs[kp] = nil
         elseif sig == "KILL" and not p.unkillable then W.procs[kp] = nil end
+        return ""
       end
-      return ""
+      return "", false   -- kill(1) on a pid nothing holds exits 1 (ESRCH)
     end
     W.unknown[#W.unknown + 1] = cmd
     return ""
@@ -250,13 +259,17 @@ function F.new()
     -- probeSignaled models a ps killed mid-reply: its partial output, and
     -- hs.execute's status saying a signal ended it.
     execute = function(cmd)
-      if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill")) then
+      -- sendFails = { TERM = true, ... } fails only those signals' sends.
+      local sig = cmd:match("^/bin/kill %-(%u+)")
+      if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill"))
+         or (sig and W.sendFails and W.sendFails[sig]) then
         error("fork: Resource temporarily unavailable")
       end
-      local out = exec(cmd)
+      local out, exited0 = exec(cmd)
       if W.probeSignaled and cmd:find("^/bin/ps %-p") then
         return out:sub(1, math.max(0, math.floor(#out / 2))), nil, "signal", 9
       end
+      if exited0 == false then return out, nil, "exit", 1 end
       return out, true, "exit", 0
     end,
     processInfo = { processID = SELF_PID },
@@ -267,7 +280,7 @@ function F.new()
       -- timersStall: a one-shot callback that never gets to run (a run loop
       -- stalled past it), so a narrative waiting on it never finishes.
       -- timerLag: one-shots run that much late (a run loop blocked in a
-      -- probe during a storm), so a follow-up runs after later evidence.
+      -- probe during a storm), so a follow-up or an outcome arrives after later evidence.
       doAfter = function(sec, fn)
         return addTimer("after", W.timersStall and math.huge or (sec + (W.timerLag or 0)), nil, fn)
       end,
@@ -364,7 +377,9 @@ function F.new()
   -- A Hammerspoon reload: every timer and canvas of the old Lua state dies
   -- with it (persisted files and posted notifications survive).
   function W.reloadState()
-    for _, t in ipairs(W.timers) do t.stopped = true end
+    for _, t in ipairs(W.timers) do
+      if not t.world then t.stopped = true end   -- the world's own timers carry on
+    end
     if W.hud then W.hud._showing = false end
     W.hud, W.menu = nil, nil
   end

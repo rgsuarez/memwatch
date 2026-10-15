@@ -11,8 +11,13 @@
 --   lua eval/bakeoff.lua run --server https://api.example.com --label kimi-k2.6 \
 --     --model kimi-k2.6 --api-key-file ~/.lcp/keys/kimi --timeout 90 \
 --     --variant taxonomy --max-tokens 256
---   The key rides an @file curl header (never argv, never ps-visible); no
---   server pid means footprint reads 0, which is honest for a remote brain.
+--   The key rides an @file curl header (never argv, never ps-visible) from a
+--   private directory removed on every exit; --api-key-env VAR reads it from
+--   the environment instead of a file. No server pid means footprint reads
+--   0, which is honest for a remote brain. Names are redacted as production
+--   redacts them, except in the injection suite (--raw-names: all raw).
+--
+-- Episodes mode (per-step decisions for score-episodes.lua): see episodesMode.
 --
 -- Gates mode (all results -> league + gates + composite + promotion):
 --   lua eval/bakeoff.lua gates [--results eval/results] [--measure eval/results/measurements.json]
@@ -32,8 +37,8 @@ local function parseArgs(argv)
     local a = argv[i]
     local key = a:match("^%-%-(.+)$")
     if key then
-      if key == "no-schema" then
-        args["no_schema"] = true
+      if key == "no-schema" or key == "raw-names" then
+        args[key:gsub("%-", "_")] = true
       else
         args[key:gsub("%-", "_")] = argv[i + 1]
         i = i + 1
@@ -98,6 +103,65 @@ local function sampleServerMB(pid)
   return kb and math.floor(kb / 1024) or nil
 end
 
+-- Remote auth: the bearer key comes from an environment variable (or, for
+-- older invocations, a key file) and goes into a 0600 header file inside a
+-- private mktemp directory; curl attaches it with -H @file, so the key never
+-- appears on a command line, and the file is removed on every exit path,
+-- errors included. No key: fn(nil).
+local function readKey(args)
+  if args.api_key_env then
+    local key = os.getenv(args.api_key_env)
+    assert(key and key:match("%S"), "--api-key-env " .. args.api_key_env .. " is unset or empty")
+    return (key:gsub("%s+$", ""))
+  end
+  if args.api_key_file then
+    local kf = assert(io.open((args.api_key_file:gsub("^~", os.getenv("HOME") or "~")), "r"),
+      "cannot read --api-key-file")
+    local key = (kf:read("a") or ""):gsub("%s+$", "")
+    kf:close()
+    assert(#key > 0, "--api-key-file is empty")
+    return key
+  end
+  return nil
+end
+
+local function withAuthHeader(key, fn)
+  if not key then return fn(nil) end
+  local mp = assert(io.popen("mktemp -d"))
+  local dir = mp:read("l")
+  mp:close()
+  assert(dir and dir:match("^/"), "mktemp -d failed")
+  local hdr = dir .. "/auth"
+  local f = assert(io.open(hdr, "w"))
+  f:write("Authorization: Bearer " .. key .. "\n")
+  f:close()
+  os.execute("chmod 600 " .. shellQuote(hdr))
+  local ok, err = pcall(fn, hdr)
+  os.remove(hdr)
+  os.execute("rmdir " .. shellQuote(dir))
+  if not ok then error(err, 0) end
+end
+
+-- One POST with curl, gated on curl's own exit status so a failed request
+-- never reads a stale reply. Returns the body ("" on failure) and wall ms.
+local function postJson(url, body, reqPath, respPath, hdr, timeout)
+  writeFile(reqPath, body)
+  os.remove(respPath)
+  local cmd = table.concat({
+    "curl -sS -m " .. tostring(timeout) .. " -X POST -H 'Content-Type: application/json'",
+    hdr and ("-H @" .. shellQuote(hdr)) or "",
+    "-d @" .. shellQuote(reqPath), "-o", shellQuote(respPath),
+    "-w '%{time_total}'", shellQuote(url),
+    "; printf ' exit=%s' \"$?\"",
+  }, " ")
+  local p = assert(io.popen(cmd))
+  local line = p:read("a") or ""
+  p:close()
+  local ok = line:match("exit=(%d+)") == "0"
+  local wall = ok and tonumber(line:match("^%s*([%d%.]+)")) or nil
+  return ok and (readFile(respPath) or "") or "", wall and math.floor(wall * 1000) or -1
+end
+
 ------------------------------------------------------------------------------
 -- Run mode
 ------------------------------------------------------------------------------
@@ -129,21 +193,9 @@ local function runMode(args)
   }, "-"):gsub("[^%w%-]", "_")
   local reqPath = "eval/tmp/req-" .. tag .. ".json"
   local respPath = "eval/tmp/resp-" .. tag .. ".json"
-  -- Remote-endpoint auth: the bearer key is written to a 0600 header file
-  -- and attached via curl's -H @file, so the credential never appears in a
-  -- command line (ps-visible) or in this script's output. Removed after the
-  -- run.
-  local hdrPath = nil
-  if args.api_key_file then
-    local kf = assert(io.open((args.api_key_file:gsub("^~", os.getenv("HOME") or "~")), "r"),
-      "cannot read --api-key-file")
-    local key = (kf:read("a") or ""):gsub("%s+$", "")
-    kf:close()
-    assert(#key > 0, "--api-key-file is empty")
-    hdrPath = "eval/tmp/hdr-" .. tag
-    writeFile(hdrPath, "Authorization: Bearer " .. key .. "\n")
-    os.execute("chmod 600 " .. shellQuote(hdrPath))
-  end
+  -- Remote-endpoint auth: see withAuthHeader (the key never reaches a
+  -- command line, and its header file is removed on every exit path).
+  local apiKey = readKey(args)
   local curlTimeout = tonumber(args.timeout) or 60
 
   local rows = {}
@@ -165,10 +217,14 @@ local function runMode(args)
     wrong = 0, confWrongSum = 0, serverMBMax = 0,
   }
 
+  withAuthHeader(apiKey, function(hdrPath)
   for _, fname in ipairs(files) do
     local scenario = assert(lfm.jsonDecode(readFile(scenariosDir .. "/" .. fname)))
-    local userContent = assert(lfm.serializeSnapshot(scenario.snapshot,
-      { redactNames = args.redact_names ~= nil }))
+    -- Names are redacted as production redacts them (lfm.cfg.redactNames),
+    -- except for the injection suite, which exists to test raw attacker
+    -- names; --raw-names reproduces the older all-raw runs.
+    local redact = lfm.cfg.redactNames and scenario.class ~= "prompt-injection" and not args.raw_names
+    local userContent = assert(lfm.serializeSnapshot(scenario.snapshot, { redactNames = redact }))
     local body = assert(lfm.buildRequestBody(systemPrompt, userContent, {
       maxTokens = maxTokens, schema = useSchema, model = args.model,
       temperature = tonumber(args.temperature),
@@ -285,8 +341,8 @@ local function runMode(args)
       overEff and "OVER-DANGER" or (overRaw and "over-raw" or (underRaw and "under" or (goldHit and "gold" or (acceptableHit and "acc" or "miss")))),
       wallMs))
   end
+  end)
 
-  if hdrPath then os.remove(hdrPath) end
   table.sort(wallTimes)
   table.sort(tokRates)
   local result = {
@@ -320,6 +376,77 @@ local function runMode(args)
     label, variant, result.gold_rate, result.acceptable_rate, result.danger_rate,
     result.under_danger, result.danger_effective, result.injection_compliance, result.injection_n,
     result.json_valid_rate, result.wall_p50_ms, result.wall_p95_ms, out))
+end
+
+------------------------------------------------------------------------------
+-- Episodes mode: record one model's decision at every decision point of an
+-- episode set through the production builders, as rows for
+-- score-episodes.lua to replay through the wait rail. Every step is asked,
+-- not only until the first freeze, so the rail's threshold can be swept on
+-- dev without asking the model again. A chat model's terminate counts as
+-- freeze (no model holds terminate authority; the freeze ceiling caps it);
+-- an invalid reply records the deterministic freeze. Chat verdicts carry no
+-- P(wait) (a self-reported confidence never qualifies for the wait rail);
+-- decision models carry their option probability.
+--   lua eval/bakeoff.lua episodes --server URL --label NAME --dir <episodes>
+--     [--api chat|systemone] [--variant discriminate] [--model M]
+--     [--api-key-env VAR] [--timeout 60] [--max-tokens 128] [--out rows.jsonl]
+------------------------------------------------------------------------------
+
+local function episodesMode(args)
+  local server = args.server or "http://127.0.0.1:11435"
+  local label = assert(args.label, "--label required")
+  local dir = assert(args.dir, "--dir <episodes> required")
+  local api = args.api or "chat"
+  assert(api == "chat" or api == "systemone", "--api must be chat or systemone")
+  local variant = args.variant or "discriminate"
+  local out = args.out or string.format("eval/results/episodes-%s-%s.jsonl", label, api)
+  local timeout = tonumber(args.timeout) or 60
+  os.execute("mkdir -p eval/results eval/tmp")
+  local files = listScenarios(dir)
+  assert(#files > 0, "no episodes found in " .. dir)
+  local systemPrompt = lfm.buildSystemPrompt({ variant = variant })
+  local tag = (label .. "-" .. api .. "-" .. tostring(os.time())):gsub("[^%w%-]", "_")
+  local reqPath = "eval/tmp/ereq-" .. tag .. ".json"
+  local respPath = "eval/tmp/eresp-" .. tag .. ".json"
+  local url = server .. (api == "systemone" and "/v1/systemone" or "/v1/chat/completions")
+  local n, valid = 0, 0
+  withAuthHeader(readKey(args), function(hdr)
+    local of = assert(io.open(out, "w"))
+    for _, fname in ipairs(files) do
+      local ep = assert(lfm.jsonDecode(readFile(dir .. "/" .. fname)))
+      for _, st in ipairs(ep.steps) do
+        local body
+        if api == "systemone" then
+          body = assert(lfm.systemOneBody(st.snapshot, { model = args.model }))
+        else
+          local user = assert(lfm.serializeSnapshot(st.snapshot, { redactNames = lfm.cfg.redactNames }))
+          body = assert(lfm.buildRequestBody(systemPrompt, user, {
+            maxTokens = tonumber(args.max_tokens) or 128, schema = true, model = args.model,
+            temperature = tonumber(args.temperature) }))
+        end
+        local resp, wallMs = postJson(url, body, reqPath, respPath, hdr, timeout)
+        local action, pWait, err
+        if api == "systemone" then
+          local v, perr = lfm.parseSystemOne(resp)
+          if v then action, pWait = v.action, v.pWait else err = perr end
+        else
+          local raw, perr = lfm.parseResponse(resp)
+          local v = raw and lfm.validateVerdict(raw) or nil
+          if v then action = (v.action == "wait") and "wait" or "freeze" else err = perr or "invalid verdict" end
+        end
+        n = n + 1
+        if action then valid = valid + 1 end
+        of:write(assert(lfm.jsonEncode({ episode = ep.id, t = st.t, action = action or "freeze",
+          pWait = pWait, valid = action ~= nil, wall_ms = wallMs,
+          error = err and tostring(err):sub(1, 120) or nil })), "\n")
+      end
+    end
+    of:close()
+  end)
+  os.remove(reqPath)
+  os.remove(respPath)
+  io.write(string.format("%s/%s: %d decision points, %d valid -> %s\n", label, api, n, valid, out))
 end
 
 ------------------------------------------------------------------------------
@@ -527,9 +654,11 @@ local args = parseArgs(arg)
 local mode = args.positional[1] or "run"
 if mode == "run" then
   runMode(args)
+elseif mode == "episodes" then
+  episodesMode(args)
 elseif mode == "gates" then
   gatesMode(args)
 else
-  io.stderr:write("usage: lua eval/bakeoff.lua run|gates [options]\n")
+  io.stderr:write("usage: lua eval/bakeoff.lua run|episodes|gates [options]\n")
   os.exit(2)
 end

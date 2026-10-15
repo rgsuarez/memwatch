@@ -1287,7 +1287,7 @@ end
 -- happened. A freeze or terminate that changed a process always notifies,
 -- even with desktop alerts muted (silence there turns a muted alert into a
 -- mystery hang); an action that signaled nothing is logged, not announced.
-local RECEIPT_OUTCOMES = { frozen = true, terminated = true, failed = true, unconfirmed = true }
+local RECEIPT_OUTCOMES = { frozen = true, terminated = true, replaced = true, failed = true, unconfirmed = true }
 local function unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
   if not RECEIPT_OUTCOMES[outcome] then return end
   local why = (adjudicator == "lfm")
@@ -1733,6 +1733,21 @@ local function saveFrozen()
   f:close()
 end
 
+-- A ledger writer changes only its own process's entry: the slot holds
+-- nothing, an entry with no start time, or this very start time. An entry
+-- for another start time (a newer freeze of the pid's next process, or one
+-- a reload adopted) is not the writer's to touch.
+local function ownsEntry(pid, lstart)
+  local cur = frozen[pid]
+  return cur == nil or cur.lstart == nil or cur.lstart == lstart
+end
+local function dropOwnEntry(pid, lstart)
+  if frozen[pid] ~= nil and ownsEntry(pid, lstart) then
+    frozen[pid] = nil
+    saveFrozen()
+  end
+end
+
 local function loadFrozen()
   local f = io.open(FROZEN_PATH, "r")
   if not f then return {} end
@@ -1751,10 +1766,19 @@ local function frozenReconcile()
   local list = loadFrozen()
   frozen = {}
   local survivors = {}
+  local now = hs.timer.secondsSinceEpoch()
   for _, e in ipairs(list) do
     if type(e) == "table" and type(e.pid) == "number" then
       local proc, why = resolveSignalTarget(e.pid, e.name, e.lstart)
-      if why == "unverified" then
+      if e.pendingUntil and now < e.pendingUntil and (proc or why == "unverified") then
+        -- A freeze still being verified when memwatch reloaded: its STOP may
+        -- land after this probe (a process in a syscall stops on return to
+        -- user space). Its verifier died with the reload, so the sweep
+        -- decides once the pending window ends.
+        M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):pending", e.name or "?", e.pid))
+        frozen[e.pid] = e
+        survivors[#survivors + 1] = e.name
+      elseif why == "unverified" then
         M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):unverified", e.name or "?", e.pid))
         frozen[e.pid] = e
         survivors[#survivors + 1] = e.name
@@ -1908,6 +1932,9 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       if stopSent then
         onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
       else
+        -- No STOP went out: there is nothing to protect, and a pending
+        -- entry would only hide a running process and swallow a retry.
+        dropOwnEntry(pid, proc.lstart)
         onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
       end
     elseif not reprobe then
@@ -1966,8 +1993,7 @@ function M.resumePid(pid, onUpdate)
     return
   end
   if not proc then
-    frozen[pid] = nil
-    saveFrozen()
+    dropOwnEntry(pid, e.lstart)
     M.logSnapshot(string.format("resume-drop:%s(%d):%s", e.name or "?", pid, twhy))
     onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name or tostring(pid), twhy), true)
     return
@@ -1982,13 +2008,13 @@ function M.resumePid(pid, onUpdate)
       M.logSnapshot(string.format("resume-unverified:%s(%d)", e.name, pid))
       onUpdate(string.format("sent CONT to %s; can't verify it resumed, check the menu again", e.name), true)
     elseif not again then
-      frozen[pid] = nil
-      saveFrozen()
+      -- The resumed process is gone; an entry for whatever holds the pid now
+      -- (frozen meanwhile) is not this resume's to drop.
+      dropOwnEntry(pid, e.lstart)
       M.logSnapshot(string.format("resume-drop:%s(%d):%s", e.name, pid, awhy))
       onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name, awhy), true)
     elseif not core.isStopped(again) then
-      frozen[pid] = nil
-      saveFrozen()
+      dropOwnEntry(pid, e.lstart)
       M.logSnapshot(string.format("resume-done:%s(%d)", e.name, pid))
       onUpdate(string.format("%s resumed after %.0f min frozen", e.name,
         (hs.timer.secondsSinceEpoch() - (e.frozenAt or 0)) / 60), true)
@@ -2834,10 +2860,14 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   if not send("TERM", pid) then
-    -- Nothing terminated it. A process continued for its TERM may be
-    -- running again, and that is said.
-    if contSent then
-      onUpdate(string.format("couldn't send TERM to %s; it was continued and may be running", liveName),
+    -- Nothing terminated it. A process continued for its TERM is stopped
+    -- again (its ledger entry still true); if that cannot be sent either, it
+    -- runs, its entry goes, and that is said.
+    if contSent and send("STOP", pid) then
+      onUpdate(string.format("couldn't send TERM to %s; it was stopped again", liveName), true, "unverified")
+    elseif contSent then
+      dropOwnEntry(pid, proc.lstart)
+      onUpdate(string.format("couldn't send TERM to %s; it was continued and is running", liveName),
         true, "unconfirmed")
     else
       onUpdate(string.format("couldn't send TERM to %s; nothing was signaled", liveName), true, "unverified")
@@ -2857,12 +2887,18 @@ function M.killPid(pid, expectedName, onUpdate, opts)
         -- Gone, or the pid now holds another process: the original exited.
         -- Only its own frozen-ledger entry goes; one for a newer process
         -- at this pid is not this kill's to touch.
-        local fe = frozen[pid]
-        if fe and (fe.lstart == nil or fe.lstart == proc.lstart) then frozen[pid] = nil; saveFrozen() end
+        dropOwnEntry(pid, proc.lstart)
         local footTxt = footBeforeGB and string.format("-footprint=%.1fGB", footBeforeGB) or ""
         M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB%s", liveName, pid, reclaimedGB, footTxt))
-        onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
-          footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or ""), true, "terminated")
+        local how = string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
+          footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or "")
+        if vwhy == "exited" then
+          onUpdate(how, true, "terminated")
+        else
+          -- Another process holds the pid now: a new question for every
+          -- surface (rebind), never one marked gone with the old process.
+          onUpdate(how .. string.format("; pid %d now holds another process", pid), true, "replaced")
+        end
       elseif killSent then
         M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
         onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true, "failed")

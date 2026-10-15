@@ -91,10 +91,12 @@ function F.new()
   end
   -- Grow a process by mbPerSec while it runs (a stopped process holds still).
   function W.grow(pid, mbPerSec)
-    return addTimer("every", 1, 1, function()
+    local t = addTimer("every", 1, 1, function()
       local p = W.procs[pid]
       if p and p.state == "S" then p.rssKB = p.rssKB + math.floor(mbPerSec * 1024) end
     end)
+    t.world = true   -- the process's own behavior: a Hammerspoon reload does not stop it
+    return t
   end
 
   local function etime(p)
@@ -161,9 +163,10 @@ function F.new()
         if sig == "STOP" then
           if not p.unstoppable then
             if W.stopDelay then
+              -- The kernel applies the STOP whatever memwatch does meanwhile.
               addTimer("after", W.stopDelay, nil, function()
                 if W.procs[kp] == p then p.state = "T" end
-              end)
+              end).world = true
             else
               p.state = "T"
             end
@@ -246,7 +249,10 @@ function F.new()
     -- probeSignaled models a ps killed mid-reply: its partial output, and
     -- hs.execute's status saying a signal ended it.
     execute = function(cmd)
-      if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill")) then
+      -- sendFails = { TERM = true, ... } fails only those signals' sends.
+      local sig = cmd:match("^/bin/kill %-(%u+)")
+      if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill"))
+         or (sig and W.sendFails and W.sendFails[sig]) then
         error("fork: Resource temporarily unavailable")
       end
       local out = exec(cmd)
@@ -338,7 +344,9 @@ function F.new()
   -- A Hammerspoon reload: every timer and canvas of the old Lua state dies
   -- with it (persisted files and posted notifications survive).
   function W.reloadState()
-    for _, t in ipairs(W.timers) do t.stopped = true end
+    for _, t in ipairs(W.timers) do
+      if not t.world then t.stopped = true end   -- the world's own timers carry on
+    end
     if W.hud then W.hud._showing = false end
     W.hud, W.menu = nil, nil
   end

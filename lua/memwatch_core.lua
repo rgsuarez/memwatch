@@ -596,8 +596,10 @@ end
 -- What an action's outcome means for the alert that asked for it (the
 -- signal engines report the outcome; nothing is re-probed after the fact):
 --   done    frozen, terminated, or verified gone before any signal
---   rebind  the pid holds another process: forget the binding, and treat
---           whoever holds the pid now as a new question
+--   rebind  the pid holds another process (stale: refused before any
+--           signal; replaced: the target was terminated and another
+--           process holds the pid): forget the binding, and treat whoever
+--           holds the pid now as a new question
 --   snooze  refused by policy, or signaled but survived: ask again later
 --   stand   unverified (or unknown): nothing is concluded, and the alert
 --           stays as it was, visible and retryable
@@ -605,7 +607,7 @@ end
 --   stands; unlike unverified, something may have changed, so it is
 --   announced)
 local ANSWER = { frozen = "done", terminated = "done", exited = "done",
-                 stale = "rebind", refused = "snooze", failed = "snooze" }
+                 stale = "rebind", replaced = "rebind", refused = "snooze", failed = "snooze" }
 function M.answerFor(outcome) return ANSWER[outcome] or "stand" end
 
 -- Should the HUD raise now? Never while the episode's alert is already up

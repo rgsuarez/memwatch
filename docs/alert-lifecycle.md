@@ -80,7 +80,8 @@ the fact:
 | `frozen` | stopped and verified, or already frozen by memwatch | done |
 | `terminated` | verified gone after the signal | done |
 | `exited` | verified gone before any signal | done |
-| `stale` | the pid now holds a different process | rebind; the newcomer is a new question |
+| `stale` | the pid now holds a different process (nothing signaled) | rebind; the newcomer is a new question |
+| `replaced` | terminated, and another process holds the pid now | rebind; the newcomer is a new question |
 | `refused` | the policy gate refused (protected, not ours) | snoozed |
 | `failed` | signaled, but it survived (did not stop, still present) | snoozed |
 | `unconfirmed` | a signal went out, but its result could not be verified | stands as it was; announced |
@@ -145,6 +146,17 @@ could not be verified). An action whose result has not arrived by the hold
 deadline gets an `unconfirmed` receipt then. An action that signaled
 nothing (`unverified`, `refused`, `stale`, `exited`) is logged, not
 announced.
+
+## The frozen ledger
+
+Every writer changes only its own process's entry: a freeze verifier, a
+resume, a kill and the reconcile each drop or settle the entry for the
+start time they acted on, never an entry for the pid's next process. An
+entry is written before its STOP; if the STOP could not be sent, the entry
+goes. A freeze still being verified when memwatch reloads keeps its entry
+(its STOP may land after the reload) until the sweep can decide. A frozen
+process continued for a Force Quit whose TERM cannot be sent is stopped
+again.
 
 ## Banners
 

@@ -72,7 +72,8 @@ the fact:
 | `stale` | the pid now holds a different process | rebind; the newcomer is a new question |
 | `refused` | the policy gate refused (protected, not ours) | snoozed |
 | `failed` | signaled, but it survived (did not stop, still present) | snoozed |
-| `unverified` | identity or result could not be verified | stands as it was: visible, unanswered, retryable |
+| `unconfirmed` | a signal went out, but its result could not be verified | stands as it was; announced |
+| `unverified` | nothing was signaled: the probe failed first, or the signal could not be sent | stands as it was: visible, unanswered, retryable |
 
 An answered process stops being a candidate by its own state, not by a note
 in a list: memwatch holds it frozen, it is gone, or it is ignored. Nothing
@@ -121,8 +122,13 @@ any other way (an unbound refusal, a self-test button) is not an answer
 either. memwatch never retries a freeze or terminate that already failed
 on the same process.
 
-Receipts for unattended actions report what happened (frozen, terminated,
-refused, could not verify), and are posted when the action completes.
+Receipts for unattended actions say what happened and are posted when the
+action completes, even with desktop alerts muted: `frozen`, `terminated`,
+`failed` (it survived), or `unconfirmed` (a signal went out but its result
+could not be verified). An action whose result has not arrived by the hold
+deadline gets an `unconfirmed` receipt then. An action that signaled
+nothing (`unverified`, `refused`, `stale`, `exited`) is logged, not
+announced.
 
 ## Banners
 

@@ -90,6 +90,7 @@ end
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
 local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
 local unattendedSkipLogAt = 0  -- last "identity unverified" skip line (one a minute)
+local openReceipts = {}        -- [owed] = true: unattended actions whose outcome has not arrived
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
 local lfmServerPort  = nil
@@ -329,6 +330,15 @@ local COLOR = {
 local function sh(cmd)
   local out = hs.execute(cmd)
   return out or ""
+end
+
+-- Send one signal to a pid the caller has verified. A fork that fails
+-- (hs.execute raises) sent nothing: the send returns false and is logged,
+-- so the action reports that instead of dying before its outcome.
+local function send(sig, pid)
+  local ok = pcall(sh, string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
+  if not ok then M.logSnapshot(string.format("signal-send-failed:%s:%d", sig, pid)) end
+  return ok
 end
 
 -- Sample memory metrics. Native hs.host.vmStat() first (no fork, and it
@@ -1266,6 +1276,21 @@ local function unattendedReceipt(action, target, adjudicator, rationale, outcome
                   withdrawAfter = 0 }):send()
 end
 
+-- An unattended action whose outcome never arrived by the hold deadline
+-- (a step of its narrative never ran) still owes its receipt: a signal may
+-- have gone out, so the operator is told, never left with silence.
+local function settleOpenReceipts(now)
+  for owed in pairs(openReceipts) do
+    if now > owed.dueAt then
+      openReceipts[owed] = nil
+      M.logSnapshot(string.format("unattended-no-result:%s:%s(%d)", owed.action,
+        owed.target.name or "?", owed.target.pid or -1))
+      unattendedReceipt(owed.action, owed.target, owed.adjudicator, owed.rationale, "unconfirmed",
+        string.format("%s started, but its result never came back", owed.action))
+    end
+  end
+end
+
 -- Unattended action: opt-in, extreme growers only, the alert episode
 -- unanswered for the grace window, once per offender. With desktop alerts
 -- muted the episode still arms and counts the same clock: muted-and-
@@ -1328,8 +1353,14 @@ local function unattendedStep(offender, now)
   end
   hudHold, hudHoldUntil = true, now + HOLD_MAX_SEC
   local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
+  -- The receipt is owed from here (settleOpenReceipts covers an outcome
+  -- that never arrives).
+  local owed = { action = action, target = target, adjudicator = adjudicator,
+                 rationale = rationale, dueAt = now + HOLD_MAX_SEC }
+  openReceipts[owed] = true
   local gen = runGen
   local narrate = function(text, done, outcome)
+    if done then openReceipts[owed] = nil end
     if gen ~= runGen then
       -- The run ended mid-action: still say what memwatch did, but leave
       -- the new run's alert alone.
@@ -1499,6 +1530,7 @@ local function tick()
   -- must be cleared before this tick's unattended decision can read it, or a
   -- recycled pid could inherit stale state for one tick.
   gcUnattendedState()
+  settleOpenReceipts(now)
   alertSurfaces(state, now)
   -- Frozen-ledger liveness sweep, in every state: a frozen pid is no
   -- candidate, so a phantom entry (the process died, its pid was reused)
@@ -1828,7 +1860,10 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   }
   frozen[pid] = entry
   saveFrozen()
-  sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
+  -- A STOP that could not be sent still goes through the verifier, which
+  -- decides from the process's state: stopped keeps the entry, running
+  -- means nothing was done.
+  local stopSent = send("STOP", pid)
   afterHeld(0.5, guard("freeze-verify", function()
     -- Re-probe IDENTITY and state in one fork after the signal: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
@@ -1845,10 +1880,14 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     local ours = cur == nil or cur.lstart == nil or cur.lstart == proc.lstart
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
-      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
+      if stopSent then
+        onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
+      else
+        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
+      end
     elseif not reprobe then
       if ours then
-        sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+        if stopSent then send("CONT", pid) end
         frozen[pid] = nil
         saveFrozen()
       end
@@ -1873,8 +1912,12 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
         frozen[pid] = nil
         saveFrozen()
       end
-      M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
-      onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed")
+      if stopSent then
+        M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
+        onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed")
+      else
+        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
+      end
     end
   end))
 end
@@ -1904,7 +1947,10 @@ function M.resumePid(pid, onUpdate)
     onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name or tostring(pid), twhy), true)
     return
   end
-  sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+  if not send("CONT", pid) then
+    onUpdate(string.format("couldn't send CONT to %s; it stays frozen, try again", e.name or tostring(pid)), true)
+    return
+  end
   afterHeld(0.5, guard("resume-verify", function()
     local again, awhy = resolveSignalTarget(pid, e.name, e.lstart)
     if awhy == "unverified" then
@@ -2748,12 +2794,21 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- A SIGSTOPped process cannot handle SIGTERM until it is continued, so a
   -- TERM to a frozen target would just pend and force the full escalation
   -- wait before SIGKILL. Continue it first so the graceful signal can land.
-  if frozenEntry or core.isStopped(proc) then
-    sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
-  end
+  local contSent = false
+  if frozenEntry or core.isStopped(proc) then contSent = send("CONT", pid) end
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
-  sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
+  if not send("TERM", pid) then
+    -- Nothing terminated it. A process continued for its TERM may be
+    -- running again, and that is said.
+    if contSent then
+      onUpdate(string.format("couldn't send TERM to %s; it was continued and may be running", liveName),
+        true, "unconfirmed")
+    else
+      onUpdate(string.format("couldn't send TERM to %s; nothing was signaled", liveName), true, "unverified")
+    end
+    return
+  end
   local killSent = false
   local function verify()
     afterHeld(k.verifySec + k.settleSec, guard("kill-verify", function()
@@ -2777,10 +2832,11 @@ function M.killPid(pid, expectedName, onUpdate, opts)
         M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
         onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true, "failed")
       else
-        -- It survived TERM and memwatch never got to verify it for KILL:
-        -- nothing about it is final, and it can be tried again.
+        -- It survived TERM and memwatch never got KILL to it (unverified,
+        -- or the send failed): nothing about it is final, and it can be
+        -- tried again.
         M.logSnapshot(string.format("kill-unconfirmed:%s(%d)-no-kill-sent", liveName, pid))
-        onUpdate(string.format("%s ignored TERM, and memwatch could not verify it to send KILL", liveName),
+        onUpdate(string.format("%s ignored TERM, and memwatch could not send it KILL", liveName),
           true, "unconfirmed")
       end
     end))
@@ -2796,8 +2852,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       if again then
         M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
         onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
-        sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
-        killSent = true
+        killSent = send("KILL", pid)
       elseif awhy == "unverified" and attempt < 3 then
         M.logSnapshot(string.format("kill-escalate-retry:%s(%d)-unverified", liveName, pid))
         escalate(attempt + 1)

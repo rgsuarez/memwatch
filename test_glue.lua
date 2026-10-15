@@ -676,9 +676,9 @@ end)
 
 -- ---- outcomes: an unattended receipt says what happened, when it happened ----
 -- (round 3) A same-name process took the pid under an inherited binding:
--- the attempt is refused, so no "freeze" receipt, and the newcomer is a new
--- alert with its own grace.
-scenario("a refused unattended action posts no receipt", '{"unattended":"freeze","alerts":false}', function(W)
+-- the attempt is refused as stale, so no "freeze" receipt, and the
+-- newcomer is a new alert with its own grace.
+scenario("an unattended action refused as stale posts no receipt", '{"unattended":"freeze","alerts":false}', function(W)
   leaker(W, 4242)
   W.run(12)
   W.kern = 4
@@ -695,6 +695,39 @@ scenario("a refused unattended action posts no receipt", '{"unattended":"freeze"
   check("receipt: the newcomer is frozen on its own identity", W.signalsTo(4242), "STOP")
   check("receipt: (a full grace after the refusal)", W.sigs[#W.sigs].t - refusedAt >= 59, true)
   check("receipt: exactly one receipt, for the freeze that happened", #W.notices("memwatch unattended freeze"), 1)
+end)
+
+-- (round 4) The policy gate refuses another user's process: nothing is
+-- signaled, and nothing is announced.
+scenario("an unattended action the policy refuses posts no receipt", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "rootleak", 2000, { uid = 0 })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  local refused = runUntil(W, 120, function() return logHas(W, "freeze-refuse:rootleak(4242)") end)
+  check("policy: the unattended freeze is refused", refused, true)
+  W.run(10)
+  check("policy: nothing was signaled", W.signalsTo(4242), "")
+  check("policy: and no receipt claims anything", #W.notices("memwatch unattended"), 0)
+end)
+
+-- (round 4) An unattended action whose result never arrives (its verifier
+-- never got to run) still owes a receipt: a STOP went out, and the muted
+-- operator is told so at the hold deadline.
+scenario("an unattended action with no result still posts a receipt", '{"unattended":"freeze","alerts":false}', function(W)
+  W.onSignal = function(sig) if sig == "STOP" then W.timersStall = true end end
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal, W.timersStall = nil, false
+  check("no-result: the STOP went out", W.signalsTo(4242), "STOP")
+  check("no-result: nothing is announced before the deadline", #W.notices("memwatch unattended"), 0)
+  W.run(50)
+  local n = W.notices("memwatch unattended freeze")
+  check("no-result: one receipt at the deadline, though alerts are muted", #n, 1)
+  check("no-result: it says the result never came back",
+    n[1] ~= nil and (n[1].attrs.informativeText or ""):find("never came back", 1, true) ~= nil, true)
 end)
 
 -- (round 3) A freeze that did not stop the process is a snooze, not a
@@ -1171,9 +1204,31 @@ scenario("a toggle that cannot be saved says so", '{"unattended":"off","remoteSe
 end)
 
 -- ---- narratives: a hold that never ends is released ----
--- A fork that fails mid-action (here the kill itself) ends the narrative
--- without its last update. The alert must not stay frozen in that hold.
+-- A narrative whose next step never runs (the run loop stalls past its
+-- escalation) ends without its last update. The alert must not stay
+-- frozen in that hold.
 scenario("a stuck narrative hold is released", nil, function(W)
+  W.addProc(4242, "leaker", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.timersStall = true              -- the escalation after TERM never runs
+  W.click("kill")
+  W.timersStall = false
+  W.run(5)
+  check("hold: the narrative is stuck mid-action", W.hudBody():find("terminating", 1, true) ~= nil, true)
+  check("hold: the alert comes back to live numbers after the deadline",
+    runUntil(W, 60, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end), true)
+  W.click("kill")
+  W.run(20)
+  check("hold: and acts again", W.signalsTo(4242), "TERM,TERM,KILL")
+end)
+
+-- (round 4) A signal whose fork fails sent nothing: the action says so at
+-- once and ends, instead of holding the alert until the deadline.
+scenario("a signal that cannot be sent ends its narrative", nil, function(W)
   leaker(W, 4242)
   W.run(12)
   W.kern = 4
@@ -1182,13 +1237,14 @@ scenario("a stuck narrative hold is released", nil, function(W)
   W.killRaises = true               -- the probe answers; the kill itself cannot fork
   W.click("kill")
   W.killRaises = false
-  W.run(5)
-  check("hold: the narrative is stuck mid-action", W.hudBody():find("terminating", 1, true) ~= nil, true)
-  check("hold: the alert comes back to live numbers after the deadline",
-    runUntil(W, 60, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end), true)
+  W.run(1)
+  check("send: the narrative says nothing was signaled",
+    W.hudBody():find("couldn't send TERM", 1, true) ~= nil, true)
+  check("send: the alert stands, back on live numbers well before the hold deadline",
+    runUntil(W, 10, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end), true)
   W.click("kill")
   W.run(10)
-  check("hold: and acts again", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
+  check("send: and the next click acts", W.signalsTo(4242), "TERM")
 end)
 
 -- ---- round 4: interactions the design pass introduced ----

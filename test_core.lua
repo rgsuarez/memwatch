@@ -1014,39 +1014,84 @@ do
   check("offender: none equals none", core.sameOffender(nil, nil), true)
   check("offender: none differs from one", core.sameOffender(nil, A), false)
 
+  check("kind: severity rises from hog to extreme",
+    core.kindRank("hog") < core.kindRank("absolute") and core.kindRank("absolute") < core.kindRank("sustained")
+      and core.kindRank("sustained") < core.kindRank("extreme"), true)
+  check("kind: an unknown kind ranks lowest", core.kindRank(nil), 0)
+
+  -- W = withdraw, P = post (after the cooldown), R = replace in place now.
   local function step(a)
     local s = core.bannerStep(a)
-    return (s.withdraw and "W" or "-") .. (s.post and "P" or "-")
+    return (s.withdraw and "W" or "-") .. (s.post and "P" or "-") .. (s.replace and "R" or "-")
   end
-  -- Happy: the episode's first banner posts; the live one for the same
-  -- offender stays, cooldown or not (never re-posted, even if dismissed).
-  check("banner: first post of an episode", step({ hasBanner = false, offender = A, sinceLastPostSec = 1e9, cooldownSec = 180 }), "-P")
+  local Ab = { pid = 10, name = "node", lstart = A.lstart, kind = "extreme", canAct = true }
+  local Au = { pid = 10, name = "node", kind = "extreme", canAct = false }   -- posted unbound
+  local Ah = { pid = 10, name = "node", lstart = A.lstart, kind = "hog", canAct = true }
+  local base = { sinceLastPostSec = 1e9, cooldownSec = 180 }
+  local function with(over)
+    local t = {}
+    for k, v in pairs(base) do t[k] = v end
+    for k, v in pairs(over) do t[k] = v end
+    return t
+  end
+  -- Happy: the first post; the live banner for the same offender stays.
+  check("banner: first post of an episode", step(with({ hasBanner = false, offender = A })), "-P-")
   check("banner: the current offender's banner stays",
-    step({ hasBanner = true, banner = A, offender = A2, sinceLastPostSec = 1e9, cooldownSec = 180 }), "--")
+    step(with({ hasBanner = true, banner = Ab, offender = A2, canAct = true })), "---")
+  -- Upgrades in place, without the cooldown: identity bound, kind escalated,
+  -- a generic banner gaining a name.
+  check("banner: an unbound banner upgrades once identity binds",
+    step(with({ hasBanner = true, banner = Au, offender = A, canAct = true, sinceLastPostSec = 5 })), "--R")
+  check("banner: a hog banner upgrades when it escalates",
+    step(with({ hasBanner = true, banner = Ah, offender = { pid = 10, name = "node", kind = "extreme" },
+               canAct = true, sinceLastPostSec = 5 })), "--R")
+  check("banner: a generic banner gains the offender's name at once",
+    step(with({ hasBanner = true, banner = nil, offender = A, canAct = true, sinceLastPostSec = 5 })), "--R")
   -- Changed: a stale banner goes at once; its replacement waits the cooldown.
   check("banner: a new offender withdraws the stale banner at once",
-    step({ hasBanner = true, banner = A, offender = B, sinceLastPostSec = 30, cooldownSec = 180 }), "W-")
+    step(with({ hasBanner = true, banner = Ab, offender = B, sinceLastPostSec = 30 })), "W--")
   check("banner: the replacement posts once the cooldown allows",
-    step({ hasBanner = false, offender = B, sinceLastPostSec = 181, cooldownSec = 180 }), "-P")
+    step(with({ hasBanner = false, offender = B, sinceLastPostSec = 181 })), "-P-")
   check("banner: a reused pid is a different offender",
-    step({ hasBanner = true, banner = A, offender = Ar, sinceLastPostSec = 30, cooldownSec = 180 }), "W-")
-  -- Degraded: the offender vanishes mid-episode; a generic banner follows.
-  check("banner: a vanished offender withdraws its banner",
-    step({ hasBanner = true, banner = A, offender = nil, sinceLastPostSec = 1e9, cooldownSec = 180 }), "WP")
+    step(with({ hasBanner = true, banner = Ab, offender = Ar, sinceLastPostSec = 30 })), "W--")
+  -- History: an offender already announced this episode stays quiet.
+  check("banner: a returning offender already announced stays quiet",
+    step(with({ hasBanner = false, offender = A, notified = true })), "---")
+  check("banner: and a stale banner still goes when it returns",
+    step(with({ hasBanner = true, banner = { pid = 11, name = "python3" }, offender = A, notified = true })), "W--")
+  -- Answered offenders get no banner, and lose the one they had.
+  check("banner: an answered offender gets none", step(with({ hasBanner = false, offender = A, handled = true })), "---")
+  check("banner: an answered offender's banner goes",
+    step(with({ hasBanner = true, banner = Ab, offender = A, handled = true })), "W--")
+  check("banner: even once no offender is named",
+    step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = nil, notified = true })), "W--")
+  -- Degraded: the offender vanishes mid-episode; the banner stays (no churn).
+  check("banner: a vanished offender keeps its banner",
+    step(with({ hasBanner = true, banner = Ab, offender = nil })), "---")
   check("banner: a generic banner stays while no offender is named",
-    step({ hasBanner = true, banner = nil, offender = nil, sinceLastPostSec = 1e9, cooldownSec = 180 }), "--")
+    step(with({ hasBanner = true, banner = nil, offender = nil })), "---")
+  check("banner: a generic banner posts once per episode",
+    step(with({ hasBanner = false, offender = nil, notified = true })), "---")
 
   local function raise(a) return core.hudRaiseDue(a) end
+  local snoozed = { off = A, kind = "extreme", untilAt = 1060 }
   check("hud: never re-raises an episode already up",
     raise({ visible = true, offender = B, episode = A, sinceRaiseSec = 1e9, raiseSec = 60 }), false)
   check("hud: an episode's first offender raises at once",
     raise({ visible = false, offender = A, episode = nil, sinceRaiseSec = 0, raiseSec = 60 }), true)
-  check("hud: a closed HUD's offender waits out the cooldown",
-    raise({ visible = false, offender = A2, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), false)
-  check("hud: and returns after it",
-    raise({ visible = false, offender = A2, episode = A, sinceRaiseSec = 61, raiseSec = 60 }), true)
+  check("hud: a snoozed offender stays down until the snooze ends",
+    raise({ visible = false, offender = A2, episode = A, snooze = snoozed, now = 1030, sinceRaiseSec = 999, raiseSec = 60 }), false)
+  check("hud: and returns when it ends",
+    raise({ visible = false, offender = A2, episode = A, snooze = snoozed, now = 1061, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: an escalation preempts the snooze",
+    raise({ visible = false, offender = { pid = 10, name = "node", kind = "extreme" }, episode = A,
+            snooze = { off = A, kind = "hog", untilAt = 2000 }, now = 1010, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: an answered offender never returns",
+    raise({ visible = false, offender = A2, episode = A, handled = true, sinceRaiseSec = 1e9, raiseSec = 60 }), false)
   check("hud: a new offender preempts the cooldown",
     raise({ visible = false, offender = B, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), true)
+  check("hud: the same offender again waits the cooldown",
+    raise({ visible = false, offender = A2, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), false)
   check("hud: no named offender stays cooldown-gated",
     raise({ visible = false, offender = nil, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), false)
 end
@@ -1067,7 +1112,7 @@ do
   check("banner glue: notifyCrit located", #notify > 400, true)
   check("banner glue: steps through core.bannerStep", notify:find("core.bannerStep(", 1, true) ~= nil, true)
   check("banner glue: Force Quit passes the bound start time",
-    notify:find("M.killPid(off.pid, off.name, nil, { expectedLstart = off.lstart })", 1, true) ~= nil, true)
+    notify:find("M.killPid(off.pid, off.name, nil, { expectedLstart = lstart })", 1, true) ~= nil, true)
   check("banner glue: the button exists only when identity is bound",
     notify:find("hasActionButton   = canAct,", 1, true) ~= nil, true)
   check("banner glue: no unbound kill remains (control: old shape is caught)",
@@ -1076,17 +1121,24 @@ do
   local surfaces = body("local function alertSurfaces(state, now)")
   check("hud glue: alertSurfaces located", #surfaces > 400, true)
   check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)
-  check("hud glue: a refresh binds identity", surfaces:find("bindOffender(offender, hudOffender)", 1, true) ~= nil, true)
+  check("hud glue: a refresh inherits the bound identity",
+    surfaces:find("bindOffender(offender, hudOffender, now, false)", 1, true) ~= nil, true)
+  check("hud glue: a retarget binds anew and restarts the grace",
+    surfaces:find("bindOffender(offender, nil, now, true)\n          hudShownAt = now\n          hudInteracted = false", 1, true) ~= nil, true)
   check("hud glue: the refresh never drops the bound table (control included)",
     ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
       and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)
-  check("hud glue: the episode's end forgets its offender", surfaces:find("hudEpisodeOff = nil", 1, true) ~= nil, true)
+  check("hud glue: the episode's end forgets its memory",
+    surfaces:find("hudEpisodeOff, hudSnooze, hudHandled, hudStalePid = nil, nil, {}, nil", 1, true) ~= nil, true)
   local closeAt = src:find('elseif id == "close" then', 1, true)
   local closeBody = closeAt and src:sub(closeAt, closeAt + 260) or ""
-  local restart = closeBody:find("lastHudRaiseAt = hs.timer.secondsSinceEpoch()", 1, true)
-  local hide = closeBody:find("M.hideHud()", 1, true)
-  check("hud glue: a close restarts the raise clock before hiding",
-    restart ~= nil and hide ~= nil and restart < hide, true)
+  check("hud glue: a close is a snooze", closeBody:find('dismissHud("snooze")', 1, true) ~= nil, true)
+  local clicks = body('hud:mouseCallback(guard("hud-click"', "\n  end))")
+  local _, bareHides = clicks:gsub("M%.hideHud%(%)", "")
+  check("hud glue: no click handler hides the HUD without answering it (control: counts a bare hide)",
+    (select(2, ("M.hideHud()"):gsub("M%.hideHud%(%)", ""))) == 1 and bareHides == 0, true)
+  check("hud glue: a click acts only on a bound identity",
+    clicks:find("if not target.lstart then", 1, true) ~= nil, true)
   local poll = body("local function untilHeld(pred, action, interval)")
   check("poller glue: untilHeld located", #poll > 200, true)
   check("poller glue: an error no longer ends the poller (control: old shape caught)",
@@ -1098,6 +1150,17 @@ do
   local police = src:find('"memwatch: adjudicator over budget"', 1, true)
   check("receipt glue: the over-budget notice ignores the mute",
     police ~= nil and not src:sub(police - 200, police):find("if alertsEnabled then", 1, true), true)
+  check("banner glue: the episode history gates every post",
+    notify:find("canAct = canAct, notified = notified,", 1, true) ~= nil, true)
+  check("banner glue: every post joins the episode history",
+    notify:find("critNotified[#critNotified + 1] = critNotifOff or { none = true }", 1, true) ~= nil, true)
+  check("banner glue: the episode's end clears the history", surfaces:find("critNotified = {}", 1, true) ~= nil, true)
+  local raiseBody = body("local function raiseHud(offender, titleText)")
+  check("hud glue: a fresh raise binds identity anew",
+    raiseBody:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
+  check("hud glue: a raise no longer inherits across the episode (control: old shape caught)",
+    ("bindOffender(offender, hudEpisodeOff)"):find("bindOffender(offender, hudEpisodeOff)", 1, true) ~= nil
+      and raiseBody:find("bindOffender(offender, hudEpisodeOff)", 1, true) == nil, true)
   local test = body("function M.test(level, seconds)")
   local clearAt = test:find("critNotif, critNotifOff = nil, nil", 1, true)
   local postAt = test:find("notifyCrit(lastMetrics)", 1, true)
@@ -1117,6 +1180,9 @@ do
     src:find('logError("local-config-save"', 1, true) ~= nil, true)
   local mute = body("function M.setAlertsEnabled(on)")
   check("mute glue: unmuting lets the banner return with the HUD", mute:find("lastNotifyAt = 0", 1, true) ~= nil, true)
+  check("mute glue: muting forgets the episode history so unmute restores the banner",
+    mute:find("critNotified = {}", 1, true) ~= nil, true)
+  check("self-test glue: a fresh run clears the episode history", test:find("critNotified = {}", 1, true) ~= nil, true)
 end
 
 -- ---- episode banner: the cooldown ends with the episode ----
@@ -1127,7 +1193,7 @@ do
   -- True when the settle branch resets the cooldown under the settle gate
   -- itself, not under a live-banner condition that skips it.
   local function resetsOnSettle(body)
-    local gate = body:find("if settled then", 1, true)
+    local gate = body:find("if settled then", 1, true) or body:find("if settled and not hudHold then", 1, true)
     local reset = body:find("lastNotifyAt = 0", 1, true)
     return gate ~= nil and reset ~= nil and gate < reset
   end

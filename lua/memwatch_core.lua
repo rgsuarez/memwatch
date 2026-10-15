@@ -425,34 +425,88 @@ function M.sameOffender(a, b)
   return a.lstart == nil or b.lstart == nil or a.lstart == b.lstart
 end
 
--- The critical banner's next step. A live banner naming a process the alerts
--- have moved off (a new offender, a reused pid, or none) is withdrawn at
--- once, so its Force Quit can never act on the wrong process. A banner is
--- posted only when none is live and the cooldown allows, which damps
--- offender flap within an episode (the episode's end resets the cooldown).
--- A live banner naming the current offender stays: it is never re-posted,
--- even after a manual dismissal, which macOS does not report.
--- a: { hasBanner, banner = {pid,name,lstart}|nil, offender = ...|nil,
---      sinceLastPostSec, cooldownSec }  ->  { withdraw = bool, post = bool }
+-- Severity of an offender kind, for escalation: a process that moves up
+-- this ladder is new information even if it is the same process.
+local KIND_RANK = { hog = 1, absolute = 2, sustained = 3, extreme = 4 }
+function M.kindRank(kind) return KIND_RANK[kind] or 0 end
+
+-- The critical banner's next step. One banner per offender per episode:
+--   * a live banner for the current offender stays (never re-posted, even
+--     after a manual dismissal, which macOS does not report), except that it
+--     is replaced in place, without the cooldown, when it gains a bound
+--     identity (its Force Quit becomes safe to offer) or its kind escalates;
+--   * a live generic banner (no offender identified) is replaced in place as
+--     soon as an offender is named: the episode's breadcrumb gains a name;
+--   * a live banner naming someone else goes at once, so its Force Quit can
+--     never act on a process the alerts have moved off; the new offender's
+--     banner follows when the cooldown allows (damping offender flap; the
+--     episode's end resets it) and only if it has not had one this episode;
+--   * with no offender named, whatever is up stays (no churn), and a
+--     generic banner is posted at most once per episode;
+--   * an offender the operator already answered (frozen, quit, ignored)
+--     gets no banner, and a live one naming it goes, even once the episode
+--     has no named offender at all.
+-- a: { hasBanner, banner = {pid,name,lstart,kind,canAct}|nil (nil with
+--      hasBanner means a generic banner is up), bannerHandled (the live
+--      banner's offender is answered), offender = {pid,name,lstart,kind}|nil,
+--      canAct (the offender's identity is bound now), notified, handled,
+--      sinceLastPostSec, cooldownSec }
+--   -> { withdraw = bool, post = bool, replace = bool }; replace means
+--      withdraw and post now, regardless of the cooldown.
 function M.bannerStep(a)
-  if a.hasBanner and M.sameOffender(a.banner, a.offender) then
-    return { withdraw = false, post = false }
+  local off, b = a.offender, a.banner
+  local cooled = (a.sinceLastPostSec or math.huge) >= (a.cooldownSec or 0)
+  local keep = { withdraw = false, post = false, replace = false }
+  -- Whether a new banner may go up for the current offender (or a generic
+  -- one when none is named), with nothing in the way.
+  local function mayPost()
+    if off == nil then return (not a.notified) and cooled end
+    return (not a.handled) and (not a.notified) and cooled
   end
-  return { withdraw = a.hasBanner == true,
-           post = (a.sinceLastPostSec or math.huge) >= (a.cooldownSec or 0) }
+  if a.hasBanner and a.bannerHandled then
+    -- The live banner names an offender already answered: it goes, whoever
+    -- heads the episode now.
+    return { withdraw = true, post = mayPost(), replace = false }
+  end
+  if a.hasBanner then
+    if off == nil then return keep end
+    if b ~= nil and M.sameOffender(b, off) then
+      if a.handled then return { withdraw = true, post = false, replace = false } end
+      if (a.canAct and not b.canAct) or M.kindRank(off.kind) > M.kindRank(b.kind) then
+        return { withdraw = false, post = false, replace = true }
+      end
+      return keep
+    end
+    if b == nil then
+      if a.handled then return keep end
+      return { withdraw = false, post = false, replace = true }
+    end
+    return { withdraw = true, post = mayPost(), replace = false }
+  end
+  return { withdraw = false, post = mayPost(), replace = false }
 end
 
--- Should the HUD raise now? Never while the episode is already up (visible
--- covers muted-but-armed). A process other than the one this episode last
--- raised for preempts the raise cooldown. The same process, after its HUD
--- was closed, waits the cooldown out: a close means "not now" (Ignore is the
--- "leave it alone" answer), and the re-raise is a new question with its own
--- grace window. No identified offender is cooldown-gated as before.
--- a: { visible, offender = {pid,name,lstart}|nil, episode = ...|nil,
---      sinceRaiseSec, raiseSec }
+-- Should the HUD raise now? Never while the episode's alert is already up
+-- (visible covers muted-but-armed). For a named offender:
+--   * one the operator answered this episode (handled) is never raised again;
+--   * one the operator closed (snoozed) returns when the snooze ends, or at
+--     once if its kind escalates (a quiet hog turning into a runaway);
+--   * any other process than the one this episode last raised for preempts
+--     the raise cooldown.
+-- The same process again, and no identified offender, wait the cooldown.
+-- a: { visible, offender, episode, snooze = { off, kind, untilAt }|nil,
+--      handled, sinceRaiseSec, raiseSec, now }
 function M.hudRaiseDue(a)
   if a.visible then return false end
-  if a.offender and not M.sameOffender(a.episode, a.offender) then return true end
+  local off = a.offender
+  if off then
+    if a.handled then return false end
+    local sn = a.snooze
+    if sn and M.sameOffender(sn.off, off) then
+      return M.kindRank(off.kind) > M.kindRank(sn.kind) or (a.now or 0) >= (sn.untilAt or 0)
+    end
+    if not M.sameOffender(a.episode, off) then return true end
+  end
   return (a.sinceRaiseSec or math.huge) >= (a.raiseSec or 0)
 end
 

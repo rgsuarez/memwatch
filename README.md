@@ -81,24 +81,33 @@ SIGKILL after 7s if the target refuses to die, verifies death, and reports the
 memory actually reclaimed. Safety rails, enforced in pure logic
 (`core.killAllowed`): same-uid processes only, a curated denylist
 (WindowServer, loginwindow, Finder, Dock, Hammerspoon itself, and friends),
-never pid 1, never memwatch's own host. The target's identity is re-validated
-before TERM and again before KILL: by name, and by start time wherever the
-alert bound one (the HUD and the banner bind it when they first show a
-process), so a recycled pid is refused rather than signaled. Every action and
-refusal is logged.
+never pid 1, never memwatch's own host. Every alert action acts on an
+identity, never a name: when an alert first shows a process it binds that
+process's start time, and the target is re-validated against it before TERM
+and again before KILL, so a recycled pid is refused rather than signaled. If
+the binding fails (the probe forks starve under pressure), the HUD's buttons
+refuse and the binding is retried; unattended action waits for it too.
+Every action and refusal is logged.
 
-The HUD's close button means "not now": if the same process is still the
-offender, the HUD returns after the raise cooldown as a fresh alert with its
-own grace window. **Ignore 30m** is the "leave it alone" answer.
+Each alert answers for one process. If a different process takes over as the
+offender while the HUD is up, the HUD switches to it as a new alert with its
+own grace window. The close button means "not now": the same process returns
+after the raise cooldown, as a new alert, or at once if it escalates (a quiet
+hog turning into a runaway). Freeze, Force Quit and **Ignore 30m** answer the
+alert for the episode: that process is not raised again, and memwatch never
+acts on it unattended. An ignored process also stays off the HUD and banner
+as the largest-process fallback.
 
 A notification breadcrumb accompanies the HUD: one banner per offender per
 critical episode, never re-posted for the same offender within the episode
 (even after a manual dismissal), and withdrawn on its own once the state
-settles below critical. When the named offender changes, the stale banner is
-withdrawn at once and its replacement follows after a cooldown that damps
-offender flap. Its Force Quit action button appears only when the offender's
-start time is bound, and renders reliably only when Hammerspoon
-notifications are set to the Alerts style; the HUD is the dependable surface.
+settles below critical. A generic banner (no offender identified yet) is
+replaced in place as soon as one is named. When the named offender changes,
+the stale banner is withdrawn at once and its replacement follows after a
+cooldown that damps offender flap. Its Force Quit action button appears only
+once the offender's start time is bound (the banner is upgraded in place when
+it binds), and renders reliably only when Hammerspoon notifications are set
+to the Alerts style; the HUD is the dependable surface.
 
 **Desktop alerts: on/off** in the menu mutes both surfaces at will
 (persisted as `"alerts": false` in `memwatch-local.json`; CLI:
@@ -201,7 +210,8 @@ cd ~/projects/memwatch && lua test_core.lua
 ```
 
 Visual self-test and full-surface simulation (no real process involved; the
-fake offender probes as already exited, so clicking Force Quit is safe):
+fake offender is synthetic, so its buttons never signal anything, whatever
+process may really hold its pid):
 
 ```sh
 hs -c "memwatch.test('elevated')"    # amber title for 12s

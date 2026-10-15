@@ -49,6 +49,7 @@ local alertsEnabled = true  -- desktop alert surfaces (HUD + banners); menu togg
 local alertActive   = false -- a critical alert episode is live (HUD up, or muted-but-armed)
 local critNotif     = nil   -- the live critical banner; one at a time, withdrawn on recovery
 local critNotifOff  = nil   -- { pid, name, lstart } the live banner names (nil = none identified)
+local critNotified  = {}    -- every offender this episode has bannered ({ none = true } = unnamed)
 local runGen        = 0     -- bumped by start/stop: a held resume from an older run is a no-op
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
@@ -62,6 +63,7 @@ local frozen        = {}  -- [pid] = persisted frozen-ledger entry
 local lastFrozenSweepAt = 0 -- calm-state liveness sweep bookkeeping
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
 local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
+local unattendedSkipLogAt = 0  -- last "identity unverified" skip line (one a minute)
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
 local lfmServerPort  = nil
@@ -84,6 +86,7 @@ local lfmTick
 local gcUnattendedState
 local offenderIsForeground
 local probePid
+local resolveSignalTarget
 local frozenSweep
 local lfmRemoteActive
 
@@ -345,7 +348,16 @@ local function assessProcesses(now)
         r.kind, r.name, r.pid, r.slopeMBmin))
     end
   end
-  local offender, watch = procs.pickOffender(kept, lastRanked, smState.state,
+  -- The largest-process fallback honors the same answers: an ignored,
+  -- protected or memwatch-frozen process is never named as the hog.
+  local rankedKept = {}
+  for _, h in ipairs(lastRanked) do
+    if (ignoredUntil[h.pid .. "|" .. h.name] or 0) < now
+       and not protectedPids[h.pid] and not frozen[h.pid] then
+      rankedKept[#rankedKept + 1] = h
+    end
+  end
+  local offender, watch = procs.pickOffender(kept, rankedKept, smState.state,
     function(pid) return procs.peakSlopeFor(tracker, pid) end)
   if offender and not offender.weightMB then offender.weightMB = offender.rssMB or 0 end
   lastOffender = offender
@@ -479,20 +491,62 @@ local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
 local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind, lstart } on screen
 local hudEpisodeOff  = nil    -- the offender this episode last raised for; survives a close
+-- The alert episode (one critical episode, until it settles below critical):
+--   surfaced  the offender the HUD names (hudOffender), with its own grace
+--             clock (hudShownAt) and answered flag (hudInteracted);
+--   snoozed   the operator closed its HUD: back after the raise cooldown,
+--             or at once if it escalates (hudSnooze);
+--   handled   the operator (or memwatch) froze, quit or ignored it: never
+--             raised again this episode, never acted on unattended
+--             (hudHandled).
+-- Every destructive action requires the identity the alert bound (lstart).
+local hudSnooze      = nil    -- { off, kind, untilAt }
+local hudHandled     = {}     -- identities answered this episode
+local hudStalePid    = nil    -- a pid whose bound identity a signal path found replaced
+local bindTriedAt    = {}     -- [pid] = last bind probe
+local BIND_RETRY_SEC = 10     -- a failing probe is retried, but never every tick
 
--- Bind an offender's start time (lstart) once per process. A refreshed
--- offender table for the process already bound inherits it; a different
--- process is probed now, before any HUD or banner button can signal it.
--- The same pid and name with nothing bound is not re-probed every tick: a
--- probe is a fork, and the raise path already tried once.
-local function bindOffender(offender, prev)
-  if type(offender) ~= "table" or offender.lstart or not offender.pid then return end
-  if prev and prev.pid == offender.pid and prev.name == offender.name then
-    offender.lstart = prev.lstart
-    return
+local function identityOf(off)
+  return off and { pid = off.pid, name = off.name, lstart = off.lstart, kind = off.kind } or nil
+end
+
+-- Bind an offender's start time (lstart), the identity every destructive
+-- alert action requires, through the same name check the signal path uses.
+-- A fresh bind (a new alert, a retarget, a binding found stale) always
+-- probes. Otherwise a refreshed table for the same pid and name inherits the
+-- bound value, and an unbound one is probed again at most every
+-- BIND_RETRY_SEC: a probe is a fork, and forks starve under pressure. A
+-- stale inherited value can only refuse (the signal path compares it with
+-- the live process), and that refusal triggers a fresh bind. Synthetic
+-- offenders (self-test, simulate) are never bound.
+local function bindOffender(offender, prev, now, fresh)
+  if type(offender) ~= "table" or not offender.pid or offender.synthetic then return end
+  if not fresh then
+    if offender.lstart then return end
+    if prev and prev.pid == offender.pid and prev.name == offender.name and prev.lstart then
+      offender.lstart = prev.lstart
+      return
+    end
+    if (now - (bindTriedAt[offender.pid] or -math.huge)) < BIND_RETRY_SEC then return end
   end
-  local probed = probePid(offender.pid)
-  if probed then offender.lstart = probed.lstart end
+  bindTriedAt[offender.pid] = now
+  offender.lstart = nil
+  local proc = resolveSignalTarget(offender.pid, offender.name, nil)
+  if proc and proc.lstart then offender.lstart = proc.lstart end
+end
+
+-- Has the operator (or memwatch) already answered this offender this
+-- episode? An unbound table for the pid and name of an answered process is
+-- bound first, so a same-name process reusing the pid is not mistaken for it.
+local function isHandled(off, now)
+  if not off then return false end
+  for _, h in ipairs(hudHandled) do
+    if h.pid == off.pid and h.name == off.name then
+      if not off.lstart and h.lstart then bindOffender(off, nil, now, false) end
+      if core.sameOffender(h, off) then return true end
+    end
+  end
+  return false
 end
 
 local HUD_W, HUD_H = 380, 176
@@ -508,6 +562,45 @@ function M.hideHud()
   hudOffender = nil
   hudHold = false
   alertActive = false
+end
+
+-- Every hide that answers the alert goes through here, so no path can quietly
+-- re-arm it: "snooze" (the close button: not now; back after the raise
+-- cooldown, or at once if it escalates) or "handled" (frozen, quit or
+-- ignored: not raised again this episode, never acted on unattended).
+local function dismissHud(how, off)
+  off = off or hudOffender
+  local now = hs.timer.secondsSinceEpoch()
+  if off and not off.synthetic then
+    if how == "handled" then
+      hudHandled[#hudHandled + 1] = identityOf(off)
+      hudSnooze = nil
+    else
+      hudSnooze = { off = identityOf(off), kind = off.kind,
+                    untilAt = now + core.cfg.cool.hudRaiseSec }
+    end
+  end
+  lastHudRaiseAt = now
+  M.hideHud()
+end
+
+-- After an action's narrative ends: the process is gone, or memwatch holds it
+-- frozen -> handled; it survived the action -> snoozed, back after the
+-- cooldown; the pid turned out to hold another process -> neither, so the
+-- next tick surfaces whoever holds it now as a new alert.
+local function settleAction(target, refused)
+  if refused then
+    hudStalePid = target.pid
+    lastHudRaiseAt = 0
+    M.hideHud()
+    return
+  end
+  local still = resolveSignalTarget(target.pid, target.name, target.lstart)
+  if (not still) or frozen[target.pid] then
+    dismissHud("handled", target)
+  else
+    dismissHud("snooze", target)
+  end
 end
 
 local function hudBodyText()
@@ -567,52 +660,71 @@ local function buildHud()
   hud:mouseCallback(guard("hud-click", function(_, evt, id)
     if evt ~= "mouseUp" then return end
     hudInteracted = true
-    if id == "freeze" or id == "freeze-label" then
-      if hudOffender then
-        local target = hudOffender
-        hudHold = true
-        M.freezePid(target.pid, target.name, function(text, done)
-          if hud then hud[3].text = text end
-          if done then
-            afterHeld(4, guard("hud-close", function() M.hideHud() end))
-          end
-        end, { weightMB = target.weightMB, expectedLstart = target.lstart })
+    local isFreeze = id == "freeze" or id == "freeze-label"
+    if isFreeze or id == "kill" or id == "kill-label" then
+      local target = hudOffender
+      if not target then return end
+      if target.synthetic then
+        if hud then hud[3].text = "Self-test: nothing was signaled." end
+        return
       end
-    elseif id == "kill" or id == "kill-label" then
-      if hudOffender then
-        local target = hudOffender
-        hudHold = true
-        M.killPid(target.pid, target.name, function(text, done)
-          if hud then hud[3].text = text end
-          if done then
-            afterHeld(4, guard("hud-close", function() M.hideHud() end))
-          end
-        end, { expectedLstart = target.lstart })
+      -- A destructive action acts only on the identity this alert bound.
+      -- Unbound (its probe failed): refuse, bind again now, and let the
+      -- operator click again; never fall back to a name-only signal.
+      if not target.lstart then
+        bindOffender(target, nil, hs.timer.secondsSinceEpoch(), true)
+        if hud then
+          hud[3].text = target.lstart and "Identity verified. Click again to act."
+            or "Can't verify this process yet. Try again in a moment."
+        end
+        return
+      end
+      hudHold = true
+      local refused = false
+      local narrate = function(text, done)
+        if hud then hud[3].text = text end
+        if done then afterHeld(4, guard("hud-close", function() settleAction(target, refused) end)) end
+      end
+      local onRefused = function(reason)
+        if type(reason) == "string" and reason:find("pid-reused", 1, true) then refused = true end
+      end
+      if isFreeze then
+        M.freezePid(target.pid, target.name, narrate,
+          { weightMB = target.weightMB, expectedLstart = target.lstart, onRefused = onRefused })
+      else
+        M.killPid(target.pid, target.name, narrate,
+          { expectedLstart = target.lstart, onRefused = onRefused })
       end
     elseif id == "ignore" or id == "ignore-label" then
-      if hudOffender then M.ignore(hudOffender.pid, hudOffender.name) end
-      M.hideHud()
+      if hudOffender and not hudOffender.synthetic then
+        M.ignore(hudOffender.pid, hudOffender.name)
+      end
+      dismissHud("handled")
     elseif id == "monitor" or id == "monitor-label" then
       hs.application.launchOrFocus("Activity Monitor")
     elseif id == "close" then
-      -- A close means "not now": restart the raise clock so the same
-      -- offender returns only after the raise cooldown, as a new question.
-      lastHudRaiseAt = hs.timer.secondsSinceEpoch()
-      M.hideHud()
+      -- A close means "not now": the same offender returns after the raise
+      -- cooldown as a new question, or at once if it escalates.
+      dismissHud("snooze")
     end
   end))
   return hud
 end
 
 local function raiseHud(offender, titleText)
-  -- Capture the offender's start time at raise, so a Freeze/Force Quit click
-  -- seconds later binds identity and cannot signal a pid reused meanwhile.
-  bindOffender(offender, hudEpisodeOff)
+  -- A fresh alert re-validates identity: probe the start time anew rather
+  -- than trust one inherited across refreshes, because pid and name alone
+  -- do not prove continuity (a same-name process can have reused the pid).
+  -- The probe binds it, so a Freeze/Force Quit click seconds later cannot
+  -- signal a pid reused meanwhile.
+  local now = hs.timer.secondsSinceEpoch()
+  bindOffender(offender, nil, now, true)
   hudOffender = offender
   hudEpisodeOff = offender
+  if hudSnooze and offender and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
   hudInteracted = false
   hudHold = false
-  hudShownAt = hs.timer.secondsSinceEpoch()
+  hudShownAt = now
   alertActive = true
   -- Desktop alerts muted: the episode still arms (the unattended grace clock
   -- runs on hudShownAt); only the canvas stays hidden.
@@ -703,9 +815,25 @@ local function buildMenu()
     local label = (off.kind == "hog")
       and string.format("Force Quit largest process (%s, pid %d)", off.name, off.pid)
       or  string.format("Force Quit %s (pid %d)", off.name, off.pid)
-    -- The alerts bind the offender's start time; pass it when they have.
-    items[#items + 1] = { title = label,
-      fn = function() M.killPid(off.pid, off.name, nil, { expectedLstart = off.lstart }) end }
+    -- The alert's bound start time when it has one; otherwise the click binds
+    -- it, so this item never signals by name alone.
+    local bound = off.lstart or ((hudOffender and hudOffender.pid == off.pid
+      and hudOffender.name == off.name) and hudOffender.lstart or nil)
+    items[#items + 1] = { title = label, disabled = off.synthetic == true or nil,
+      fn = function()
+        local lst = bound
+        if not lst then
+          local p = resolveSignalTarget(off.pid, off.name, nil)
+          lst = p and p.lstart or nil
+        end
+        if not lst then
+          -- (hs.alert directly: alertUpdate is declared further down the file)
+          hs.alert.show(string.format("memwatch: can't verify %s (pid %d); nothing signaled",
+            off.name, off.pid), 2.5)
+          return
+        end
+        M.killPid(off.pid, off.name, nil, { expectedLstart = lst })
+      end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
       fn = function() M.ignore(off.pid, off.name) end }
     items[#items + 1] = { title = "-" }
@@ -728,31 +856,51 @@ local function buildMenu()
 end
 
 local function notifyCrit(m)
-  -- One banner per offender per critical episode (core.bannerStep): a banner
-  -- naming a process the alerts have moved off is withdrawn at once and its
-  -- replacement waits out the cooldown, which damps offender flap; a banner
-  -- is never re-posted for the same offender within the episode, even after
-  -- a manual dismissal; alertSurfaces withdraws it once the state settles
-  -- below critical, which also resets the cooldown.
+  -- One banner per offender per critical episode; core.bannerStep holds the
+  -- rules (an unbound banner or a generic one upgrades in place, a stale one
+  -- goes at once, flap waits out the cooldown, an answered offender gets
+  -- none). alertSurfaces withdraws it once the episode settles, which also
+  -- resets the cooldown and the episode's history.
   if not alertsEnabled then return end
   local off = lastOffender
-  local now = os.time()
+  local now = hs.timer.secondsSinceEpoch()
+  -- The bound identity lives on the HUD's table for the same process when
+  -- an assessment has since replaced the offender table.
+  local lstart = off and (off.lstart or ((hudOffender and hudOffender.pid == off.pid
+    and hudOffender.name == off.name) and hudOffender.lstart or nil)) or nil
+  local canAct = off ~= nil and lstart ~= nil and not off.synthetic
+  -- The episode's notification history outlives the live banner: an
+  -- offender that hands off and comes back has already been announced.
+  local notified = false
+  for _, n in ipairs(critNotified) do
+    if (off == nil and n.none) or (off ~= nil and not n.none and core.sameOffender(n, off)) then
+      notified = true
+      break
+    end
+  end
   local step = core.bannerStep({ hasBanner = critNotif ~= nil, banner = critNotifOff,
-                                 offender = off, sinceLastPostSec = now - lastNotifyAt,
+                                 offender = off and { pid = off.pid, name = off.name, lstart = lstart,
+                                                      kind = off.kind } or nil,
+                                 canAct = canAct, notified = notified,
+                                 handled = off ~= nil and isHandled(off, now),
+                                 bannerHandled = critNotifOff ~= nil and isHandled(critNotifOff, now),
+                                 sinceLastPostSec = now - lastNotifyAt,
                                  cooldownSec = core.cfg.notifyCooldownSec })
-  if step.withdraw then
+  if (step.withdraw or step.replace) and critNotif then
     pcall(function() critNotif:withdraw() end)
     critNotif, critNotifOff = nil, nil
   end
-  if not step.post then return end
-  lastNotifyAt = now
+  if not (step.post or step.replace) then return end
+  -- An upgrade in place is the same notification, not a new post: it does
+  -- not restart the cooldown.
+  if step.post then lastNotifyAt = now end
   local sub
-  if lastOffender and lastOffender.kind == "hog" then
+  if off and off.kind == "hog" then
     sub = string.format("largest: %s (pid %d) \u{00B7} %.1f GB, not growing",
-      lastOffender.name, lastOffender.pid, (lastOffender.weightMB or 0) / 1024)
-  elseif lastOffender then
+      off.name, off.pid, (off.weightMB or 0) / 1024)
+  elseif off then
     sub = string.format("%s (pid %d) \u{00B7} %.1f GB",
-      lastOffender.name, lastOffender.pid, (lastOffender.weightMB or 0) / 1024)
+      off.name, off.pid, (off.weightMB or 0) / 1024)
   else
     sub = string.format("swap-out %.0f pg/s | avail %.0f%% | swap %.1f GB",
       lastRates.swapOut, m.availPct, m.swapGB)
@@ -765,14 +913,15 @@ local function notifyCrit(m)
   -- Action button is best-effort: macOS only renders it reliably when
   -- Hammerspoon notifications are set to the Alerts style. The HUD is the
   -- dependable one-click surface; this is the breadcrumb. The button exists
-  -- only when the offender's start time is bound (the HUD binds it before
-  -- this runs): the click passes it as expectedLstart, so a pid reused
-  -- since the post is refused, never signaled.
-  local canAct = off ~= nil and off.lstart ~= nil
-  critNotifOff = off and { pid = off.pid, name = off.name, lstart = off.lstart } or nil
+  -- only when the offender's start time is bound: the click passes it as
+  -- expectedLstart, so a pid reused since the post is refused, never
+  -- signaled. Until then the banner upgrades in place once it binds.
+  critNotifOff = off and { pid = off.pid, name = off.name, lstart = lstart, kind = off.kind,
+                           canAct = canAct } or nil
+  if not notified then critNotified[#critNotified + 1] = critNotifOff or { none = true } end
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
-      M.killPid(off.pid, off.name, nil, { expectedLstart = off.lstart })
+      M.killPid(off.pid, off.name, nil, { expectedLstart = lstart })
     end
   end), {
     title             = "Memory pressure: CRITICAL",
@@ -885,23 +1034,40 @@ local function alertSurfaces(state, now)
     local offender = lastOffender
     local visible = alertActive
     if not visible then
-      -- A new process preempts the raise cooldown; the process this episode
-      -- already raised for (its HUD closed) waits it out (core.hudRaiseDue).
+      -- core.hudRaiseDue: an answered offender never returns this episode, a
+      -- snoozed one returns when the snooze ends or it escalates, and any
+      -- other process preempts the raise cooldown.
+      if offender and offender.pid == hudStalePid then
+        hudStalePid = nil
+        bindOffender(offender, nil, now, true)
+      end
       if core.hudRaiseDue({ visible = false, offender = offender, episode = hudEpisodeOff,
+                            snooze = hudSnooze, handled = offender ~= nil and isHandled(offender, now),
                             sinceRaiseSec = now - lastHudRaiseAt,
-                            raiseSec = core.cfg.cool.hudRaiseSec }) then
+                            raiseSec = core.cfg.cool.hudRaiseSec, now = now }) then
         lastHudRaiseAt = now
         raiseHud(offender)
       end
     elseif not hudHold then
       -- Keep identity bound across refreshes: each assessment builds a new
-      -- offender table, and the buttons signal with its lstart. The same
-      -- process inherits the bound start time; a different one is bound
-      -- fresh before it is shown.
+      -- offender table, and the same process inherits its bound start time.
+      -- A different process heading the episode is a new question: bound
+      -- fresh, with its own grace and its own answer, even while the canvas
+      -- stays up or alerts are muted.
       if offender and offender ~= hudOffender then
-        bindOffender(offender, hudOffender)
+        if hudOffender and not core.sameOffender(hudOffender, offender) then
+          bindOffender(offender, nil, now, true)
+          hudShownAt = now
+          hudInteracted = false
+          if hudSnooze and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
+          M.logSnapshot(string.format("hud-retarget:%s(%d)", offender.name, offender.pid))
+        else
+          bindOffender(offender, hudOffender, now, false)
+        end
         hudOffender = offender
         hudEpisodeOff = offender
+      elseif hudOffender and not hudOffender.lstart then
+        bindOffender(hudOffender, nil, now, false)   -- bounded retry of a failed bind
       end
       if alertsEnabled then
         if hud and hud:isShowing() then
@@ -934,13 +1100,21 @@ local function alertSurfaces(state, now)
     local mode = core.resolveUnattended(core.cfg)
     if mode ~= "off" and offender and offender.kind == "extreme"
        and alertActive and not hudInteracted and not hudHold
+       and hudOffender and core.sameOffender(hudOffender, offender)
+       and not frozen[offender.pid] and not isHandled(offender, now)
        and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec then
-      -- Bind the offender's start time BEFORE reading the fired/streak state:
-      -- a same-name pid reuse (a new node/python reusing the pid) must NOT
-      -- inherit the prior process's fired stamp or wait streak. The entry
-      -- carries lstart; a mismatch resets it (a fresh offender starts clean).
-      local bound = probePid(offender.pid)
-      local lstart = bound and bound.lstart or nil
+      -- Act only on the identity the alert bound and surfaced, never on a
+      -- name: without a bound start time (the probe failed) skip this tick
+      -- and stay armed; the refresh retries the bind. The same start time
+      -- keys the fired/streak state, so a same-name pid reuse starts clean.
+      local lstart = hudOffender.lstart
+      if not lstart then
+        if (now - (unattendedSkipLogAt or 0)) > 60 then
+          unattendedSkipLogAt = now
+          M.logSnapshot(string.format("unattended-skip:identity-unverified:%s(%d)",
+            offender.name, offender.pid))
+        end
+      else
       local fired = unattendedFiredFor[offender.pid]
       if fired and fired.lstart and lstart and fired.lstart ~= lstart then
         unattendedFiredFor[offender.pid] = nil
@@ -967,9 +1141,11 @@ local function alertSurfaces(state, now)
       end
       if action ~= "wait" then
         hudHold = true
+        local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
         local narrate = function(text, done)
           if hud then hud[3].text = "AUTO: " .. text end
-          if done then afterHeld(6, guard("hud-close", function() M.hideHud() end)) end
+          -- memwatch's own action answers the alert like an operator's would.
+          if done then afterHeld(6, guard("hud-close", function() settleAction(target) end)) end
         end
         -- The bound start time also protects the autonomous signal (and its
         -- TERM->KILL escalation seconds later) from acting on a pid reused
@@ -983,6 +1159,7 @@ local function alertSurfaces(state, now)
         end
       end
       end
+      end
     end
   else
     hudBelowCritSince = hudBelowCritSince or now
@@ -993,13 +1170,15 @@ local function alertSurfaces(state, now)
     -- The episode's end also ends its cooldown and its HUD memory, so the
     -- next episode posts and raises on entry instead of inheriting the last
     -- episode's quiet period.
-    if settled then
+    if settled and not hudHold then
       if critNotif then
         pcall(function() critNotif:withdraw() end)
         critNotif, critNotifOff = nil, nil
       end
+      critNotified = {}
       lastNotifyAt = 0
-      hudEpisodeOff = nil
+      hudEpisodeOff, hudSnooze, hudHandled, hudStalePid = nil, nil, {}, nil
+      bindTriedAt = {}
     end
   end
 end
@@ -1137,7 +1316,7 @@ end
 -- drifts between them. Names sourced from the top stream are truncated at
 -- ~16 chars, so a long expected name may be a prefix of the live one; short
 -- names must match exactly. Returns proc (with .liveName) or nil, reason.
-local function resolveSignalTarget(pid, expectedName, expectedLstart)
+resolveSignalTarget = function(pid, expectedName, expectedLstart)
   local proc = probePid(pid)
   if not proc then return nil, "exited" end
   local liveName = procs.friendlyName(proc.comm)
@@ -1266,6 +1445,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
     else
       M.logSnapshot(string.format("freeze-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
+      if opts.onRefused then pcall(opts.onRefused, twhy) end
       onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true)
     end
     return
@@ -2098,6 +2278,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       -- Identity mismatch: drop any stale ledger entry AND block the action.
       if frozenEntry then frozen[pid] = nil; saveFrozen() end
       M.logSnapshot(string.format("kill-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
+      if opts.onRefused then pcall(opts.onRefused, twhy) end
       onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true)
     end
     return
@@ -2172,6 +2353,10 @@ function M.ignore(pid, name)
     lastOffender = nil
     titleSnap.offenderName, titleSnap.offenderGB = nil, nil
   end
+  -- An ignore is an answer: if the alert is on this process, it is handled.
+  if hudOffender and hudOffender.pid == pid and hudOffender.name == name then
+    dismissHud("handled", hudOffender)
+  end
 end
 
 ------------------------------------------------------------------------------
@@ -2225,6 +2410,10 @@ end
 
 function M.stop()
   runGen = runGen + 1   -- orphans any pending self-test or simulate resume
+  if hud then hud:hide() end
+  alertActive, hudOffender, hudHold = false, nil, false
+  if critNotif then pcall(function() critNotif:withdraw() end) end
+  critNotif, critNotifOff = nil, nil
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
@@ -2288,6 +2477,10 @@ function M.test(level, seconds)
                   elevated = "elevated", critical = "critical" }
   local state = alias[tostring(level)] or "critical"
   local dur = tonumber(seconds) or 12
+  -- Its own generation: a later diagnostic, a stop or a restart orphans this
+  -- run's resume, so overlapping runs leave exactly one poller.
+  runGen = runGen + 1
+  local gen = runGen
   -- Freeze live sampling so the faked state is not overwritten mid-demo.
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   smState.state = state
@@ -2303,22 +2496,23 @@ function M.test(level, seconds)
     -- nothing.
     if critNotif then pcall(function() critNotif:withdraw() end) end
     critNotif, critNotifOff = nil, nil
+    critNotified = {}
     lastNotifyAt = 0
-    hudEpisodeOff = nil
+    hudEpisodeOff, hudSnooze, hudHandled = nil, nil, {}
+    -- A synthetic offender: its surfaces never signal, whatever process may
+    -- really hold pid 99999 (no binding, no banner action, inert buttons).
     lastOffender = { pid = 99999, name = "FakeProc", weightMB = 22 * 1024,
-                     slopeMBmin = 12000, kind = "extreme" }
+                     slopeMBmin = 12000, kind = "extreme", synthetic = true }
     notifyCrit(lastMetrics)
-    -- The banner carries no Force Quit here (a fake pid has no start time
-    -- to bind); the HUD's is safe to click: pid 99999 probes as exited.
     raiseHud(lastOffender, "Memory CRITICAL (self-test)")
   end
-  local gen = runGen
   afterHeld(dur, guard("test-resume", function()
-    if gen ~= runGen then return end   -- stopped or restarted meanwhile
+    if gen ~= runGen then return end   -- superseded, stopped or restarted
     M.hideHud()
     lastOffender = nil
     smState = core.newSMState(hs.timer.secondsSinceEpoch())
     titleSnap = {}
+    if pollTimer then pollTimer:stop() end
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
     tick()                                                -- revert to the real state
   end))
@@ -2331,23 +2525,25 @@ end
 -- exited). Usage: hs -c "memwatch.simulate()"
 function M.simulate(seconds)
   local dur = tonumber(seconds) or 20
+  runGen = runGen + 1
+  local gen = runGen
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   smState.state = "critical"
   smState.since = hs.timer.secondsSinceEpoch()
   local fake = { pid = 99999, name = "SimRunaway", weightMB = 22 * 1024,
-                 slopeMBmin = 12000, kind = "extreme" }
+                 slopeMBmin = 12000, kind = "extreme", synthetic = true }
   lastOffender = fake
   titleSnap = { offenderName = fake.name, offenderGB = fake.weightMB / 1024, causeTag = "SWAP" }
   applyFlash("critical")
   if not flashTimer then renderTitleNow() end
   raiseHud(fake, "Runaway process (simulation)")
-  local gen = runGen
   afterHeld(dur, guard("simulate-end", function()
-    if gen ~= runGen then return end   -- stopped or restarted meanwhile
+    if gen ~= runGen then return end   -- superseded, stopped or restarted
     M.hideHud()
     lastOffender = nil
     smState = core.newSMState(hs.timer.secondsSinceEpoch())
     titleSnap = {}
+    if pollTimer then pollTimer:stop() end
     pollTimer = hs.timer.doEvery(core.cfg.pollSec, guard("tick", tick))
     tick()
   end))
@@ -2447,6 +2643,7 @@ function M.setAlertsEnabled(on)
     if hud then hud:hide() end   -- clear the popup; the episode stays armed
     if critNotif then pcall(function() critNotif:withdraw() end) end
     critNotif, critNotifOff = nil, nil
+    critNotified = {}   -- unmuting restores the episode's banner
   else
     -- Unmuting restores a live episode's surfaces together: the HUD comes
     -- back on the next tick, so the banner must not lag behind a cooldown.

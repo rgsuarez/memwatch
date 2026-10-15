@@ -1006,7 +1006,7 @@ do
   check("plain: name field kept",     plain:find('"name"', 1, true) ~= nil, true)
 end
 
-for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua", "lua/memwatch_report.lua" }) do
+for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua", "lua/memwatch_report.lua", "lua/memwatch_observe.lua" }) do
   local bad = earlyRefs(path)
   for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end
   check("split-scope clean: " .. path, #bad, 0)
@@ -1052,6 +1052,98 @@ do
   check("deferral: no first wait is not exhausted", lfm.deferralExhausted(nil, now, 120), false)
   check("deferral bound spans at least two grace windows",
     lfm.cfg.maxDeferSec >= 2 * core.cfg.cool.autoKillGraceSec, true)
+end
+
+-- ---- passive observation ledger (pure half) ----
+do
+  local observe = require("memwatch_observe")
+  -- Row shape: the snapshot is the serialized model input (pid-free by
+  -- construction); the top-level pid is only a local join key.
+  local runs = {}
+  for i = 1, 5 do
+    runs[i] = { pid = 1000 + i, name = "proc" .. i, kind = "extreme", weightMB = 4000, slopeMBmin = 9000 }
+  end
+  local snap = { state = "critical", availPct = 7, kern = 2,
+    offender = { pid = 4242, name = "leak.py", kind = "extreme", weightMB = 9000.7,
+                 slopeMBmin = 11000.2, peakSlopeMBmin = 12000, ageSec = 40 },
+    runaways = runs }
+  local user = lfm.serializeSnapshot(snap, { redactNames = true })
+  local row = observe.row({ at = "2026-10-14T00:00:00Z", seq = 7, point = "decision",
+    state = "critical", kern = 2, availPct = 7.6, swapGB = 15.55, compressorGB = 52.04,
+    swapoutRate = 4000.9, compRate = 90000.2, runawayCount = 5, mode = "off", lfmEnabled = false,
+    wouldAct = "freeze", graceElapsedSec = 61.4, category = "unknown",
+    offender = snap.offender, snapshot = user, snapshotHash = lfm.snapshotHash(user) })
+  check("observe: row point", row.point, "decision")
+  check("observe: row pid is the local join key", row.pid, 4242)
+  check("observe: row numbers floored", row.availPct, 7)
+  check("observe: offender weight floored", row.offender.weightMB, 9000)
+  check("observe: offender age carried", row.offender.ageSec, 40)
+  check("observe: wouldAct carried", row.wouldAct, "freeze")
+  check("observe: snapshot is pid-free", row.snapshot:find('"pid"', 1, true), nil)
+  check("observe: snapshot is redacted", row.snapshot:find("leak.py", 1, true), nil)
+  local line = lfm.ledgerLine(row)
+  check("observe: row encodes", line ~= nil, true)
+  check("observe: row well under the 64 KB decoder cap", #line < 16000, true)
+  check("observe: row decodes back", (lfm.jsonDecode(line:sub(1, -2)) or {}).seq, 7)
+  check("observe: synthetic flag only when set", row.synthetic, nil)
+  check("observe: synthetic flag carried",
+    observe.row({ synthetic = true, offender = {} }).synthetic, true)
+
+  -- Fate: decided only from tick data, never guessed.
+  check("fate: memwatch froze it", (observe.fate({ frozen = true, sampleAgeSec = 99 })), "frozen")
+  local f1, d1 = observe.fate({ sampleAgeSec = 40, psRow = { pid = 1 } })
+  check("fate: stale sample is unknown", f1, "unknown")
+  check("fate: stale sample detail", d1, "stale-sample")
+  check("fate: absent from a fresh sample", (observe.fate({ sampleAgeSec = 3 })), "exited")
+  check("fate: present, same process",
+    (observe.fate({ sampleAgeSec = 3, psRow = { pid = 1 }, startedAt = 1000, psStartedAt = 1004 })), "alive")
+  local f2, d2 = observe.fate({ sampleAgeSec = 3, psRow = { pid = 1 }, startedAt = 1000, psStartedAt = 1100 })
+  check("fate: pid now belongs to a newer process", f2, "exited")
+  check("fate: reuse detail", d2, "pid-reused")
+
+  -- Jetsam report names carry their local timestamp.
+  local times = observe.jetsamTimes({ "JetsamEvent-2026-10-12-235154.ips",
+    "JetsamEvent-2026-10-12-023117.ips", "not-a-report.ips", "JetsamEvent-garbage.ips" })
+  check("jetsam: only well-formed names parse", #times, 2)
+  check("jetsam: local timestamp", times[1],
+    os.time({ year = 2026, month = 10, day = 12, hour = 23, min = 51, sec = 54 }))
+  check("jetsam: window count", observe.countSince(times, times[1] - 1, times[1] + 1), 1)
+  check("jetsam: empty window", observe.countSince(times, times[1] + 10, times[1] + 20), 0)
+
+  check("observe: ring max", observe.ringMax({ { v = 3 }, { v = 9 }, { v = 4 } }), 9)
+  check("observe: empty ring", observe.ringMax({}), nil)
+  local plan = observe.rotationPlan("/tmp/x.jsonl", 3)
+  check("rotation: oldest moves first", plan[1][1] .. ">" .. plan[1][2], "/tmp/x.jsonl.2>/tmp/x.jsonl.3")
+  check("rotation: live file moves last", plan[#plan][1] .. ">" .. plan[#plan][2], "/tmp/x.jsonl>/tmp/x.jsonl.1")
+  check("rotation: step count", #plan, 3)
+end
+
+-- ---- observation glue: fork-free, error-bounded, mode-independent ----
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local s = src:find("writeObservation = function(", 1, true)
+  local e = s and src:find("\nend\n", s, true)
+  local body = (s and e) and src:sub(s, e) or ""
+  check("observe glue: writeObservation located", #body > 200, true)
+  -- Frontier patterns: a bare sh( call, not the tail of snapshotHash(.
+  local forkers = { "%f[%w_]sh%(", "pidAlive%(", "pidState%(", "probePid%(",
+                    "hs%.execute", "io%.popen", "hs%.task" }
+  check("observe glue: fork scan sees a real sh( call (positive control)",
+    ("local out = sh(cmd)"):find(forkers[1]) ~= nil, true)
+  check("observe glue: fork scan ignores snapshotHash( (negative control)",
+    ("lfm.snapshotHash(user)"):find(forkers[1]), nil)
+  for _, forker in ipairs(forkers) do
+    check("observe glue: no fork via " .. forker, body:find(forker), nil)
+  end
+  check("observe glue: follow-ups use held timers", body:find("afterHeld(h,", 1, true) ~= nil, true)
+  check("observe glue: decision point is error-bounded",
+    src:find('pcall(writeObservation, "decision"', 1, true) ~= nil, true)
+  check("observe glue: advisory cadence is error-bounded",
+    src:find('pcall(writeObservation, "advisory"', 1, true) ~= nil, true)
+  check("observe glue: decision observation does not require an unattended mode",
+    src:find('if observeEnabled and offender and offender.kind == "extreme"', 1, true) ~= nil, true)
 end
 
 -- ---- glue pins: the live path must use the predicates above ----

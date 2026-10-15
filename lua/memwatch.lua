@@ -17,6 +17,7 @@
 local core  = require("memwatch_core")
 local procs = require("memwatch_procs")
 local lfm   = require("memwatch_lfm")
+local observe = require("memwatch_observe")
 
 local M = {}
 
@@ -73,7 +74,13 @@ local lfmReqNonce    = 0      -- monotonic request generation
 local lfmInFlight    = nil    -- { nonce, pid, hash, at, ident }
 local lfmRemoteKey   = nil    -- bearer key for the remote adjudicator (never logged)
 local lfmRemoteCooldownUntil = 0 -- F1: remote backoff deadline (retry, not hard latch)
-local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident }
+local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident, kind, snapshot }
+-- Passive observation ledger state (cross-section, so declared here).
+local observeEnabled    = true -- local-only outcome record; config key "observe"
+local observeSeq        = 0
+local observeLastAt     = 0
+local observeDecisionAt = {}   -- [pid] = epoch of the last would-be decision observation
+local observeStats      = { rows = 0, followups = 0, lastAt = 0, errors = 0 }
 -- Forward declarations, assigned in the kill-engine section: alertSurfaces
 -- (defined earlier in the file) calls these at tick time, and a top-level
 -- local referenced above its declaration silently splits into a global.
@@ -85,6 +92,7 @@ local offenderIsForeground
 local probePid
 local frozenSweep
 local lfmRemoteActive
+local writeObservation
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -210,6 +218,9 @@ local function applyLocalConfig()
   -- Desktop alert surfaces (HUD + banners). Muting them never disarms the
   -- unattended engine or the menu-bar state icon.
   if type(conf.alerts) == "boolean" then alertsEnabled = conf.alerts end
+  -- The passive observation ledger is on by default (local file only, no
+  -- action, no network); "observe": false turns it off.
+  if type(conf.observe) == "boolean" then observeEnabled = conf.observe end
   if type(conf.lfm) == "table" then
     for k, v in pairs(conf.lfm) do
       if lfm.cfg[k] ~= nil and type(v) == type(lfm.cfg[k]) then lfm.cfg[k] = v end
@@ -873,6 +884,19 @@ local function alertSurfaces(state, now)
     -- disables unattended coverage while the crisis continues. Each
     -- adjudication stamps the time; another full grace window must pass
     -- before the same offender is adjudicated again.
+    -- Passive observation at every WOULD-BE decision point, whatever the
+    -- unattended mode (including off): the record of exactly what an
+    -- adjudicator would have faced, once per offender per grace window.
+    -- Error boundary: the observation layer may never break alerting.
+    if observeEnabled and offender and offender.kind == "extreme"
+       and alertActive and not hudInteracted and not hudHold
+       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec
+       and (now - (observeDecisionAt[offender.pid] or 0)) >= core.cfg.cool.autoKillGraceSec then
+      observeDecisionAt[offender.pid] = now
+      local okObs, errObs = pcall(writeObservation, "decision", offender, now,
+        { graceElapsedSec = now - hudShownAt })
+      if not okObs then logError("observe-decision", errObs) end
+    end
     local mode = core.resolveUnattended(core.cfg)
     if mode ~= "off" and offender and offender.kind == "extreme"
        and alertActive and not hudInteracted and not hudHold
@@ -968,6 +992,15 @@ local function tick()
   -- recycled pid could inherit stale state for one tick.
   gcUnattendedState()
   alertSurfaces(state, now)
+  -- Passive observation on the advisory cadence while pressure is up: the
+  -- distribution of offenders an adjudicator would have been asked about,
+  -- not only the extreme ones that reach a decision point.
+  if observeEnabled and state ~= "ok" and lastOffender
+     and (now - observeLastAt) >= observe.cfg.intervalSec then
+    observeLastAt = now
+    local okObs, errObs = pcall(writeObservation, "advisory", lastOffender, now)
+    if not okObs then logError("observe-advisory", errObs) end
+  end
   -- Frozen-ledger liveness sweep (calm only: probing forks a ps per entry,
   -- and a phantom entry is harmless mid-crisis).
   if state == "ok" then frozenSweep(now) end
@@ -1781,6 +1814,120 @@ local function buildLfmSnapshot(offender)
   }, (withForeground(offender) or {}).foreground
 end
 
+------------------------------------------------------------------------------
+-- passive observation ledger (memwatch-observe.jsonl; see memwatch_observe)
+------------------------------------------------------------------------------
+
+local OBSERVE_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-observe.jsonl"
+local JETSAM_DIR = "/Library/Logs/DiagnosticReports"
+
+local function appendObserve(line)
+  if not line then return end
+  local f = io.open(OBSERVE_PATH, "a")
+  if not f then observeStats.errors = observeStats.errors + 1; return end
+  if f:seek("end") > observe.cfg.maxBytes then
+    f:close()
+    for _, step in ipairs(observe.rotationPlan(OBSERVE_PATH, observe.cfg.keep)) do
+      os.rename(step[1], step[2])
+    end
+    f = io.open(OBSERVE_PATH, "a")
+    if not f then observeStats.errors = observeStats.errors + 1; return end
+  end
+  f:write(line)
+  f:close()
+end
+
+-- Jetsam reports written since `since` (epoch), from a native directory
+-- listing: no fork. nil means "could not look", never zero.
+local function jetsamSince(since)
+  local names = {}
+  local ok = pcall(function()
+    for name in hs.fs.dir(JETSAM_DIR) do
+      if name:sub(1, 12) == "JetsamEvent-" then names[#names + 1] = name end
+    end
+  end)
+  if not ok then return nil end
+  return observe.countSince(observe.jetsamTimes(names), since - 5,
+    hs.timer.secondsSinceEpoch() + 5)
+end
+
+-- Write one observation row and schedule its follow-ups. point is
+-- "advisory" (the pressure cadence), "decision" (an extreme offender at
+-- grace expiry) or "synthetic" (memwatch.testObserve). Never forks: the
+-- snapshot is built from tick state, fates come from the latest ps sample
+-- and the frozen ledger, exit-cause evidence from a directory listing.
+writeObservation = function(point, offender, now, extra)
+  if not observeEnabled or type(offender) ~= "table" then return end
+  extra = extra or {}
+  local snap, foreground = buildLfmSnapshot(offender)
+  local user = lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })
+  observeSeq = observeSeq + 1
+  local seq = observeSeq
+  local obsIso = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  local wouldAct = "none"
+  if point == "decision" or point == "synthetic" then
+    -- What the deterministic policy would do at the freeze ceiling.
+    wouldAct = (offender.kind == "extreme") and deterministicAction("freeze", foreground) or "wait"
+  end
+  appendObserve(lfm.ledgerLine(observe.row({
+    at = obsIso, seq = seq, point = point, synthetic = extra.synthetic,
+    state = smState.state, kern = lastKern,
+    availPct = lastMetrics.availPct, swapGB = lastMetrics.swapGB,
+    compressorGB = lastMetrics.compGB,
+    swapoutRate = lastRates.swapOut, compRate = lastRates.comp, runawayCount = #lastRuns,
+    mode = core.resolveUnattended(core.cfg), lfmEnabled = lfm.cfg.enabled,
+    wouldAct = wouldAct, graceElapsedSec = extra.graceElapsedSec,
+    category = lfm.categorize(offender.name, nil),
+    offender = { pid = offender.pid, name = offender.name, kind = offender.kind,
+                 weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
+                 peakSlopeMBmin = offender.peakSlopeMBmin, ageSec = offender.ageSec,
+                 foreground = foreground },
+    snapshot = user, snapshotHash = user and lfm.snapshotHash(user) or nil,
+  })))
+  observeStats.rows = observeStats.rows + 1
+  observeStats.lastAt = now
+  -- Follow-ups: what actually became of this process, and of the machine.
+  local pid = offender.pid
+  local startedAt = type(offender.ageSec) == "number" and (now - offender.ageSec) or nil
+  local weight0 = offender.weightMB or 0
+  local avail0 = lastMetrics.availPct or 0
+  local hud0 = hudInteracted
+  for _, h in ipairs(extra.horizons or observe.cfg.horizons) do
+    afterHeld(h, guard("observe-followup", function()
+      local t = hs.timer.secondsSinceEpoch()
+      local psRow = nil
+      for _, p in ipairs(lastPsList) do
+        if p.pid == pid then psRow = p; break end
+      end
+      local psStartedAt = (psRow and psRow.etimeSec) and (lastSampleAt - psRow.etimeSec) or nil
+      local fate, detail = observe.fate({
+        frozen = frozen[pid] ~= nil,
+        sampleAgeSec = lastSampleAt > 0 and (t - lastSampleAt) or nil,
+        psRow = psRow, startedAt = startedAt, psStartedAt = psStartedAt,
+      })
+      local present = fate == "alive" or fate == "frozen"
+      local e = present and tracker.procs[pid] or nil
+      local weightNow = e and e.weightMB or nil
+      local peak = e and observe.ringMax(e.ring) or nil
+      local availNow = lastMetrics.availPct or 0
+      appendObserve(lfm.ledgerLine({
+        at = os.date("!%Y-%m-%dT%H:%M:%SZ"), followup_for = seq, observed_at = obsIso,
+        horizonSec = h, synthetic = extra.synthetic == true or nil, pid = pid,
+        fate = fate, fateDetail = detail,
+        weightMB = weightNow and math.floor(weightNow) or nil,
+        weightDeltaMB = weightNow and math.floor(weightNow - weight0) or nil,
+        windowPeakMB = peak and math.floor(peak) or nil,
+        availPct = math.floor(availNow), availDelta = math.floor(availNow - avail0),
+        state = smState.state,
+        hudInteractedSince = (hudInteracted and not hud0) or false,
+        jetsamSince = jetsamSince(now),
+      }))
+      observeStats.followups = observeStats.followups + 1
+    end))
+  end
+  return seq
+end
+
 -- Remote adjudicator: active when enabled + configured + key loaded. The
 -- remote brain replaces the local server lifecycle, never the rails.
 lfmRemoteActive = function()
@@ -2023,6 +2170,9 @@ gcUnattendedState = function()
   for pid in pairs(unattendedFiredFor) do
     if not liveRun[pid] then unattendedFiredFor[pid] = nil end
   end
+  for pid in pairs(observeDecisionAt) do
+    if not liveRun[pid] then observeDecisionAt[pid] = nil end
+  end
 end
 
 -- One-click kill: re-validate identity first (pid-reuse guard), check the
@@ -2215,6 +2365,9 @@ function M.debug()
                        offline = lfmOffline, pid = lfmServerPid, port = lfmServerPort,
                        remote = lfmRemoteActive() and lfm.cfg.remoteModel or nil,
                        cached = (function() local n = 0; for _ in pairs(verdictCache) do n = n + 1 end; return n end)() },
+    observe        = { enabled = observeEnabled, rows = observeStats.rows,
+                       followups = observeStats.followups, errors = observeStats.errors,
+                       lastAgeSec = observeStats.lastAt > 0 and math.floor(now - observeStats.lastAt) or -1 },
   }
 end
 
@@ -2352,6 +2505,22 @@ function M.testRemote()
         (verdict.rationale or ""):sub(1, 80)))
     end))
   return "memwatch.testRemote dispatched; watch memwatch.log for test-remote lines"
+end
+
+-- One-shot synthetic probe of the observation path: writes a row tagged
+-- synthetic (excluded from any dataset built from the ledger) for a fake
+-- extreme offender and schedules its follow-ups at 2, 4 and 6 s, with NO
+-- real process and NO memory load. Usage: hs -c "memwatch.testObserve()".
+function M.testObserve()
+  if not observeEnabled then return "observation ledger disabled (observe=false)" end
+  local now = hs.timer.secondsSinceEpoch()
+  local fake = { pid = -1, name = "memwatch-observe-probe", kind = "extreme",
+                 weightMB = 9200, slopeMBmin = 11000, peakSlopeMBmin = 12000,
+                 ageSec = 40, foreground = false }
+  local seq = writeObservation("synthetic", fake, now,
+    { synthetic = true, horizons = { 2, 4, 6 } })
+  return string.format("memwatch.testObserve wrote synthetic row %s; follow-ups land in ~6 s in %s",
+    tostring(seq), OBSERVE_PATH)
 end
 
 -- Render the value report from the local ledgers and open it.

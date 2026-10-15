@@ -158,3 +158,10 @@ are facts about the process, not about the episode.
 A poller whose predicate errors continuously for two minutes gives up
 explicitly: the give-up is logged and handled by its owner (the LFM health
 poll retires the server and latches it offline), never treated as success.
+
+The LFM server is signaled (TERM or KILL, on retire, or as a crash orphan
+at the next start) only while its pid holds the process recorded when it
+started: the same start time and name, from a probe that answered. With no
+recorded start time, the pid itself gets no signal; only the task handle
+and a port listener verified as an llama-server on memwatch's model
+directory are signaled.

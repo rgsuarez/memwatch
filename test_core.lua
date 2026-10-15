@@ -875,6 +875,23 @@ do
   check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
 end
 
+-- ---- identity: a recorded process may be signaled only while it holds ----
+do
+  local ident = { pid = 4100, lstart = "Mon Oct 12 10:00:01 2026", name = "llama-server" }
+  check("holds: the recorded process, probed present", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "llama-server"), true)
+  check("holds: another start time on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:09:09 2026", "llama-server"), false)
+  check("holds: a probe that could not tell is refused", core.identityHolds(ident, "unknown", nil, nil), false)
+  check("holds: an exited process is refused", core.identityHolds(ident, "absent", nil, nil), false)
+  check("holds: a record without a start time never signals",
+    core.identityHolds({ pid = 4100, name = "llama-server" }, "present", "Mon Oct 12 10:00:01 2026", "llama-server"), false)
+  check("holds: another name on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "python3"), false)
+  check("holds: a record without a name compares start time alone",
+    core.identityHolds({ pid = 4100, lstart = "L" }, "present", "L", "anything"), true)
+end
+
 -- ---- identity: continuity versus memory ----
 do
   local full = "Google Chrome Helper (Renderer)"
@@ -1288,9 +1305,18 @@ do
       and poll:find("or not ok", 1, true) == nil, true)
   check("poller glue: a continuous error run gives up", poll:find("UNTIL_GIVEUP_SEC", 1, true) ~= nil, true)
   local retire = body("local function retireLfmServer(reason)")
-  check("lfm glue: the retire KILL checks the tracked server's identity",
-    retire:find('if pid and (sig == "TERM" or trackedIsOurs()) then', 1, true) ~= nil
-      and retire:find('if pid then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end', 1, true) == nil, true)
+  check("lfm glue: the retire TERM and KILL both check the recorded server identity",
+    retire:find("local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)", 1, true) ~= nil
+      and retire:find("if owner == pid then return true end", 1, true) == nil
+      and retire:find("core.identityHolds(ident, st,", 1, true) ~= nil
+      and retire:find('sig == "TERM" or', 1, true) == nil, true)
+  check("lfm glue: the identity is the one recorded at start, not probed at retire",
+    retire:find("local ident = probePid(pid)", 1, true) == nil
+      and src:find("recordLfmServer(owner)", 1, true) ~= nil, true)
+  local start = body("function M.start()")
+  check("lfm glue: the orphan sweep requires the recorded start time",
+    start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
+      and start:find("not rec.lstart or", 1, true) == nil, true)
   check("lfm glue: the health poll's give-up retires the server",
     src:find('retireLfmServer("health-giveup")', 1, true) ~= nil, true)
   check("poller glue: the retire probe cannot skip the KILL deadline",

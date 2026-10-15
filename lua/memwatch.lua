@@ -93,6 +93,7 @@ local unattendedSkipLogAt = 0  -- last "identity unverified" skip line (one a mi
 local openReceipts = {}        -- [owed] = true: unattended actions whose outcome has not arrived
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
+local lfmServerIdent = nil    -- { pid, lstart, name } recorded when the server started
 local lfmServerPort  = nil
 local lfmServerReady = false
 local lfmSpawnedAt   = nil    -- epoch of the current spawn (fast-crash detection)
@@ -2191,9 +2192,9 @@ end
 -- port is free (not merely the tracked pid gone), so a pre-health child can
 -- never be orphaned still holding the port.
 local function retireLfmServer(reason)
-  local pid, port = lfmServerPid, lfmServerPort
+  local pid, port, ident = lfmServerPid, lfmServerPort, lfmServerIdent
   lfmServerReady = false
-  lfmServerPid, lfmServerPort = nil, nil
+  lfmServerPid, lfmServerPort, lfmServerIdent = nil, nil, nil
   lfmSpawnedAt = nil  -- a deliberate retire must not trip the fast-crash latch
   os.remove(LFM_PIDFILE)  -- a cleanly retired server is not a crash orphan
   lfmInFlight = nil
@@ -2202,38 +2203,39 @@ local function retireLfmServer(reason)
   protectedPids = { [selfPid] = true }
   if not pid then return end
   M.logSnapshot(string.format("lfm-retire:%s:pid=%d", reason or "?", pid))
-  -- The tracked pid's identity, captured before any signal (and again on a
-  -- later poll if this probe cannot run): KILL goes to it only while it
-  -- still holds that process, so a pid reused after our server exits is
-  -- never signaled.
-  local ident = probePid(pid)
+  -- TERM and KILL go to the tracked pid only while it still holds the
+  -- process recorded when the server started (its start time and name), so
+  -- a pid reused after our server exited is never signaled. No recorded
+  -- start time, or a probe that cannot tell: nothing is sent to the pid
+  -- (the task handle's own terminate above and the port check below remain).
   local function trackedIsOurs()
-    if not ident then ident = probePid(pid); return false end
-    return resolveSignalTarget(pid, procs.friendlyName(ident.comm), ident.lstart) ~= nil
+    if not ident or ident.pid ~= pid then return false end
+    local st, live = probe(pid)
+    return core.identityHolds(ident, st, live and live.lstart, live and procs.friendlyName(live.comm))
   end
   -- Signal the tracked pid AND the actual port listener (may be a child),
-  -- but only signal the listener if it is CONFIRMED ours: our tracked pid,
-  -- or an llama-server serving OUR model dir. In the narrow window after our
+  -- but only signal the listener if it is CONFIRMED ours: an llama-server
+  -- serving OUR model dir, holding our port. In the narrow window after our
   -- server died, an unrelated process could bind the port; never kill it.
+  -- (This also covers the tracked pid itself when no start time could be
+  -- recorded for it.)
   local function listenerIsOurs(owner)
     if not owner then return false end
-    if owner == pid then return true end
     local info = sh(string.format("/bin/ps -p %d -o comm=,args= 2>/dev/null", owner))
     local comm = info:match("^(%S+)")
     return comm ~= nil and comm:match("([^/]+)$") == "llama-server"
       and info:find("projects/memwatch/models/", 1, true) ~= nil
   end
   local function signalTargets(sig)
-    if pid and (sig == "TERM" or trackedIsOurs()) then
-      sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
-    elseif pid then
-      M.logSnapshot(string.format("lfm-retire-%s-skip:pid=%d:unverified-or-gone", sig, pid))
-    end
+    local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)
     if port then
       local owner = listenerPid(port)
-      if owner and owner ~= pid and listenerIsOurs(owner) then
-        sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, owner))
+      if owner and not (sent and owner == pid) and listenerIsOurs(owner) then
+        if send(sig, owner) and owner == pid then sent = true end
       end
+    end
+    if pid and not sent then
+      M.logSnapshot(string.format("lfm-retire-%s-skip:pid=%d:unverified-or-gone", sig, pid))
     end
   end
   signalTargets("TERM")
@@ -2257,7 +2259,7 @@ local function retireLfmServer(reason)
           -- The listener lookup failed: KILL the tracked pid directly, but
           -- only while it still holds our server.
           logError("lfm-retire-kill", kerr)
-          if pid and trackedIsOurs() then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
+          if pid and trackedIsOurs() then send("KILL", pid) end
         end
         return hs.timer.secondsSinceEpoch() > deadline + 3
       end
@@ -2267,8 +2269,23 @@ local function retireLfmServer(reason)
     1,
     function()
       -- The predicate kept erroring: one last identity-checked KILL.
-      if pid and trackedIsOurs() then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
+      if pid and trackedIsOurs() then send("KILL", pid) end
     end)
+end
+
+-- Record the server's identity (pid, start time, name) for the retire's
+-- signals, and to a pidfile so a crash-orphan sweep on the next start kills
+-- exactly OUR server, never a user's manual benchmark. Recorded at spawn
+-- and again for the verified listener once /health passes.
+local function recordLfmServer(pid)
+  local probed = probePid(pid)
+  lfmServerIdent = { pid = pid, lstart = probed and probed.lstart or nil,
+                     name = probed and procs.friendlyName(probed.comm) or nil }
+  local rec = lfm.jsonEncode({ pid = pid, lstart = lfmServerIdent.lstart })
+  if rec then
+    local pf = io.open(LFM_PIDFILE, "w")
+    if pf then pf:write(rec, "\n"); pf:close() end
+  end
 end
 
 local function spawnLfmServer()
@@ -2329,7 +2346,7 @@ local function spawnLfmServer()
       M.logSnapshot(string.format("lfm-server-exit:code=%s", tostring(code)))
       lfmServerTask = nil
       lfmServerReady = false
-      lfmServerPid, lfmServerPort = nil, nil
+      lfmServerPid, lfmServerPort, lfmServerIdent = nil, nil, nil
       protectedPids = { [selfPid] = true }
       -- A FAST crash (died within a few seconds of spawn, before it was ever
       -- ready) latches the adjudicator offline: otherwise the next elevated
@@ -2361,14 +2378,7 @@ local function spawnLfmServer()
   protectedPids = { [selfPid] = true, [lfmServerPid] = true }
   -- Record the spawned pid + start time so a crash-orphan sweep on the next
   -- start kills exactly OUR server, never a user's manual benchmark.
-  do
-    local probed = probePid(lfmServerPid)
-    local rec = lfm.jsonEncode({ pid = lfmServerPid, lstart = probed and probed.lstart or nil })
-    if rec then
-      local pf = io.open(LFM_PIDFILE, "w")
-      if pf then pf:write(rec, "\n"); pf:close() end
-    end
-  end
+  recordLfmServer(lfmServerPid)
   M.logSnapshot(string.format("lfm-spawn:pid=%d:port=%d:avail=%d%%",
     lfmServerPid, port, math.floor(lastMetrics.availPct or 0)))
   -- Health poll to ready, with the listener-ownership check: the pid bound
@@ -2406,6 +2416,7 @@ local function spawnLfmServer()
         protectedPids = { [selfPid] = true, [owner] = true }
         if expected then protectedPids[expected] = true end
         lfmServerPid = owner
+        recordLfmServer(owner)
         lfmServerReady = true
         M.logSnapshot(string.format("lfm-ready:%.1fs:pid=%d",
           hs.timer.secondsSinceEpoch() - lfmSpawnedAt, owner))
@@ -2919,13 +2930,18 @@ function M.start()
     if pf then
       local rec = lfm.jsonDecode(pf:read("a")); pf:close()
       if type(rec) == "table" and type(rec.pid) == "number" then
-        local info = sh(string.format("/bin/ps -p %d -o lstart=,comm=,args= 2>/dev/null", rec.pid))
-        local comm = info:match("%d%s+(%S+)") or info:match("^%s*%a+%s+%a+%s+%d+%s+[%d:]+%s+%d+%s+(%S+)")
-        if info:find("projects/memwatch/models/", 1, true)
-           and info:find("llama-server", 1, true)
-           and (not rec.lstart or info:find(rec.lstart, 1, true)) then
-          sh(string.format("/bin/kill -KILL %d 2>/dev/null", rec.pid))
-          M.logSnapshot("lfm-orphan-sweep:pid=" .. rec.pid)
+        -- The recorded start time must match the live process (a record
+        -- without one signals nothing), and it must still be an
+        -- llama-server on our model dir.
+        local st, live = probe(rec.pid)
+        if core.identityHolds({ pid = rec.pid, lstart = rec.lstart }, st, live and live.lstart, nil) then
+          local okInfo, info = pcall(sh, string.format("/bin/ps -p %d -o args= 2>/dev/null", rec.pid))
+          if okInfo and info:find("projects/memwatch/models/", 1, true) and info:find("llama-server", 1, true)
+             and send("KILL", rec.pid) then
+            M.logSnapshot("lfm-orphan-sweep:pid=" .. rec.pid)
+          end
+        elseif rec.lstart == nil then
+          M.logSnapshot("lfm-orphan-skip:no-start-time:pid=" .. rec.pid)
         end
       end
     end

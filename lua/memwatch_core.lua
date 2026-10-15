@@ -419,6 +419,17 @@ function M.probeResult(rows, pid)
   return "absent"
 end
 
+-- May a signal go to a process memwatch recorded (ident: pid, lstart and
+-- optionally name), given a fresh probe of its pid (status, and the live
+-- start time and name)? Only when the probe saw it with the recorded start
+-- time (and name). A record without a start time, or a probe that could
+-- not tell, never allows a signal: the pid may hold another process.
+function M.identityHolds(ident, status, liveLstart, liveName)
+  if type(ident) ~= "table" or ident.lstart == nil then return false end
+  if status ~= "present" or liveLstart ~= ident.lstart then return false end
+  return ident.name == nil or M.sameName(liveName, ident.name)
+end
+
 -- A probed process is stopped (SIGSTOP): its state starts with T.
 function M.isStopped(proc)
   return proc ~= nil and type(proc.state) == "string" and proc.state:sub(1, 1) == "T"

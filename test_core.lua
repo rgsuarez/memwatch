@@ -1108,6 +1108,11 @@ do
   check("simulate glue: a stale resume is a no-op", sim:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
   local stop = body("function M.stop()")
   check("lifecycle glue: stop orphans pending resumes", stop:find("runGen = runGen + 1", 1, true) ~= nil, true)
+  -- The LFM pollers (not reachable from the behavioral harness).
+  check("lfm glue: a health poller ends when its server is no longer current",
+    src:find("if not myTask or lfmServerTask ~= myTask then return true end", 1, true) ~= nil, true)
+  check("lfm glue: the retire KILL survives a failing listener lookup",
+    src:find('local okKill, kerr = pcall(signalTargets, "KILL")', 1, true) ~= nil, true)
   check("config glue: an undecodable local config is never rewritten",
     src:find('logError("local-config-save"', 1, true) ~= nil, true)
   local mute = body("function M.setAlertsEnabled(on)")

@@ -1606,7 +1606,12 @@ local function retireLfmServer(reason)
       end)
       if okGone and gone then return true end
       if hs.timer.secondsSinceEpoch() > deadline then
-        signalTargets("KILL")
+        local okKill, kerr = pcall(signalTargets, "KILL")
+        if not okKill then
+          -- The listener lookup failed: KILL the tracked pid directly.
+          logError("lfm-retire-kill", kerr)
+          if pid then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
+        end
         return hs.timer.secondsSinceEpoch() > deadline + 3
       end
       return false
@@ -1718,9 +1723,12 @@ local function spawnLfmServer()
   -- Health poll to ready, with the listener-ownership check: the pid bound
   -- to our port must be our child (or its direct descendant via taskpolicy).
   local healthDeadline = hs.timer.secondsSinceEpoch() + 60
+  local myTask = lfmServerTask
   untilHeld(
     function()
-      if not lfmServerTask then return true end -- died; exit callback logged it
+      -- Died (the exit callback logged it), or a stop/start replaced it: a
+      -- poller never acts on a server it did not start.
+      if not myTask or lfmServerTask ~= myTask then return true end
       if hs.timer.secondsSinceEpoch() > healthDeadline then
         M.logSnapshot("lfm-health-timeout")
         retireLfmServer("health-timeout")

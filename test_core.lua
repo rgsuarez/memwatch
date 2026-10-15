@@ -1031,6 +1031,55 @@ do
   check("held-timer: doUntil only inside untilHeld", untilCount, 1)
 end
 
+-- ---- System One adapter (decision models): body and bounded parse ----
+do
+  local snap = { state = "critical", kern = 4, availPct = 7, swapGB = 9.4,
+    offender = { pid = 4242, name = "python3", kind = "extreme", weightMB = 5000.4,
+                 slopeMBmin = 11000, peakSlopeMBmin = 12000, ageSec = 95 },
+    runaways = { { pid = 4242, name = "python3", kind = "extreme", weightMB = 5000 } } }
+  local doc = lfm.snapshotDoc(snap, { redactNames = true })
+  local fenced = lfm.serializeSnapshot(snap, { redactNames = true })
+  check("systemone: snapshotDoc is what serializeSnapshot fences",
+    fenced:find(lfm.jsonEncode(doc), 1, true) ~= nil, true)
+  local body = assert(lfm.systemOneBody(snap, { model = "d1" }))
+  local req = lfm.jsonDecode(body)
+  check("systemone: body decodes", type(req), "table")
+  check("systemone: model carried", req.model, "d1")
+  check("systemone: the state is the snapshot object", req.state.availPct, 7)
+  check("systemone: no pid anywhere", body:find('"pid"', 1, true), nil)
+  check("systemone: names redacted by default", body:find("python3", 1, true), nil)
+  check("systemone: the category is sent", req.state.offender.category, "unknown")
+  local q = req.questions.action
+  check("systemone: a choice question", q.type, "choice")
+  local opts = {}
+  for k in pairs(q.criteria) do opts[#opts + 1] = k end
+  table.sort(opts)
+  check("systemone: offered freeze or wait only", table.concat(opts, ","), "freeze,wait")
+  check("systemone: instructions carry the discriminate clause",
+    q.instructions:find("self-limiting burst", 1, true) ~= nil, true)
+  check("systemone: no model field when none is given", lfm.jsonDecode(lfm.systemOneBody(snap)).model, nil)
+
+  local function reply(probs, extra)
+    local a = { type = "choice", choice = "x", probabilities = probs, confidence = 0.4 }
+    for k, v in pairs(extra or {}) do a[k] = v end
+    return lfm.jsonEncode({ model = "d1", answers = { action = a } })
+  end
+  local v = lfm.parseSystemOne(reply({ freeze = 0.8, wait = 0.2 }))
+  check("systemone parse: freeze", v and v.action, "freeze")
+  check("systemone parse: P(wait)", v and v.pWait, 0.2)
+  check("systemone parse: confidence carried", v and v.confidence, 0.4)
+  check("systemone parse: wait", (lfm.parseSystemOne(reply({ freeze = 0.3, wait = 0.7 })) or {}).action, "wait")
+  check("systemone parse: a tie reads as wait", (lfm.parseSystemOne(reply({ freeze = 0.5, wait = 0.5 })) or {}).action, "wait")
+  check("systemone parse: an extra option is refused", (lfm.parseSystemOne(reply({ freeze = 0.5, wait = 0.3, terminate = 0.2 }))), nil)
+  check("systemone parse: a missing option is refused", (lfm.parseSystemOne(reply({ freeze = 1 }))), nil)
+  check("systemone parse: a bad sum is refused", (lfm.parseSystemOne(reply({ freeze = 0.7, wait = 0.7 }))), nil)
+  check("systemone parse: a negative probability is refused", (lfm.parseSystemOne(reply({ freeze = 1.2, wait = -0.2 }))), nil)
+  check("systemone parse: no answers is refused", (lfm.parseSystemOne('{"model":"d1"}')), nil)
+  check("systemone parse: non-JSON is refused", (lfm.parseSystemOne("not json")), nil)
+  check("systemone parse: empty is refused", (lfm.parseSystemOne("")), nil)
+  check("systemone parse: oversized is refused", (lfm.parseSystemOne(("x"):rep(70000))), nil)
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

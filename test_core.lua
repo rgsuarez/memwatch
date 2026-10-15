@@ -2667,9 +2667,17 @@ do
     local z = a and src:find("\nend\n", a, true)
     return (a and z) and src:sub(a, z) or ""
   end
-  local resolveBody = fnBody("resolveUnattendedAction = function(mode, offender, now)")
+  local resolveBody = fnBody("resolveUnattendedAction = function(mode, offender, now, floorWhy)")
   check("glue: resolveUnattendedAction takes the tick's clock", #resolveBody > 500, true)
-  check("glue: the decision passes the tick's clock", count(src, "resolveUnattendedAction(mode, offender, now)"), 1)
+  check("glue: the decision passes the tick's clock", count(src, "resolveUnattendedAction(mode, offender, now, floorWhy)"), 1)
+  -- (floor round 3) The floor's reason is read before the step consumes its
+  -- check, so a decision it brought forward records why even without a
+  -- verdict at hand.
+  do
+    local a = src:find("local floorWhy = floorDue and lfm.floorActs(w, lastMetrics, now) or nil", 1, true)
+    local b = src:find("if type(w) == \"table\" then w.exhausted = nil end", 1, true)
+    check("glue: the floor's reason is read before its check is consumed", a ~= nil and b ~= nil and a < b, true)
+  end
   check("glue: that decision is the only caller", count(src, "resolveUnattendedAction("), 1)
   check("glue: the decision never re-reads the clock", count(resolveBody, "secondsSinceEpoch"), 0)
   -- Absent pids are pruned only on a complete table taken after the pid
@@ -3201,6 +3209,23 @@ do
   check("floorActs: a cap at or under the bound acts at the bound",
     lfm.floorActs(st, known(90), 1120, { floorAvailPct = 12, maxHoldSec = 120 }), "hold-cap")
   check("floorActs: the defaults hold 30% at the bound", lfm.floorActs(st, known(30), 1120), nil)
+  -- (round 3) A hold cap of 0 holds nothing past the bound: it acts there,
+  -- as a cap under the bound does.
+  check("floorActs: a hold cap of 0 acts at the bound",
+    lfm.floorActs(st, known(90), 1120, { floorAvailPct = 12, maxHoldSec = 0 }), "hold-cap")
+  -- (round 3) What a floor decision records, held or acting.
+  local rec = lfm.floorRecord(st, known(30), 1130, cfg)
+  check("floorRecord: the threshold and cap in force", rec.floorAvailPct == 12 and rec.maxHoldSec == 600, true)
+  check("floorRecord: the headroom it read", rec.headroomPct == 30 and rec.headroomKnown == true, true)
+  check("floorRecord: the waits so far", rec.deferrals, 3)
+  check("floorRecord: how long the first wait has held", rec.deferredSec, 130)
+  check("floorRecord: a first wait stamped now has held 0", lfm.floorRecord(st, known(30), 1000, cfg).deferredSec, 0)
+  check("floorRecord: one stamped after now has held 0, never less",
+    lfm.floorRecord(st, known(30), 990, cfg).deferredSec, 0)
+  local unk = lfm.floorRecord(st, { availPct = 100, availKnown = false }, 1130, cfg)
+  check("floorRecord: unreadable headroom says so, and records no reading",
+    unk.headroomKnown == false and unk.headroomPct == nil, true)
+  check("floorRecord: no wait state records no wait", lfm.floorRecord(nil, known(30), 1130, cfg).deferredSec, nil)
   -- The every-tick check: only a held wait, only with the adjudicator on.
   local held = { firstAt = 1000, count = 3, exhausted = true }
   check("floorDue: a held wait at the floor is due", lfm.floorDue(held, known(10), 1130, cfg), true)

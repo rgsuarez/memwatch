@@ -2856,6 +2856,65 @@ scenario("a held wait's record, and the ledger row for a floor act mid-window", 
   check("floor-rec: and its threshold", a.floorAvailPct, 12)
 end)
 
+-- (round 3) A held wait whose verdict ages out before the headroom falls: the
+-- floor still acts on the tick it falls, and the record still says why. A
+-- 45 s freshness makes the cached verdict expire inside the grace window.
+local REMOTE_LFM_FREEZE_FRESH45 = '{"unattended":"freeze","lfm":{"enabled":true,"advisoryIntervalSec":600,'
+  .. '"verdictFreshSec":45,"remoteServer":"https://lfm.invalid","remoteKeyFile":"' .. LFM_KEYFILE .. '"}}'
+scenario("a floor act after its held verdict expired still records the floor", REMOTE_LFM_FREEZE_FRESH45, function(W, mw)
+  check("floor-expired: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  W.httpDelay = 600                   -- re-asks stay in flight: the cached verdict ages out
+  W.run(50)                           -- past its 45 s freshness, still inside the grace window
+  check("floor-expired: nothing acted while the verdict aged out (control)", W.signalsTo(4242), "")
+  W.availPct = 10
+  check("floor-expired: the floor acts on the fall, ahead of the grace expiry", stopsWithin(W, 8), true)
+  check("floor-expired: before the next grace expiry (" .. math.floor(W.now - heldAt) .. " s after the hold)",
+    W.now - heldAt < 60, true)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  local rails = {}
+  for _, x in ipairs(a.rails or {}) do rails[x] = true end
+  check("floor-expired: with no fresh verdict at hand (control)", rails["no-fresh-verdict"] == true, true)
+  check("floor-expired: the acting record names the floor", rails["deferral-floor-fired-by-headroom"] == true, true)
+  check("floor-expired: with its threshold, hold cap and headroom",
+    a.floorAvailPct == 12 and a.maxHoldSec == 600 and type(a.headroomPct) == "number" and a.headroomPct <= 12, true)
+  check("floor-expired: and how long the wait held (" .. tostring(a.deferredSec) .. " s)", (a.deferredSec or 0) >= 160, true)
+end)
+
+-- (round 3) Switching the adjudicator off and on again: a verdict cached
+-- before the switch decides nothing after it, and a wait it held no longer
+-- holds the policy off or arms the floor's every-tick check.
+scenario("a verdict cached before an off-and-on switch decides nothing after it", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  local kAt = W.now
+  check("switch-cache: a wait verdict is cached (control)",
+    runUntil(W, 40, function() return mw.debug().lfm.cached > 0 end), true)
+  -- Late enough that the cached verdict is the one asked about the start
+  -- time the alert bound (an earlier one is dropped and asked again at the
+  -- bind), early enough that the grace expiry has not come.
+  runUntil(W, 60, function() return W.now - kAt >= 45 end)
+  check("switch-cache: before the grace expiry (control)", W.signalsTo(4242) == "" and unattendedRow(W, "lfm") == nil, true)
+  mw.setLfmEnabled(false)
+  W.httpDelay = 600                   -- nothing the switch-on asks comes back in time
+  mw.setLfmEnabled(true)
+  check("switch-cache: the deterministic freeze acts at grace expiry", stopsWithin(W, 90), true)
+  check("switch-cache: and no model decision was made", unattendedRow(W, "lfm"), nil)
+end)
+
+scenario("a held wait does not survive an off-and-on switch", REMOTE_LFM_FREEZE, function(W, mw)
+  check("switch-held: headroom holds the wait", toHeldWait(W), true)
+  W.run(10)
+  mw.setLfmEnabled(false)
+  W.httpDelay = 600
+  mw.setLfmEnabled(true)
+  W.availPct = 10                     -- a fall the held wait's check would act on mid-window
+  check("switch-held: no floor act mid-window: the held wait is gone", stopsWithin(W, 20), false)
+  check("switch-held: the base system decides at its grace expiry", stopsWithin(W, 60), true)
+end)
+
 -- Headroom that cannot be read (no memory size: availPct reads 100) is
 -- unknown, and the floor fails closed on it.
 scenario("a held wait ends when headroom cannot be read", REMOTE_LFM_FREEZE, function(W, mw)

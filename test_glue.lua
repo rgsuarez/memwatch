@@ -2726,7 +2726,8 @@ end
 local function lastRowBy(W, adjudicator)
   local last
   for _, r in ipairs(decisionRows(W)) do
-    if r.adjudicator == adjudicator then last = r end
+    -- (not the 60 s outcome row each decision schedules)
+    if r.adjudicator == adjudicator and r.outcome_for == nil then last = r end
   end
   return last
 end
@@ -2849,6 +2850,9 @@ scenario("a held wait's record, and the ledger row for a floor act mid-window", 
   W.availPct = 10
   check("floor-rec: the floor acts on the fall", stopsWithin(W, 15), true)
   check("floor-rec: and the ledger records that decision point", #obsDecisions(W, 4242) - before, 1)
+  local od = obsDecisions(W, 4242)
+  check("floor-rec: the forced row says why the floor brought it forward", (od[#od] or {}).floorAct, "headroom")
+  check("floor-rec: a cadence row says nothing of the kind (control)", (od[1] or {}).floorAct, nil)
   local a = lastRowBy(W, "deterministic-fallback") or {}
   local fired = false
   for _, x in ipairs(a.rails or {}) do if x == "deferral-floor-fired-by-headroom" then fired = true end end
@@ -2879,6 +2883,49 @@ scenario("a floor act after its held verdict expired still records the floor", R
   check("floor-expired: with its threshold, hold cap and headroom",
     a.floorAvailPct == 12 and a.maxHoldSec == 600 and type(a.headroomPct) == "number" and a.headroomPct <= 12, true)
   check("floor-expired: and how long the wait held (" .. tostring(a.deferredSec) .. " s)", (a.deferredSec or 0) >= 160, true)
+end)
+
+-- (round 4) The negative case: a held wait whose verdict expired, with
+-- headroom falling only on the grace-expiry tick. That decision is the
+-- plain deterministic one the grace brings, the floor brought nothing
+-- forward, and its record says so: no floor rail, no floor fields.
+scenario("a grace-expiry fallback after a held wait is not credited to the floor", REMOTE_LFM_FREEZE_FRESH45, function(W, mw)
+  check("floor-grace: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  W.httpDelay = 600                   -- re-asks stay in flight: the verdict ages out
+  runUntil(W, 70, function() return W.now - heldAt >= 59 end)
+  check("floor-grace: nothing acted inside the window (control)", W.signalsTo(4242), "")
+  W.availPct = 10                     -- the fall lands on the grace-expiry tick
+  check("floor-grace: the grace expiry acts", stopsWithin(W, 8), true)
+  check("floor-grace: at the grace expiry (" .. math.floor(W.now - heldAt) .. " s after the hold, control)",
+    W.now - heldAt >= 60, true)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  local floorRail = false
+  for _, x in ipairs(a.rails or {}) do if x:find("deferral-floor", 1, true) then floorRail = true end end
+  check("floor-grace: the record names no floor", floorRail, false)
+  check("floor-grace: and carries no floor fields", a.floorAvailPct == nil and a.headroomPct == nil, true)
+end)
+
+-- (round 4) A held wait whose model has since answered freeze: the floor
+-- brings that decision forward when headroom falls mid-window, and the
+-- record says so beside the model's own.
+scenario("a fresh freeze verdict on a held wait still records the floor that brought it forward", REMOTE_LFM_FREEZE_FRESH45, function(W, mw)
+  check("floor-fresh-freeze: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  W.httpReply = cannedVerdict("freeze")  -- the next answer, once the wait verdict ages out (45 s)
+  W.run(50)
+  check("floor-fresh-freeze: nothing acted before the fall (control)", W.signalsTo(4242), "")
+  W.availPct = 10
+  check("floor-fresh-freeze: the decision comes on the fall", stopsWithin(W, 8), true)
+  check("floor-fresh-freeze: ahead of the grace expiry (" .. math.floor(W.now - heldAt) .. " s after the hold)",
+    W.now - heldAt < 60, true)
+  local a = lastRowBy(W, "lfm") or {}
+  local rails = {}
+  for _, x in ipairs(a.rails or {}) do rails[x] = true end
+  check("floor-fresh-freeze: it is the model's freeze (control)", a.action, "freeze")
+  check("floor-fresh-freeze: and its record names the floor", rails["deferral-floor-fired-by-headroom"] == true, true)
+  check("floor-fresh-freeze: with its threshold and headroom",
+    a.floorAvailPct == 12 and type(a.headroomPct) == "number" and a.headroomPct <= 12, true)
 end)
 
 -- (round 3) Switching the adjudicator off and on again: a verdict cached

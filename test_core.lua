@@ -2674,10 +2674,13 @@ do
   -- check, so a decision it brought forward records why even without a
   -- verdict at hand.
   do
-    local a = src:find("local floorWhy = floorDue and lfm.floorActs(w, lastMetrics, now) or nil", 1, true)
+    local a = src:find("local floorWhy = obs.floorActDue(offender, now)", 1, true)
     local b = src:find("if type(w) == \"table\" then w.exhausted = nil end", 1, true)
     check("glue: the floor's reason is read before its check is consumed", a ~= nil and b ~= nil and a < b, true)
   end
+  -- (round 4) The floor brings nothing forward once the grace has run.
+  check("glue: the floor predicate says nothing once the grace has run",
+    src:find("and (now - fired.at) >= core.cfg.cool.autoKillGraceSec then return nil end", 1, true) ~= nil, true)
   check("glue: that decision is the only caller", count(src, "resolveUnattendedAction("), 1)
   check("glue: the decision never re-reads the clock", count(resolveBody, "secondsSinceEpoch"), 0)
   -- Absent pids are pruned only on a complete table taken after the pid
@@ -3226,6 +3229,17 @@ do
   check("floorRecord: unreadable headroom says so, and records no reading",
     unk.headroomKnown == false and unk.headroomPct == nil, true)
   check("floorRecord: no wait state records no wait", lfm.floorRecord(nil, known(30), 1130, cfg).deferredSec, nil)
+  -- (round 4) Every decision the floor brought forward says so.
+  local r0, x0 = { "lfm", "freeze-ok" }, { model = "m", confidence = 0.9, deferrals = 7 }
+  local r1, x1 = lfm.withFloorRecord(r0, x0, "headroom", rec)
+  check("withFloorRecord: the floor's rail is added", r1[#r1], "deferral-floor-fired-by-headroom")
+  check("withFloorRecord: beside the decision's own rails", r1[1] == "lfm" and r1[2] == "freeze-ok", true)
+  check("withFloorRecord: and the floor's fields", x1.floorAvailPct == 12 and x1.headroomPct == 30, true)
+  check("withFloorRecord: the decision's own fields win", x1.deferrals == 7 and x1.model == "m", true)
+  check("withFloorRecord: its arguments are untouched", #r0 == 2 and x0.floorAvailPct == nil, true)
+  local r2 = lfm.withFloorRecord(r1, x1, "headroom", rec)
+  check("withFloorRecord: never twice", #r2, #r1)
+  check("withFloorRecord: no rail when the floor is off", #lfm.withFloorRecord({ "x" }, nil, "no-floor", rec), 1)
   -- The every-tick check: only a held wait, only with the adjudicator on.
   local held = { firstAt = 1000, count = 3, exhausted = true }
   check("floorDue: a held wait at the floor is due", lfm.floorDue(held, known(10), 1130, cfg), true)

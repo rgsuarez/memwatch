@@ -37,6 +37,7 @@ M.cfg = {
   bootstrap    = 2000,
   bootSeed     = 20261015,
   noisyFlip    = 0.10,
+  powerShare   = 0.50,   -- the power control's share of the oracle's improvement
   powerTarget  = 0.80,
   ruleMinAvail = 12,   -- the category rule waits only with at least this much headroom
 }
@@ -219,8 +220,26 @@ M.candidates["oracle"] = function()
   return function(_, ep) return ep.labels.runaway and "freeze" or "wait", ep.labels.runaway and 1 or 0 end
 end
 
+-- The gate's power control: a candidate halfway (by default) between the
+-- best baseline and the label oracle. Per episode, chosen deterministically
+-- from its id and the seed, it decides like the oracle with probability
+-- `share` and like the baseline otherwise, so its true improvement over that
+-- baseline is `share` of the oracle's. The gate is adequately powered when
+-- such a candidate passes in at least powerTarget of the seeds. (A label
+-- oracle with flipped labels is no power control: flipping a runaway's label
+-- makes it miss, so it fails the miss bound by construction.)
+function M.mixedOracle(baseline, share, seed)
+  local oracle = M.candidates["oracle"]()
+  return function(st, ep)
+    local h = tonumber(lfm.snapshotHash(ep.id .. ":mix:" .. tostring(seed)), 16) or 0
+    if (h % 100000) / 100000 < share then return oracle(st, ep) end
+    return baseline(st, ep)
+  end
+end
+
 -- A label-reading oracle with a fixed fraction of episodes flipped
--- (deterministic per episode id): the gate's power control.
+-- (deterministic per episode id): a robustness diagnostic, not the power
+-- control (see mixedOracle).
 function M.noisyOracle(flip, seed)
   return function(_, ep)
     local h = tonumber(lfm.snapshotHash(ep.id .. ":" .. tostring(seed)), 16) or 0
@@ -572,16 +591,20 @@ function M.main(argv)
   elseif a.cmd == "controls" then
     local gF = M.gate(eps, M.candidates["always-freeze"](), baselines)
     local gO = M.gate(eps, M.candidates["oracle"](), baselines)
-    local passes = 0
-    local trials = 50
-    for s = 1, trials do
-      if M.gate(eps, M.noisyOracle(M.cfg.noisyFlip, s), baselines).pass then passes = passes + 1 end
-    end
     print(string.format("control always-freeze must FAIL: %s", gF.pass and "FAILED (gate passed it)" or "ok (failed)"))
     print(string.format("control oracle must PASS: %s", gO.pass and "ok (passed)" or "FAILED (gate failed it)"))
-    print(string.format("power: noisy oracle (%.0f%% flipped) passed %d/%d seeds (target >= %.0f%%): %s",
-      M.cfg.noisyFlip * 100, passes, trials, M.cfg.powerTarget * 100,
-      (passes / trials) >= M.cfg.powerTarget and "ok" or "UNDERPOWERED"))
+    if not gO.bestBaseline then
+      print("power: no baseline meets the miss bound on this set; the gate compares against nothing")
+    else
+      local passes, trials = 0, 50
+      for seed = 1, trials do
+        local mix = M.mixedOracle(baselines[gO.bestBaseline], M.cfg.powerShare, seed)
+        if M.gate(eps, mix, baselines).pass then passes = passes + 1 end
+      end
+      print(string.format("power: a candidate %.0f%% of the way from %s to the oracle passed %d/%d seeds (target >= %.0f%%): %s",
+        M.cfg.powerShare * 100, gO.bestBaseline, passes, trials, M.cfg.powerTarget * 100,
+        (passes / trials) >= M.cfg.powerTarget and "ok" or "UNDERPOWERED"))
+    end
   else
     error("usage: score-episodes.lua gate|controls --dir <episodes> [--fit-dir <dev>] [--candidate <name>]")
   end

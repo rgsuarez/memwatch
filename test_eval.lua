@@ -163,6 +163,18 @@ do
   check("gate: the oracle never misses", s.misses, 0)
   check("gate: the oracle itself never freezes a savable", s.wrongful - s.wrongfulByFloor, 0)
   check("gate: floor freezes are attributed to the floor", s.wrongfulByFloor >= 0, true)
+  -- The power control mixes the oracle into a baseline by episode.
+  local af = sc.candidates["always-freeze"]()
+  local none, all = sc.mixedOracle(af, 0, 1), sc.mixedOracle(af, 1, 1)
+  local sameAsBase, sameAsOracle = true, true
+  local oracle = sc.candidates.oracle()
+  for _, ep in ipairs(eps) do
+    local st = ep.steps[1]
+    if (none(st, ep)) ~= (af(st, ep)) then sameAsBase = false end
+    if (all(st, ep)) ~= (oracle(st, ep)) then sameAsOracle = false end
+  end
+  check("power control: share 0 is the baseline", sameAsBase, true)
+  check("power control: share 1 is the oracle", sameAsOracle, true)
   sc.cfg.bootstrap = 2000
 end
 

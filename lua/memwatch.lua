@@ -44,8 +44,9 @@ local lastRuns     = {}   -- current runaway list, ignores applied
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
-local lastSampleLaunchedAt = nil -- when the sampler behind lastPsList was launched
-local lastSampleComplete = false -- that sampler exited 0 (its ps table is whole)
+-- The sampler run behind lastPsList: when it was launched (nil: unknown,
+-- start windows unbounded), and whether it exited 0 (its table is whole).
+local lastSample = { launchedAt = nil, complete = false }
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -84,41 +85,50 @@ local lfmInFlight    = nil    -- { nonce, pid, hash, at } of the request in flig
 local lfmRemoteKey   = nil    -- bearer key for the remote adjudicator (never logged)
 local lfmRemoteCooldownUntil = 0 -- F1: remote backoff deadline (retry, not hard latch)
 local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident, kind, snapshot }
--- Passive observation ledger state (cross-section, so declared here).
-local observeEnabled    = true -- local-only outcome record; config key "observe"
-local observeSeq        = 0
-local observeLastAt     = 0
-local observeDecisionAt = {}   -- [pid] = { at, comm, start } of the last decision observation
-local observeStats      = { rows = 0, followups = 0, lastAt = 0, errors = 0 }
--- The evidence of each observation still awaiting follow-ups ([seq] =
--- observe.newEvidence), folded forward as ps samples, memwatch's own
--- signals and operator touches arrive, and dropped after its last horizon.
--- A follow-up reads only its own record (see observe.foldSample).
-local pendingObs        = {}
--- Rows carry this load's session id: observation seq restarts at 1 on every
--- reload, so (session, seq) is the join key between a row and its
--- follow-ups.
-local observeSession    = string.format("%d-%04x", os.time(), math.random(0, 0xffff))
+-- Passive observation ledger state and functions (cross-section, so
+-- declared here). One table, not a local each: Lua caps a chunk's locals
+-- at 200, and this file is near the cap (test_core pins the headroom).
+local obs = {
+  enabled    = true,   -- local-only outcome record; config key "observe"
+  seq        = 0,
+  lastAt     = 0,
+  decisionAt = {},     -- [pid] = { at, comm, start } of the last decision observation
+  stats      = { rows = 0, followups = 0, lastAt = 0, errors = 0 },
+  -- The evidence of each observation still awaiting follow-ups ([seq] =
+  -- observe.newEvidence), folded forward as ps samples, memwatch's own
+  -- signals and operator touches arrive, and dropped after its last horizon.
+  -- A follow-up reads only its own record (see observe.foldSample).
+  pending    = {},
+  -- Rows carry this load's session id: observation seq restarts at 1 on
+  -- every reload, so (session, seq) is the join key between a row and its
+  -- follow-ups.
+  session    = string.format("%d-%04x", os.time(), math.random(0, 0xffff)),
+  -- Every operator touch on an alert or a process (HUD click, menu action,
+  -- banner button) bumps this monotonic counter (see byOperator).
+  operatorActions = 0,
+  path       = os.getenv("HOME") .. "/projects/memwatch/memwatch-observe.jsonl",
+  jetsamDir  = "/Library/Logs/DiagnosticReports",
+}
 
 -- A signal memwatch sent (after its identity and policy gates) folds into
 -- every pending observation of that pid; the verified target's comm and
 -- start time decide whether it was the observed process.
-local function noteSignal(pid, action, proc)
-  if not next(pendingObs) then return end
+function obs.noteSignal(pid, action, proc)
+  if not next(obs.pending) then return end
   local sig = { action = action, at = hs.timer.secondsSinceEpoch(),
                 comm = proc and proc.comm or nil,
                 startEpoch = proc and observe.lstartEpoch(proc.lstart) or nil }
-  for _, ev in pairs(pendingObs) do
+  for _, ev in pairs(obs.pending) do
     if ev.pid == pid then observe.foldSignal(ev, sig) end
   end
 end
 
 -- An operator touch aimed at a process (its pid, and its bound start time
 -- when known) folds into the pending observations of that pid.
-local function noteTouch(off)
-  if type(off) ~= "table" or not off.pid or not next(pendingObs) then return end
+function obs.noteTouch(off)
+  if type(off) ~= "table" or not off.pid or not next(obs.pending) then return end
   local t = { startEpoch = observe.lstartEpoch(off.lstart) }
-  for _, ev in pairs(pendingObs) do
+  for _, ev in pairs(obs.pending) do
     if ev.pid == off.pid then observe.foldTouch(ev, t) end
   end
 end
@@ -135,7 +145,6 @@ local probeRows
 local resolveSignalTarget
 local frozenSweep
 local lfmRemoteActive
-local writeObservation
 
 local KERN_NAME = { [1] = "NORMAL", [2] = "WARN", [4] = "CRITICAL" }
 
@@ -278,7 +287,7 @@ local function applyLocalConfig()
   if type(conf.alerts) == "boolean" then alertsEnabled = conf.alerts end
   -- The passive observation ledger is on by default (local file only, no
   -- action, no network); "observe": false turns it off.
-  if type(conf.observe) == "boolean" then observeEnabled = conf.observe end
+  if type(conf.observe) == "boolean" then obs.enabled = conf.observe end
   if type(conf.lfm) == "table" then
     for k, v in pairs(conf.lfm) do
       if lfm.cfg[k] ~= nil and type(v) == type(lfm.cfg[k]) then lfm.cfg[k] = v end
@@ -570,17 +579,16 @@ end
 local function markInteracted(off)
   if off and not off.synthetic then
     recordFor(interacted, off, true)
-    noteTouch(off)
+    obs.noteTouch(off)
   end
 end
 -- Every operator touch on an alert or a process (HUD click, menu action,
 -- banner button) bumps one monotonic counter. An observation compares it
 -- across its follow-up window, so a human intervention is never hidden by a
 -- later raise resetting the per-process answered marks.
-local operatorActions = 0
-local function byOperator(fn)
+function obs.byOperator(fn)
   return function(...)
-    operatorActions = operatorActions + 1
+    obs.operatorActions = obs.operatorActions + 1
     return fn(...)
   end
 end
@@ -809,7 +817,7 @@ local function buildHud()
               textColor = { white = 0.6, alpha = 1 }, textSize = 13, trackMouseUp = true }
   hud:mouseCallback(guard("hud-click", function(_, evt, id)
     if evt ~= "mouseUp" then return end
-    operatorActions = operatorActions + 1
+    obs.operatorActions = obs.operatorActions + 1
     -- Every click is an operator touch for the observation ledger. It
     -- answers the alert (and stands unattended action down for this
     -- process) only when it does something: an action dispatched on a
@@ -950,19 +958,19 @@ local function buildMenu()
       title = string.format("%-22s %5.1f GB  (pid %d)", name:sub(1, 22), p.weightMB / 1024, pid),
       menu = {
         { title = "Freeze " .. name .. note, disabled = (lst == nil) or nil,
-          fn = byOperator(function()
+          fn = obs.byOperator(function()
             markInteracted(target)
             M.freezePid(pid, name, surfaceUpdate(target), { weightMB = wMB, expectedLstart = lst })
           end) },
         { title = "Force Quit " .. name .. note, disabled = (lst == nil) or nil,
-          fn = byOperator(function()
+          fn = obs.byOperator(function()
             markInteracted(target)
             M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
           end) },
         { title = "Ignore for 30 min",
-          fn = byOperator(function() M.ignore(pid, name) end) },
+          fn = obs.byOperator(function() M.ignore(pid, name) end) },
         { title = "Show in Activity Monitor",
-          fn = byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) },
+          fn = obs.byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) },
       },
     }
   end
@@ -981,16 +989,16 @@ local function buildMenu()
           (e.weightMB or 0) / 1024, mins),
         menu = {
           { title = "Resume " .. (e.name or "?"),
-            fn = byOperator(function() M.resumePid(pid) end) },
+            fn = obs.byOperator(function() M.resumePid(pid) end) },
           { title = "Force Quit " .. (e.name or "?"),
-            fn = byOperator(function()
+            fn = obs.byOperator(function()
               M.killPid(pid, e.name, surfaceUpdate({ pid = pid, name = e.name, lstart = e.lstart }))
             end) },
         },
       }
     end
     if #frozenRows > 1 then
-      items[#items + 1] = { title = "Resume all", fn = byOperator(function() M.resumeAll() end) }
+      items[#items + 1] = { title = "Resume all", fn = obs.byOperator(function() M.resumeAll() end) }
     end
   end
   items[#items + 1] = { title = "-" }
@@ -1004,7 +1012,7 @@ local function buildMenu()
     local bound = off.lstart or ((hudOffender and hudOffender.pid == off.pid
       and hudOffender.name == off.name) and hudOffender.lstart or nil)
     items[#items + 1] = { title = label, disabled = off.synthetic == true or nil,
-      fn = byOperator(function()
+      fn = obs.byOperator(function()
         local lst, why = bound, nil
         if not lst then
           local p
@@ -1025,11 +1033,11 @@ local function buildMenu()
         M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
       end) }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
-      fn = byOperator(function() M.ignore(off.pid, off.name) end) }
+      fn = obs.byOperator(function() M.ignore(off.pid, off.name) end) }
     items[#items + 1] = { title = "-" }
   end
   items[#items + 1] = { title = "Open Activity Monitor",
-    fn = byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) }
+    fn = obs.byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) }
   items[#items + 1] = { title = "Log snapshot now",
     fn = function() M.logSnapshot("manual") end }
   items[#items + 1] = { title = string.format("Desktop alerts: %s", alertsEnabled and "on" or "off"),
@@ -1124,7 +1132,7 @@ local function notifyCrit(m)
   if not notified then critNotified[#critNotified + 1] = critNotifOff or { none = true } end
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
-      operatorActions = operatorActions + 1
+      obs.operatorActions = obs.operatorActions + 1
       markInteracted(off)
       M.killPid(off.pid, off.name,
         surfaceUpdate({ pid = off.pid, name = off.name, lstart = lstart }), { expectedLstart = lstart })
@@ -1218,10 +1226,10 @@ local function onSample(blob, exitCode, launchedAt)
   local now = hs.timer.secondsSinceEpoch()
   -- A callback from a sampler launched before the one already applied holds
   -- an older table: it never replaces a newer one.
-  if launchedAt and lastSampleLaunchedAt and launchedAt < lastSampleLaunchedAt then return end
+  if launchedAt and lastSample.launchedAt and launchedAt < lastSample.launchedAt then return end
   lastSampleAt = now
-  lastSampleLaunchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
-  lastSampleComplete = (exitCode == 0)
+  lastSample.launchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
+  lastSample.complete = (exitCode == 0)
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -1241,14 +1249,14 @@ local function onSample(blob, exitCode, launchedAt)
   -- Every pending observation folds this sample into its evidence: presence
   -- by acquisition time (this sampler's launch), weight and peak, or proof
   -- its process is gone.
-  if next(pendingObs) then
+  if next(obs.pending) then
     local rows = {}
     for _, p in ipairs(lastPsList) do rows[p.pid] = p end
-    for _, ev in pairs(pendingObs) do
+    for _, ev in pairs(obs.pending) do
       local row = rows[ev.pid]
       local e = row and tracker.procs[ev.pid] or nil
       observe.foldSample(ev, {
-        complete = lastSampleComplete, row = row,
+        complete = lastSample.complete, row = row,
         start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
         launchedAt = launchedAt, deliveredAt = now })
@@ -1271,7 +1279,7 @@ local function resetEpisode()
   exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil
   -- A new episode is a new decision sequence: deferral, latches and the
   -- decision-row stamps start over.
-  unattendedWaitStreak, unattendedFiredFor, observeDecisionAt = {}, {}, {}
+  unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, {}, {}
 end
 
 -- The unattended receipt, posted when the action completes and saying what
@@ -1492,16 +1500,16 @@ local function alertSurfaces(state, now)
     -- may never break alerting.
     local decGrace = hudOffender and recordFor(exposure, hudOffender, false) or nil
     local decEntry = offender and tracker.procs[offender.pid] or nil
-    local decStamp = offender and observe.liveStamp(observeDecisionAt[offender.pid], decEntry) or nil
+    local decStamp = offender and observe.liveStamp(obs.decisionAt[offender.pid], decEntry) or nil
     if observe.decisionDue({
-         enabled = observeEnabled, gate = gateFor(offender, now),
+         enabled = obs.enabled, gate = gateFor(offender, now),
          sinceLastSec = decStamp and (now - decStamp.at) or nil,
          graceSec = core.cfg.cool.autoKillGraceSec,
        }) then
       -- Stamped before the write on purpose: a throwing write must not retry every tick.
-      observeDecisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,
+      obs.decisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,
                                           start = observe.startOf(decEntry) }
-      local okObs, errObs = pcall(writeObservation, "decision", offender, now,
+      local okObs, errObs = pcall(obs.writeObservation, "decision", offender, now,
         { graceElapsedSec = decGrace and decGrace.sec or 0 })
       if not okObs then logError("observe-decision", errObs) end
     end
@@ -1552,10 +1560,10 @@ local function tick()
   -- Passive observation on the advisory cadence while pressure is up: the
   -- distribution of offenders an adjudicator would have been asked about,
   -- not only the extreme ones that reach a decision point.
-  if observeEnabled and state ~= "ok" and lastOffender
-     and (now - observeLastAt) >= observe.cfg.intervalSec then
-    observeLastAt = now
-    local okObs, errObs = pcall(writeObservation, "advisory", lastOffender, now)
+  if obs.enabled and state ~= "ok" and lastOffender
+     and (now - obs.lastAt) >= observe.cfg.intervalSec then
+    obs.lastAt = now
+    local okObs, errObs = pcall(obs.writeObservation, "advisory", lastOffender, now)
     if not okObs then logError("observe-advisory", errObs) end
   end
   -- Frozen-ledger liveness sweep, in every state: a frozen pid is no
@@ -1864,7 +1872,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   frozen[pid] = entry
   saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
-  noteSignal(pid, "freeze", proc)
+  obs.noteSignal(pid, "freeze", proc)
   afterHeld(0.5, guard("freeze-verify", function()
     -- Re-probe IDENTITY and state in one fork after the signal: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
@@ -2506,23 +2514,21 @@ end
 -- passive observation ledger (memwatch-observe.jsonl; see memwatch_observe)
 ------------------------------------------------------------------------------
 
-local OBSERVE_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-observe.jsonl"
-local JETSAM_DIR = "/Library/Logs/DiagnosticReports"
 
 -- Append one line; true only when it reached the file, so the counters
 -- count written rows. A nil line (an encode failure), an open failure and a
 -- write or close failure each count as an error and return false.
-local function appendObserve(line)
-  if not line then observeStats.errors = observeStats.errors + 1; return false end
-  local f, err = io.open(OBSERVE_PATH, "a")
+function obs.appendObserve(line)
+  if not line then obs.stats.errors = obs.stats.errors + 1; return false end
+  local f, err = io.open(obs.path, "a")
   if not f then
-    observeStats.errors = observeStats.errors + 1
+    obs.stats.errors = obs.stats.errors + 1
     logError("observe-open", err)
     return false
   end
   if f:seek("end") > observe.cfg.maxBytes then
     f:close()
-    for _, step in ipairs(observe.rotationPlan(OBSERVE_PATH, observe.cfg.keep)) do
+    for _, step in ipairs(observe.rotationPlan(obs.path, observe.cfg.keep)) do
       -- An older generation that does not exist yet is not a failure; a
       -- rename of one that does exist must succeed or be logged.
       local src = io.open(step[1], "r")
@@ -2532,9 +2538,9 @@ local function appendObserve(line)
         if not ok then logError("observe-rotate", err) end
       end
     end
-    f, err = io.open(OBSERVE_PATH, "a")
+    f, err = io.open(obs.path, "a")
     if not f then
-      observeStats.errors = observeStats.errors + 1
+      obs.stats.errors = obs.stats.errors + 1
       logError("observe-open", err)
       return false
     end
@@ -2542,7 +2548,7 @@ local function appendObserve(line)
   local wrote, werr = f:write(line)
   local closed = f:close()
   if not (wrote and closed) then
-    observeStats.errors = observeStats.errors + 1
+    obs.stats.errors = obs.stats.errors + 1
     logError("observe-write", werr)
     return false
   end
@@ -2553,12 +2559,12 @@ end
 -- listing and each report's modification time (an epoch, so no local-time
 -- name parsing and no daylight-saving shift): no fork. nil means "could not
 -- look", never zero.
-local function jetsamSince(since)
+function obs.jetsamSince(since)
   local times = {}
   local ok = pcall(function()
-    for name in hs.fs.dir(JETSAM_DIR) do
+    for name in hs.fs.dir(obs.jetsamDir) do
       if name:sub(1, 12) == "JetsamEvent-" then
-        local m = hs.fs.attributes(JETSAM_DIR .. "/" .. name, "modification")
+        local m = hs.fs.attributes(obs.jetsamDir .. "/" .. name, "modification")
         if type(m) == "number" then times[#times + 1] = m end
       end
     end
@@ -2572,13 +2578,13 @@ end
 -- grace expiry) or "synthetic" (memwatch.testObserve). Never forks: the
 -- snapshot is built from tick state, fates come from the latest ps sample
 -- and the frozen ledger, exit-cause evidence from a directory listing.
-writeObservation = function(point, offender, now, extra)
-  if not observeEnabled or type(offender) ~= "table" then return end
+obs.writeObservation = function(point, offender, now, extra)
+  if not obs.enabled or type(offender) ~= "table" then return end
   extra = extra or {}
   local snap, foreground = buildLfmSnapshot(offender)
   local user = lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })
-  observeSeq = observeSeq + 1
-  local seq = observeSeq
+  obs.seq = obs.seq + 1
+  local seq = obs.seq
   local obsIso = os.date("!%Y-%m-%dT%H:%M:%SZ")
   local mode = core.resolveUnattended(core.cfg)
   -- A decision point records what the deterministic policy fires under the
@@ -2594,7 +2600,7 @@ writeObservation = function(point, offender, now, extra)
     wouldActAtFreeze = deterministicAction("freeze", foreground)
   end
   local row = observe.row({
-    at = obsIso, session = observeSession, seq = seq, point = point, synthetic = extra.synthetic,
+    at = obsIso, session = obs.session, seq = seq, point = point, synthetic = extra.synthetic,
     state = smState.state, kern = lastKern,
     availPct = lastMetrics.availPct, swapGB = lastMetrics.swapGB,
     compressorGB = lastMetrics.compGB,
@@ -2612,9 +2618,9 @@ writeObservation = function(point, offender, now, extra)
   -- An oversize row drops its snapshot, never the row. A row that was not
   -- written gets no follow-ups and no sequence number back.
   local line = observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)
-  if not appendObserve(line) then return nil end
-  observeStats.rows = observeStats.rows + 1
-  observeStats.lastAt = now
+  if not obs.appendObserve(line) then return nil end
+  obs.stats.rows = obs.stats.rows + 1
+  obs.stats.lastAt = now
   -- Follow-ups: what actually became of this process, and of the machine.
   -- Identity at observation time is the tracker's comm and the start
   -- window of its latest ps sighting; from here on the observation's own
@@ -2625,13 +2631,13 @@ writeObservation = function(point, offender, now, extra)
   local weight0 = offender.weightMB or 0
   local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
                                    start0 = observe.startOf(e0), obsAt = now, weightMB = weight0 })
-  pendingObs[seq] = ev
+  obs.pending[seq] = ev
   local avail0 = lastMetrics.availPct or 0
-  local ops0 = operatorActions
+  local ops0 = obs.operatorActions
   local horizons = extra.horizons or observe.cfg.horizons
   for i, h in ipairs(horizons) do
     afterHeld(h, guard("observe-followup", function()
-      if i == #horizons then pendingObs[seq] = nil end
+      if i == #horizons then obs.pending[seq] = nil end
       local t = hs.timer.secondsSinceEpoch()
       local frozenSame = observe.frozenMatches(frozen[pid], ev.start0)
       local fate, detail = observe.fateAt(ev, t, frozenSame == true)
@@ -2640,7 +2646,7 @@ writeObservation = function(point, offender, now, extra)
       local sig = ev.signals[1]
       local availNow = lastMetrics.availPct or 0
       local fline = lfm.ledgerLine({
-        at = os.date("!%Y-%m-%dT%H:%M:%SZ"), session = observeSession,
+        at = os.date("!%Y-%m-%dT%H:%M:%SZ"), session = obs.session,
         followup_for = seq, observed_at = obsIso,
         horizonSec = h, synthetic = extra.synthetic == true or nil, pid = pid,
         fate = fate, fateDetail = detail,
@@ -2651,13 +2657,13 @@ writeObservation = function(point, offender, now, extra)
         availPct = math.floor(availNow), availDelta = math.floor(availNow - avail0),
         state = smState.state,
         frozenLedger = frozenSame,
-        operatorActionsSince = operatorActions - ops0,
+        operatorActionsSince = obs.operatorActions - ops0,
         operatorTouchesSince = ev.touches,
         memwatchSignalSince = sig and sig.action or nil,
         memwatchSignalUncertain = sig and sig.uncertain or nil,
-        jetsamSince = jetsamSince(now),
+        jetsamSince = obs.jetsamSince(now),
       })
-      if appendObserve(fline) then observeStats.followups = observeStats.followups + 1 end
+      if obs.appendObserve(fline) then obs.stats.followups = obs.stats.followups + 1 end
     end))
   end
   return seq
@@ -2902,7 +2908,7 @@ end
 -- episode's end clears the rest (resetEpisode). Runs every tick regardless
 -- of LFM.
 gcUnattendedState = function(now)
-  if not lastSampleComplete then return end
+  if not lastSample.complete then return end
   local alive = {}
   for _, p in ipairs(lastPsList) do alive[p.pid] = true end
   for pid in pairs(unattendedWaitStreak) do
@@ -2911,8 +2917,8 @@ gcUnattendedState = function(now)
   for pid in pairs(unattendedFiredFor) do
     if not alive[pid] then unattendedFiredFor[pid] = nil end
   end
-  for pid in pairs(observeDecisionAt) do
-    if not alive[pid] then observeDecisionAt[pid] = nil end
+  for pid in pairs(obs.decisionAt) do
+    if not alive[pid] then obs.decisionAt[pid] = nil end
   end
 end
 
@@ -2984,7 +2990,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- The TERM is the signal of record: a KILL escalation below carries out
   -- the same decision.
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
-  noteSignal(pid, "terminate", proc)
+  obs.noteSignal(pid, "terminate", proc)
   afterHeld(k.escalateSec, guard("kill-escalate", function()
     -- Re-validate FULL identity (name AND the start time bound above)
     -- before SIGKILL: between TERM and this escalation the original may
@@ -3136,9 +3142,9 @@ function M.debug()
                        offline = lfmOffline, pid = lfmServerPid, port = lfmServerPort,
                        remote = lfmRemoteActive() and lfm.cfg.remoteModel or nil,
                        cached = (function() local n = 0; for _ in pairs(verdictCache) do n = n + 1 end; return n end)() },
-    observe        = { enabled = observeEnabled, rows = observeStats.rows,
-                       followups = observeStats.followups, errors = observeStats.errors,
-                       lastAgeSec = observeStats.lastAt > 0 and math.floor(now - observeStats.lastAt) or -1 },
+    observe        = { enabled = obs.enabled, rows = obs.stats.rows,
+                       followups = obs.stats.followups, errors = obs.stats.errors,
+                       lastAgeSec = obs.stats.lastAt > 0 and math.floor(now - obs.stats.lastAt) or -1 },
   }
 end
 
@@ -3300,18 +3306,18 @@ end
 -- extreme offender and schedules its follow-ups at 2, 4 and 6 s, with NO
 -- real process and NO memory load. Usage: hs -c "memwatch.testObserve()".
 function M.testObserve()
-  if not observeEnabled then return "observation ledger disabled (observe=false)" end
+  if not obs.enabled then return "observation ledger disabled (observe=false)" end
   local now = hs.timer.secondsSinceEpoch()
   local fake = { pid = -1, name = "memwatch-observe-probe", kind = "extreme",
                  weightMB = 9200, slopeMBmin = 11000, peakSlopeMBmin = 12000,
                  ageSec = 40, foreground = false }
-  local seq = writeObservation("synthetic", fake, now,
+  local seq = obs.writeObservation("synthetic", fake, now,
     { synthetic = true, horizons = { 2, 4, 6 } })
   if not seq then
     return "memwatch.testObserve could NOT write its row (see memwatch.debug().observe.errors and memwatch.log)"
   end
   return string.format("memwatch.testObserve wrote synthetic row %d; follow-ups land in ~6 s in %s",
-    seq, OBSERVE_PATH)
+    seq, obs.path)
 end
 
 -- Render the value report from the local ledgers and open it.

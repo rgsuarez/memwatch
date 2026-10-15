@@ -1763,8 +1763,8 @@ do
   local dz = alertBody:find("unattendedStep(offender, now)", 1, true)
   local observePath = {
     { "writeObservation", body },
-    { "jetsamSince", fnBody("local function jetsamSince(since)") },
-    { "appendObserve", fnBody("local function appendObserve(line)") },
+    { "jetsamSince", fnBody("function obs.jetsamSince(since)") },
+    { "appendObserve", fnBody("function obs.appendObserve(line)") },
     { "buildLfmSnapshot", fnBody("local function buildLfmSnapshot(offender)") },
     { "the decision trigger", (da and dz and da < dz) and alertBody:sub(da + 1, dz - 1) or "" },
   }
@@ -1800,9 +1800,9 @@ do
     triggerTakesNoMode("observe.decisionDue({ enabled = x, mode = core.resolveUnattended(core.cfg) })"), false)
   check("observe glue: the decision trigger takes no mode", triggerTakesNoMode(alertBody), true)
   check("observe glue: an existing stamp counts only for the same process",
-    alertBody:find("observe.liveStamp(observeDecisionAt[offender.pid], decEntry)", 1, true) ~= nil, true)
-  local stampAt = alertBody:find("observeDecisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,", 1, true)
-  local writeAt = alertBody:find('pcall(writeObservation, "decision"', 1, true)
+    alertBody:find("observe.liveStamp(obs.decisionAt[offender.pid], decEntry)", 1, true) ~= nil, true)
+  local stampAt = alertBody:find("obs.decisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,", 1, true)
+  local writeAt = alertBody:find('pcall(obs.writeObservation, "decision"', 1, true)
   check("observe glue: the stamp carries the process identity", stampAt ~= nil, true)
   check("observe glue: the stamp is set before the write", stampAt ~= nil and writeAt ~= nil and stampAt < writeAt, true)
   -- wouldAct is what fires under the live mode; the freeze ceiling is a
@@ -1821,24 +1821,24 @@ do
     dbody:find("name = observe.sanitizeName(offender.name)", 1, true) ~= nil, true)
   check("decision ledger glue: no raw name is stored", dbody:find("name = offender.name", 1, true), nil)
   check("observe glue: decision point is error-bounded",
-    src:find('pcall(writeObservation, "decision"', 1, true) ~= nil, true)
+    src:find('pcall(obs.writeObservation, "decision"', 1, true) ~= nil, true)
   check("observe glue: advisory cadence is error-bounded",
-    src:find('pcall(writeObservation, "advisory"', 1, true) ~= nil, true)
+    src:find('pcall(obs.writeObservation, "advisory"', 1, true) ~= nil, true)
   -- Fates come only from the observation's own evidence: every sample folds
   -- in with its completeness and its start window, and the operator signal
   -- is the monotonic counter, not the resettable HUD flag.
   local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt)")
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
-    sampleBody:find("complete = lastSampleComplete, row = row,", 1, true) ~= nil, true)
+    sampleBody:find("complete = lastSample.complete, row = row,", 1, true) ~= nil, true)
   check("observe glue: and its start window, bounded by launch and delivery",
     sampleBody:find("start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
-    sampleBody:find("if launchedAt and lastSampleLaunchedAt and launchedAt < lastSampleLaunchedAt then return end", 1, true) ~= nil, true)
+    sampleBody:find("if launchedAt and lastSample.launchedAt and launchedAt < lastSample.launchedAt then return end", 1, true) ~= nil, true)
   check("observe glue: no point-estimate start compare remains",
     body:find("psStartedAt", 1, true), nil)
   check("observe glue: operator actions counted across the window",
-    body:find("operatorActionsSince = operatorActions - ops0", 1, true) ~= nil, true)
+    body:find("operatorActionsSince = obs.operatorActions - ops0", 1, true) ~= nil, true)
   check("observe glue: the resettable HUD flag is not the operator signal",
     body:find("hudInteracted", 1, true), nil)
   check("observe glue: the frozen ledger counts only for the observed process",
@@ -1874,10 +1874,10 @@ do
   check("signals glue: freezePid located", #freezeBody > 500, true)
   check("signals glue: a terminate is recorded at its TERM, after the gates",
     recordedAtSend(killBody, 'sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))',
-      'noteSignal(pid, "terminate", proc)'), true)
+      'obs.noteSignal(pid, "terminate", proc)'), true)
   check("signals glue: a freeze is recorded at its STOP, after the gates",
     recordedAtSend(freezeBody, 'sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))',
-      'noteSignal(pid, "freeze", proc)'), true)
+      'obs.noteSignal(pid, "freeze", proc)'), true)
   local _, recordSites = src:gsub('noteSignal%(pid, "', "")
   check("signals glue: only the two signal sites record", recordSites, 2)
   check("signals glue: no pid-keyed signal record remains", src:find("memwatchSignals", 1, true), nil)
@@ -1889,10 +1889,10 @@ do
   check("signals glue: the tick hands the GC its clock", src:find("gcUnattendedState(now)", 1, true) ~= nil, true)
   -- Counters count rows that reached the file: appendObserve reports
   -- success, and every increment is guarded by it.
-  local appendBody = fnBody("local function appendObserve(line)")
+  local appendBody = fnBody("function obs.appendObserve(line)")
   check("observe glue: appendObserve located", #appendBody > 200, true)
   check("observe glue: a nil line counts as an error",
-    appendBody:find("if not line then observeStats.errors = observeStats.errors + 1; return false end", 1, true) ~= nil, true)
+    appendBody:find("if not line then obs.stats.errors = obs.stats.errors + 1; return false end", 1, true) ~= nil, true)
   local _, falseReturns = appendBody:gsub("return false", "")
   check("observe glue: nil line, both opens and the write each report failure", falseReturns, 4)
   check("observe glue: write and close are both checked",
@@ -1903,21 +1903,21 @@ do
   check("observe glue: a failed rotation rename is logged",
     appendBody:find('if not ok then logError("observe-rotate", err) end', 1, true) ~= nil, true)
   local function guardedIncrements(text, counter)
-    local inc = "observeStats." .. counter .. " = observeStats." .. counter .. " + 1"
+    local inc = "obs.stats." .. counter .. " = obs.stats." .. counter .. " + 1"
     local n, guarded, i = 0, 0, 1
     while true do
       local a = text:find(inc, i, true)
       if not a then return n, guarded end
       n = n + 1
       local before = text:sub(math.max(1, a - 120), a - 1)
-      if before:find("if appendObserve(", 1, true)
-         or before:find("if not appendObserve(line) then return nil end", 1, true) then
+      if before:find("if obs.appendObserve(", 1, true)
+         or before:find("if not obs.appendObserve(line) then return nil end", 1, true) then
         guarded = guarded + 1
       end
       i = a + #inc
     end
   end
-  local cn, cg = guardedIncrements("appendObserve(line)\nobserveStats.rows = observeStats.rows + 1\n", "rows")
+  local cn, cg = guardedIncrements("obs.appendObserve(line)\nobs.stats.rows = obs.stats.rows + 1\n", "rows")
   check("observe glue: the guard scan sees an unguarded increment (positive control)", cn - cg, 1)
   local rn, rg = guardedIncrements(src, "rows")
   local fn, fg = guardedIncrements(src, "followups")
@@ -1937,7 +1937,7 @@ do
   check("sampler glue: callback forwards exit code and launch time",
     src:find("onDone(table.concat(acc), exitCode, launchedAt)", 1, true) ~= nil, true)
   check("sampler glue: completeness comes from the exit code",
-    src:find("lastSampleComplete = (exitCode == 0)", 1, true) ~= nil, true)
+    src:find("lastSample.complete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time",
     src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt)", 1, true) ~= nil, true)
 end
@@ -1962,16 +1962,16 @@ do
   check("operator actions: scan sees an unwrapped menu kill (positive control)",
     countUnwrapped('{ title = "x", fn = function() M.killPid(pid, name) end }'), 1)
   check("operator actions: scan ignores a wrapped one (negative control)",
-    countUnwrapped('{ title = "x", fn = byOperator(function() M.killPid(pid, name) end) }'), 0)
+    countUnwrapped('{ title = "x", fn = obs.byOperator(function() M.killPid(pid, name) end) }'), 0)
   check("operator actions: every menu process action is wrapped", countUnwrapped(src), 0)
-  local _, wrapped = src:gsub("fn = byOperator%(function%(%)", "")
+  local _, wrapped = src:gsub("fn = obs%.byOperator%(function%(%)", "")
   check("operator actions: the ten menu actions are wrapped", wrapped, 10)
   local hs0 = src:find('if evt ~= "mouseUp" then return end', 1, true)
   check("operator actions: HUD clicks count",
-    hs0 ~= nil and src:sub(hs0, hs0 + 160):find("operatorActions = operatorActions + 1", 1, true) ~= nil, true)
+    hs0 ~= nil and src:sub(hs0, hs0 + 160):find("obs.operatorActions = obs.operatorActions + 1", 1, true) ~= nil, true)
   local nb = src:find("actionButtonClicked then", 1, true)
   check("operator actions: the banner's Force Quit counts",
-    nb ~= nil and src:sub(nb, nb + 120):find("operatorActions = operatorActions + 1", 1, true) ~= nil, true)
+    nb ~= nil and src:sub(nb, nb + 120):find("obs.operatorActions = obs.operatorActions + 1", 1, true) ~= nil, true)
 end
 
 -- ---- glue pins: the live path must use the predicates above ----
@@ -2014,22 +2014,22 @@ do
   -- Absent pids are pruned only after a fresh, complete sample; signal
   -- records go only when the process is absent from a complete ps table.
   local function prunesOnlyOnCompleteTables(text)
-    local guard = text:find("if not lastSampleComplete then return end", 1, true)
+    local guard = text:find("if not lastSample.complete then return end", 1, true)
     local sweep = text:find("for _, p in ipairs(lastPsList) do alive[p.pid] = true end", 1, true)
     return guard ~= nil and sweep ~= nil and guard < sweep
       and text:find("lastRuns", 1, true) == nil
   end
   check("glue: the prune scan refuses a guard after the sweep (positive control)",
     prunesOnlyOnCompleteTables("for _, p in ipairs(lastPsList) do alive[p.pid] = true end\n"
-      .. "if not lastSampleComplete then return end\n"), false)
+      .. "if not lastSample.complete then return end\n"), false)
   check("glue: the prune scan refuses pruning by the runaway list (positive control)",
-    prunesOnlyOnCompleteTables("if not lastSampleComplete then return end\n"
+    prunesOnlyOnCompleteTables("if not lastSample.complete then return end\n"
       .. "for _, p in ipairs(lastPsList) do alive[p.pid] = true end\nfor _, r in ipairs(lastRuns) do end\n"), false)
   check("glue: a pid's records go only when a complete ps table lacks it",
     prunesOnlyOnCompleteTables(fnBody("gcUnattendedState = function(now)")), true)
   check("glue: the episode's end resets the unattended and decision records",
     fnBody("local function resetEpisode()"):find(
-      "unattendedWaitStreak, unattendedFiredFor, observeDecisionAt = {}, {}, {}", 1, true) ~= nil, true)
+      "unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, {}, {}", 1, true) ~= nil, true)
   check("glue: cache entries record the dispatch kind", count(src, "kind = offender.kind, snapshot = user,"), 1)
   check("glue: names redacted on every serialize call",
     count(src, "lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })"), 3)
@@ -2039,6 +2039,31 @@ do
     count(src, "lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }"), 1)
   check("glue: the in-flight record is built in one place", count(src, "lfmInFlight = {"), 1)
   check("lfm: names are redacted by default", lfm.cfg.redactNames, true)
+end
+
+-- ---- glue: room under Lua's 200-local cap ----
+-- Lua caps a chunk's locals at 200, and memwatch.lua's main chunk is near
+-- the cap. Past it the file does not load at all; this pin trips first.
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local function topLocals(text)
+    local n = 0
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+      if line:match("^local%s+function%s") then
+        n = n + 1
+      else
+        local names = line:match("^local%s+([%w_,%s]+)")
+        if names then for _ in names:gmatch("[%a_][%w_]*") do n = n + 1 end end
+      end
+    end
+    return n
+  end
+  check("locals: the count sees lists, functions, and skips nested locals (control)",
+    topLocals("local a, b, c = 1\nlocal function d() end\n  local e = 1\nlocal g\n"), 5)
+  local n = topLocals(src)
+  check(string.format("locals: memwatch.lua keeps headroom under the 200 cap (%d used)", n), n <= 190, true)
 end
 
 if fails == 0 then

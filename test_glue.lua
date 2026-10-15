@@ -696,6 +696,95 @@ scenario("a dead frozen process does not hide its pid's newcomer", nil, function
     runUntil(W, 150, function() return W.hudShowing() and bodyNames(W, "node") end), true)
 end)
 
+-- ---- grace: per process, from when it heads the alert as extreme ----
+-- (round 3 P1) A generic alert that later names an extreme offender must
+-- not act on it the moment it is named.
+scenario("a generic alert's first offender gets a full grace", UNATTENDED_FREEZE, function(W)
+  W.kern = 4
+  W.run(70)                         -- a generic HUD, up past a grace window
+  check("generic-grace: a generic HUD is up", W.hudShowing(), true)
+  leaker(W, 4242)
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  local namedAt = W.now
+  W.run(40)
+  check("generic-grace: not acted on right after it is named", W.signalsTo(4242), "")
+  runUntil(W, 60, function() return W.signalsTo(4242) ~= "" end)
+  check("generic-grace: acted on after its own grace", W.signalsTo(4242), "STOP")
+  check("generic-grace: (at least a grace after it was named)", W.sigs[#W.sigs].t - namedAt >= 59, true)
+end)
+
+-- A hog shown for minutes that turns into a runaway gets a full grace as
+-- a runaway: its time as a quiet hog does not count.
+scenario("a hog that escalates gets a full grace", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "bigvm", 12000)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "bigvm") end)
+  W.run(90)
+  W.grow(4242, 250)
+  runUntil(W, 40, function() return bodyNames(W, "MB/min") end)
+  local extremeAt = W.now
+  W.run(40)
+  check("hog-grace: not acted on right after it escalates", W.signalsTo(4242), "")
+  runUntil(W, 60, function() return W.signalsTo(4242) ~= "" end)
+  check("hog-grace: acted on after a grace as a runaway", W.signalsTo(4242), "STOP")
+  check("hog-grace: (at least a grace after it escalated)", W.sigs[#W.sigs].t - extremeAt >= 55, true)
+end)
+
+-- (round 3 P1) Two runaways trading the top spot each keep their own clock:
+-- the alternation must not starve unattended action.
+scenario("alternating offenders each get acted on", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "alpha", 2000)
+  W.addProc(5151, "beta", 2000)
+  local fast = 4242
+  W.addTimer("every", 1, 1, function()
+    for _, pid in ipairs({ 4242, 5151 }) do
+      local p = W.procs[pid]
+      if p and p.state == "S" then p.rssKB = p.rssKB + math.floor(((pid == fast) and 400 or 150) * 1024) end
+    end
+  end)
+  W.addTimer("every", 20, 20, function() fast = (fast == 4242) and 5151 or 4242 end)
+  W.run(12)
+  W.kern = 4
+  local both = runUntil(W, 400, function()
+    return W.signalsTo(4242):find("STOP", 1, true) ~= nil and W.signalsTo(5151):find("STOP", 1, true) ~= nil
+  end)
+  check("flap: both alternating runaways are frozen in the end", both, true)
+  check("flap: (the HUD retargeted between them)", logHas(W, "hud-retarget:alpha") and logHas(W, "hud-retarget:beta"), true)
+end)
+
+-- (round 3 P1) A click that did nothing (an unbound refusal) is not an
+-- answer: unattended still acts once the identity binds.
+scenario("a refused click does not disarm unattended", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.click("kill")
+  W.run(2)
+  check("refused-click: the unbound click refused", W.hudBody():find("Can't verify", 1, true) ~= nil, true)
+  W.probeFails = false
+  check("refused-click: unattended still freezes once it binds",
+    runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+end)
+
+-- (round 3) A banner Force Quit is the operator's answer: unattended does
+-- not act on that process during the operator's TERM escalation.
+scenario("a banner Force Quit stands unattended down", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "stubborn", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "stubborn") end)
+  W.run(57)                         -- the TERM escalation overlaps the grace expiry
+  local b = W.liveBanners()[1]
+  check("banner-answer: the banner offers Force Quit", b ~= nil and b.attrs.hasActionButton == true, true)
+  if b then W.clickBanner(b) end
+  W.run(30)
+  check("banner-answer: the operator's kill ran, and memwatch never froze it", W.signalsTo(4242), "TERM,KILL")
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

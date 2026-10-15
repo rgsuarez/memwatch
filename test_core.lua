@@ -1191,8 +1191,13 @@ do
   check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)
   check("hud glue: a refresh inherits the bound identity",
     surfaces:find("bindOffender(offender, hudOffender, now, false)", 1, true) ~= nil, true)
-  check("hud glue: a retarget binds anew and restarts the grace",
-    surfaces:find("bindOffender(offender, nil, now, true)\n          hudShownAt = now\n          hudInteracted = false", 1, true) ~= nil, true)
+  check("hud glue: a retarget binds anew",
+    surfaces:find("if not core.sameOffender(hudOffender, offender) then", 1, true) ~= nil
+      and surfaces:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
+  check("hud glue: the grace is per process (control: the single shared clock is gone)",
+    ("(now - hudShownAt) < core.cfg"):find("hudShownAt", 1, true) ~= nil
+      and src:find("hudShownAt", 1, true) == nil
+      and surfaces:find("exposure[exposureHead]", 1, true) ~= nil, true)
   check("hud glue: the refresh never drops the bound table (control included)",
     ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
       and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)

@@ -492,8 +492,22 @@ end
 ------------------------------------------------------------------------------
 
 local hud            = nil
-local hudShownAt     = 0
-local hudInteracted  = false
+-- The grace clock and the answered mark are per process (keyed by pid and
+-- the name's first 15 characters, which top's truncation preserves), so a
+-- handoff, an alternation or a newly named offender never borrows another
+-- process's clock. Both start over at every raise.
+local exposure       = {}     -- [key] = seconds it headed the active alert as extreme
+local interacted     = {}     -- [key] = the operator acted on it since the raise
+local exposureTickAt = nil    -- the previous critical tick (nil: none yet)
+local exposureHead   = nil    -- the key that headed the alert since that tick
+local EXPOSURE_STEP_MAX = 15  -- a stalled tick counts at most this much grace
+local function procKey(off)
+  return off and off.pid and (off.pid .. "|" .. (off.name or ""):sub(1, 15)) or nil
+end
+local function markInteracted(off)
+  local k = procKey(off)
+  if k and not off.synthetic then interacted[k] = true end
+end
 local hudHold        = false  -- a kill narrative owns the body text
 local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
@@ -502,7 +516,7 @@ local hudEpisodeOff  = nil    -- the offender this episode last raised for; surv
 -- The alert episode (one critical episode, until it settles below critical;
 -- docs/alert-lifecycle.md has the full rules):
 --   surfaced  the offender the HUD names (hudOffender), with its own grace
---             clock (hudShownAt) and answered flag (hudInteracted);
+--             clock (exposure) and answered mark (interacted);
 --   snoozed   the operator closed its HUD: back after the raise cooldown,
 --             or at once if it escalates (hudSnooze);
 --   answered  by the process's own state, not a note in a list: memwatch
@@ -677,7 +691,10 @@ local function buildHud()
               textColor = { white = 0.6, alpha = 1 }, textSize = 13, trackMouseUp = true }
   hud:mouseCallback(guard("hud-click", function(_, evt, id)
     if evt ~= "mouseUp" then return end
-    hudInteracted = true
+    -- A click answers the alert (and stands unattended action down for this
+    -- process) only when it does something: an action dispatched on a
+    -- bound identity, Ignore, close, or opening Activity Monitor. A refused
+    -- click and a self-test button do not.
     local isFreeze = id == "freeze" or id == "freeze-label"
     if isFreeze or id == "kill" or id == "kill-label" then
       local target = hudOffender
@@ -697,6 +714,7 @@ local function buildHud()
         end
         return
       end
+      markInteracted(target)
       hudHold = true
       local narrate = function(text, done, outcome)
         if hud then hud[3].text = text end
@@ -709,15 +727,18 @@ local function buildHud()
         M.killPid(target.pid, target.name, narrate, { expectedLstart = target.lstart })
       end
     elseif id == "ignore" or id == "ignore-label" then
+      markInteracted(hudOffender)
       if hudOffender and not hudOffender.synthetic then
         M.ignore(hudOffender.pid, hudOffender.name)
       end
       dismissHud("done")
     elseif id == "monitor" or id == "monitor-label" then
+      markInteracted(hudOffender)
       hs.application.launchOrFocus("Activity Monitor")
     elseif id == "close" then
       -- A close means "not now": the same offender returns after the raise
       -- cooldown as a new question, or at once if it escalates.
+      markInteracted(hudOffender)
       dismissHud("snooze")
     end
   end))
@@ -735,12 +756,13 @@ local function raiseHud(offender, titleText)
   hudOffender = offender
   hudEpisodeOff = offender
   if hudSnooze and offender and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
-  hudInteracted = false
+  -- Every raise is a new question: every process's grace and answered mark
+  -- start over.
+  exposure, interacted, exposureTickAt, exposureHead = {}, {}, now, nil
   hudHold = false
-  hudShownAt = now
   alertActive = true
-  -- Desktop alerts muted: the episode still arms (the unattended grace clock
-  -- runs on hudShownAt); only the canvas stays hidden.
+  -- Desktop alerts muted: the episode still arms (the unattended grace
+  -- clock runs while it is armed); only the canvas stays hidden.
   if not alertsEnabled then return end
   buildHud()
   hud:frame(hudFrame())
@@ -848,6 +870,7 @@ local function buildMenu()
           hs.alert.show("memwatch: " .. msg, 2.5)
           return
         end
+        markInteracted(off)
         M.killPid(off.pid, off.name, nil, { expectedLstart = lst })
       end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
@@ -950,6 +973,7 @@ local function notifyCrit(m)
   if not notified then critNotified[#critNotified + 1] = critNotifOff or { none = true } end
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
+      markInteracted(off)
       M.killPid(off.pid, off.name, nil, { expectedLstart = lstart })
     end
   end), {
@@ -1090,10 +1114,10 @@ end
 local function unattendedStep(offender, now)
   local mode = core.resolveUnattended(core.cfg)
   if mode == "off" or not offender or offender.kind ~= "extreme" then return end
-  if not alertActive or hudInteracted or hudHold then return end
+  if not alertActive or hudHold then return end
   if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
-  if isAnswered(offender, now) then return end
-  if (now - hudShownAt) < core.cfg.cool.autoKillGraceSec then return end
+  if interacted[procKey(offender)] or isAnswered(offender, now) then return end
+  if (exposure[procKey(offender)] or 0) < core.cfg.cool.autoKillGraceSec then return end
   -- Act only on the identity the alert bound and surfaced, never on a name:
   -- without a bound start time (the probe failed) skip this tick and stay
   -- armed; the refresh retries the bind. The same start time keys the
@@ -1184,10 +1208,11 @@ local function alertSurfaces(state, now)
       -- fresh, with its own grace and its own answer, even while the canvas
       -- stays up or alerts are muted.
       if offender and offender ~= hudOffender then
-        if hudOffender and not core.sameOffender(hudOffender, offender) then
+        if not core.sameOffender(hudOffender, offender) then
+          -- A different process (or the first one named on a generic
+          -- alert): bound fresh. Its grace is its own exposure, so it gets
+          -- a full window from now unless it already headed this alert.
           bindOffender(offender, nil, now, true)
-          hudShownAt = now
-          hudInteracted = false
           if hudSnooze and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
           M.logSnapshot(string.format("hud-retarget:%s(%d)", offender.name, offender.pid))
         else
@@ -1213,8 +1238,20 @@ local function alertSurfaces(state, now)
       end
     end
     notifyCrit(lastMetrics)
+    -- Grace accrues, interval by interval, to the process that headed the
+    -- active alert (shown, or muted but armed) as extreme over that
+    -- interval, and to no one during a narrative. A stalled tick counts at
+    -- most EXPOSURE_STEP_MAX.
+    if exposureHead and exposureTickAt then
+      exposure[exposureHead] = (exposure[exposureHead] or 0)
+        + math.min(math.max(now - exposureTickAt, 0), EXPOSURE_STEP_MAX)
+    end
+    exposureTickAt = now
+    exposureHead = (alertActive and not hudHold and hudOffender and hudOffender.kind == "extreme")
+      and procKey(hudOffender) or nil
     unattendedStep(offender, now)
   else
+    exposureTickAt, exposureHead = nil, nil
     hudBelowCritSince = hudBelowCritSince or now
     local settled = (now - hudBelowCritSince) >= 10
     if alertActive and settled and not hudHold then M.hideHud() end

@@ -1384,6 +1384,12 @@ do
   check("lfm glue: a later probe that cannot answer keeps the recorded start time",
     body("local function recordLfmServer(pid)"):find(
       "lstart = probed and probed.lstart or (prev and prev.lstart) or nil", 1, true) ~= nil, true)
+  local rls = body("local function recordLfmServer(pid)")
+  check("lfm glue: only the start time carries over a failed probe, never the name",
+    rls:find("name = probed and procs.friendlyName(probed.comm) or nil", 1, true) ~= nil
+      and rls:find("prev and prev.name", 1, true) == nil, true)
+  check("lfm glue: no pidfile is written without a start time",
+    rls:find("local rec = lfmServerIdent.lstart and lfm.jsonEncode(", 1, true) ~= nil, true)
   check("lfm glue: the orphan sweep requires the recorded start time",
     start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
       and forbids("function M.start()", "not rec.lstart or",

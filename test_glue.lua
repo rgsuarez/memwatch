@@ -1676,6 +1676,264 @@ scenario("a kill never drops a newer process's ledger entry", nil, function(W)
   check("newer-ledger: and still listed under Frozen by memwatch", W.menuItem("   node") ~= nil, true)
 end)
 
+-- ---- round 6: the lifecycle rules (docs/alert-lifecycle.md) ----
+-- A node frozen from the HUD and shown in the menu's frozen rows.
+local function frozenNode(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(3)
+  return W.procs[4242] and W.procs[4242].state
+end
+local function frozenRowAction(W, name, title)
+  local row = W.menuItem("   " .. name)
+  for _, it in ipairs(row and row.menu or {}) do
+    if type(it.title) == "string" and it.title:find(title, 1, true) and it.fn then return it.fn end
+  end
+end
+local function liveUnattendedReceipts(W)
+  local out = {}
+  for _, n in ipairs(W.notices("memwatch unattended")) do
+    if not n.withdrawn then out[#out + 1] = n end
+  end
+  return out
+end
+
+-- Rule 1: the STOP that re-freezes a process whose quit could not be sent
+-- is a new freeze, verified afresh: a same-name newcomer that took the pid
+-- after the CONT is never stopped.
+scenario("a quit whose TERM cannot be sent re-freezes only the process it verified", nil, function(W)
+  check("refreeze: the node is frozen", frozenNode(W), "T")
+  local quit = frozenRowAction(W, "node", "Force Quit")
+  check("refreeze: the frozen row offers Force Quit", quit ~= nil, true)
+  W.sendFails = { TERM = true }
+  W.onSignal = function(sig) if sig == "CONT" then W.reusePid(4242, "node", 500) end end
+  quit()
+  W.onSignal = nil
+  W.run(5)
+  W.sendFails = nil
+  check("refreeze: the newcomer on the pid keeps running", W.procs[4242] and W.procs[4242].state, "S")
+  check("refreeze: and was never sent a STOP", W.signalsTo(4242), "STOP,CONT")
+  check("refreeze: the old process's entry is gone", W.menuItem("   node"), nil)
+end)
+
+scenario("a quit whose TERM cannot be sent freezes the same process again", nil, function(W)
+  check("refreeze-same: the node is frozen", frozenNode(W), "T")
+  local quit = frozenRowAction(W, "node", "Force Quit")
+  W.sendFails = { TERM = true }
+  quit()
+  W.run(5)
+  W.sendFails = nil
+  check("refreeze-same: the same node is stopped again (control)", W.procs[4242] and W.procs[4242].state, "T")
+  check("refreeze-same: and still offered for Resume", frozenRowAction(W, "node", "Resume") ~= nil, true)
+end)
+
+-- Rules 1 and 2: that re-freeze is a pending entry like any freeze, so a
+-- reload before its STOP lands keeps it, and Resume is still there.
+scenario("a re-freeze survives a reload before its STOP lands", nil, function(W)
+  W.stopDelay = 0.2
+  check("refreeze-reload: the node is frozen", frozenNode(W), "T")
+  local quit = frozenRowAction(W, "node", "Force Quit")
+  W.sendFails, W.stopDelay = { TERM = true }, 5
+  quit()
+  W.run(0.2)
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.sendFails = nil
+  W.run(8)
+  check("refreeze-reload: the node stopped after the reload", W.procs[4242] and W.procs[4242].state, "T")
+  check("refreeze-reload: and the menu still offers its Resume", frozenRowAction(W, "node", "Resume") ~= nil, true)
+end)
+
+-- Rule 2: a freeze whose STOP could not be sent, interrupted by a reload
+-- before its verifier ran, is not kept: the process runs, unhidden.
+scenario("a freeze whose STOP was never sent is forgotten at reload", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.sendFails = { STOP = true }
+  W.click("freeze")
+  W.run(0.1)
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.sendFails = nil
+  W.run(3)
+  check("unsent-reload: the process runs", W.procs[4242] and W.procs[4242].state, "S")
+  check("unsent-reload: and is not listed as frozen", W.menuItem("   node"), nil)
+end)
+
+-- Rule 1: the CONT that undoes a STOP which reached the pid's next process
+-- goes to a process seen stopped; if it cannot be sent, that process stays
+-- in the ledger so it can be resumed.
+scenario("a STOP that reached the pid's next process is undone", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.reuseAfterProbe = 4242          -- the newcomer takes the pid between the probe and the STOP
+  W.click("freeze")
+  W.run(3)
+  check("abort: the newcomer was continued (control)", W.procs[4242] and W.procs[4242].state, "S")
+end)
+
+scenario("a newcomer left stopped by a failed undo stays resumable", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(5)
+  W.reuseAfterProbe = 4242
+  W.sendFails = { CONT = true }     -- the undo cannot be sent
+  W.click("freeze")
+  W.run(3)
+  W.sendFails = nil
+  check("abort-fail: the newcomer is still stopped", W.procs[4242] and W.procs[4242].state, "T")
+  check("abort-fail: and the menu offers its Resume", frozenRowAction(W, "node", "Resume") ~= nil, true)
+  check("abort-fail: the failure is logged", logHas(W, "freeze-abort-cont-failed:node(4242)"), true)
+  local resume = frozenRowAction(W, "node", "Resume")
+  if resume then resume() end
+  W.run(2)
+  check("abort-fail: Resume continues it", W.procs[4242] and W.procs[4242].state, "S")
+end)
+
+-- Rule 4: an unattended action whose narrative never finishes releases its
+-- in-flight hold one hold window after its deadline receipt; until then no
+-- second action starts.
+scenario("an action that never finishes releases its hold after a backstop", UNATTENDED_KILL, function(W)
+  W.frontmost = { name = "Terminal", pid = 760 }   -- another app is in front: terminate is allowed
+  leaker(W, 4242, "node")
+  W.procs[4242].ignoreTerm = true
+  -- From the TERM on, one-shot timers stall: its escalation and verifier
+  -- never run.
+  W.onSignal = function(sig) if sig == "TERM" then W.timersStall = true end end
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal = nil
+  check("backstop: the first action sent its TERM", W.signalsTo(4242), "TERM")
+  W.run(80)
+  check("backstop: no second action while in flight", W.signalsTo(4242), "TERM")
+  W.run(160)
+  W.timersStall = false
+  check("backstop: the hold was released", logHas(W, "unattended-hold-released:terminate:node(4242)"), true)
+  check("backstop: and the process could be acted on again", select(2, W.signalsTo(4242):gsub("TERM", "")) >= 2, true)
+end)
+
+-- The denied case in terminate mode (a freeze's pending entry would hide
+-- the process anyway): one TERM while its narrative is slow.
+scenario("no second terminate starts while the first is in flight", UNATTENDED_KILL, function(W)
+  W.frontmost = { name = "Terminal", pid = 760 }   -- another app is in front: terminate is allowed
+  leaker(W, 4242, "node")
+  W.procs[4242].ignoreTerm = true
+  W.onSignal = function(sig) if sig == "TERM" then W.timerLag = 400 end end
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal = nil
+  W.run(80)
+  W.timerLag = 0
+  check("in-flight: one TERM while the first action is in flight", W.signalsTo(4242), "TERM")
+end)
+
+-- Rule 5: once the deadline receipt is up, any final outcome replaces it,
+-- even one never announced on time (here the process exits before the late
+-- verifier runs).
+scenario("a late outcome that is not announced on time still replaces its receipt",
+         '{"unattended":"freeze","alerts":false}', function(W)
+  W.onSignal = function(sig) if sig == "STOP" then W.timerLag = 70 end end
+  leaker(W, 4242, "node")
+  W.procs[4242].unstoppable = true
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal, W.timerLag = nil, 0
+  W.run(50)
+  check("late-other: the deadline receipt is up", #liveUnattendedReceipts(W), 1)
+  W.procs[4242] = nil               -- it exits before the late verifier runs
+  W.run(40)
+  local l = liveUnattendedReceipts(W)
+  check("late-other: one live receipt in the end", #l, 1)
+  check("late-other: and it says what happened",
+    l[1] ~= nil and (l[1].attrs.informativeText or ""):find("exited", 1, true) ~= nil, true)
+end)
+
+-- Rule 6: a HUD whose process was answered from another surface goes, even
+-- when it never bound (its probe failed at the raise).
+scenario("a HUD goes when its process is frozen from the menu, bound or not", nil, function(W, mw)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.probeFails = true               -- the raise cannot bind
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.probeFails = false
+  W.run(1)
+  local row = W.menuItem("node")   -- the menu binds its rows when it opens
+  local freeze = row and row.menu and row.menu[1]
+  check("retire: the menu offers the offender's Freeze", freeze ~= nil and freeze.fn ~= nil, true)
+  if freeze then freeze.fn() end
+  W.run(12)
+  check("retire: the process is frozen", W.procs[4242] and W.procs[4242].state, "T")
+  check("retire: and the HUD has gone", W.hudShowing(), false)
+end)
+
+-- Rule 7: a frozen mark never holds for a process with another name, and
+-- a mark growth released stays released.
+scenario("a frozen mark never hides a process with another name", nil, function(W)
+  check("other-name: the node is frozen", frozenNode(W), "T")
+  W.procs[4242] = nil
+  -- A steady process takes the pid (state R: running, and in the fake only
+  -- S grows), so no growth can reveal it: only its name can.
+  W.addProc(4242, "python", 1000, { state = "R" })
+  W.probeFails = true               -- the sweep cannot prove the mark stale
+  local shown = runUntil(W, 120, function() return W.hudShowing() and bodyNames(W, "python") end)
+  W.probeFails = false
+  check("other-name: the newcomer is named while probes fail", shown, true)
+end)
+
+scenario("a mark that growth released stays released", nil, function(W)
+  check("released: the node is frozen", frozenNode(W), "T")
+  W.reusePid(4242, "node", 2000)
+  local g = W.grow(4242, 220)
+  W.probeFails = true
+  local shown = runUntil(W, 120, function() return W.hudShowing() and bodyNames(W, "node (pid 4242)") end)
+  check("released: the climbing newcomer is surfaced", shown, true)
+  g:stop()                          -- it plateaus (state R: running, and in
+  W.procs[4242].state = "R"         -- the fake only S grows)
+  W.run(30)
+  W.probeFails = false
+  check("released: a plateau does not hide it again", W.hudShowing() and bodyNames(W, "node (pid 4242)"), true)
+end)
+
+-- Rule 2: an entry an older version wrote without a start time is bound at
+-- reload to that program stopped there, or dropped.
+local function legacyEntryWorld(W, state)
+  leaker(W, 4242, "node")
+  W.procs[4242].state = state
+  W.run(6)
+  local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+  f:write('[{"pid":4242,"name":"node","weightMB":0,"frozenAt":1}]\n')
+  f:close()
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+end
+scenario("an old entry without a start time is bound when its process is stopped", nil, function(W)
+  legacyEntryWorld(W, "T")
+  check("legacy: a stopped node is kept, bound", frozenRowAction(W, "node", "Resume") ~= nil, true)
+  check("legacy: the bind is logged", logHas(W, "frozen-reconcile-bind:node(4242)"), true)
+end)
+scenario("an old entry without a start time is dropped when its process runs", nil, function(W)
+  legacyEntryWorld(W, "S")
+  check("legacy: a running node is not listed as frozen", W.menuItem("   node"), nil)
+  check("legacy: the drop is logged", logHas(W, "frozen-reconcile-drop:node(4242):no-start-time"), true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

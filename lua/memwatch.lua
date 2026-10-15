@@ -87,10 +87,17 @@ end
 -- grown since the mark: a stopped process cannot grow and an exited one
 -- makes no new samples, so growth means a newcomer holds the pid (or the
 -- process runs again). Fork-free: it reads only the tracker.
-local function markHolds(mark, at, pid, lstart)
-  if not mark then return false end
+local function markHolds(mark, at, pid, lstart, name)
+  if not mark or mark.revealed then return false end
   if mark.lstart and lstart and mark.lstart ~= lstart then return false end
-  return procs.risingSince(tracker, pid, at) < REVEAL_RISES
+  if mark.name and name and not core.sameName(mark.name, name) then return false end
+  if procs.risingSince(tracker, pid, at) >= REVEAL_RISES then
+    -- Growth proved a newcomer: the mark stays released, so a later flat
+    -- sample cannot put it back over a process that is not the one marked.
+    mark.revealed = true
+    return false
+  end
+  return true
 end
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
 local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
@@ -394,9 +401,9 @@ local function assessProcesses(now)
     local ig = markFor(ignoredUntil, p)
     if (ig and ig.untilAt >= now) or protectedPids[p.pid] then return true end
     local g = markFor(goneUntil, p)
-    if g and g.untilAt >= now and markHolds(g, g.at, p.pid, nil) then return true end
+    if g and g.untilAt >= now and markHolds(g, g.at, p.pid, nil, p.name) then return true end
     local f = frozen[p.pid]
-    return f ~= nil and markHolds(f, f.frozenAt or 0, p.pid, nil)
+    return f ~= nil and markHolds(f, f.frozenAt or 0, p.pid, nil, p.name)
   end
   local kept = {}
   for _, r in ipairs(runs) do
@@ -675,9 +682,9 @@ end
 local function isAnswered(off, now)
   if not off or not off.pid then return false end
   local f = frozen[off.pid]
-  if f and markHolds(f, f.frozenAt or 0, off.pid, off.lstart) then return true end
+  if f and markHolds(f, f.frozenAt or 0, off.pid, off.lstart, off.name) then return true end
   local g = markFor(goneUntil, off)
-  if g and g.untilAt > now and markHolds(g, g.at, off.pid, off.lstart) then return true end
+  if g and g.untilAt > now and markHolds(g, g.at, off.pid, off.lstart, off.name) then return true end
   local ig = markFor(ignoredUntil, off)
   return ig ~= nil and ig.untilAt > now
 end
@@ -1314,8 +1321,8 @@ end
 -- even with desktop alerts muted (silence there turns a muted alert into a
 -- mystery hang); an action that signaled nothing is logged, not announced.
 local RECEIPT_OUTCOMES = { frozen = true, terminated = true, replaced = true, failed = true, unconfirmed = true }
-local function unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
-  if not RECEIPT_OUTCOMES[outcome] then return end
+local function unattendedReceipt(action, target, adjudicator, rationale, outcome, text, always)
+  if not RECEIPT_OUTCOMES[outcome] and not always then return end
   local why = (adjudicator == "lfm")
     and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
     or "Extreme runaway, no response to the alert."
@@ -1340,6 +1347,14 @@ local function settleOpenReceipts(now)
         owed.target.name or "?", owed.target.pid or -1))
       owed.lateReceipt = unattendedReceipt(owed.action, owed.target, owed.adjudicator, owed.rationale,
         "unconfirmed", string.format("%s started, but its result has not come back", owed.action)) or true
+      owed.releaseAt = now + HOLD_MAX_SEC
+    elseif owed.lateReceipt and now > owed.dueAt and now > (owed.releaseAt or 0) then
+      -- A further hold window with no progress: the in-flight hold goes, so
+      -- the process can be acted on again. The action's own closure keeps
+      -- its record, so a late outcome still replaces the receipt.
+      M.logSnapshot(string.format("unattended-hold-released:%s:%s(%d)", owed.action,
+        owed.target.name or "?", owed.target.pid or -1))
+      openReceipts[owed] = nil
     end
   end
 end
@@ -1427,9 +1442,12 @@ local function unattendedStep(offender, now)
   local gen = runGen
   local function receipt(outcome, text)
     -- One live receipt per action: a "has not come back" receipt posted at
-    -- the deadline gives way to the real outcome.
-    if type(owed.lateReceipt) == "table" then pcall(function() owed.lateReceipt:withdraw() end) end
-    unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
+    -- the deadline gives way to the real outcome, whatever it is, and is
+    -- withdrawn only once that is up. (A notification handle is userdata in
+    -- Hammerspoon; true marks a deadline receipt that could not be posted.)
+    local late = owed.lateReceipt
+    local posted = unattendedReceipt(action, target, adjudicator, rationale, outcome, text, late ~= nil)
+    if posted and late and late ~= true then pcall(function() late:withdraw() end) end
   end
   local narrate = function(text, done, outcome)
     local t = hs.timer.secondsSinceEpoch()
@@ -1536,6 +1554,18 @@ local function alertSurfaces(state, now)
       elseif hudOffender and not hudOffender.lstart then
         -- bounded retry of a failed bind
         if bindOffender(hudOffender, nil, now, false) == "gone" then hudOffender = nil end
+      end
+      -- Retire by state: a HUD whose process has been answered (frozen and
+      -- verified, gone, ignored), by any surface, goes now. Routing an
+      -- outcome to the HUD needs an exact identity match, which an unbound
+      -- HUD never has. A freeze still pending, or one whose result could not
+      -- be verified, is no answer yet: the alert stands.
+      local pendingFreeze = hudOffender and frozen[hudOffender.pid]
+        and frozen[hudOffender.pid].pendingUntil ~= nil
+      if hudOffender and not pendingFreeze and isAnswered(hudOffender, now) then
+        M.logSnapshot(string.format("hud-retire-answered:%s(%d)", hudOffender.name or "?", hudOffender.pid))
+        dismissHud("done", hudOffender)
+        return
       end
       if alertsEnabled then
         if hud and hud:isShowing() then
@@ -1790,7 +1820,7 @@ end
 -- a reload adopted) is not the writer's to touch.
 local function ownsEntry(pid, lstart)
   local cur = frozen[pid]
-  return cur == nil or cur.lstart == nil or cur.lstart == lstart
+  return cur == nil or (cur.lstart ~= nil and cur.lstart == lstart)
 end
 local function dropOwnEntry(pid, lstart)
   if frozen[pid] ~= nil and ownsEntry(pid, lstart) then
@@ -1816,12 +1846,33 @@ end
 local function frozenReconcile()
   local list = loadFrozen()
   frozen = {}
-  local survivors = {}
+  local survivors, unbound = {}, {}
   local now = hs.timer.secondsSinceEpoch()
   for _, e in ipairs(list) do
     if type(e) == "table" and type(e.pid) == "number" then
-      local proc, why = resolveSignalTarget(e.pid, e.name, e.lstart)
-      if e.pendingUntil and now < e.pendingUntil and (proc or why == "unverified") then
+      if e.lstart == nil then
+        -- Written by an older version, with no start time: bound now to a
+        -- stopped process of that program, or dropped. No entry without a
+        -- start time is ever signaled through; one whose probe could not
+        -- answer is named in the notice below, in case it is still stopped.
+        local st, holder = probe(e.pid)
+        if st == "present" and core.isStopped(holder)
+           and core.sameName(procs.friendlyName(holder.comm), e.name) then
+          e.lstart = holder.lstart
+          M.logSnapshot(string.format("frozen-reconcile-bind:%s(%d)", e.name or "?", e.pid))
+        else
+          M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):no-start-time", e.name or "?", e.pid))
+          if st == "unknown" then unbound[#unbound + 1] = string.format("%s (pid %d)", e.name or "?", e.pid) end
+          e = nil
+        end
+      end
+      local proc, why
+      if e then proc, why = resolveSignalTarget(e.pid, e.name, e.lstart) end
+      if not e then
+        -- dropped above
+      elseif e.pendingUntil and now < e.pendingUntil and e.stopSent == false then
+        M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):stop-never-sent", e.name or "?", e.pid))
+      elseif e.pendingUntil and now < e.pendingUntil and (proc or why == "unverified") then
         -- A freeze still being verified when memwatch reloaded: its STOP may
         -- land after this probe (a process in a syscall stops on return to
         -- user space). Its verifier died with the reload, so the sweep
@@ -1844,6 +1895,14 @@ local function frozenReconcile()
     end
   end
   saveFrozen()
+  if #unbound > 0 then
+    hs.notify.new({
+      title = "memwatch: an old frozen entry could not be checked",
+      subTitle = table.concat(unbound, ", "):sub(1, 100),
+      informativeText = "If it is still stopped, resume it in Activity Monitor.",
+      withdrawAfter = 0,
+    }):send()
+  end
   if #survivors > 0 then
     -- Action receipt: deliberately ignores the desktop-alerts mute. Processes
     -- are still frozen from a previous session; the operator must know.
@@ -1964,6 +2023,10 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   -- decides from the process's state: stopped keeps the entry, running
   -- means nothing was done.
   local stopSent = send("STOP", pid)
+  -- Whether the STOP went out is part of the entry: a reload before the
+  -- verifier runs keeps a pending entry only if it did.
+  entry.stopSent = stopSent
+  if frozen[pid] == entry then saveFrozen() end
   afterHeld(0.5, guard("freeze-verify", function()
     -- Re-probe IDENTITY and state in one fork after the signal: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
@@ -1976,8 +2039,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     -- The ledger slot is this freeze's to change only while it holds no
     -- entry for another start time (a newer freeze of the pid's next
     -- process, or one a restart adopted, is not this freeze's to touch).
-    local cur = frozen[pid]
-    local ours = cur == nil or cur.lstart == nil or cur.lstart == proc.lstart
+    local ours = ownsEntry(pid, proc.lstart)
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
       if stopSent then
@@ -1990,9 +2052,23 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       end
     elseif not reprobe then
       if ours then
-        if stopSent then send("CONT", pid) end
         frozen[pid] = nil
         saveFrozen()
+        -- The STOP reached whatever holds the pid now, or nothing. Undo it
+        -- only on a process seen stopped; if that CONT cannot be sent, the
+        -- process stays in the ledger (bound to its own start time) so the
+        -- menu can still resume it, and that is said.
+        local holder = stopSent and probePid(pid) or nil
+        if holder and core.isStopped(holder) and not send("CONT", pid) then
+          local holderName = procs.friendlyName(holder.comm)
+          frozen[pid] = { pid = pid, name = holderName, lstart = holder.lstart, weightMB = 0,
+                          frozenAt = hs.timer.secondsSinceEpoch(), stopSent = true }
+          saveFrozen()
+          M.logSnapshot(string.format("freeze-abort-cont-failed:%s(%d)", holderName, pid))
+          onUpdate(string.format("%s changed identity mid-freeze, and pid %d (%s) may be left stopped; resume it from the menu",
+            proc.liveName, pid, holderName), true, "unconfirmed")
+          return
+        end
       end
       if rwhy == "exited" then
         M.logSnapshot(string.format("freeze-abort:%s(%d)-exited", proc.liveName, pid))
@@ -2392,9 +2468,15 @@ local function recordLfmServer(pid)
   -- A probe that cannot answer never erases what an earlier one verified
   -- for the same pid.
   local prev = (lfmServerIdent and lfmServerIdent.pid == pid) and lfmServerIdent or nil
+  -- Only the start time carries over: a name an earlier probe read may have
+  -- been the launcher's image before exec, and the next probe that answers
+  -- records the server's own.
   lfmServerIdent = { pid = pid, lstart = probed and probed.lstart or (prev and prev.lstart) or nil,
-                     name = probed and procs.friendlyName(probed.comm) or (prev and prev.name) or nil }
-  local rec = lfm.jsonEncode({ pid = pid, lstart = lfmServerIdent.lstart })
+                     name = probed and procs.friendlyName(probed.comm) or nil }
+  -- A pidfile is the crash-orphan record: one without a start time would
+  -- make the next start skip the orphan sweep, so a recorded one is never
+  -- overwritten by it.
+  local rec = lfmServerIdent.lstart and lfm.jsonEncode({ pid = pid, lstart = lfmServerIdent.lstart }) or nil
   if rec then
     local pf = io.open(LFM_PIDFILE, "w")
     if pf then pf:write(rec, "\n"); pf:close() end
@@ -2928,18 +3010,24 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   if not send("TERM", pid) then
-    -- Nothing terminated it. A process continued for its TERM is stopped
-    -- again (its ledger entry still true); if that cannot be sent either, it
-    -- runs, its entry goes, and that is said.
-    if contSent and send("STOP", pid) then
-      onUpdate(string.format("couldn't send TERM to %s; it was stopped again", liveName), true, "unverified")
-    elseif contSent then
-      dropOwnEntry(pid, proc.lstart)
-      onUpdate(string.format("couldn't send TERM to %s; it was continued and is running", liveName),
-        true, "unconfirmed")
-    else
+    if not contSent then
       onUpdate(string.format("couldn't send TERM to %s; nothing was signaled", liveName), true, "unverified")
+      return
     end
+    -- A process continued for its TERM is frozen again, as a new freeze:
+    -- verified afresh (the TERM may have failed because it exited, and the
+    -- pid may hold another process by now), its entry pending until its own
+    -- verifier settles it. Its old entry goes when it proves to be gone.
+    M.freezePid(pid, liveName, function(text, done, outcome)
+      if done and (outcome == "exited" or outcome == "stale") then dropOwnEntry(pid, proc.lstart) end
+      if done and outcome == "unverified" then
+        -- Nothing was re-stopped, but the CONT went out: it may be running.
+        onUpdate(string.format("couldn't send TERM to %s, and can't verify it now; it was continued and may be running",
+          liveName), true, "unconfirmed")
+        return
+      end
+      onUpdate(string.format("couldn't send TERM to %s; %s", liveName, text), done, outcome)
+    end, { expectedLstart = proc.lstart, weightMB = frozenEntry and frozenEntry.weightMB or 0 })
     return
   end
   local killSent = false

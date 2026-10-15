@@ -92,7 +92,9 @@ Three comparisons are kept apart:
 - *Exact identity* ("is this the very process the action was on?") routes an
   action's outcome from the menu or a banner to the HUD: pid, name, and
   both start times bound and equal. An unbound HUD is never answered by an
-  outcome; it rebinds on its own.
+  outcome; it rebinds on its own, and it goes as soon as its process has
+  been answered by state (frozen and verified, gone, ignored), whichever
+  surface answered it.
 
 Per-process records (grace clocks, interaction marks) are filed by pid and
 carry the name and start time they were made for. A record made while
@@ -129,8 +131,10 @@ memwatch failed to stop, is alertable again.
 
 A frozen or gone mark is about one process, not a pid. It stops counting
 as soon as the pid shows a run of growth after the mark (a stopped process
-cannot grow, and an exited one makes no samples), or, on a surface that
-has bound the process there, a different start time. Either way a
+cannot grow, and an exited one makes no samples), holds a process with
+another name, or, on a surface that has bound the process there, has a
+different start time. A mark growth has released stays released: a
+newcomer that then plateaus is not hidden again. Either way a
 newcomer holds the pid, and it is alertable at once, without waiting for
 the frozen-ledger sweep, which cannot run while probes fail. Candidates
 themselves carry no start time, so a newcomer that does not grow stays
@@ -172,9 +176,12 @@ on the same process.
 
 Receipts for unattended actions say what happened and are posted when the
 action completes, even with desktop alerts muted: `frozen`, `terminated`,
-`failed` (it survived), or `unconfirmed` (a signal went out but its result
-could not be verified). An action that signaled nothing (`unverified`,
-`refused`, `stale`, `exited`) is logged, not announced.
+`replaced` (terminated, and another process holds the pid), `failed` (it
+survived), or `unconfirmed` (a signal went out but its result could not be
+verified). An action that signaled nothing (`unverified`, `refused`,
+`stale`, `exited`) is logged, not announced, unless a receipt has already
+said its result has not come back: then its outcome, whatever it is,
+replaces that receipt.
 
 An action stays in flight until its final outcome arrives. Each progress
 step pushes its deadlines (the HUD's hold, a pending interaction mark, the
@@ -182,18 +189,35 @@ owed receipt) out by 45 seconds, so a slow narrative is not a lost one.
 If an unattended action's outcome has still not arrived by its deadline
 (a stalled run loop), a receipt says so, and no second action starts on
 that process while the first is in flight. If the outcome then arrives, it
-replaces that receipt: one action, one live receipt.
+replaces that receipt: one action, one live receipt. One more hold window
+with no progress releases the in-flight hold, so a narrative that will
+never finish cannot keep the process from being acted on again; its outcome
+still replaces the receipt if it ever arrives.
 
 ## The frozen ledger
 
 Every writer changes only its own process's entry: a freeze verifier, a
 resume, a kill and the reconcile each drop or settle the entry for the
 start time they acted on, never an entry for the pid's next process. An
-entry is written before its STOP; if the STOP could not be sent, the entry
-goes. A freeze still being verified when memwatch reloads keeps its entry
-(its STOP may land after the reload) until the sweep can decide. A frozen
-process continued for a Force Quit whose TERM cannot be sent is stopped
-again.
+entry with no start time is owned by no writer.
+
+An entry is written before its STOP and records whether the STOP went out;
+if it could not be sent, the entry goes. A freeze still being verified when
+memwatch reloads keeps its entry (its STOP may land after the reload) until
+the sweep can decide, unless its STOP was never sent. If the freeze's
+verifier finds the pid taken over, the STOP reached the newcomer: it is
+continued if seen stopped, and if that CONT cannot be sent it stays in the
+ledger, bound to its own start time, so the menu can resume it.
+
+A frozen process continued for a Force Quit whose TERM cannot be sent is
+frozen again as a new freeze: verified afresh, so a newcomer that took the
+pid is never stopped, and pending until its own verifier settles it, so a
+reload in between keeps it.
+
+An entry written by an older version without a start time is bound at
+reload to that program, if a probe finds it stopped there, or dropped; one
+whose probe could not answer is named in a notice in case it is still
+stopped.
 
 ## Banners
 

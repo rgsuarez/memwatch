@@ -1758,6 +1758,23 @@ function obs.gateFor(offender, now)
   })
 end
 
+-- Does the deferral floor act on this offender now, ahead of its grace?
+-- The one answer both callers read: the unattended step acts on it, and the
+-- observation ledger records that tick as a decision point. Every early
+-- return of the step is here too: unattended off, a gate that is not open,
+-- a held wait bound to another start time than the alert's, a final latch,
+-- an action in flight. So the two never disagree on a tick.
+function obs.floorActDue(offender, now)
+  if not offender or core.resolveUnattended(core.cfg) == "off" then return false end
+  if obs.gateFor(offender, now) ~= "open" then return false end
+  local fired = unattendedFiredFor[offender.pid]
+  if not (fired and hudOffender and fired.lstart ~= nil and fired.lstart == hudOffender.lstart) then
+    return false
+  end
+  if fired.final or actionInFlight(hudOffender) then return false end
+  return lfm.floorDue(unattendedWaitStreak[offender.pid], lastMetrics, now)
+end
+
 local function unattendedStep(offender, now)
   local mode = core.resolveUnattended(core.cfg)
   if mode == "off" then return end
@@ -1797,9 +1814,10 @@ local function unattendedStep(offender, now)
   -- A model's wait held past its bound is re-checked every tick while the
   -- adjudicator is on: the floor acts the tick headroom falls to
   -- floorAvailPct, becomes unreadable, or the hold reaches maxHoldSec, not at
-  -- the next grace expiry (lfm.floorDue; the observation hook asks the same).
+  -- the next grace expiry (obs.floorActDue; the observation hook asks the
+  -- same, before this step consumes the check below).
   local w = unattendedWaitStreak[offender.pid]
-  local floorDue = lfm.floorDue(w, lastMetrics, now)
+  local floorDue = obs.floorActDue(offender, now)
   if sinceFired < core.cfg.cool.autoKillGraceSec and not floorDue then return end
   -- That check ends one held wait. Whatever this decision is, the next one
   -- waits out the grace again, unless headroom holds the wait again.
@@ -2014,12 +2032,10 @@ local function alertSurfaces(state, now)
     local decGrace = hudOffender and recordFor(exposure, hudOffender, false) or nil
     local decEntry = offender and tracker.procs[offender.pid] or nil
     local decStamp = offender and observe.liveStamp(obs.decisionAt[offender.pid], decEntry) or nil
-    -- The deferral floor acts ahead of the grace window on a held wait still
-    -- bound to this process (unattendedStep clears one whose start time no
-    -- longer matches): that act is a decision point too.
-    local heldFired = offender and unattendedFiredFor[offender.pid]
-    local floorNow = heldFired ~= nil and hudOffender ~= nil and heldFired.lstart == hudOffender.lstart
-      and lfm.floorDue(unattendedWaitStreak[offender.pid], lastMetrics, now)
+    -- The deferral floor acts ahead of the grace window: that act is a
+    -- decision point too. Asked here before unattendedStep runs below, which
+    -- consumes the held wait's check on the tick it acts.
+    local floorNow = obs.floorActDue(offender, now)
     if observe.decisionDue({
          enabled = obs.enabled, gate = obs.gateFor(offender, now),
          sinceLastSec = decStamp and (now - decStamp.at) or nil,
@@ -3087,7 +3103,7 @@ resolveUnattendedAction = function(mode, offender, now)
         local why = lfm.floorActs(w, lastMetrics, now)
         local floorRec = { floorAvailPct = lfm.cfg.floorAvailPct, maxHoldSec = lfm.cfg.maxHoldSec,
           headroomPct = lfm.floorHeadroom(lastMetrics), deferrals = w.count,
-          deferredSec = math.floor(now - w.firstAt) }
+          deferredSec = math.max(0, math.floor(now - w.firstAt)) }
         if not why then
           w.exhausted = true
           local held = { "lfm", "deferral-floor-held-by-headroom" }
@@ -4571,6 +4587,12 @@ end
 -- local config so the choice survives reloads.
 function M.setLfmEnabled(on)
   lfm.cfg.enabled = on == true
+  if not lfm.cfg.enabled then
+    -- Off means the base system at once: cached verdicts, a request in flight
+    -- (its reply is dropped by nonce) and the waits they held all go, so none
+    -- of them decides anything after the switch, even once it is on again.
+    verdictCache, lfmInFlight, unattendedWaitStreak = {}, nil, {}
+  end
   if not saveLocalConfig() then
     showAlert("couldn't save the LFM setting (local config unreadable); it lasts until reload", 4)
   end

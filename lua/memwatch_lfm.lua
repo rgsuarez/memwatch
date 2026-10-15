@@ -45,10 +45,11 @@ M.cfg = {
   -- (see deferralExhausted). 120 s = two further grace windows at the 60 s
   -- default, the same reach the old three-wait count had at that cadence.
   maxDeferSec = 120,
-  -- Once the deferral has run its maxDeferSec, the deterministic policy acts
-  -- only at or below this much available memory (a percentage), checked every
-  -- tick: above it a model's wait keeps standing. 0 turns the gate off (the
-  -- policy then acts at the bound, as before).
+  -- Once the deferral has run its maxDeferSec, the floor decides (floorActs):
+  -- the deterministic policy acts at or below this much available memory (a
+  -- percentage), on headroom it cannot read, or once maxHoldSec has run,
+  -- checked every tick; otherwise a model's wait keeps standing. 0 turns the
+  -- gate off (the policy then acts at the bound, as before).
   floorAvailPct = 12,
   -- ...but never past this long from the first wait, whatever the headroom:
   -- a model holds the decision for a while, never for good. At or below
@@ -850,7 +851,10 @@ function M.floorDue(state, metrics, now, cfg)
 end
 
 -- One model wait at grace expiry, folded into the per-offender deferral
--- state { firstAt, count }; a nil (or malformed) state starts at now. The
+-- state { firstAt, count }; a nil (or malformed) state starts at now. Each
+-- step returns a fresh table, so the floor's every-tick mark (exhausted, set
+-- by the caller on a wait held past the bound) never survives a step: only a
+-- wait held again re-arms it. The
 -- caller passes the decision tick's own clock to every step: a first stamp
 -- read later than the checks that follow it (behind a slow probe fork)
 -- would keep the wait that should exhaust the bound from exhausting it.

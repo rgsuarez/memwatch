@@ -3155,6 +3155,7 @@ do
   local held = { firstAt = 1000, count = 3, exhausted = true }
   check("floorDue: a held wait at the floor is due", lfm.floorDue(held, known(10), 1130, cfg), true)
   check("floorDue: a held wait above it is not", lfm.floorDue(held, known(30), 1130, cfg), false)
+  check("floorDue: a held wait at the hold cap is due whatever the headroom", lfm.floorDue(held, known(90), 1600, cfg), true)
   check("floorDue: a wait the last decision did not hold is not",
     lfm.floorDue({ firstAt = 1000, count = 3 }, known(10), 1130, cfg), false)
   check("floorDue: with the adjudicator off it never is",

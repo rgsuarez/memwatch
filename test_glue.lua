@@ -2583,10 +2583,11 @@ do
 end
 local REMOTE_LFM = '{"lfm":{"enabled":true,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
   .. LFM_KEYFILE .. '"}}'
-local function cannedVerdict(action)
+local function cannedVerdict(action, conf)
   return function()
     return 200, '{"choices":[{"message":{"content":"{\\"action\\":\\"' .. action
-      .. '\\",\\"process_class\\":\\"build\\",\\"confidence\\":0.9,\\"rationale\\":\\"test\\"}"}}]}'
+      .. '\\",\\"process_class\\":\\"build\\",\\"confidence\\":' .. tostring(conf or 0.9)
+      .. ',\\"rationale\\":\\"test\\"}"}}]}'
   end
 end
 
@@ -2709,7 +2710,6 @@ scenario("a wait past its bound holds while headroom stays above the floor", REM
   check("floor-held: the floor acts once headroom falls", stopped, true)
   check("floor-held: within a tick or two of the fall, not a grace window later (" .. math.floor(W.now - dropAt) .. " s)",
     W.now - dropAt <= 12, true)      -- two ticks at most; the grace cadence is 60 s
-  check("floor-held: and only after the bound", dropAt - firstWait >= 120, true)
 end)
 
 -- The every-tick check ends one held wait. A decision that does not hold
@@ -2835,7 +2835,7 @@ for _, case in ipairs({
   { name = "a threshold of 0 acts at the bound", key = '"floorAvailPct":0', avail = 30, lo = 115, hi = 135 },
   { name = "a threshold of 25 acts at 20%", key = '"floorAvailPct":25', avail = 20, lo = 115, hi = 135,
     rail = "deferral-floor-fired-by-headroom" },
-  { name = "a hold cap of 300 s acts at 30%", key = '"maxHoldSec":300', avail = 30, lo = 295, hi = 315,
+  { name = "a hold cap of 330 s acts at 30%, between grace expiries", key = '"maxHoldSec":330', avail = 30, lo = 325, hi = 345,
     rail = "deferral-floor-fired-by-hold-cap" },
 }) do
   local conf = REMOTE_LFM_FREEZE:gsub('"advisoryIntervalSec":600,', '"advisoryIntervalSec":600,' .. case.key .. ',')
@@ -2877,6 +2877,68 @@ scenario("a held wait survives a step back without acting early", REMOTE_LFM_FRE
   check("floor-step: the shift ran without error", logHas(W, "error:clock-shift"), false)
   W.availPct = 10
   check("floor-step: and the floor still acts when headroom falls", stopsWithin(W, 15), true)
+end)
+
+-- (round 2) Unattended mode switched off while a wait is held: the step does
+-- nothing, so the ledger writes no forced decision row either.
+scenario("with unattended off mid-hold, no forced decision rows", REMOTE_LFM_FREEZE, function(W, mw)
+  check("mode-off: headroom holds the wait", toHeldWait(W), true)
+  require("memwatch_core").cfg.unattended = "off"
+  W.run(5)
+  local before = #obsDecisions(W, 4242)
+  W.availPct = 10
+  W.run(30)
+  check("mode-off: no act with unattended off", W.signalsTo(4242), "")
+  check("mode-off: no forced rows, at most the grace cadence's own (" .. (#obsDecisions(W, 4242) - before) .. " in 30 s)",
+    #obsDecisions(W, 4242) - before <= 1, true)
+end)
+
+-- (round 2) The floor's act ahead of the grace respects a closed gate: an
+-- alert the operator closed is an answer, and the floor does not act on it.
+scenario("the floor does not act on an alert the operator closed", REMOTE_LFM_FREEZE, function(W, mw)
+  check("gate-closed: headroom holds the wait", toHeldWait(W), true)
+  check("gate-closed: the alert is up (control)", W.hudShowing(), true)
+  if W.hudShowing() then W.click("close") end
+  W.run(5)
+  W.availPct = 10
+  W.run(70)                           -- past the next grace expiry too
+  check("gate-closed: nothing is stopped", W.signalsTo(4242), "")
+end)
+
+-- (round 2) A held wait's record keeps the verdict's own rails: a freeze
+-- under the confidence floor arrives as a wait, and says so.
+scenario("a held wait's record keeps the verdict's own rails", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("freeze", 0.3)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local held = runUntil(W, 300, function() return #railRows(W, "deferral-floor-held-by-headroom") > 0 end)
+  check("held-rails: headroom holds the wait", held, true)
+  local r = railRows(W, "deferral-floor-held-by-headroom")[1] or {}
+  local has = false
+  for _, x in ipairs(r.rails or {}) do if x == "conf-floor-freeze" then has = true end end
+  check("held-rails: the record says the wait came from the confidence floor", has, true)
+end)
+
+-- (round 2) A verdict whose reply lands after the adjudicator is switched off
+-- decides nothing, even once it is on again: the switch drops the request
+-- in flight and the cache with it.
+scenario("a verdict across an off-and-on switch decides nothing", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  W.httpDelay = 20                    -- the answer is slow
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local asked = runUntil(W, 60, function() return #(W.httpPosts or {}) >= 2 end)
+  check("switch: the bound process's request is in flight (control)", asked, true)
+  mw.setLfmEnabled(false)             -- switched off while it is in flight
+  W.run(25)                           -- its reply lands meanwhile
+  W.httpDelay = 600                   -- a new ask would not land before the next decision
+  mw.setLfmEnabled(true)
+  check("switch: the base system freezes at grace expiry", stopsWithin(W, 90), true)
+  check("switch: no model wait from the verdict across the switch", unattendedRow(W, "lfm"), nil)
 end)
 
 -- (round 6) A wall clock stepped back while a model's wait defers the

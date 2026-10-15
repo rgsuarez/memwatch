@@ -86,7 +86,10 @@ The model is an advisor inside hard rails, never an autonomous authority.
   the wait it was holding: after any decision, the next one waits out the
   grace again unless the floor holds the wait again, so an action that
   fails is never retried every tick. Each such act is a decision point
-  the observation ledger records on its own tick.
+  the observation ledger records on its own tick. The step and the ledger
+  ask one predicate for it (unattended on, the alert's gate open, the wait
+  bound to the alert's start time, no final latch, no action in flight),
+  so the ledger never records an act the step did not take.
 - **The records say why.** A held wait's decision record carries the rail
   `deferral-floor-held-by-headroom`. An act past the bound carries
   `deferral-floor-fired-by-headroom`, `-by-unknown-headroom` or
@@ -99,8 +102,9 @@ The model is an advisor inside hard rails, never an autonomous authority.
   malformed, memwatch behaves exactly as it does without the feature: the
   deterministic unattended policy acts (or the HUD simply waits for you),
   and one rate-limited log line notes the degradation. Turning the feature
-  off takes effect at once: a verdict cached before the switch decides
-  nothing after it, and a held wait arms no every-tick check.
+  off takes effect at once: cached verdicts, a request in flight and the
+  waits they held are dropped, so none of them decides anything after the
+  switch, even once the feature is on again.
 - **memwatch protects its own adjudicator.** The model server is filtered
   out of the runaway and ranked lists and refused by the kill-policy gate,
   so memwatch can never freeze or kill the process it depends on. An

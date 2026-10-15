@@ -10,15 +10,29 @@
 #   0  clean
 #   1  an internal reference, or a tracked internal-only artifact, was found
 #   2  refused to scan blind: the local term list is missing, or holds no
-#      effective pattern (only blank and # lines). A public clone has no
-#      local list by design and sets MEMWATCH_PUBLIC_CLONE=1 to scan with the
-#      structural patterns alone.
+#      effective pattern (only blank and # lines); a pattern does not
+#      compile; a named file cannot be read; a file cannot be scanned; or
+#      the tree scan found no files at all (not a git tree). A public clone
+#      has no local list by design and sets MEMWATCH_PUBLIC_CLONE=1 to scan
+#      with the structural patterns alone.
 # test-no-internal-refs.sh pins this contract.
 #
 # Usage:
 #   eval/checks/no-internal-refs.sh              # scan the tracked tree
 #   eval/checks/no-internal-refs.sh <file>...    # scan the named files only
 set -euo pipefail
+
+# Named files are resolved BEFORE moving to the repository root, so a path
+# relative to the caller's directory scans the file the caller meant; a
+# named file that cannot be read is a refusal, never a clean pass.
+NAMED=()
+for f in "$@"; do
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    echo "no-internal-refs: cannot read $f; refusing" >&2
+    exit 2
+  fi
+  NAMED+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")")
+done
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$0")/" 2>/dev/null || true
 
@@ -62,30 +76,56 @@ elif [ "${MEMWATCH_PUBLIC_CLONE:-0}" != "1" ]; then
   exit 2
 fi
 
+# A pattern that does not compile would make every grep fail, and a failing
+# grep reads like no match: refuse instead of scanning blind.
+for pat in "${PATTERNS[@]}"; do
+  rc=0
+  grep -E -e "$pat" /dev/null >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    echo "no-internal-refs: a pattern does not compile; refusing" >&2
+    exit 2
+  fi
+done
+
 fail=0
+scanned=0
 
 scan_file() {
   local f="$1"
   case "$f" in
-    eval/checks/no-internal-refs.sh) return 0 ;;  # the pattern list itself
-    lua/memwatch_report.lua|test_report.lua) return 0 ;; # emit/assert the league sentinel as a string literal; rendered ARTIFACTS carrying it are the leak class
+    eval/checks/no-internal-refs.sh|*/eval/checks/no-internal-refs.sh) return 0 ;;  # the pattern list itself
+    lua/memwatch_report.lua|test_report.lua|*/lua/memwatch_report.lua|*/test_report.lua) return 0 ;; # emit/assert the league sentinel as a string literal; rendered ARTIFACTS carrying it are the leak class
     *.gguf|*.png) return 0 ;;                      # binary artifacts
   esac
+  scanned=$((scanned + 1))
   for pat in "${PATTERNS[@]}"; do
-    if grep -InE "$pat" "$f" /dev/null 2>/dev/null | head -3 | grep -q .; then
+    # grep -q itself, never a pipe: under pipefail a pipe into head turns a
+    # large match set into SIGPIPE, which would read as no match. 0 is a
+    # match, 1 none, anything else a file that could not be scanned.
+    local rc=0
+    grep -IqE -e "$pat" -- "$f" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
       echo "INTERNAL-REF: pattern '$pat' in $f:" >&2
-      grep -InE "$pat" "$f" 2>/dev/null | head -3 >&2
+      { grep -InE -e "$pat" -- "$f" 2>/dev/null || true; } | head -3 >&2 || true
       fail=1
+    elif [ "$rc" -ge 2 ]; then
+      echo "no-internal-refs: could not scan $f; refusing" >&2
+      exit 2
     fi
   done
 }
 
-if [ "$#" -gt 0 ]; then
-  for f in "$@"; do scan_file "$f"; done
+if [ "${#NAMED[@]}" -gt 0 ]; then
+  for f in "${NAMED[@]}"; do scan_file "$f"; done
 else
   # Tracked-tree scan, plus tracked-path class assertions: runtime and
-  # internal-only artifacts must never be tracked.
-  while IFS= read -r f; do scan_file "$f"; done < <(git ls-files)
+  # internal-only artifacts must never be tracked. A tree scan that finds
+  # no file at all (not a git tree) is blind, not clean.
+  while IFS= read -r f; do scan_file "$f"; done < <(git ls-files 2>/dev/null)
+  if [ "$scanned" -eq 0 ]; then
+    echo "no-internal-refs: the tree scan found no tracked files (not a git tree?); refusing" >&2
+    exit 2
+  fi
   BAD_TRACKED="$(git ls-files -- 'models/*.gguf' 'eval/results/*' 'eval/tmp/*' 'eval/panel/*' 'reports/*' 'memwatch-lfm.jsonl*' 'memwatch-observe.jsonl*' 'memwatch-frozen.json*' 'memwatch-local.json*' 'memwatch.log*' 2>/dev/null || true)"
   if [ -n "$BAD_TRACKED" ]; then
     echo "INTERNAL-ARTIFACT TRACKED (must stay gitignored):" >&2

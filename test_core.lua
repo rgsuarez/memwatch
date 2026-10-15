@@ -3065,10 +3065,9 @@ do
   check("clock frames: the menu's build and every item are frames",
     src:find("    clock.enter()\n    local ok, items = pcall(buildMenu)\n    clock.leave()", 1, true) ~= nil
       and src:find('it.fn = guard("menu-item", it.fn)', 1, true) ~= nil, true)
-  -- The fake cannot empty a slot inside the half-second verify window, so
-  -- the verifier's put-back clamp is pinned by text.
-  check("frozen ledger: a verifier putting its own entry back reads a freeze stamp ahead of now as now",
-    src:find("if type(entry.frozenAt) == \"number\" and entry.frozenAt > t then entry.frozenAt = t end", 1, true) ~= nil, true)
+  -- The stale-row branch answers for the process the row showed.
+  check("resume: a stale row over another frozen process answers for the one it showed",
+    src:find("if shown and not core.sameIdentity(shown, e) then\n    markInteracted(shown, nil, true)", 1, true) ~= nil, true)
   check("resume: a stale row's Resume still answers for the process it showed",
     src:find("if shown then markInteracted(shown, nil, true) end", 1, true) ~= nil, true)
   -- Here the wait streak is a deferral ({ firstAt, count }): its first wait

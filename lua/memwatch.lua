@@ -48,7 +48,7 @@ local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local alertsEnabled = true  -- desktop alert surfaces (HUD + banners); menu toggle, persisted
 local alertActive   = false -- a critical alert episode is live (HUD up, or muted-but-armed)
 local critNotif     = nil   -- the live critical banner; one at a time, withdrawn on recovery
-local critNotifPid  = nil   -- offender pid the live banner names (0 = none identified)
+local critNotifOff  = nil   -- { pid, name, lstart } the live banner names (nil = none identified)
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
@@ -455,7 +455,23 @@ local hudInteracted  = false
 local hudHold        = false  -- a kill narrative owns the body text
 local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
-local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind } at raise
+local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind, lstart } on screen
+local hudEpisodeOff  = nil    -- the offender this episode last raised for; survives a close
+
+-- Bind an offender's start time (lstart) once per process. A refreshed
+-- offender table for the process already bound inherits it; a different
+-- process is probed now, before any HUD or banner button can signal it.
+-- The same pid and name with nothing bound is not re-probed every tick: a
+-- probe is a fork, and the raise path already tried once.
+local function bindOffender(offender, prev)
+  if type(offender) ~= "table" or offender.lstart or not offender.pid then return end
+  if prev and prev.pid == offender.pid and prev.name == offender.name then
+    offender.lstart = prev.lstart
+    return
+  end
+  local probed = probePid(offender.pid)
+  if probed then offender.lstart = probed.lstart end
+end
 
 local HUD_W, HUD_H = 380, 176
 
@@ -557,6 +573,9 @@ local function buildHud()
     elseif id == "monitor" or id == "monitor-label" then
       hs.application.launchOrFocus("Activity Monitor")
     elseif id == "close" then
+      -- A close means "not now": restart the raise clock so the same
+      -- offender returns only after the raise cooldown, as a new question.
+      lastHudRaiseAt = hs.timer.secondsSinceEpoch()
       M.hideHud()
     end
   end))
@@ -564,13 +583,11 @@ local function buildHud()
 end
 
 local function raiseHud(offender, titleText)
-  hudOffender = offender
   -- Capture the offender's start time at raise, so a Freeze/Force Quit click
   -- seconds later binds identity and cannot signal a pid reused meanwhile.
-  if offender and offender.pid and not offender.lstart then
-    local probed = probePid(offender.pid)
-    if probed then offender.lstart = probed.lstart end
-  end
+  bindOffender(offender, hudEpisodeOff)
+  hudOffender = offender
+  hudEpisodeOff = offender
   hudInteracted = false
   hudHold = false
   hudShownAt = hs.timer.secondsSinceEpoch()
@@ -664,8 +681,9 @@ local function buildMenu()
     local label = (off.kind == "hog")
       and string.format("Force Quit largest process (%s, pid %d)", off.name, off.pid)
       or  string.format("Force Quit %s (pid %d)", off.name, off.pid)
+    -- The alerts bind the offender's start time; pass it when they have.
     items[#items + 1] = { title = label,
-      fn = function() M.killPid(off.pid, off.name) end }
+      fn = function() M.killPid(off.pid, off.name, nil, { expectedLstart = off.lstart }) end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
       fn = function() M.ignore(off.pid, off.name) end }
     items[#items + 1] = { title = "-" }
@@ -688,16 +706,23 @@ local function buildMenu()
 end
 
 local function notifyCrit(m)
-  -- One banner per critical episode per offender: post on entry or when the
-  -- named offender changes, replace the previous banner instead of stacking
-  -- a new one, never re-post after a manual dismissal, and let alertSurfaces
-  -- withdraw it once the state settles below critical. The cooldown damps
-  -- offender flap within one episode; the episode's end resets it.
+  -- One banner per offender per critical episode (core.bannerStep): a banner
+  -- naming a process the alerts have moved off is withdrawn at once and its
+  -- replacement waits out the cooldown, which damps offender flap; a banner
+  -- is never re-posted for the same offender within the episode, even after
+  -- a manual dismissal; alertSurfaces withdraws it once the state settles
+  -- below critical, which also resets the cooldown.
   if not alertsEnabled then return end
-  local pid = lastOffender and lastOffender.pid or 0
-  if critNotif and pid == critNotifPid then return end
+  local off = lastOffender
   local now = os.time()
-  if now - lastNotifyAt < core.cfg.notifyCooldownSec then return end
+  local step = core.bannerStep({ hasBanner = critNotif ~= nil, banner = critNotifOff,
+                                 offender = off, sinceLastPostSec = now - lastNotifyAt,
+                                 cooldownSec = core.cfg.notifyCooldownSec })
+  if step.withdraw then
+    pcall(function() critNotif:withdraw() end)
+    critNotif, critNotifOff = nil, nil
+  end
+  if not step.post then return end
   lastNotifyAt = now
   local sub
   if lastOffender and lastOffender.kind == "hog" then
@@ -717,21 +742,23 @@ local function notifyCrit(m)
   end
   -- Action button is best-effort: macOS only renders it reliably when
   -- Hammerspoon notifications are set to the Alerts style. The HUD is the
-  -- dependable one-click surface; this is the breadcrumb.
-  local off = lastOffender
-  if critNotif then pcall(function() critNotif:withdraw() end) end
-  critNotifPid = pid
+  -- dependable one-click surface; this is the breadcrumb. The button exists
+  -- only when the offender's start time is bound (the HUD binds it before
+  -- this runs): the click passes it as expectedLstart, so a pid reused
+  -- since the post is refused, never signaled.
+  local canAct = off ~= nil and off.lstart ~= nil
+  critNotifOff = off and { pid = off.pid, name = off.name, lstart = off.lstart } or nil
   critNotif = hs.notify.new(guard("notify-action", function(notif)
-    if off and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
-      M.killPid(off.pid, off.name)
+    if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
+      M.killPid(off.pid, off.name, nil, { expectedLstart = off.lstart })
     end
   end), {
     title             = "Memory pressure: CRITICAL",
     subTitle          = sub,
     informativeText   = "Top: " .. table.concat(names, ", "),
     withdrawAfter     = 0,      -- no timer: withdrawn when the episode ends
-    hasActionButton   = off ~= nil,
-    actionButtonTitle = off and "Force Quit" or nil,
+    hasActionButton   = canAct,
+    actionButtonTitle = canAct and "Force Quit" or nil,
     -- intentionally no soundName: alerts are silent by design
   }):send()
 end
@@ -836,13 +863,24 @@ local function alertSurfaces(state, now)
     local offender = lastOffender
     local visible = alertActive
     if not visible then
-      local newOffender = offender and (not hudOffender or hudOffender.pid ~= offender.pid)
-      if (now - lastHudRaiseAt) >= core.cfg.cool.hudRaiseSec or newOffender then
+      -- A new process preempts the raise cooldown; the process this episode
+      -- already raised for (its HUD closed) waits it out (core.hudRaiseDue).
+      if core.hudRaiseDue({ visible = false, offender = offender, episode = hudEpisodeOff,
+                            sinceRaiseSec = now - lastHudRaiseAt,
+                            raiseSec = core.cfg.cool.hudRaiseSec }) then
         lastHudRaiseAt = now
         raiseHud(offender)
       end
     elseif not hudHold then
-      hudOffender = offender or hudOffender
+      -- Keep identity bound across refreshes: each assessment builds a new
+      -- offender table, and the buttons signal with its lstart. The same
+      -- process inherits the bound start time; a different one is bound
+      -- fresh before it is shown.
+      if offender and offender ~= hudOffender then
+        bindOffender(offender, hudOffender)
+        hudOffender = offender
+        hudEpisodeOff = offender
+      end
       if alertsEnabled then
         if hud and hud:isShowing() then
           hud[3].text = hudBodyText()
@@ -930,14 +968,16 @@ local function alertSurfaces(state, now)
     if alertActive and settled and not hudHold then M.hideHud() end
     -- The critical banner lives exactly as long as the episode: withdraw it
     -- once the state settles below critical, even if the HUD went earlier.
-    -- The episode's end also ends its cooldown, so the next episode posts
-    -- on entry instead of inheriting the last banner's quiet period.
+    -- The episode's end also ends its cooldown and its HUD memory, so the
+    -- next episode posts and raises on entry instead of inheriting the last
+    -- episode's quiet period.
     if settled then
       if critNotif then
         pcall(function() critNotif:withdraw() end)
-        critNotif, critNotifPid = nil, nil
+        critNotif, critNotifOff = nil, nil
       end
       lastNotifyAt = 0
+      hudEpisodeOff = nil
     end
   end
 end
@@ -2221,11 +2261,18 @@ function M.test(level, seconds)
     or  { watchName = "FakeProc" }
   applyFlash(state)
   if state == "critical" then
+    -- A fresh episode: clear any banner and HUD memory an earlier run left,
+    -- or a back-to-back self-test would see its own stale banner and post
+    -- nothing.
+    if critNotif then pcall(function() critNotif:withdraw() end) end
+    critNotif, critNotifOff = nil, nil
     lastNotifyAt = 0
+    hudEpisodeOff = nil
     lastOffender = { pid = 99999, name = "FakeProc", weightMB = 22 * 1024,
                      slopeMBmin = 12000, kind = "extreme" }
     notifyCrit(lastMetrics)
-    -- Clicking Force Quit here is safe: pid 99999 probes as already exited.
+    -- The banner carries no Force Quit here (a fake pid has no start time
+    -- to bind); the HUD's is safe to click: pid 99999 probes as exited.
     raiseHud(lastOffender, "Memory CRITICAL (self-test)")
   end
   afterHeld(dur, guard("test-resume", function()
@@ -2358,7 +2405,11 @@ function M.setAlertsEnabled(on)
   if not alertsEnabled then
     if hud then hud:hide() end   -- clear the popup; the episode stays armed
     if critNotif then pcall(function() critNotif:withdraw() end) end
-    critNotif, critNotifPid = nil, nil
+    critNotif, critNotifOff = nil, nil
+  else
+    -- Unmuting restores a live episode's surfaces together: the HUD comes
+    -- back on the next tick, so the banner must not lag behind a cooldown.
+    lastNotifyAt = 0
   end
   saveLocalConfig()
   M.logSnapshot("alerts-" .. (alertsEnabled and "enabled" or "disabled"))

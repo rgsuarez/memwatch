@@ -415,6 +415,47 @@ function M.pruneFrozen(entries, probe)
   return kept, dropped
 end
 
+-- Offender identity for the alert surfaces: pid and name, plus the start
+-- time (lstart) when both sides have one bound. A missing start time never
+-- forces a mismatch (it is bound lazily), but two bound ones must agree, so
+-- a pid reused by a same-name process reads as a different offender.
+function M.sameOffender(a, b)
+  if a == nil or b == nil then return a == b end
+  if a.pid ~= b.pid or a.name ~= b.name then return false end
+  return a.lstart == nil or b.lstart == nil or a.lstart == b.lstart
+end
+
+-- The critical banner's next step. A live banner naming a process the alerts
+-- have moved off (a new offender, a reused pid, or none) is withdrawn at
+-- once, so its Force Quit can never act on the wrong process. A banner is
+-- posted only when none is live and the cooldown allows, which damps
+-- offender flap within an episode (the episode's end resets the cooldown).
+-- A live banner naming the current offender stays: it is never re-posted,
+-- even after a manual dismissal, which macOS does not report.
+-- a: { hasBanner, banner = {pid,name,lstart}|nil, offender = ...|nil,
+--      sinceLastPostSec, cooldownSec }  ->  { withdraw = bool, post = bool }
+function M.bannerStep(a)
+  if a.hasBanner and M.sameOffender(a.banner, a.offender) then
+    return { withdraw = false, post = false }
+  end
+  return { withdraw = a.hasBanner == true,
+           post = (a.sinceLastPostSec or math.huge) >= (a.cooldownSec or 0) }
+end
+
+-- Should the HUD raise now? Never while the episode is already up (visible
+-- covers muted-but-armed). A process other than the one this episode last
+-- raised for preempts the raise cooldown. The same process, after its HUD
+-- was closed, waits the cooldown out: a close means "not now" (Ignore is the
+-- "leave it alone" answer), and the re-raise is a new question with its own
+-- grace window. No identified offender is cooldown-gated as before.
+-- a: { visible, offender = {pid,name,lstart}|nil, episode = ...|nil,
+--      sinceRaiseSec, raiseSec }
+function M.hudRaiseDue(a)
+  if a.visible then return false end
+  if a.offender and not M.sameOffender(a.episode, a.offender) then return true end
+  return (a.sinceRaiseSec or math.huge) >= (a.raiseSec or 0)
+end
+
 -- What the menu-bar title should say. Quiet until trouble:
 --   ok        ●                    (dim)
 --   elevated  ● <watch>↑           (amber; hint only while a grower is watched)

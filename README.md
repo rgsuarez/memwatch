@@ -82,22 +82,31 @@ memory actually reclaimed. Safety rails, enforced in pure logic
 (`core.killAllowed`): same-uid processes only, a curated denylist
 (WindowServer, loginwindow, Finder, Dock, Hammerspoon itself, and friends),
 never pid 1, never memwatch's own host. The target's identity is re-validated
-by comm before TERM and again before KILL, so a recycled pid can never be
-signaled. Every action and refusal is logged.
+before TERM and again before KILL: by name, and by start time wherever the
+alert bound one (the HUD and the banner bind it when they first show a
+process), so a recycled pid is refused rather than signaled. Every action and
+refusal is logged.
 
-A notification breadcrumb accompanies the HUD: one banner per critical
-episode, replaced in place if the named offender changes, never re-posted
-after a manual dismissal, and withdrawn on its own once the state settles
-below critical (its Force Quit action button renders reliably only when
-Hammerspoon notifications are set to the Alerts style; the HUD is the
-dependable surface).
+The HUD's close button means "not now": if the same process is still the
+offender, the HUD returns after the raise cooldown as a fresh alert with its
+own grace window. **Ignore 30m** is the "leave it alone" answer.
+
+A notification breadcrumb accompanies the HUD: one banner per offender per
+critical episode, never re-posted for the same offender within the episode
+(even after a manual dismissal), and withdrawn on its own once the state
+settles below critical. When the named offender changes, the stale banner is
+withdrawn at once and its replacement follows after a cooldown that damps
+offender flap. Its Force Quit action button appears only when the offender's
+start time is bound, and renders reliably only when Hammerspoon
+notifications are set to the Alerts style; the HUD is the dependable surface.
 
 **Desktop alerts: on/off** in the menu mutes both surfaces at will
 (persisted as `"alerts": false` in `memwatch-local.json`; CLI:
 `hs -c "memwatch.setAlertsEnabled(false)"`). Muting hides the HUD and the
 banners only: the menu-bar state icon, logging, and the unattended engine
 stay live, and action receipts (an autonomous freeze/quit, frozen processes
-surviving a reload) still notify.
+surviving a reload) still notify. Unmuting during an episode restores its HUD
+and banner.
 
 The dropdown menu shows the state and its cause, kernel level, live rates,
 headroom, top-5 processes by true weight (each with Force Quit / Ignore

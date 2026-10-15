@@ -59,21 +59,44 @@ local runGen        = 0     -- bumped by start/stop: a held resume from an older
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
-local ignoredUntil = {}   -- ["pid|name"] = epoch when the ignore expires
-local goneUntil    = {}   -- ["pid|name"] = verified gone: kept off the candidates
-                          -- while its last samples age out of the tracker
+local ignoredUntil = {}   -- [answerKey] = epoch when the ignore expires
+local goneUntil    = {}   -- [answerKey] = { untilAt, at, lstart }: verified gone, kept
+                          -- off the candidates while its last samples age out
 local GONE_SEC     = 20   -- runawayFreshSec plus a sample period
+local REVEAL_RISES = 3    -- rises after a frozen or gone mark that only a running process makes
+-- The ignore and gone lists' key: the pid and the name's first 15
+-- characters (core.sameName's rule), so a name top truncated and the full
+-- name ps fills in later key the same process.
+local function answerKey(pid, name) return pid .. "|" .. (name or ""):sub(1, 15) end
 local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
 local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
-local lastFrozenSweepAt = 0 -- calm-state liveness sweep bookkeeping
+local lastFrozenSweepAt = 0 -- liveness sweep bookkeeping
+
+-- A verified exit keeps the process off the candidates while its last
+-- samples age out. The mark carries the start time when one was bound.
+local function markGone(off, now)
+  goneUntil[answerKey(off.pid, off.name)] = { untilAt = now + GONE_SEC, at = now, lstart = off.lstart }
+end
+-- Does a frozen or gone mark still describe the process at its pid? Not
+-- when that process has another bound start time, and not when it has
+-- grown since the mark: a stopped process cannot grow and an exited one
+-- makes no new samples, so growth means a newcomer holds the pid (or the
+-- process runs again). Fork-free: it reads only the tracker.
+local function markHolds(mark, at, pid, lstart)
+  if not mark then return false end
+  if mark.lstart and lstart and mark.lstart ~= lstart then return false end
+  return procs.risingSince(tracker, pid, at) < REVEAL_RISES
+end
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
 local unattendedWaitStreak = {} -- [pid] = { firstAt, count } of model waits at grace expiry
 local unattendedSkipLogAt = 0  -- last "identity unverified" skip line (one a minute)
+local openReceipts = {}        -- [owed] = true: unattended actions whose outcome has not arrived
 local lfmServerTask  = nil    -- hs.task handle for llama-server
 local lfmServerPid   = nil
+local lfmServerIdent = nil    -- { pid, lstart, name } recorded when the server started
 local lfmServerPort  = nil
 local lfmServerReady = false
 local lfmSpawnedAt   = nil    -- epoch of the current spawn (fast-crash detection)
@@ -363,6 +386,15 @@ local function sh(cmd)
   return out or ""
 end
 
+-- Send one signal to a pid the caller has verified. A fork that fails
+-- (hs.execute raises) sent nothing: the send returns false and is logged,
+-- so the action reports that instead of dying before its outcome.
+local function send(sig, pid)
+  local ok = pcall(sh, string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
+  if not ok then M.logSnapshot(string.format("signal-send-failed:%s:%d", sig, pid)) end
+  return ok
+end
+
 -- Sample memory metrics. Native hs.host.vmStat() first (no fork, and it
 -- carries the cumulative counters the rate signals need); the vm_stat popen
 -- path survives only as a fallback. Swap usage and the kernel pressure level
@@ -393,14 +425,20 @@ local function assessProcesses(now)
   local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
   -- An answered process is no candidate, by its own state: ignored, held
   -- frozen by memwatch (stopped, so its extreme latch is history, not
-  -- growth), or verified gone while its last samples age out.
+  -- growth), or verified gone while its last samples age out. A frozen or
+  -- gone mark yields as soon as the pid shows growth since the mark: that
+  -- is a newcomer (or a process running again), never the one marked.
+  local function heldBack(p)
+    local key = answerKey(p.pid, p.name)
+    if (ignoredUntil[key] or 0) >= now or protectedPids[p.pid] then return true end
+    local g = goneUntil[key]
+    if g and g.untilAt >= now and markHolds(g, g.at, p.pid, nil) then return true end
+    local f = frozen[p.pid]
+    return f ~= nil and markHolds(f, f.frozenAt or 0, p.pid, nil)
+  end
   local kept = {}
   for _, r in ipairs(runs) do
-    local key = r.pid .. "|" .. r.name
-    if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
-       and not protectedPids[r.pid] and not frozen[r.pid] then
-      kept[#kept + 1] = r
-    end
+    if not heldBack(r) then kept[#kept + 1] = r end
   end
   lastRuns = kept
   lastExtreme = false
@@ -417,11 +455,7 @@ local function assessProcesses(now)
   -- protected, memwatch-frozen or gone process is never named as the hog.
   local rankedKept = {}
   for _, h in ipairs(lastRanked) do
-    local key = h.pid .. "|" .. h.name
-    if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
-       and not protectedPids[h.pid] and not frozen[h.pid] then
-      rankedKept[#rankedKept + 1] = h
-    end
+    if not heldBack(h) then rankedKept[#rankedKept + 1] = h end
   end
   local offender, watch = procs.pickOffender(kept, rankedKept, smState.state,
     function(pid) return procs.peakSlopeFor(tracker, pid) end)
@@ -563,7 +597,7 @@ local exposureTickAt = nil    -- the previous critical tick (nil: none yet)
 local exposureHead   = nil    -- the record whose process headed the alert since that tick
 local EXPOSURE_STEP_MAX = 15  -- a stalled tick counts at most this much grace
 local function procKey(off)
-  return off and off.pid and (off.pid .. "|" .. (off.name or ""):sub(1, 15)) or nil
+  return off and off.pid and answerKey(off.pid, off.name) or nil
 end
 -- The record in `map` for this process, or nil: a record made for a
 -- different bound process does not count (create replaces it).
@@ -575,12 +609,6 @@ local function recordFor(map, off, create)
   if not r and create then r = {}; map[k] = r end
   if r and r.lstart == nil and off.lstart then r.lstart = off.lstart end
   return r
-end
-local function markInteracted(off)
-  if off and not off.synthetic then
-    recordFor(interacted, off, true)
-    obs.noteTouch(off)
-  end
 end
 -- Every operator touch on an alert or a process (HUD click, menu action,
 -- banner button) bumps one monotonic counter. An observation compares it
@@ -594,7 +622,37 @@ function obs.byOperator(fn)
 end
 local hudHold        = false  -- a kill narrative owns the body text
 local hudHoldUntil   = 0      -- a hold no narrative released by now is released
-local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 3 + 4 s)
+local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 2 + 2 + 3, then 4 s to settle)
+-- An operator action on a process answers it for unattended purposes.
+-- Ignore, close and opening Activity Monitor answer at once. An action
+-- handed to a signal engine is pending until its outcome: one that did
+-- nothing (unverified: the probe failed before any signal) is no answer,
+-- any other outcome confirms it, and a pending mark whose outcome never
+-- came back lapses at the hold deadline.
+local function markInteracted(off, pending)
+  if not off or off.synthetic then return end
+  obs.noteTouch(off)
+  local r = recordFor(interacted, off, true)
+  if not pending then
+    r.confirmed, r.pendingUntil = true, nil
+  elseif not r.confirmed then
+    r.pendingUntil = hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
+  end
+end
+local function settleInteraction(target, outcome)
+  local r = recordFor(interacted, target, false)
+  if not r or r.confirmed then return end
+  if outcome == "unverified" then
+    interacted[procKey(target)] = nil
+  else
+    r.confirmed, r.pendingUntil = true, nil
+  end
+end
+-- Does the operator's answer stand this process's unattended action down?
+local function interactionStands(off, now)
+  local r = recordFor(interacted, off, false)
+  return r ~= nil and (r.confirmed or (r.pendingUntil or 0) > now)
+end
 local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
 local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind, lstart } on screen
@@ -626,12 +684,13 @@ end
 -- BIND_RETRY_SEC: a probe is a fork, and forks starve under pressure. A
 -- stale inherited value can only refuse (the signal path compares it with
 -- the live process), and that refusal triggers a fresh bind. Synthetic
--- offenders (self-test, simulate) are never bound.
+-- offenders (self-test, simulate) are never bound. Returns "gone" when the
+-- probe proved the process gone: no surface names it.
 local function bindOffender(offender, prev, now, fresh)
   if type(offender) ~= "table" or not offender.pid or offender.synthetic then return end
   if not fresh then
     if offender.lstart then return end
-    if prev and prev.pid == offender.pid and prev.name == offender.name and prev.lstart then
+    if prev and prev.pid == offender.pid and core.sameName(prev.name, offender.name) and prev.lstart then
       offender.lstart = prev.lstart
       return
     end
@@ -645,19 +704,23 @@ local function bindOffender(offender, prev, now, fresh)
   elseif why == "exited" or (why or ""):find("^pid%-reused") then
     -- Verified gone (or the pid holds a differently named process): the
     -- tracker's last samples of it are stale, so it is no candidate.
-    goneUntil[offender.pid .. "|" .. offender.name] = now + GONE_SEC
+    markGone(offender, now)
+    return "gone"
   end
 end
 
--- Is this process answered, by its own state? memwatch holds it frozen (the
--- ledger's start time agreeing when both are known), it is verified gone,
--- or it is ignored. A pure read: it never probes.
+-- Is this process answered, by its own state? memwatch holds it frozen, it
+-- is verified gone, or it is ignored. A frozen or gone mark counts only
+-- while it still describes this process (markHolds). A pure read: it
+-- never probes.
 local function isAnswered(off, now)
   if not off or not off.pid then return false end
-  local key = off.pid .. "|" .. (off.name or "")
+  local key = answerKey(off.pid, off.name)
   local f = frozen[off.pid]
-  if f and not (f.lstart and off.lstart and f.lstart ~= off.lstart) then return true end
-  return (goneUntil[key] or 0) > now or (ignoredUntil[key] or 0) > now
+  if f and markHolds(f, f.frozenAt or 0, off.pid, off.lstart) then return true end
+  local g = goneUntil[key]
+  if g and g.untilAt > now and markHolds(g, g.at, off.pid, off.lstart) then return true end
+  return (ignoredUntil[key] or 0) > now
 end
 
 local HUD_W, HUD_H = 380, 176
@@ -703,9 +766,16 @@ end
 local function identityRefused(target)
   if not target or not target.pid then return end
   hudStalePid = target.pid
+  -- Only the refused process's own records go: a record already made for
+  -- the process now holding the pid is that process's, not this one's.
   local k = procKey(target)
-  if k then exposure[k], interacted[k] = nil, nil end
+  if recordFor(exposure, target, false) then exposure[k] = nil end
+  if recordFor(interacted, target, false) then interacted[k] = nil end
+  -- The banner goes only when it names the refused process: the same pid
+  -- and name, and its start time when both are known. A banner already
+  -- bound to the process now holding the pid stays.
   if critNotif and critNotifOff and critNotifOff.pid == target.pid
+     and core.sameName(critNotifOff.name, target.name)
      and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then
     pcall(function() critNotif:withdraw() end)
     critNotif, critNotifOff = nil, nil
@@ -720,6 +790,7 @@ end
 -- holds it now as a new alert), or nothing at all (unverified: the alert
 -- stands as it was, still retryable).
 local function settleAction(target, outcome)
+  settleInteraction(target, outcome)
   local answer = core.answerFor(outcome)
   M.logSnapshot(string.format("answered:%s:%s(%d):%s", answer, target.name or "?",
     target.pid or -1, outcome or "none"))
@@ -728,9 +799,7 @@ local function settleAction(target, outcome)
     lastHudRaiseAt = 0
     M.hideHud()
   elseif answer == "done" then
-    if outcome ~= "frozen" then
-      goneUntil[target.pid .. "|" .. (target.name or "")] = hs.timer.secondsSinceEpoch() + GONE_SEC
-    end
+    if outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
     dismissHud("done", target)
   elseif answer == "snooze" then
     dismissHud("snooze", target)
@@ -741,22 +810,26 @@ end
 
 -- Progress for an action started from the menu or a banner (no HUD of its
 -- own): a brief on-screen alert per step, and the outcome routed to the
--- episode as the HUD's is. A reused pid rebinds every surface; a process
--- frozen or verified gone is answered, so a HUD still naming it comes down.
+-- episode as the HUD's is (core.answerFor): a reused pid rebinds every
+-- surface, and a HUD still naming the same process comes down as done or
+-- snoozed, unless a narrative of its own holds it. The episode it routes
+-- to is this run's: after a stop or start, only a verified exit (a fact
+-- about the process, not the episode) is kept.
 -- (hs.alert directly: alertUpdate is declared further down the file.)
 local function surfaceUpdate(target)
+  local gen = runGen
   return function(text, done, outcome)
     hs.alert.show("memwatch: " .. text, 2.5)
     if not done then return end
-    if outcome == "stale" then
+    local answer = core.answerFor(outcome)
+    if answer == "done" and outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
+    if gen ~= runGen then return end
+    settleInteraction(target, outcome)
+    if answer == "rebind" then
       identityRefused(target)
-    elseif core.answerFor(outcome) == "done" then
-      if outcome ~= "frozen" then
-        goneUntil[target.pid .. "|" .. (target.name or "")] = hs.timer.secondsSinceEpoch() + GONE_SEC
-      end
-      if hudOffender and hudOffender.pid == target.pid and not hudHold then
-        dismissHud("done", hudOffender)
-      end
+    elseif (answer == "done" or answer == "snooze")
+       and hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
+      dismissHud(answer, hudOffender)
     end
   end
 end
@@ -842,7 +915,7 @@ local function buildHud()
         end
         return
       end
-      markInteracted(target)
+      markInteracted(target, true)
       hudHold, hudHoldUntil = true, hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
       -- The narrative belongs to this run: after a stop, start or
       -- diagnostic it touches nothing (the signal engine still finishes the
@@ -889,7 +962,9 @@ local function raiseHud(offender, titleText)
   -- The probe binds it, so a Freeze/Force Quit click seconds later cannot
   -- signal a pid reused meanwhile.
   local now = hs.timer.secondsSinceEpoch()
-  bindOffender(offender, nil, now, true)
+  -- A process this bind proves gone is not named: the alert rises without
+  -- a named offender.
+  if bindOffender(offender, nil, now, true) == "gone" then offender = nil end
   hudOffender = offender
   hudEpisodeOff = offender
   if hudSnooze and offender and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
@@ -959,12 +1034,12 @@ local function buildMenu()
       menu = {
         { title = "Freeze " .. name .. note, disabled = (lst == nil) or nil,
           fn = obs.byOperator(function()
-            markInteracted(target)
+            markInteracted(target, true)
             M.freezePid(pid, name, surfaceUpdate(target), { weightMB = wMB, expectedLstart = lst })
           end) },
         { title = "Force Quit " .. name .. note, disabled = (lst == nil) or nil,
           fn = obs.byOperator(function()
-            markInteracted(target)
+            markInteracted(target, true)
             M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
           end) },
         { title = "Ignore for 30 min",
@@ -1007,10 +1082,14 @@ local function buildMenu()
     local label = (off.kind == "hog")
       and string.format("Force Quit largest process (%s, pid %d)", off.name, off.pid)
       or  string.format("Force Quit %s (pid %d)", off.name, off.pid)
-    -- The alert's bound start time when it has one; otherwise the click binds
-    -- it, so this item never signals by name alone.
-    local bound = off.lstart or ((hudOffender and hudOffender.pid == off.pid
-      and hudOffender.name == off.name) and hudOffender.lstart or nil)
+    -- The alert's bound start time when it has one (the HUD's, else the
+    -- banner's, for this process); otherwise the click binds it, so this
+    -- item never signals by name alone. A binding the pid has since
+    -- outlived refuses, and the refusal rebinds every surface.
+    local function bindingOf(s)
+      return (s and s.pid == off.pid and core.sameName(s.name, off.name)) and s.lstart or nil
+    end
+    local bound = off.lstart or bindingOf(hudOffender) or bindingOf(critNotifOff)
     items[#items + 1] = { title = label, disabled = off.synthetic == true or nil,
       fn = obs.byOperator(function()
         local lst, why = bound, nil
@@ -1029,7 +1108,7 @@ local function buildMenu()
           if why and why:find("^pid%-reused") then identityRefused(target) end
           return
         end
-        markInteracted(off)
+        markInteracted(target, true)
         M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
       end) }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
@@ -1065,7 +1144,7 @@ local function notifyCrit(m)
   -- The bound identity lives on the HUD's table for the same process when
   -- an assessment has since replaced the offender table.
   local lstart = off and (off.lstart or ((hudOffender and hudOffender.pid == off.pid
-    and hudOffender.name == off.name) and hudOffender.lstart or nil)) or nil
+    and core.sameName(hudOffender.name, off.name)) and hudOffender.lstart or nil)) or nil
   local canAct = off ~= nil and lstart ~= nil and not off.synthetic
   -- The episode's notification history outlives the live banner: an
   -- offender that hands off and comes back has already been announced. It
@@ -1087,6 +1166,9 @@ local function notifyCrit(m)
                                  bannerHandled = critNotifOff ~= nil and isAnswered(critNotifOff, now),
                                  sinceLastPostSec = now - lastNotifyAt,
                                  cooldownSec = core.cfg.notifyCooldownSec })
+  -- The banner being replaced, read before the withdrawal below clears it:
+  -- an in-place replace upgrades this banner's own history record.
+  local wasBanner = critNotifOff
   if (step.withdraw or step.replace) and critNotif then
     pcall(function() critNotif:withdraw() end)
     critNotif, critNotifOff = nil, nil
@@ -1121,7 +1203,6 @@ local function notifyCrit(m)
   -- announcement: the banner's history record (the very table posted) takes
   -- the newly bound identity, rather than leaving an unbound record behind.
   -- A new post adds one record; nothing is ever recorded twice.
-  local wasBanner = critNotifOff
   critNotifOff = off and { pid = off.pid, name = off.name, lstart = lstart, kind = off.kind,
                            canAct = canAct } or nil
   if step.replace and wasBanner and critNotifOff and wasBanner.lstart == nil and lstart ~= nil
@@ -1133,9 +1214,9 @@ local function notifyCrit(m)
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
       obs.operatorActions = obs.operatorActions + 1
-      markInteracted(off)
-      M.killPid(off.pid, off.name,
-        surfaceUpdate({ pid = off.pid, name = off.name, lstart = lstart }), { expectedLstart = lstart })
+      local target = { pid = off.pid, name = off.name, lstart = lstart }
+      markInteracted(target, true)
+      M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lstart })
     end
   end), {
     title             = "Memory pressure: CRITICAL",
@@ -1300,6 +1381,21 @@ local function unattendedReceipt(action, target, adjudicator, rationale, outcome
                   withdrawAfter = 0 }):send()
 end
 
+-- An unattended action whose outcome never arrived by the hold deadline
+-- (a step of its narrative never ran) still owes its receipt: a signal may
+-- have gone out, so the operator is told, never left with silence.
+local function settleOpenReceipts(now)
+  for owed in pairs(openReceipts) do
+    if now > owed.dueAt then
+      openReceipts[owed] = nil
+      M.logSnapshot(string.format("unattended-no-result:%s:%s(%d)", owed.action,
+        owed.target.name or "?", owed.target.pid or -1))
+      unattendedReceipt(owed.action, owed.target, owed.adjudicator, owed.rationale, "unconfirmed",
+        string.format("%s started, but its result never came back", owed.action))
+    end
+  end
+end
+
 -- Unattended action: opt-in, extreme growers only, the alert episode
 -- unanswered for the grace window, once per offender. With desktop alerts
 -- muted the episode still arms and counts the same clock: muted-and-
@@ -1322,7 +1418,7 @@ local function gateFor(offender, now)
     kind = offender and offender.kind, alertActive = alertActive, hudHold = hudHold,
     sameAsHud = offender ~= nil and hudOffender ~= nil and core.sameOffender(hudOffender, offender),
     answered = offender ~= nil and isAnswered(offender, now),
-    interacted = hudOffender ~= nil and recordFor(interacted, hudOffender, false) ~= nil,
+    interacted = hudOffender ~= nil and interactionStands(hudOffender, now),
     bound = hudOffender ~= nil and hudOffender.lstart ~= nil,
     exposureSec = grace and grace.sec or 0, graceSec = core.cfg.cool.autoKillGraceSec,
   })
@@ -1373,8 +1469,14 @@ local function unattendedStep(offender, now)
   end
   hudHold, hudHoldUntil = true, now + HOLD_MAX_SEC
   local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
+  -- The receipt is owed from here (settleOpenReceipts covers an outcome
+  -- that never arrives).
+  local owed = { action = action, target = target, adjudicator = adjudicator,
+                 rationale = rationale, dueAt = now + HOLD_MAX_SEC }
+  openReceipts[owed] = true
   local gen = runGen
   local narrate = function(text, done, outcome)
+    if done then openReceipts[owed] = nil end
     if gen ~= runGen then
       -- The run ended mid-action: still say what memwatch did, but leave
       -- the new run's alert alone.
@@ -1420,6 +1522,9 @@ local function alertSurfaces(state, now)
   if state == "critical" then
     hudBelowCritSince = nil
     local offender = lastOffender
+    -- Answered since the last assessment (a bind proved it gone, an action
+    -- froze it): until the next sample drops it, it is nobody's offender.
+    if offender and isAnswered(offender, now) then offender = nil end
     local visible = alertActive
     if not visible then
       -- core.hudRaiseDue: an answered offender never returns this episode, a
@@ -1427,7 +1532,7 @@ local function alertSurfaces(state, now)
       -- other process preempts the raise cooldown.
       if offender and offender.pid == hudStalePid then
         hudStalePid = nil
-        bindOffender(offender, nil, now, true)
+        if bindOffender(offender, nil, now, true) == "gone" then offender = nil end
       end
       if core.hudRaiseDue({ visible = false, offender = offender, episode = hudEpisodeOff,
                             snooze = hudSnooze,
@@ -1441,29 +1546,36 @@ local function alertSurfaces(state, now)
       -- holds the pid now is a new process, bound fresh, with its own grace.
       if hudStalePid and hudOffender and hudOffender.pid == hudStalePid then
         hudStalePid = nil
-        bindOffender(hudOffender, nil, now, true)
         M.logSnapshot(string.format("hud-rebind:%s(%d)", hudOffender.name, hudOffender.pid))
+        if bindOffender(hudOffender, nil, now, true) == "gone" then hudOffender = nil end
       end
       -- Keep identity bound across refreshes: each assessment builds a new
       -- offender table, and the same process inherits its bound start time.
       -- A different process heading the episode is a new question: bound
       -- fresh, with its own grace and its own answer, even while the canvas
       -- stays up or alerts are muted.
+      -- A process a bind proves gone is never named: no retarget to it, and
+      -- a HUD whose own process is proven gone goes on without a name.
       if offender and offender ~= hudOffender then
         if not core.sameOffender(hudOffender, offender) then
           -- A different process (or the first one named on a generic
           -- alert): bound fresh. Its grace is its own exposure, so it gets
           -- a full window from now unless it already headed this alert.
-          bindOffender(offender, nil, now, true)
-          if hudSnooze and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
-          M.logSnapshot(string.format("hud-retarget:%s(%d)", offender.name, offender.pid))
+          if bindOffender(offender, nil, now, true) ~= "gone" then
+            if hudSnooze and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
+            M.logSnapshot(string.format("hud-retarget:%s(%d)", offender.name, offender.pid))
+            hudOffender = offender
+            hudEpisodeOff = offender
+          end
+        elseif bindOffender(offender, hudOffender, now, false) == "gone" then
+          hudOffender = nil
         else
-          bindOffender(offender, hudOffender, now, false)
+          hudOffender = offender
+          hudEpisodeOff = offender
         end
-        hudOffender = offender
-        hudEpisodeOff = offender
       elseif hudOffender and not hudOffender.lstart then
-        bindOffender(hudOffender, nil, now, false)   -- bounded retry of a failed bind
+        -- bounded retry of a failed bind
+        if bindOffender(hudOffender, nil, now, false) == "gone" then hudOffender = nil end
       end
       if alertsEnabled then
         if hud and hud:isShowing() then
@@ -1556,6 +1668,7 @@ local function tick()
   -- must be cleared before this tick's unattended decision can read it, or a
   -- recycled pid could inherit stale state for one tick.
   gcUnattendedState(now)
+  settleOpenReceipts(now)
   alertSurfaces(state, now)
   -- Passive observation on the advisory cadence while pressure is up: the
   -- distribution of offenders an adjudicator would have been asked about,
@@ -1660,11 +1773,16 @@ protectedPids[selfPid] = true
 -- or hs.execute can raise, and both read as unknown.
 probeRows = function(pids)
   local list = {}
-  for _, p in ipairs(pids) do list[#list + 1] = string.format("%d", p) end
+  for _, p in ipairs(pids) do
+    if math.type(p) == "integer" or (type(p) == "number" and p == math.floor(p)) then
+      list[#list + 1] = string.format("%d", p)
+    end
+  end
   list[#list + 1] = string.format("%d", selfPid)
-  local ok, out = pcall(hs.execute, string.format(
+  local ok, out, _, how = pcall(hs.execute, string.format(
     "/bin/ps -p %s -o pid=,uid=,state=,lstart=,comm= 2>/dev/null", table.concat(list, ",")))
-  if not ok then return nil end
+  -- A ps killed by a signal may have left partial output: unknown.
+  if not ok or how == "signal" then return nil end
   return core.parseProbeRows(out, selfPid)
 end
 
@@ -1686,9 +1804,9 @@ end
 
 -- The single identity gate every signal path goes through (kill, freeze,
 -- resume, and the frozen-ledger reconcile), so probe discipline never
--- drifts between them. Names sourced from the top stream are truncated at
--- ~16 chars, so a long expected name may be a prefix of the live one; short
--- names must match exactly. Returns proc (with .liveName and .state) or nil
+-- drifts between them. Names compare with core.sameName: the top stream
+-- truncates names at ~16 chars, so a name of 15 or more characters may be
+-- a prefix of the other; shorter names must match exactly. Returns proc (with .liveName and .state) or nil
 -- plus why: "exited" (verified gone), "pid-reused:<why>" (the pid holds
 -- another process), or "unverified" (the probe could not run: never read
 -- as an exit, and never as a reason to signal).
@@ -1697,10 +1815,7 @@ resolveSignalTarget = function(pid, expectedName, expectedLstart)
   if st == "unknown" then return nil, "unverified" end
   if st == "absent" then return nil, "exited" end
   local liveName = procs.friendlyName(proc.comm)
-  local nameMatches = (liveName == expectedName)
-    or (expectedName ~= nil and #expectedName >= 15
-        and liveName:sub(1, #expectedName) == expectedName)
-  if expectedName and not nameMatches then
+  if expectedName and not core.sameName(liveName, expectedName) then
     return nil, string.format("pid-reused:%s", liveName)
   end
   if expectedLstart and proc.lstart and proc.lstart ~= expectedLstart then
@@ -1850,9 +1965,30 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     onUpdate(string.format("refusing to freeze %s: %s", proc.liveName, why), true, "refused")
     return
   end
-  if frozen[pid] then
-    onUpdate(string.format("%s is already frozen", proc.liveName), true, "frozen")
-    return
+  -- A ledger entry answers "already frozen" only for this very process,
+  -- verified stopped now. An entry for another start time is a phantom
+  -- (its process is gone and a newcomer holds the pid): it goes, and the
+  -- newcomer is frozen. One still being verified stands. One whose process
+  -- runs again (resumed outside memwatch) goes, and the freeze proceeds.
+  local held = frozen[pid]
+  if held then
+    local now = hs.timer.secondsSinceEpoch()
+    if held.lstart and proc.lstart and held.lstart ~= proc.lstart then
+      M.logSnapshot(string.format("frozen-phantom-drop:%s(%d)", held.name or "?", pid))
+      frozen[pid] = nil
+      saveFrozen()
+    elseif core.isStopped(proc) then
+      onUpdate(string.format("%s is already frozen", proc.liveName), true, "frozen")
+      return
+    elseif held.pendingUntil and now < held.pendingUntil then
+      onUpdate(string.format("a freeze of %s is still being verified; nothing more was sent",
+        proc.liveName), true, "unverified")
+      return
+    else
+      M.logSnapshot(string.format("frozen-stale-drop:%s(%d):running", held.name or "?", pid))
+      frozen[pid] = nil
+      saveFrozen()
+    end
   end
   -- Record the ledger entry BEFORE the SIGSTOP, not after the verify: a
   -- reload in the verify window would otherwise leave a SIGSTOPped process
@@ -1871,8 +2007,11 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   }
   frozen[pid] = entry
   saveFrozen()
-  sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
-  obs.noteSignal(pid, "freeze", proc)
+  -- A STOP that could not be sent still goes through the verifier, which
+  -- decides from the process's state: stopped keeps the entry, running
+  -- means nothing was done.
+  local stopSent = send("STOP", pid)
+  if stopSent then obs.noteSignal(pid, "freeze", proc) end
   afterHeld(0.5, guard("freeze-verify", function()
     -- Re-probe IDENTITY and state in one fork after the signal: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
@@ -1882,13 +2021,24 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     -- cannot run keeps the entry: the STOP may have landed, and the
     -- reconcile and the sweep re-check it.
     local reprobe, rwhy = resolveSignalTarget(pid, proc.liveName, proc.lstart)
+    -- The ledger slot is this freeze's to change only while it holds no
+    -- entry for another start time (a newer freeze of the pid's next
+    -- process, or one a restart adopted, is not this freeze's to touch).
+    local cur = frozen[pid]
+    local ours = cur == nil or cur.lstart == nil or cur.lstart == proc.lstart
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
-      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
+      if stopSent then
+        onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
+      else
+        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
+      end
     elseif not reprobe then
-      sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
-      frozen[pid] = nil
-      saveFrozen()
+      if ours then
+        if stopSent then send("CONT", pid) end
+        frozen[pid] = nil
+        saveFrozen()
+      end
       if rwhy == "exited" then
         M.logSnapshot(string.format("freeze-abort:%s(%d)-exited", proc.liveName, pid))
         onUpdate(string.format("%s exited during the freeze", proc.liveName), true, "exited")
@@ -1906,10 +2056,16 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       onUpdate(string.format(
         "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true, "frozen")
     else
-      frozen[pid] = nil
-      saveFrozen()
-      M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
-      onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed")
+      if ours then
+        frozen[pid] = nil
+        saveFrozen()
+      end
+      if stopSent then
+        M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
+        onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed")
+      else
+        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
+      end
     end
   end))
 end
@@ -1939,7 +2095,10 @@ function M.resumePid(pid, onUpdate)
     onUpdate(string.format("%s is gone (%s); ledger entry dropped", e.name or tostring(pid), twhy), true)
     return
   end
-  sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+  if not send("CONT", pid) then
+    onUpdate(string.format("couldn't send CONT to %s; it stays frozen, try again", e.name or tostring(pid)), true)
+    return
+  end
   afterHeld(0.5, guard("resume-verify", function()
     local again, awhy = resolveSignalTarget(pid, e.name, e.lstart)
     if awhy == "unverified" then
@@ -2202,9 +2361,9 @@ end
 -- port is free (not merely the tracked pid gone), so a pre-health child can
 -- never be orphaned still holding the port.
 local function retireLfmServer(reason)
-  local pid, port = lfmServerPid, lfmServerPort
+  local pid, port, ident = lfmServerPid, lfmServerPort, lfmServerIdent
   lfmServerReady = false
-  lfmServerPid, lfmServerPort = nil, nil
+  lfmServerPid, lfmServerPort, lfmServerIdent = nil, nil, nil
   lfmSpawnedAt = nil  -- a deliberate retire must not trip the fast-crash latch
   os.remove(LFM_PIDFILE)  -- a cleanly retired server is not a crash orphan
   lfmInFlight = nil
@@ -2213,38 +2372,39 @@ local function retireLfmServer(reason)
   protectedPids = { [selfPid] = true }
   if not pid then return end
   M.logSnapshot(string.format("lfm-retire:%s:pid=%d", reason or "?", pid))
-  -- The tracked pid's identity, captured before any signal (and again on a
-  -- later poll if this probe cannot run): KILL goes to it only while it
-  -- still holds that process, so a pid reused after our server exits is
-  -- never signaled.
-  local ident = probePid(pid)
+  -- TERM and KILL go to the tracked pid only while it still holds the
+  -- process recorded when the server started (its start time and name), so
+  -- a pid reused after our server exited is never signaled. No recorded
+  -- start time, or a probe that cannot tell: nothing is sent to the pid
+  -- (the task handle's own terminate above and the port check below remain).
   local function trackedIsOurs()
-    if not ident then ident = probePid(pid); return false end
-    return resolveSignalTarget(pid, procs.friendlyName(ident.comm), ident.lstart) ~= nil
+    if not ident or ident.pid ~= pid then return false end
+    local st, live = probe(pid)
+    return core.identityHolds(ident, st, live and live.lstart, live and procs.friendlyName(live.comm))
   end
   -- Signal the tracked pid AND the actual port listener (may be a child),
-  -- but only signal the listener if it is CONFIRMED ours: our tracked pid,
-  -- or an llama-server serving OUR model dir. In the narrow window after our
+  -- but only signal the listener if it is CONFIRMED ours: an llama-server
+  -- serving OUR model dir, holding our port. In the narrow window after our
   -- server died, an unrelated process could bind the port; never kill it.
+  -- (This also covers the tracked pid itself when no start time could be
+  -- recorded for it.)
   local function listenerIsOurs(owner)
     if not owner then return false end
-    if owner == pid then return true end
     local info = sh(string.format("/bin/ps -p %d -o comm=,args= 2>/dev/null", owner))
     local comm = info:match("^(%S+)")
     return comm ~= nil and comm:match("([^/]+)$") == "llama-server"
       and info:find("projects/memwatch/models/", 1, true) ~= nil
   end
   local function signalTargets(sig)
-    if pid and (sig == "TERM" or trackedIsOurs()) then
-      sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
-    elseif pid then
-      M.logSnapshot(string.format("lfm-retire-%s-skip:pid=%d:unverified-or-gone", sig, pid))
-    end
+    local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)
     if port then
       local owner = listenerPid(port)
-      if owner and owner ~= pid and listenerIsOurs(owner) then
-        sh(string.format("/bin/kill -%s %d 2>/dev/null", sig, owner))
+      if owner and not (sent and owner == pid) and listenerIsOurs(owner) then
+        if send(sig, owner) and owner == pid then sent = true end
       end
+    end
+    if pid and not sent then
+      M.logSnapshot(string.format("lfm-retire-%s-skip:pid=%d:unverified-or-gone", sig, pid))
     end
   end
   signalTargets("TERM")
@@ -2268,7 +2428,7 @@ local function retireLfmServer(reason)
           -- The listener lookup failed: KILL the tracked pid directly, but
           -- only while it still holds our server.
           logError("lfm-retire-kill", kerr)
-          if pid and trackedIsOurs() then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
+          if pid and trackedIsOurs() then send("KILL", pid) end
         end
         return hs.timer.secondsSinceEpoch() > deadline + 3
       end
@@ -2278,8 +2438,23 @@ local function retireLfmServer(reason)
     1,
     function()
       -- The predicate kept erroring: one last identity-checked KILL.
-      if pid and trackedIsOurs() then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end
+      if pid and trackedIsOurs() then send("KILL", pid) end
     end)
+end
+
+-- Record the server's identity (pid, start time, name) for the retire's
+-- signals, and to a pidfile so a crash-orphan sweep on the next start kills
+-- exactly OUR server, never a user's manual benchmark. Recorded at spawn
+-- and again for the verified listener once /health passes.
+local function recordLfmServer(pid)
+  local probed = probePid(pid)
+  lfmServerIdent = { pid = pid, lstart = probed and probed.lstart or nil,
+                     name = probed and procs.friendlyName(probed.comm) or nil }
+  local rec = lfm.jsonEncode({ pid = pid, lstart = lfmServerIdent.lstart })
+  if rec then
+    local pf = io.open(LFM_PIDFILE, "w")
+    if pf then pf:write(rec, "\n"); pf:close() end
+  end
 end
 
 local function spawnLfmServer()
@@ -2340,7 +2515,7 @@ local function spawnLfmServer()
       M.logSnapshot(string.format("lfm-server-exit:code=%s", tostring(code)))
       lfmServerTask = nil
       lfmServerReady = false
-      lfmServerPid, lfmServerPort = nil, nil
+      lfmServerPid, lfmServerPort, lfmServerIdent = nil, nil, nil
       protectedPids = { [selfPid] = true }
       -- A FAST crash (died within a few seconds of spawn, before it was ever
       -- ready) latches the adjudicator offline: otherwise the next elevated
@@ -2372,14 +2547,7 @@ local function spawnLfmServer()
   protectedPids = { [selfPid] = true, [lfmServerPid] = true }
   -- Record the spawned pid + start time so a crash-orphan sweep on the next
   -- start kills exactly OUR server, never a user's manual benchmark.
-  do
-    local probed = probePid(lfmServerPid)
-    local rec = lfm.jsonEncode({ pid = lfmServerPid, lstart = probed and probed.lstart or nil })
-    if rec then
-      local pf = io.open(LFM_PIDFILE, "w")
-      if pf then pf:write(rec, "\n"); pf:close() end
-    end
-  end
+  recordLfmServer(lfmServerPid)
   M.logSnapshot(string.format("lfm-spawn:pid=%d:port=%d:avail=%d%%",
     lfmServerPid, port, math.floor(lastMetrics.availPct or 0)))
   -- Health poll to ready, with the listener-ownership check: the pid bound
@@ -2417,6 +2585,7 @@ local function spawnLfmServer()
         protectedPids = { [selfPid] = true, [owner] = true }
         if expected then protectedPids[expected] = true end
         lfmServerPid = owner
+        recordLfmServer(owner)
         lfmServerReady = true
         M.logSnapshot(string.format("lfm-ready:%.1fs:pid=%d",
           hs.timer.secondsSinceEpoch() - lfmSpawnedAt, owner))
@@ -2952,8 +3121,12 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       onUpdate(string.format("can't verify %s right now; nothing was signaled",
         expectedName or tostring(pid)), true, "unverified")
     else
-      -- Identity mismatch: drop any stale ledger entry AND block the action.
-      if frozenEntry then frozen[pid] = nil; saveFrozen() end
+      -- Identity mismatch: block the action, and drop the ledger entry when
+      -- the refusal was about that entry's own process (it is gone).
+      if frozenEntry and (opts.expectedLstart == nil or opts.expectedLstart == frozenEntry.lstart) then
+        frozen[pid] = nil
+        saveFrozen()
+      end
       M.logSnapshot(string.format("kill-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
       onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true, "stale")
     end
@@ -2982,31 +3155,26 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- A SIGSTOPped process cannot handle SIGTERM until it is continued, so a
   -- TERM to a frozen target would just pend and force the full escalation
   -- wait before SIGKILL. Continue it first so the graceful signal can land.
-  if frozenEntry or core.isStopped(proc) then
-    sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
-  end
+  local contSent = false
+  if frozenEntry or core.isStopped(proc) then contSent = send("CONT", pid) end
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
+  if not send("TERM", pid) then
+    -- Nothing terminated it. A process continued for its TERM may be
+    -- running again, and that is said.
+    if contSent then
+      onUpdate(string.format("couldn't send TERM to %s; it was continued and may be running", liveName),
+        true, "unconfirmed")
+    else
+      onUpdate(string.format("couldn't send TERM to %s; nothing was signaled", liveName), true, "unverified")
+    end
+    return
+  end
   -- The TERM is the signal of record: a KILL escalation below carries out
   -- the same decision.
-  sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
   obs.noteSignal(pid, "terminate", proc)
-  afterHeld(k.escalateSec, guard("kill-escalate", function()
-    -- Re-validate FULL identity (name AND the start time bound above)
-    -- before SIGKILL: between TERM and this escalation the original may
-    -- have exited and the pid been reused by another same-name process;
-    -- name alone would not catch that, start time does. A probe that
-    -- cannot run sends nothing: KILL never goes to an unverified pid.
-    local again, awhy = resolveSignalTarget(pid, liveName, proc.lstart)
-    if again then
-      M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
-      onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
-      sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
-    elseif awhy == "unverified" then
-      M.logSnapshot(string.format("kill-escalate-skip:%s(%d)-unverified", liveName, pid))
-    elseif awhy ~= "exited" then
-      M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
-    end
+  local killSent = false
+  local function verify()
     afterHeld(k.verifySec + k.settleSec, guard("kill-verify", function()
       local still, vwhy = resolveSignalTarget(pid, liveName, proc.lstart)
       local m = readMetrics()
@@ -3016,22 +3184,57 @@ function M.killPid(pid, expectedName, onUpdate, opts)
         onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true, "unconfirmed")
       elseif not still then
         -- Gone, or the pid now holds another process: the original exited.
-        if frozen[pid] then frozen[pid] = nil; saveFrozen() end
+        -- Only its own frozen-ledger entry goes; one for a newer process
+        -- at this pid is not this kill's to touch.
+        local fe = frozen[pid]
+        if fe and (fe.lstart == nil or fe.lstart == proc.lstart) then frozen[pid] = nil; saveFrozen() end
         local footTxt = footBeforeGB and string.format("-footprint=%.1fGB", footBeforeGB) or ""
         M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB%s", liveName, pid, reclaimedGB, footTxt))
         onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
           footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or ""), true, "terminated")
-      else
+      elseif killSent then
         M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
         onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true, "failed")
+      else
+        -- It survived TERM and memwatch never got KILL to it (unverified,
+        -- or the send failed): nothing about it is final, and it can be
+        -- tried again.
+        M.logSnapshot(string.format("kill-unconfirmed:%s(%d)-no-kill-sent", liveName, pid))
+        onUpdate(string.format("%s ignored TERM, and memwatch could not send it KILL", liveName),
+          true, "unconfirmed")
       end
     end))
-  end))
+  end
+  -- Re-validate FULL identity (name AND the start time bound above) before
+  -- SIGKILL: between TERM and this escalation the original may have exited
+  -- and the pid been reused by another same-name process; name alone would
+  -- not catch that, start time does. A probe that cannot run sends nothing
+  -- (KILL never goes to an unverified pid) and is retried twice, 2 s apart.
+  local function escalate(attempt)
+    afterHeld((attempt == 1) and k.escalateSec or 2, guard("kill-escalate", function()
+      local again, awhy = resolveSignalTarget(pid, liveName, proc.lstart)
+      if again then
+        M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
+        onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
+        killSent = send("KILL", pid)
+      elseif awhy == "unverified" and attempt < 3 then
+        M.logSnapshot(string.format("kill-escalate-retry:%s(%d)-unverified", liveName, pid))
+        escalate(attempt + 1)
+        return
+      elseif awhy == "unverified" then
+        M.logSnapshot(string.format("kill-escalate-skip:%s(%d)-unverified", liveName, pid))
+      elseif awhy ~= "exited" then
+        M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
+      end
+      verify()
+    end))
+  end
+  escalate(1)
 end
 
 -- Silence alerts for one process for the standard window.
 function M.ignore(pid, name)
-  ignoredUntil[pid .. "|" .. name] = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec
+  ignoredUntil[answerKey(pid, name)] = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec
   M.logSnapshot(string.format("ignore:%s(%d)", name, pid))
   if lastOffender and lastOffender.pid == pid then
     lastOffender = nil
@@ -3075,13 +3278,18 @@ function M.start()
     if pf then
       local rec = lfm.jsonDecode(pf:read("a")); pf:close()
       if type(rec) == "table" and type(rec.pid) == "number" then
-        local info = sh(string.format("/bin/ps -p %d -o lstart=,comm=,args= 2>/dev/null", rec.pid))
-        local comm = info:match("%d%s+(%S+)") or info:match("^%s*%a+%s+%a+%s+%d+%s+[%d:]+%s+%d+%s+(%S+)")
-        if info:find("projects/memwatch/models/", 1, true)
-           and info:find("llama-server", 1, true)
-           and (not rec.lstart or info:find(rec.lstart, 1, true)) then
-          sh(string.format("/bin/kill -KILL %d 2>/dev/null", rec.pid))
-          M.logSnapshot("lfm-orphan-sweep:pid=" .. rec.pid)
+        -- The recorded start time must match the live process (a record
+        -- without one signals nothing), and it must still be an
+        -- llama-server on our model dir.
+        local st, live = probe(rec.pid)
+        if core.identityHolds({ pid = rec.pid, lstart = rec.lstart }, st, live and live.lstart, nil) then
+          local okInfo, info = pcall(sh, string.format("/bin/ps -p %d -o args= 2>/dev/null", rec.pid))
+          if okInfo and info:find("projects/memwatch/models/", 1, true) and info:find("llama-server", 1, true)
+             and send("KILL", rec.pid) then
+            M.logSnapshot("lfm-orphan-sweep:pid=" .. rec.pid)
+          end
+        elseif rec.lstart == nil then
+          M.logSnapshot("lfm-orphan-skip:no-start-time:pid=" .. rec.pid)
         end
       end
     end
@@ -3131,6 +3339,7 @@ function M.debug()
     watch          = titleSnap.watchName,
     unattended     = core.resolveUnattended(core.cfg),
     frozenCount    = (function() local n = 0; for _ in pairs(frozen) do n = n + 1 end; return n end)(),
+    bannerRecords  = #critNotified,   -- this episode's banner history
     protectedPids  = (function()
                        local t = {}
                        for pid in pairs(protectedPids) do t[#t + 1] = pid end
@@ -3181,11 +3390,12 @@ function M.test(level, seconds)
     and { offenderName = "FakeProc", offenderGB = 22, causeTag = "SWAP" }
     or  { watchName = "FakeProc" }
   applyFlash(state)
+  -- A diagnostic is a run boundary at every level: the live episode ends
+  -- here (its banner withdrawn, its memory cleared), or a real banner and
+  -- its history would outlive the run that posted them, and a back-to-back
+  -- self-test would see its own stale banner and post nothing.
+  resetEpisode()
   if state == "critical" then
-    -- A fresh episode: clear any banner and HUD memory an earlier run left,
-    -- or a back-to-back self-test would see its own stale banner and post
-    -- nothing.
-    resetEpisode()
     -- A synthetic offender: its surfaces never signal, whatever process may
     -- really hold pid 99999 (no binding, no banner action, inert buttons).
     lastOffender = { pid = 99999, name = "FakeProc", weightMB = 22 * 1024,

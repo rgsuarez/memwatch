@@ -353,6 +353,27 @@ local runsBig = procs.runaways(trBig, 25, "critical", 36864)
 check("absolute fires at critical", #runsBig, 1)
 check("absolute kind", runsBig[1].kind, "absolute")
 
+-- risingSince: a run of rises after a mark (a freeze, a verified exit)
+-- means the pid holds a running process; a held or compressing one never
+-- makes a run. Three cases plus the empty one.
+do
+  local function series(values, comm)
+    local sr = {}
+    for i, v in ipairs(values) do sr[#sr + 1] = { t = (i - 1) * 5, list = { row(60, v, comm or "node") } } end
+    return feed(sr)
+  end
+  -- Frozen at t=12: big and flat before it, a newcomer growing after it.
+  local trNew = series({ 9000, 9000, 9000, 2000, 2300, 2600, 2900, 3200 })
+  check("risingSince: a grower after the mark is a run", procs.risingSince(trNew, 60, 12) >= 3, true)
+  check("risingSince: the mark bounds the count (rises before it do not count)",
+    procs.risingSince(series({ 1000, 1400, 1800, 2200, 2200, 2200 }), 60, 12), 0)
+  -- A held process whose pages compress: each drop is caught up by one rise.
+  local trHeld = series({ 9000, 9000, 8000, 8300, 7500, 7800, 7000, 7300 })
+  check("risingSince: a compressing held process never makes a run", procs.risingSince(trHeld, 60, 0) < 3, true)
+  check("risingSince: no samples after the mark", procs.risingSince(trNew, 60, 999), 0)
+  check("risingSince: an untracked pid", procs.risingSince(trNew, 61, 0), 0)
+end
+
 -- weight rings: cmprs from top joins rss and sticks between top refreshes,
 -- so a runaway whose pages are compressed away in real time stays visible.
 local trW = procs.newTracker(PC)
@@ -900,6 +921,34 @@ do
     "unknown")
   check("probe: a nil reply (the fork raised) is unknown", (core.probeResult(core.parseProbeRows(nil, SELF), 4242)), "unknown")
   check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
+  check("probe: the control row beside a cut-off line is unknown, not absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n 4242   50", SELF), 4242)),
+    "unknown")
+  check("probe: a complete reply that omits the pid is absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF), 4242)),
+    "absent")
+  local selfOnly = core.parseProbeRows(
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF)
+  check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
+end
+
+-- ---- identity: a recorded process may be signaled only while it holds ----
+do
+  local ident = { pid = 4100, lstart = "Mon Oct 12 10:00:01 2026", name = "llama-server" }
+  check("holds: the recorded process, probed present", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "llama-server"), true)
+  check("holds: another start time on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:09:09 2026", "llama-server"), false)
+  check("holds: a probe that could not tell is refused", core.identityHolds(ident, "unknown", nil, nil), false)
+  check("holds: an exited process is refused", core.identityHolds(ident, "absent", nil, nil), false)
+  check("holds: a record without a start time never signals",
+    core.identityHolds({ pid = 4100, name = "llama-server" }, "present", "Mon Oct 12 10:00:01 2026", "llama-server"), false)
+  check("holds: another name on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "python3"), false)
+  check("holds: a record without a name compares start time alone",
+    core.identityHolds({ pid = 4100, lstart = "L" }, "present", "L", "anything"), true)
 end
 
 -- ---- identity: continuity versus memory ----
@@ -910,6 +959,10 @@ do
   check("name: either way round", core.sameName(full, "Google Chrome He"), true)
   check("name: short names must match exactly", core.sameName("node", "node2"), false)
   check("name: a short prefix is not enough", core.sameName("Google", full), false)
+  check("name: a 15-character prefix matches a 20-character name",
+    core.sameName("Chrome Helper (", "Chrome Helper (GPU)1"), true)
+  check("name: two long names that differ inside the prefix do not",
+    core.sameName("Chrome Helper (Renderer)", "Chrome Helpers (GPU)"), false)
   check("continuity: a truncated name is the same offender",
     core.sameOffender({ pid = 7, name = "Google Chrome He" }, { pid = 7, name = full, lstart = "L1" }), true)
   local bound, other = { pid = 7, name = "node", lstart = "L1" }, { pid = 7, name = "node", lstart = "L2" }
@@ -1246,28 +1299,45 @@ do
 end
 
 -- ---- alert-surface glue: identity binding and lifecycle ----
--- Source pins (the glue needs Hammerspoon); each scan carries a control
--- showing it would see the broken shape.
+-- Source pins (the behavioral harness, test_glue.lua, drives the glue;
+-- these pin shapes it cannot reach or that must never come back). A
+-- forbidden shape is checked with a real control: the same extractor run
+-- over a pre-fix body must find it, so neither a vacuous extraction nor a
+-- scan that cannot see the shape passes.
 do
   local f = assert(io.open("lua/memwatch.lua", "r"))
   local src = f:read("a")
   f:close()
-  local function body(startPat, endPat)
-    local s = src:find(startPat, 1, true)
-    local e = s and src:find(endPat or "\nend\n", s, true)
-    return (s and e) and src:sub(s, e) or ""
+  local function bodyIn(text, startPat, endPat)
+    local s = text:find(startPat, 1, true)
+    local e = s and text:find(endPat or "\nend\n", s, true)
+    return (s and e) and text:sub(s, e) or ""
   end
+  local function body(startPat, endPat) return bodyIn(src, startPat, endPat) end
+  -- The live body has no `bad`; a pre-fix body, extracted the same way, has it.
+  local function forbids(startPat, bad, preFix, endPat)
+    local live, old = bodyIn(src, startPat, endPat), bodyIn(preFix, startPat, endPat)
+    return #live > 0 and live:find(bad, 1, true) == nil and old:find(bad, 1, true) ~= nil
+  end
+  check("source pins: the control rejects a live body that still has the shape",
+    (function()
+      local saved = src
+      src = "local function probe()\n  bad()\nend\n"
+      local verdict = forbids("local function probe()", "bad()", src)
+      src = saved
+      return verdict
+    end)(), false)
   local notify = body("local function notifyCrit(m)")
   check("banner glue: notifyCrit located", #notify > 400, true)
   check("banner glue: steps through core.bannerStep", notify:find("core.bannerStep(", 1, true) ~= nil, true)
   check("banner glue: Force Quit passes the bound start time",
-    notify:find("{ expectedLstart = lstart })", 1, true) ~= nil
-      and notify:find("surfaceUpdate({ pid = off.pid, name = off.name, lstart = lstart })", 1, true) ~= nil, true)
+    notify:find("local target = { pid = off.pid, name = off.name, lstart = lstart }", 1, true) ~= nil
+      and notify:find("surfaceUpdate(target), { expectedLstart = lstart })", 1, true) ~= nil, true)
   check("banner glue: the button exists only when identity is bound",
     notify:find("hasActionButton   = canAct,", 1, true) ~= nil, true)
-  check("banner glue: no unbound kill remains (control: old shape is caught)",
-    ("M.killPid(off.pid, off.name)\n"):find("M.killPid(off.pid, off.name)\n", 1, true) ~= nil
-      and notify:find("M.killPid(off.pid, off.name)\n", 1, true) == nil, true)
+  check("banner glue: no unbound kill remains",
+    forbids("local function notifyCrit(m)", "M.killPid(off.pid, off.name)\n",
+      "local function notifyCrit(m)\n  critNotif = hs.notify.new(function()\n    M.killPid(off.pid, off.name)\n  end)\nend\n"), true)
   local surfaces = body("local function alertSurfaces(state, now)")
   check("hud glue: alertSurfaces located", #surfaces > 400, true)
   check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)
@@ -1276,13 +1346,14 @@ do
   check("hud glue: a retarget binds anew",
     surfaces:find("if not core.sameOffender(hudOffender, offender) then", 1, true) ~= nil
       and surfaces:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
-  check("hud glue: the grace is per process (control: the single shared clock is gone)",
-    ("(now - hudShownAt) < core.cfg"):find("hudShownAt", 1, true) ~= nil
+  check("hud glue: the grace is per process (the single shared clock is gone)",
+    forbids("local function unattendedStep(offender, now)", "hudShownAt",
+      "local function unattendedStep(offender, now)\n  if (now - hudShownAt) < core.cfg.cool.autoKillGraceSec then return end\nend\n")
       and src:find("hudShownAt", 1, true) == nil
       and surfaces:find("exposureHead.sec = (exposureHead.sec or 0)", 1, true) ~= nil, true)
-  check("hud glue: the refresh never drops the bound table (control included)",
-    ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
-      and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)
+  check("hud glue: the refresh never drops the bound table",
+    forbids("local function alertSurfaces(state, now)", "hudOffender = offender or hudOffender",
+      "local function alertSurfaces(state, now)\n      hudOffender = offender or hudOffender\nend\n"), true)
   local reset = body("local function resetEpisode()")
   check("episode glue: resetEpisode located", #reset > 100, true)
   check("episode glue: the episode's end forgets its HUD memory",
@@ -1297,23 +1368,38 @@ do
   local closeBody = closeAt and src:sub(closeAt, closeAt + 260) or ""
   check("hud glue: a close is a snooze", closeBody:find('dismissHud("snooze")', 1, true) ~= nil, true)
   local clicks = body('hud:mouseCallback(guard("hud-click"', "\n  end))")
-  local _, bareHides = clicks:gsub("M%.hideHud%(%)", "")
-  check("hud glue: no click handler hides the HUD without answering it (control: counts a bare hide)",
-    (select(2, ("M.hideHud()"):gsub("M%.hideHud%(%)", ""))) == 1 and bareHides == 0, true)
+  check("hud glue: no click handler hides the HUD without answering it",
+    #clicks > 0 and forbids('hud:mouseCallback(guard("hud-click"', "M.hideHud()",
+      'hud:mouseCallback(guard("hud-click", function(_, evt, id)\n    if id == "close" then M.hideHud() end\n  end))',
+      "\n  end))"), true)
   check("hud glue: a click acts only on a bound identity",
     clicks:find("if not target.lstart then", 1, true) ~= nil, true)
   local poll = body("local function untilHeld(pred, action, interval, onGiveUp)")
   check("poller glue: untilHeld located", #poll > 200, true)
   check("poller glue: a give-up calls the owner's handler, never the success action",
     poll:find('if step == "giveup" then', 1, true) ~= nil and poll:find("pcall(onGiveUp)", 1, true) ~= nil, true)
-  check("poller glue: an error no longer ends the poller (control: old shape caught)",
-    ("done = done == true or not ok"):find("or not ok", 1, true) ~= nil
-      and poll:find("or not ok", 1, true) == nil, true)
+  check("poller glue: an error no longer ends the poller",
+    forbids("local function untilHeld(pred, action, interval, onGiveUp)", "or not ok",
+      "local function untilHeld(pred, action, interval, onGiveUp)\n    done = done == true or not ok\nend\n"), true)
   check("poller glue: a continuous error run gives up", poll:find("UNTIL_GIVEUP_SEC", 1, true) ~= nil, true)
   local retire = body("local function retireLfmServer(reason)")
-  check("lfm glue: the retire KILL checks the tracked server's identity",
-    retire:find('if pid and (sig == "TERM" or trackedIsOurs()) then', 1, true) ~= nil
-      and retire:find('if pid then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end', 1, true) == nil, true)
+  local RETIRE = "local function retireLfmServer(reason)"
+  check("lfm glue: the retire TERM and KILL both check the recorded server identity",
+    retire:find("local sent = pid ~= nil and trackedIsOurs() and send(sig, pid)", 1, true) ~= nil
+      and retire:find("core.identityHolds(ident, st,", 1, true) ~= nil
+      and forbids(RETIRE, 'sig == "TERM" or',
+        RETIRE .. '\n    if pid and (sig == "TERM" or trackedIsOurs()) then\nend\n'), true)
+  check("lfm glue: a listener on the tracked pid gets no shortcut",
+    forbids(RETIRE, "if owner == pid then return true end",
+      RETIRE .. "\n    if owner == pid then return true end\nend\n"), true)
+  check("lfm glue: the identity is the one recorded at start, not probed at retire",
+    forbids(RETIRE, "local ident = probePid(pid)", RETIRE .. "\n  local ident = probePid(pid)\nend\n")
+      and src:find("recordLfmServer(owner)", 1, true) ~= nil, true)
+  local start = body("function M.start()")
+  check("lfm glue: the orphan sweep requires the recorded start time",
+    start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
+      and forbids("function M.start()", "not rec.lstart or",
+        "function M.start()\n           and (not rec.lstart or info:find(rec.lstart, 1, true)) then\nend\n"), true)
   check("lfm glue: the health poll's give-up retires the server",
     src:find('retireLfmServer("health-giveup")', 1, true) ~= nil, true)
   check("poller glue: the retire probe cannot skip the KILL deadline",
@@ -1329,9 +1415,9 @@ do
   local raiseBody = body("local function raiseHud(offender, titleText)")
   check("hud glue: a fresh raise binds identity anew",
     raiseBody:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
-  check("hud glue: a raise no longer inherits across the episode (control: old shape caught)",
-    ("bindOffender(offender, hudEpisodeOff)"):find("bindOffender(offender, hudEpisodeOff)", 1, true) ~= nil
-      and raiseBody:find("bindOffender(offender, hudEpisodeOff)", 1, true) == nil, true)
+  check("hud glue: a raise no longer inherits across the episode",
+    forbids("local function raiseHud(offender, titleText)", "bindOffender(offender, hudEpisodeOff)",
+      "local function raiseHud(offender, titleText)\n  bindOffender(offender, hudEpisodeOff)\nend\n"), true)
   local test = body("function M.test(level, seconds)")
   local clearAt = test:find("resetEpisode()", 1, true)
   local postAt = test:find("notifyCrit(lastMetrics)", 1, true)
@@ -1872,11 +1958,15 @@ do
   local killBody, freezeBody = fnBody("function M.killPid("), fnBody("function M.freezePid(")
   check("signals glue: killPid located", #killBody > 500, true)
   check("signals glue: freezePid located", #freezeBody > 500, true)
-  check("signals glue: a terminate is recorded at its TERM, after the gates",
-    recordedAtSend(killBody, 'sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))',
+  -- Recorded only once the signal went out: a TERM send that failed returns
+  -- before the record, and a STOP is recorded only when it was sent.
+  check("signals glue: a terminate is recorded after a TERM that went out, after the gates",
+    recordedAtSend(killBody, 'nothing was signaled", liveName), true, "unverified")\n'
+      .. '    end\n    return\n  end\n  -- The TERM is the signal of record: a KILL escalation below carries out\n'
+      .. '  -- the same decision.',
       'obs.noteSignal(pid, "terminate", proc)'), true)
-  check("signals glue: a freeze is recorded at its STOP, after the gates",
-    recordedAtSend(freezeBody, 'sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))',
+  check("signals glue: a freeze is recorded only when its STOP was sent, after the gates",
+    recordedAtSend(freezeBody, 'local stopSent = send("STOP", pid)\n  if stopSent then',
       'obs.noteSignal(pid, "freeze", proc)'), true)
   local _, recordSites = src:gsub('noteSignal%(pid, "', "")
   check("signals glue: only the two signal sites record", recordSites, 2)

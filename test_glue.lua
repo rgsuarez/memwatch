@@ -31,6 +31,12 @@ local function scenario(name, localConfig, fn)
     print("FAIL  " .. name .. " raised: " .. tostring(err))
     fails = fails + 1
   end
+  -- Every command the glue issued is one the fake models: an unmodeled one
+  -- reads as an empty answer, which would let a scenario pass on nothing.
+  if #W.unknown > 0 then
+    print("FAIL  " .. name .. " issued unmodeled commands: " .. table.concat(W.unknown, " | "):sub(1, 240))
+    fails = fails + 1
+  end
   pcall(function() if _G.memwatch then _G.memwatch.stop() end end)
   F.cleanup(W)
 end
@@ -80,7 +86,7 @@ scenario("banner follows the named offender", nil, function(W)
 end)
 
 -- ---- banner: an unbound banner gains its action once identity binds ----
-scenario("banner upgrades when identity binds", nil, function(W)
+scenario("banner upgrades when identity binds", nil, function(W, mw)
   leaker(W, 4242)
   W.run(12)
   W.probeFails = true
@@ -90,12 +96,145 @@ scenario("banner upgrades when identity binds", nil, function(W)
   local live = W.liveBanners()
   check("bind: with probes failing the banner offers no Force Quit",
     live[1] ~= nil and live[1].attrs.hasActionButton ~= true, true)
+  local records = mw.debug().bannerRecords
   W.probeFails = false
   W.run(40)
   live = W.liveBanners()
   check("bind: once probes recover the banner offers Force Quit",
     live[1] ~= nil and live[1].attrs.hasActionButton == true, true)
   check("bind: still one live banner", #live, 1)
+  check("bind: the upgrade adds no second history record", mw.debug().bannerRecords, records)
+end)
+
+-- ---- identity: a refusal keeps a banner bound to the pid's new process ----
+-- A Force Quit built while a process was unbound is clicked after another
+-- process, under another name, took its pid and earned a bound banner.
+scenario("a refusal keeps another process's banner", nil, function(W)
+  leaker(W, 4242, "nodeA")
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "nodeA") end)
+  W.run(6)
+  local stale = W.menuItem("Force Quit nodeA")
+  check("refusal: the offender item was built unbound", stale ~= nil and stale.fn ~= nil, true)
+  W.reusePid(4242, "nodeB", 2000)
+  W.grow(4242, 220)
+  W.probeFails = false
+  local function nodeBBanner()
+    local live = W.liveBanners()
+    return #live == 1 and (live[1].attrs.subTitle or ""):find("nodeB", 1, true) ~= nil
+      and live[1].attrs.hasActionButton == true
+  end
+  check("refusal: nodeB earns a bound banner", runUntil(W, 400, nodeBBanner), true)
+  stale.fn()
+  W.run(1)
+  check("refusal: the stale click signals nothing", W.signalsTo(4242), "")
+  check("refusal: nodeB's banner survives a refusal naming nodeA", nodeBBanner(), true)
+end)
+
+-- ---- names: a top-born truncated name and its full ps name are one process ----
+-- With the ps sampler starved, only the streaming top feeds the tracker, and
+-- top truncates names at 16 characters. When ps recovers it fills in the
+-- full name. An ignore made on the truncated name must hold, and the bound
+-- identity must carry over without another probe.
+local LONG = "Google Chrome Helper (Renderer)"
+local function topOnlyEpisode(W, mw)
+  -- Critical (the kernel level rides the ps sample) with the stream up,
+  -- then ps starves and the process is born: only top has seen it.
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, LONG, 2000)
+  W.grow(4242, 220)
+  return runUntil(W, 120, function() return bodyNames(W, LONG:sub(1, 16) .. " (pid") end)
+end
+local function probesOf(W, pid, from)
+  local n = 0
+  for i = from or 1, #W.exec do
+    local list = W.exec[i]:match("^/bin/ps %-p ([%d,]+) %-o pid=")
+    if list and ("," .. list .. ","):find("," .. pid .. ",", 1, true) then n = n + 1 end
+  end
+  return n
+end
+
+scenario("an ignore holds across the name ps fills in", nil, function(W, mw)
+  check("names: the HUD names the truncated top name", topOnlyEpisode(W, mw), true)
+  W.run(6)
+  W.click("ignore")
+  check("names: the ignore takes the HUD down", W.hudShowing(), false)
+  W.psStarved = false
+  runUntil(W, 120, function() return not W.hudShowing() and false end)
+  local reraised = runUntil(W, 400, function() return bodyNames(W, "Google Chrome") end)
+  check("names: the ignored process does not come back once ps names it in full", reraised, false)
+end)
+
+scenario("a refreshed full name keeps the bound identity", nil, function(W, mw)
+  check("names: the HUD names the truncated top name", topOnlyEpisode(W, mw), true)
+  W.run(20)
+  local from = #W.exec + 1
+  W.psStarved = false
+  check("names: ps fills in the full name", runUntil(W, 120, function() return bodyNames(W, LONG) end), true)
+  W.run(10)
+  check("names: no second probe for the same process", probesOf(W, 4242, from), 0)
+end)
+
+-- ---- answers: a frozen mark yields to a newcomer on its pid ----
+-- A frozen process dies and a same-name process takes its pid and runs
+-- away. Its ledger entry is a phantom until the sweep can prove it (60 s,
+-- or never while probes fail); growth since the freeze proves it sooner.
+local function frozenThenReused(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(6)
+  local frozenState = W.procs[4242] and W.procs[4242].state
+  W.reusePid(4242, "node", 2000)
+  W.grow(4242, 220)
+  return frozenState
+end
+
+scenario("a phantom frozen entry does not hide a newcomer", nil, function(W)
+  check("phantom: the runaway is frozen", frozenThenReused(W), "T")
+  W.probeFails = true   -- the sweep keeps an entry it cannot verify
+  check("phantom: the newcomer is surfaced while probes fail",
+    runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "node (pid 4242)") end), true)
+end)
+
+scenario("a freeze of the newcomer on a phantom's pid freezes it", nil, function(W)
+  check("phantom: the runaway is frozen", frozenThenReused(W), "T")
+  W.run(2)
+  local row = W.menuItem("node")
+  local freeze = row and row.menu and row.menu[1]
+  check("phantom: the menu offers the newcomer's Freeze", freeze ~= nil and freeze.fn ~= nil, true)
+  freeze.fn()
+  W.run(2)
+  check("phantom: the newcomer is stopped, not reported already frozen", W.procs[4242].state, "T")
+end)
+
+-- ---- answers: a freeze not yet verified does not answer the next click ----
+scenario("an unverified freeze does not answer the next click as frozen", nil, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].unstoppable = true
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  -- The STOP goes out (and does nothing); the verifier's probe then fails.
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  W.click("freeze")
+  W.run(1)
+  W.onSignal, W.probeFails = nil, false
+  W.run(5)
+  check("pending: the alert stands after an unverified freeze", W.hudShowing(), true)
+  W.click("freeze")
+  W.run(6)
+  check("pending: a second click does not answer it as frozen", W.hudShowing(), true)
+  check("pending: the process still runs", W.procs[4242].state, "S")
 end)
 
 -- ---- identity: an unbound HUD refuses instead of signaling by name ----
@@ -243,14 +382,16 @@ scenario("self-test is inert", nil, function(W, mw)
   W.run(6)
   mw.test("critical", 20)
   W.run(2)
+  check("selftest: the HUD shows the synthetic offender", W.hudShowing() and bodyNames(W, "FakeProc"), true)
   W.click("kill")
+  check("selftest: a button says nothing was signaled", W.hudBody(), "Self-test: nothing was signaled.")
   W.run(8)
   W.click("freeze")
   W.run(3)
   check("selftest: the HUD's buttons signal nothing", W.signalsTo(99999), "")
-  for _, b in ipairs(W.liveBanners()) do
-    check("selftest: the banner offers no Force Quit", b.attrs.hasActionButton == true, false)
-  end
+  local live = W.liveBanners()
+  check("selftest: one banner is up", #live, 1)
+  check("selftest: and it offers no Force Quit", live[1] ~= nil and live[1].attrs.hasActionButton ~= true, true)
 end)
 
 -- ---- lifecycle: overlapping self-tests leave one poller; stop clears ----
@@ -544,9 +685,9 @@ end)
 
 -- ---- outcomes: an unattended receipt says what happened, when it happened ----
 -- (round 3) A same-name process took the pid under an inherited binding:
--- the attempt is refused, so no "freeze" receipt, and the newcomer is a new
--- alert with its own grace.
-scenario("a refused unattended action posts no receipt", '{"unattended":"freeze","alerts":false}', function(W)
+-- the attempt is refused as stale, so no "freeze" receipt, and the
+-- newcomer is a new alert with its own grace.
+scenario("an unattended action refused as stale posts no receipt", '{"unattended":"freeze","alerts":false}', function(W)
   leaker(W, 4242)
   W.run(12)
   W.kern = 4
@@ -563,6 +704,39 @@ scenario("a refused unattended action posts no receipt", '{"unattended":"freeze"
   check("receipt: the newcomer is frozen on its own identity", W.signalsTo(4242), "STOP")
   check("receipt: (a full grace after the refusal)", W.sigs[#W.sigs].t - refusedAt >= 59, true)
   check("receipt: exactly one receipt, for the freeze that happened", #W.notices("memwatch unattended freeze"), 1)
+end)
+
+-- (round 4) The policy gate refuses another user's process: nothing is
+-- signaled, and nothing is announced.
+scenario("an unattended action the policy refuses posts no receipt", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "rootleak", 2000, { uid = 0 })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  local refused = runUntil(W, 120, function() return logHas(W, "freeze-refuse:rootleak(4242)") end)
+  check("policy: the unattended freeze is refused", refused, true)
+  W.run(10)
+  check("policy: nothing was signaled", W.signalsTo(4242), "")
+  check("policy: and no receipt claims anything", #W.notices("memwatch unattended"), 0)
+end)
+
+-- (round 4) An unattended action whose result never arrives (its verifier
+-- never got to run) still owes a receipt: a STOP went out, and the muted
+-- operator is told so at the hold deadline.
+scenario("an unattended action with no result still posts a receipt", '{"unattended":"freeze","alerts":false}', function(W)
+  W.onSignal = function(sig) if sig == "STOP" then W.timersStall = true end end
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal, W.timersStall = nil, false
+  check("no-result: the STOP went out", W.signalsTo(4242), "STOP")
+  check("no-result: nothing is announced before the deadline", #W.notices("memwatch unattended"), 0)
+  W.run(50)
+  local n = W.notices("memwatch unattended freeze")
+  check("no-result: one receipt at the deadline, though alerts are muted", #n, 1)
+  check("no-result: it says the result never came back",
+    n[1] ~= nil and (n[1].attrs.informativeText or ""):find("never came back", 1, true) ~= nil, true)
 end)
 
 -- (round 3) A freeze that did not stop the process is a snooze, not a
@@ -635,6 +809,24 @@ scenario("a killed process does not haunt the HUD", nil, function(W)
   local haunted = runUntil(W, 40, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end)
   check("ghost: the HUD never comes back for the dead process", haunted, false)
   check("ghost: the next process is alerted instead", W.hudShowing() and bodyNames(W, "bigvm"), true)
+end)
+
+-- ---- answers: a raise never names a process its bind proved gone ----
+-- With the ps sampler starved, the last assessment's offender outlives the
+-- process. The raise's bind proves it gone; the alert rises unnamed.
+scenario("a raise never names a process its bind proved gone", nil, function(W)
+  leaker(W, 4242, "ghost")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "ghost (pid") end)
+  W.run(5)
+  W.click("close")                      -- snoozed: back after the raise cooldown
+  W.psStarved = true
+  W.run(6)
+  W.procs[4242] = nil                   -- it exits; no sample will say so
+  local named = runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "ghost (pid") end)
+  check("gone: the HUD never names the exited process", named, false)
+  check("gone: the alert still rises, unnamed", W.hudShowing() and bodyNames(W, "No single offender"), true)
 end)
 
 -- (round 3) A banner posted before its identity bound, upgraded in place,
@@ -768,6 +960,84 @@ scenario("a refused click does not disarm unattended", UNATTENDED_FREEZE, functi
   W.probeFails = false
   check("refused-click: unattended still freezes once it binds",
     runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+end)
+
+-- (round 4) An action whose probe failed before any signal (unverified)
+-- left the process untouched, so it is no answer: once probes recover,
+-- unattended still acts. Each surface: the HUD, the banner, a menu row;
+-- and a click whose outcome never came back lapses at the hold deadline.
+local function armedEpisode(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  return runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+end
+local function freezesWithin(W, sec)
+  return runUntil(W, sec, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242)
+end
+
+scenario("an unverified HUD click does not disarm unattended", UNATTENDED_FREEZE, function(W)
+  check("unverified-hud: the alert names the runaway", armedEpisode(W), true)
+  W.run(5)
+  W.probeFails = true
+  W.click("freeze")
+  W.run(6)
+  check("unverified-hud: nothing was signaled", W.signalsTo(4242), "")
+  W.probeFails = false
+  check("unverified-hud: unattended freezes once probes recover", freezesWithin(W, 120), "STOP")
+end)
+
+scenario("an unverified banner click does not disarm unattended", UNATTENDED_FREEZE, function(W)
+  check("unverified-banner: the alert names the runaway", armedEpisode(W), true)
+  W.run(8)
+  local b = W.liveBanners()[1]
+  check("unverified-banner: the banner offers Force Quit", b ~= nil and b.attrs.hasActionButton == true, true)
+  W.probeFails = true
+  if b then W.clickBanner(b) end
+  W.run(3)
+  check("unverified-banner: nothing was signaled", W.signalsTo(4242), "")
+  W.probeFails = false
+  check("unverified-banner: unattended freezes once probes recover", freezesWithin(W, 120), "STOP")
+end)
+
+scenario("an unverified menu click does not disarm unattended", UNATTENDED_FREEZE, function(W)
+  check("unverified-menu: the alert names the runaway", armedEpisode(W), true)
+  W.run(5)
+  local row = W.menuItem("leaker")
+  local freeze = row and row.menu and row.menu[1]
+  check("unverified-menu: the row offers Freeze", freeze ~= nil and freeze.disabled == nil, true)
+  W.probeFails = true
+  if freeze then freeze.fn() end
+  W.run(3)
+  check("unverified-menu: nothing was signaled", W.signalsTo(4242), "")
+  W.probeFails = false
+  check("unverified-menu: unattended freezes once probes recover", freezesWithin(W, 120), "STOP")
+end)
+
+scenario("a click whose signal went out still answers", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "leaker", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+  W.run(5)
+  -- The STOP goes out (and does nothing); its verifier's probe fails.
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  W.click("freeze")
+  W.run(1)
+  W.onSignal, W.probeFails = nil, false
+  W.run(120)
+  check("answered: the operator's STOP is the only signal", W.signalsTo(4242), "STOP")
+end)
+
+scenario("a click whose outcome never came back lapses", UNATTENDED_FREEZE, function(W)
+  check("lapse: the alert names the runaway", armedEpisode(W), true)
+  W.run(5)
+  W.killRaises = true               -- the TERM send itself fails
+  W.click("kill")
+  W.run(2)
+  W.killRaises = false
+  check("lapse: unattended freezes after the hold deadline", freezesWithin(W, 150), "STOP")
 end)
 
 -- (round 3) A banner Force Quit is the operator's answer: unattended does
@@ -942,10 +1212,116 @@ scenario("a toggle that cannot be saved says so", '{"unattended":"off","remoteSe
   check("toggle: the operator is told the setting lasts only until reload", said, true)
 end)
 
+-- ---- runs: a menu action's outcome belongs to the run that started it ----
+-- (round 4) The action finishes on its verified identity after a restart,
+-- but its outcome no longer routes to the alert: the new run's alert for
+-- the same process stays up.
+scenario("an earlier run's menu action leaves the new run's alert alone", nil, function(W, mw)
+  W.addProc(4242, "wedged", 2000, { unkillable = true, ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "wedged (pid") end)
+  W.run(5)
+  local row = W.menuItem("wedged")
+  local forceQuit = row and row.menu and row.menu[2]
+  check("runs: the row offers Force Quit", forceQuit ~= nil and forceQuit.disabled == nil, true)
+  forceQuit.fn()                    -- TERM now; KILL and the verdict seconds later
+  W.run(1)
+  mw.stop()
+  mw.start()
+  check("runs: the new run raises its own alert",
+    runUntil(W, 10, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end), true)
+  W.run(20)
+  check("runs: the earlier action still finished on its identity", W.signalsTo(4242), "TERM,KILL")
+  check("runs: its outcome did not take the new run's alert down", W.hudShowing(), true)
+end)
+
+-- (round 4) A menu action the process survives answers the HUD naming it
+-- the way the HUD's own action would: snoozed, back after the cooldown.
+scenario("a menu Force Quit the process survives snoozes its HUD", nil, function(W)
+  W.addProc(4242, "wedged", 2000, { unkillable = true, ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "wedged (pid") end)
+  W.run(5)
+  local row = W.menuItem("wedged")
+  row.menu[2].fn()
+  W.run(20)
+  check("survived: the HUD naming it is snoozed", W.hudShowing(), false)
+  check("survived: and comes back after the cooldown",
+    runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end), true)
+end)
+
+-- (round 4) A diagnostic at any level is a run boundary: an elevated
+-- self-test during a real critical episode ends that episode, so its banner
+-- and history do not outlive the run that posted them.
+scenario("an elevated self-test ends the live episode", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  check("elevated-test: the real episode has its banner",
+    runUntil(W, 40, function() return #W.liveBanners() == 1 end), true)
+  mw.test("elevated", 5)
+  check("elevated-test: the live episode's banner is withdrawn", #W.liveBanners(), 0)
+  check("elevated-test: and its history cleared", mw.debug().bannerRecords, 0)
+  check("elevated-test: the real episode posts afresh after the test",
+    runUntil(W, 60, function() return #W.liveBanners() == 1 end), true)
+end)
+
+-- (round 4) With the HUD closed, the menu's offender Force Quit acts on
+-- the banner's binding, as the banner's own button would: a same-name
+-- process that took the pid since is refused, and the refusal rebinds.
+scenario("the menu offender acts on the banner's binding", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(6)
+  local b = W.liveBanners()[1]
+  check("menu-banner: the banner is bound", b ~= nil and b.attrs.hasActionButton == true, true)
+  W.click("close")                  -- the HUD is down; the banner stays
+  W.reusePid(4242, "node", 9000)
+  W.grow(4242, 220)
+  W.run(6)                          -- a sample: a fresh offender table, unbound
+  local item = W.menuItem("Force Quit node")
+  check("menu-banner: the offender item is offered", item ~= nil and item.fn ~= nil, true)
+  item.fn()
+  W.run(2)
+  check("menu-banner: a pid reused since the banner bound is refused", W.signalsTo(4242), "")
+  item = W.menuItem("Force Quit node")
+  item.fn()
+  W.run(10)
+  check("menu-banner: once rebound, the next click acts", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
+end)
+
 -- ---- narratives: a hold that never ends is released ----
--- A fork that fails mid-action (here the kill itself) ends the narrative
--- without its last update. The alert must not stay frozen in that hold.
+-- A narrative whose next step never runs (the run loop stalls past its
+-- escalation) ends without its last update. The alert must not stay
+-- frozen in that hold.
 scenario("a stuck narrative hold is released", nil, function(W)
+  W.addProc(4242, "leaker", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.timersStall = true              -- the escalation after TERM never runs
+  W.click("kill")
+  W.timersStall = false
+  W.run(5)
+  check("hold: the narrative is stuck mid-action", W.hudBody():find("terminating", 1, true) ~= nil, true)
+  check("hold: the alert comes back to live numbers after the deadline",
+    runUntil(W, 60, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end), true)
+  W.click("kill")
+  W.run(20)
+  check("hold: and acts again", W.signalsTo(4242), "TERM,TERM,KILL")
+end)
+
+-- (round 4) A signal whose fork fails sent nothing: the action says so at
+-- once and ends, instead of holding the alert until the deadline.
+scenario("a signal that cannot be sent ends its narrative", nil, function(W)
   leaker(W, 4242)
   W.run(12)
   W.kern = 4
@@ -954,13 +1330,14 @@ scenario("a stuck narrative hold is released", nil, function(W)
   W.killRaises = true               -- the probe answers; the kill itself cannot fork
   W.click("kill")
   W.killRaises = false
-  W.run(5)
-  check("hold: the narrative is stuck mid-action", W.hudBody():find("terminating", 1, true) ~= nil, true)
-  check("hold: the alert comes back to live numbers after the deadline",
-    runUntil(W, 60, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end), true)
+  W.run(1)
+  check("send: the narrative says nothing was signaled",
+    W.hudBody():find("couldn't send TERM", 1, true) ~= nil, true)
+  check("send: the alert stands, back on live numbers well before the hold deadline",
+    runUntil(W, 10, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end), true)
   W.click("kill")
   W.run(10)
-  check("hold: and acts again", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
+  check("send: and the next click acts", W.signalsTo(4242), "TERM")
 end)
 
 -- ---- observation ledger: what was faced, and what became of it ----
@@ -1221,6 +1598,71 @@ scenario("an unconfirmed unattended freeze is announced", '{"unattended":"freeze
   check("unconfirmed: it says the result is unverified",
     n ~= nil and (n.attrs.informativeText or ""):find("can't verify", 1, true) ~= nil, true)
   W.probeFails = false
+end)
+
+-- ---- round 5: what round 4 found ----
+-- A ps killed mid-reply can leave the control row and a cut-off target
+-- line: that proves nothing, so nothing is concluded or signaled.
+scenario("a ps cut off by a signal is not an exit", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.probeSignaled = true
+  W.click("freeze")
+  W.run(8)
+  W.probeSignaled = false
+  check("cut-off: nothing was signaled", W.signalsTo(4242), "")
+  check("cut-off: the alert stands", W.hudShowing() and bodyNames(W, "leaker"), true)
+  W.click("freeze")
+  W.run(3)
+  check("cut-off: the retry acts", W.signalsTo(4242), "STOP")
+end)
+
+-- (round 4) An escalation probe that cannot run once is retried; a
+-- survivor that never got its KILL is not reported as unkillable.
+scenario("an unverifiable escalation is retried", nil, function(W)
+  W.addProc(4242, "stubborn", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "stubborn") end)
+  W.run(5)
+  W.onSignal = function(sig)
+    if sig == "TERM" then
+      W.probeFails = true
+      W.addTimer("after", 8, nil, function() W.probeFails = false end)
+    end
+  end
+  W.click("kill")
+  W.run(25)
+  W.onSignal = nil
+  check("escalate-retry: KILL went out once the probe answered", W.signalsTo(4242), "TERM,KILL")
+  check("escalate-retry: and it is gone", W.procs[4242] == nil, true)
+end)
+
+-- (round 4) A kill's verify that finds a newer process at the pid must not
+-- drop that process's own frozen-ledger entry.
+scenario("a kill never drops a newer process's ledger entry", nil, function(W)
+  W.addProc(4242, "node", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  W.click("kill")                   -- TERM to the first node (it ignores TERM)
+  W.run(2)
+  W.reusePid(4242, "node", 1000)    -- it exits; a newer node takes the pid
+  W.run(1)
+  local r
+  for _, it in ipairs(W.menuItems()) do
+    if type(it.title) == "string" and it.title:find("(pid 4242)", 1, true) and it.menu then r = it end
+  end
+  if r then r.menu[1].fn() end      -- the operator freezes the newer node
+  W.run(20)                         -- the first kill's escalate and verify run
+  check("newer-ledger: the newer node is frozen", W.procs[4242] and W.procs[4242].state, "T")
+  check("newer-ledger: and still listed under Frozen by memwatch", W.menuItem("   node") ~= nil, true)
 end)
 
 if fails == 0 then

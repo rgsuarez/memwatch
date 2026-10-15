@@ -56,7 +56,7 @@ M.cfg = {
     ignoreSec        = 1800, -- per-offender "Ignore 30 min"
     hudRaiseSec      = 60,   -- min seconds between HUD raises (a new offender preempts)
     autoKillGraceSec = 60,   -- HUD unanswered this long before auto-kill (if enabled)
-    frozenSweepSec   = 60,   -- calm-state frozen-ledger liveness sweep cadence
+    frozenSweepSec   = 60,   -- frozen-ledger liveness sweep cadence (every state)
   },
   -- Unattended action at critical + grace expiry. The deterministic
   -- autonomous layer (successor to autoKill), model-free and shipping in
@@ -391,14 +391,17 @@ end
 -- memwatch's own pid is always in the list as a positive control: without
 -- its row the probe did not run (a fork failed under pressure, or the reply
 -- is cut short), so nothing in the reply may be read as a process being
--- gone. Returns pid -> { pid, uid, state, lstart, comm }, or nil (unknown).
+-- gone. Every line must parse: one that does not is a reply cut off or
+-- garbled, and a missing row beside it proves nothing either. Returns
+-- pid -> { pid, uid, state, lstart, comm }, or nil (unknown).
 function M.parseProbeRows(out, selfPid)
   if type(out) ~= "string" then return nil end
   local rows = {}
   for line in out:gmatch("[^\n]+") do
-    local pid, uid, state, lstart, comm = line:match(
-      "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
-    if pid then
+    if line:match("%S") then
+      local pid, uid, state, lstart, comm = line:match(
+        "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
+      if not pid then return nil end
       pid = tonumber(pid)
       rows[pid] = { pid = pid, uid = tonumber(uid), state = state, lstart = lstart, comm = comm }
     end
@@ -414,6 +417,17 @@ function M.probeResult(rows, pid)
   local p = rows[pid]
   if p then return "present", p end
   return "absent"
+end
+
+-- May a signal go to a process memwatch recorded (ident: pid, lstart and
+-- optionally name), given a fresh probe of its pid (status, and the live
+-- start time and name)? Only when the probe saw it with the recorded start
+-- time (and name). A record without a start time, or a probe that could
+-- not tell, never allows a signal: the pid may hold another process.
+function M.identityHolds(ident, status, liveLstart, liveName)
+  if type(ident) ~= "table" or ident.lstart == nil then return false end
+  if status ~= "present" or liveLstart ~= ident.lstart then return false end
+  return ident.name == nil or M.sameName(liveName, ident.name)
 end
 
 -- A probed process is stopped (SIGSTOP): its state starts with T.

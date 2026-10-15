@@ -132,9 +132,10 @@ function F.new()
     local list = cmd:match("^/bin/ps %-p ([%d,]+) %-o pid=,uid=,state=,lstart=,comm=")
     if list then
       if W.probeFails then return "" end
-      local rows, seen = {}, {}
-      for ps in list:gmatch("%d+") do
-        local pid = tonumber(ps)
+      local rows, seen, order = {}, {}, {}
+      for ps in list:gmatch("%d+") do order[#order + 1] = tonumber(ps) end
+      table.sort(order)                -- ps lists processes in pid order
+      for _, pid in ipairs(order) do
         if not seen[pid] then
           seen[pid] = true
           local p = W.procs[pid]
@@ -246,16 +247,24 @@ function F.new()
   local hs = {
     -- forkRaises models io.popen itself failing (hs.execute then raises);
     -- killRaises fails only the signal sends, after the probes succeeded.
+    -- probeSignaled models a ps killed mid-reply: its partial output, and
+    -- hs.execute's status saying a signal ended it.
     execute = function(cmd)
       if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill")) then
         error("fork: Resource temporarily unavailable")
       end
-      return exec(cmd), true
+      local out = exec(cmd)
+      if W.probeSignaled and cmd:find("^/bin/ps %-p") then
+        return out:sub(1, math.max(0, math.floor(#out / 2))), nil, "signal", 9
+      end
+      return out, true, "exit", 0
     end,
     processInfo = { processID = SELF_PID },
     timer = {
       secondsSinceEpoch = function() return W.now end,
-      doAfter = function(sec, fn) return addTimer("after", sec, nil, fn) end,
+      -- timersStall: a one-shot callback that never gets to run (a run loop
+      -- stalled past it), so a narrative waiting on it never finishes.
+      doAfter = function(sec, fn) return addTimer("after", W.timersStall and math.huge or sec, nil, fn) end,
       doEvery = function(iv, fn) return addTimer("every", iv, iv, fn) end,
       doUntil = function(pred, action, iv) return addTimer("until", iv or 1, iv or 1, action, pred) end,
     },
@@ -268,7 +277,9 @@ function F.new()
     task = { new = function(path, exitCb, streamCb)
       local t = { path = path }
       function t:start()
-        if path == "/bin/sh" then
+        -- psStarved: the sampler fork starts but never reports (the watchdog
+        -- relaunches it; a relaunch after psStarved clears reports again).
+        if path == "/bin/sh" and not W.psStarved then
           -- ps reads the table when it runs, at launch; a starved callback
           -- delivers that reading late (samplerDelay), as a real storm does.
           local blob = samplerBlob()
@@ -277,9 +288,27 @@ function F.new()
             exitCb(W.samplerExit or 0, "", "")   -- nonzero: ps failed or was cut off mid-table
           end)
         end
+        -- The streaming top: with topEmits set, one block every 5 s naming
+        -- each process the way top does (truncated at 16 characters).
+        if path == "/usr/bin/top" then
+          t.timer = addTimer("every", 5, 5, function()
+            if not W.topEmits or not streamCb then return end
+            local rows = { "  PID COMMAND          MEM    CMPRS" }
+            local pids = {}
+            for pid in pairs(W.procs) do pids[#pids + 1] = pid end
+            table.sort(pids)
+            for _, pid in ipairs(pids) do
+              local p = W.procs[pid]
+              local name = (p.comm:match("([^/]+)$") or p.comm):sub(1, 16)
+              rows[#rows + 1] = string.format("%5d %-16s %dM %dM", pid, name,
+                math.floor(p.rssKB / 1024), 0)
+            end
+            streamCb(t, table.concat(rows, "\n") .. "\n")
+          end)
+        end
         return t
       end
-      function t:terminate() end
+      function t:terminate() if t.timer then t.timer:stop() end end
       function t:isRunning() return false end
       function t:pid() return 9999 end
       return t

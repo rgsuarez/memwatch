@@ -72,18 +72,37 @@ the fact:
 | `stale` | the pid now holds a different process | rebind; the newcomer is a new question |
 | `refused` | the policy gate refused (protected, not ours) | snoozed |
 | `failed` | signaled, but it survived (did not stop, still present) | snoozed |
-| `unverified` | identity or result could not be verified | stands as it was: visible, unanswered, retryable |
+| `unconfirmed` | a signal went out, but its result could not be verified | stands as it was; announced |
+| `unverified` | nothing was signaled: the probe failed first, or the signal could not be sent | stands as it was: visible, unanswered, retryable |
+
+The answer applies whichever surface started the action: the HUD's own
+narrative, or a menu or banner action on the process the HUD names (a HUD
+held by a narrative of its own is left to that narrative).
 
 An answered process stops being a candidate by its own state, not by a note
 in a list: memwatch holds it frozen, it is gone, or it is ignored. Nothing
 else is remembered as "handled", so a process that is resumed, or that
 memwatch failed to stop, is alertable again.
 
+A frozen or gone mark is about one process, not a pid. It stops counting
+as soon as the pid shows a run of growth after the mark (a stopped process
+cannot grow, and an exited one makes no samples), or the process there has
+a different bound start time. Either way a newcomer holds the pid, and it
+is alertable at once, without waiting for the frozen-ledger sweep, which
+cannot run while probes fail. A freeze click answers "already frozen" only
+for the same process verified stopped; a freeze still being verified
+stands; a ledger entry for another start time is dropped and the newcomer
+is frozen.
+
 - **Close** is "not now": the same process returns after the raise cooldown,
   or at once if it escalates.
 - **Ignore 30m** puts the process on the ignore list for 30 minutes; it is no
   candidate for the HUD, the banner or the largest-process fallback while
-  the ignore lasts.
+  the ignore lasts. The ignore and gone lists key a process by its pid and
+  the first 15 characters of its name, so a name `top` truncated and the
+  full name `ps` reports later are one entry. The ignore carries no start
+  time: a same-name process that reuses the pid inside the window is
+  ignored too.
 - **Resume** returns a frozen process to the candidates.
 
 ## Grace and interaction
@@ -98,12 +117,22 @@ named, and a hog that escalates to `extreme` starts its clock then. Every
 raise (the HUD coming back after being down) starts all clocks over.
 
 An operator action on a process, from any surface, marks it answered for
-unattended purposes until the next raise. A click that did nothing (an
-unbound refusal, a self-test button) is not an answer. memwatch never
-retries a freeze or terminate that already failed on the same process.
+unattended purposes until the next raise. Ignore, close and opening
+Activity Monitor answer at once. A freeze or Force Quit answers when its
+outcome arrives: one that signaled nothing (`unverified`, the probe failed
+before any signal) is no answer, and one whose outcome never arrives stops
+counting at the hold deadline (45 seconds). A click that did nothing in
+any other way (an unbound refusal, a self-test button) is not an answer
+either. memwatch never retries a freeze or terminate that already failed
+on the same process.
 
-Receipts for unattended actions report what happened (frozen, terminated,
-refused, could not verify), and are posted when the action completes.
+Receipts for unattended actions say what happened and are posted when the
+action completes, even with desktop alerts muted: `frozen`, `terminated`,
+`failed` (it survived), or `unconfirmed` (a signal went out but its result
+could not be verified). An action whose result has not arrived by the hold
+deadline gets an `unconfirmed` receipt then. An action that signaled
+nothing (`unverified`, `refused`, `stale`, `exited`) is logged, not
+announced.
 
 ## Banners
 
@@ -115,14 +144,25 @@ whatever is up stays.
 
 ## Diagnostics
 
-`memwatch.test()` and `memwatch.simulate()` start a fresh episode with a
+`memwatch.test()` (at either level) and `memwatch.simulate()` end the live
+episode and start a fresh one; a critical test and a simulation show a
 synthetic offender: never bound, buttons inert, no banner action. Each run
 has its own generation, so a later diagnostic, a stop or a restart orphans
 an earlier one's resume, and an action narrative from an earlier run does
-nothing when it completes.
+nothing to the new run's alert when it completes. The signal engine itself
+finishes an action it started on a verified identity (a Force Quit's KILL
+still goes to the process it verified), and a verified exit is kept: both
+are facts about the process, not about the episode.
 
 ## Held pollers
 
 A poller whose predicate errors continuously for two minutes gives up
 explicitly: the give-up is logged and handled by its owner (the LFM health
 poll retires the server and latches it offline), never treated as success.
+
+The LFM server is signaled (TERM or KILL, on retire, or as a crash orphan
+at the next start) only while its pid holds the process recorded when it
+started: the same start time and name, from a probe that answered. With no
+recorded start time, the pid itself gets no signal; only the task handle
+and a port listener verified as an llama-server on memwatch's model
+directory are signaled.

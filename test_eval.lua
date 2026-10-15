@@ -239,6 +239,20 @@ do
   check("tau sweep: and keeps the confident savable waits", best.wrongful, 0)
 end
 
+-- ---- the time-to-exhaustion baseline ----
+do
+  local function st(avail, slope)
+    return { t = 0, snapshot = { availPct = avail, offender = { name = "x", slopeMBmin = slope, peakSlopeMBmin = slope } } }
+  end
+  -- (20 - 5)% of 36864 MB = 5529.6 MB at 9000 MB/min -> 36.9 s
+  check("ttx: projects time to the floor", math.abs(sc.ttxSec(st(20, 9000)) - 5529.6 / 9000 * 60) < 1e-6, true)
+  local ttx = sc.candidates.ttx()
+  check("ttx: a fast grower with little room is frozen", (ttx(st(20, 9000))), "freeze")
+  check("ttx: a slow grower with room waits", (ttx(st(40, 1000))), "wait")
+  check("ttx: a process holding the machine at the starvation line is frozen", (ttx(st(7, 0))), "freeze")
+  check("ttx: no growth with room waits", (ttx(st(30, 0))), "wait")
+end
+
 -- ---- field-weighted diagnostic ----
 do
   local s = { perCategory = {

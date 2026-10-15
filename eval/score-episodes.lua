@@ -24,7 +24,7 @@
 --   lua eval/score-episodes.lua tau --dir <dev episodes> --decisions <rows.jsonl> [--key <key.json>]
 --   gate also takes --prevalence <weights.json> ({ category = count } from field
 --   decisions) for a field-weighted diagnostic beside the pre-registered gate.
--- Candidates: always-freeze | never-act | rule | tree | oracle | noisy-oracle |
+-- Candidates: always-freeze | never-act | rule | ttx | tree | oracle | noisy-oracle |
 --   decisions (recorded model decisions, --decisions <rows.jsonl> [--key] --tau <x>)
 
 package.path = "lua/?.lua;eval/?.lua;" .. package.path
@@ -42,6 +42,10 @@ M.cfg = {
   powerShare   = 0.50,   -- the power control's share of the oracle's improvement
   powerTarget  = 0.80,
   ruleMinAvail = 12,   -- the category rule waits only with at least this much headroom
+  totalMB      = 36864, -- the deployment machine, for the time-to-exhaustion baseline
+  floorPct     = 5,     -- exhaustion, as the labels define it
+  starvePct    = 8,     -- the starvation line, as the labels define it
+  ttxHorizonSec = 180,  -- freeze when exhaustion is projected sooner than this
 }
 
 ------------------------------------------------------------------------------
@@ -218,6 +222,30 @@ M.candidates["rule"] = function()
       if st.t == 0 or f.slopeRatio < 0.5 then return "wait", 0.2 end
     end
     return "freeze", 0.9
+  end
+end
+
+-- A physics baseline with nothing fitted: project the time until the
+-- machine reaches the exhaustion floor at the offender's current growth,
+-- and freeze when that comes sooner than the horizon (the deferral bound
+-- plus a decision step), or when a plateaued process holds the machine at
+-- the starvation line. Unlike the tree it learns nothing from templates, so
+-- it cannot borrow the headroom ranges a template designer happened to use.
+function M.ttxSec(st, cfg)
+  cfg = cfg or M.cfg
+  local f = M.features(st)
+  local room = (f.availPct - cfg.floorPct) / 100 * cfg.totalMB
+  if room <= 0 then return 0 end
+  if f.slopeMBmin <= 0 then return math.huge end
+  return room / f.slopeMBmin * 60
+end
+M.candidates["ttx"] = function()
+  return function(st)
+    local f = M.features(st)
+    if f.availPct <= M.cfg.starvePct then return "freeze", 0.95 end
+    local ttx = M.ttxSec(st)
+    if ttx <= M.cfg.ttxHorizonSec then return "freeze", 0.9 end
+    return "wait", 0.2
   end
 end
 
@@ -572,6 +600,7 @@ local function baselineSet(fitEpisodes, depth)
   return {
     ["always-freeze"] = M.candidates["always-freeze"](),
     ["rule"] = M.candidates["rule"](),
+    ["ttx"] = M.candidates["ttx"](),
     ["tree"] = M.treeCandidate(tree),
   }, tree
 end

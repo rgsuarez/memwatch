@@ -22,6 +22,10 @@
 #   eval/checks/no-internal-refs.sh <file>...    # scan the named files only
 set -euo pipefail
 
+# This script's own directory, resolved before any cd: the local term list
+# lives beside it, wherever the script was invoked from.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # Named files are resolved BEFORE moving to the repository root, so a path
 # relative to the caller's directory scans the file the caller meant; a
 # named file that cannot be read is a refusal, never a clean pass.
@@ -34,7 +38,8 @@ for f in "$@"; do
   NAMED+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")")
 done
 
-cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$0")/" 2>/dev/null || true
+cd "$(git rev-parse --show-toplevel 2>/dev/null || echo "$SCRIPT_DIR")/" 2>/dev/null || true
+ROOT="$(pwd)"
 
 # Internal-reference patterns. STRUCTURAL only, so this tracked script
 # carries no specific internal identifier: any Notion-style workspace UUID
@@ -50,12 +55,16 @@ PATTERNS=(
   'notion\.so|app\.notion\.com'
   'league:full'
 )
-LOCAL_TERMS="$(dirname "$0")/internal-terms.txt"
+LOCAL_TERMS="$SCRIPT_DIR/internal-terms.txt"
 if [ -f "$LOCAL_TERMS" ]; then
   effective=0
   # `|| [ -n "$pat" ]` keeps a final line that has no trailing newline.
+  # Each line is judged trimmed: an indented comment is a comment, and a
+  # padded term is the term (padding would make it unmatchable as written).
   while IFS= read -r pat || [ -n "$pat" ]; do
-    [[ "$pat" =~ ^[[:space:]]*$ ]] && continue   # blank
+    pat="${pat#"${pat%%[![:space:]]*}"}"         # trim leading space
+    pat="${pat%"${pat##*[![:space:]]}"}"         # trim trailing space
+    [ -z "$pat" ] && continue                    # blank
     [ "${pat#\#}" != "$pat" ] && continue        # comment
     PATTERNS+=("$pat")
     effective=$((effective + 1))
@@ -82,7 +91,7 @@ for pat in "${PATTERNS[@]}"; do
   rc=0
   grep -E -e "$pat" /dev/null >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ge 2 ]; then
-    echo "no-internal-refs: a pattern does not compile; refusing" >&2
+    echo "no-internal-refs: pattern '$pat' does not compile; refusing" >&2
     exit 2
   fi
 done
@@ -101,12 +110,14 @@ scan_file() {
   for pat in "${PATTERNS[@]}"; do
     # grep -q itself, never a pipe: under pipefail a pipe into head turns a
     # large match set into SIGPIPE, which would read as no match. 0 is a
-    # match, 1 none, anything else a file that could not be scanned.
+    # match, 1 none, anything else a file that could not be scanned. -a reads
+    # a binary file as text: a NUL byte must not hide a term (the exempt
+    # binary classes are skipped above).
     local rc=0
-    grep -IqE -e "$pat" -- "$f" 2>/dev/null || rc=$?
+    grep -aqE -e "$pat" -- "$f" 2>/dev/null || rc=$?
     if [ "$rc" -eq 0 ]; then
       echo "INTERNAL-REF: pattern '$pat' in $f:" >&2
-      { grep -InE -e "$pat" -- "$f" 2>/dev/null || true; } | head -3 >&2 || true
+      { grep -anE -e "$pat" -- "$f" 2>/dev/null || true; } | head -3 >&2 || true
       fail=1
     elif [ "$rc" -ge 2 ]; then
       echo "no-internal-refs: could not scan $f; refusing" >&2
@@ -115,8 +126,30 @@ scan_file() {
   done
 }
 
+# Runtime and internal-only artifacts never leave the machine, whatever
+# they hold: the same classes the tracked-tree check below refuses, by name
+# anywhere, and by repository path inside this tree.
+internal_artifact() {
+  local f="$1" rel="$1"
+  case "$f" in "$ROOT"/*) rel="${f#"$ROOT"/}" ;; esac
+  case "$(basename "$f")" in
+    memwatch-lfm.jsonl*|memwatch-observe.jsonl*|memwatch-frozen.json*|memwatch-local.json*|memwatch.log*) return 0 ;;
+  esac
+  case "$rel" in
+    models/*.gguf|eval/results/*|eval/tmp/*|eval/panel/*|reports/*) return 0 ;;
+  esac
+  return 1
+}
+
 if [ "${#NAMED[@]}" -gt 0 ]; then
-  for f in "${NAMED[@]}"; do scan_file "$f"; done
+  for f in "${NAMED[@]}"; do
+    if internal_artifact "$f"; then
+      echo "INTERNAL-ARTIFACT (must not leave the machine): $f" >&2
+      fail=1
+      continue
+    fi
+    scan_file "$f"
+  done
 else
   # Tracked-tree scan, plus tracked-path class assertions: runtime and
   # internal-only artifacts must never be tracked. A tree scan that finds

@@ -108,6 +108,48 @@ expect_named 1 "named: a relative path is scanned where the caller stands" "$tmp
 printf 'plain draft\n' > "$tmp/outside/draft.md"
 expect_named 0 "named: a clean named file passes" "$tmp/outside" "draft.md"
 
+# (round 3) Comments and padding are judged after trimming: an indented
+# comment is no term, and a padded term is the term.
+printf '  # indented comment\n\t# tab-indented comment\n' > "$terms"
+expect 2 "terms with only indented comments: refused"
+printf '  %s  \n' "$term" > "$terms"
+printf 'carries %s here\n' "$term" > "$tmp/probe.txt"
+expect 1 "a padded term still matches (positive control)"
+printf '%s\n' "$term" > "$terms"
+clean
+
+# (round 3) A binary file outside the exempt classes is scanned as text: a
+# NUL byte must not hide a term.
+printf 'bin\0carries %s\n' "$term" > "$tmp/blob.dat"
+git -C "$tmp" add -f blob.dat
+expect 1 "a tracked binary carrying a term fails"
+git -C "$tmp" rm -q --cached blob.dat
+rm -f "$tmp/blob.dat"
+
+# (round 3) A named runtime ledger is refused by its path, whatever it holds.
+printf '{"seq":1}\n' > "$tmp/outside/memwatch-observe.jsonl"
+expect_named 1 "named: a runtime ledger is refused even when its content is clean" "$tmp/outside" "memwatch-observe.jsonl"
+rm -f "$tmp/outside/memwatch-observe.jsonl"
+
+# (round 3) Run from its own directory, the script still finds its term list.
+got=0
+(cd "$tmp/eval/checks" && env -u MEMWATCH_PUBLIC_CLONE bash ./no-internal-refs.sh) >/dev/null 2>&1 || got=$?
+if [ "$got" -eq 0 ]; then echo "ok    from eval/checks: the term list is found"; else echo "FAIL  from eval/checks: the term list is found got=$got want=0"; fails=$((fails + 1)); fi
+printf 'carries %s here\n' "$term" > "$tmp/probe.txt"
+got=0
+(cd "$tmp/eval/checks" && env -u MEMWATCH_PUBLIC_CLONE bash ./no-internal-refs.sh) >/dev/null 2>&1 || got=$?
+if [ "$got" -eq 1 ]; then echo "ok    from eval/checks: a planted term fails (positive control)"; else echo "FAIL  from eval/checks: a planted term fails got=$got want=1"; fails=$((fails + 1)); fi
+clean
+
+# (round 3) A refusal for a pattern that does not compile names it.
+printf '%s\n' 'acme[prod' > "$terms"
+said="$( (cd "$tmp" && env -u MEMWATCH_PUBLIC_CLONE bash "$fw") 2>&1 >/dev/null || true)"
+case "$said" in
+  *"acme[prod"*) echo "ok    a pattern that does not compile is named" ;;
+  *) echo "FAIL  a pattern that does not compile is named"; fails=$((fails + 1)) ;;
+esac
+printf '%s\n' "$term" > "$terms"
+
 # Not a git tree: a tree scan that finds no files is blind, not clean.
 notgit="$(mktemp -d)"
 mkdir -p "$notgit/eval/checks"

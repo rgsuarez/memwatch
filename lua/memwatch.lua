@@ -73,7 +73,7 @@ local lfmOffline     = false  -- timeout/self-police latch; clears at an elevate
 local lfmCalmSince   = nil    -- retire-on-calm bookkeeping
 local lfmLastAdvisoryAt = 0
 local lfmReqNonce    = 0      -- monotonic request generation
-local lfmInFlight    = nil    -- { nonce, pid, hash, at, ident }
+local lfmInFlight    = nil    -- { nonce, pid, hash, at } of the request in flight
 local lfmRemoteKey   = nil    -- bearer key for the remote adjudicator (never logged)
 local lfmRemoteCooldownUntil = 0 -- F1: remote backoff deadline (retry, not hard latch)
 local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident, kind, snapshot }
@@ -2064,7 +2064,7 @@ local function dispatchAdjudication(offender, why)
   local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart }
   local pid = offender.pid
   local sentAt = hs.timer.secondsSinceEpoch()
-  lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt, kind = offender.kind }
+  lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
   M.logSnapshot(string.format("lfm-dispatch:%s:%s(%d):nonce=%d", why, ident.name, pid, nonce))
   hs.http.asyncPost(
     remote and (lfm.cfg.remoteServer .. "/v1/chat/completions")

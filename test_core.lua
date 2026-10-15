@@ -1559,17 +1559,30 @@ do
 end
 
 -- ---- glue pins: the live path must use the predicates above ----
+-- Positive pins are exact occurrence counts, not mere presence: they pin
+-- every call site, so the zero-count negative pins beside them can never
+-- pass vacuously.
 do
   local f = assert(io.open("lua/memwatch.lua", "r"))
   local src = f:read("a")
   f:close()
-  check("glue: consumeVerdict uses verdictUsable",
-    src:find("if not lfm.verdictUsable(e, offender,", 1, true) ~= nil, true)
+  local function count(text, needle)
+    local n, i = 0, 1
+    while true do
+      local a, z = text:find(needle, i, true)
+      if not a then return n end
+      n, i = n + 1, z + 1
+    end
+  end
+  check("glue: the counter sees every occurrence (positive control)", count("ab x ab", "ab"), 2)
+  check("glue: consumeVerdict uses verdictUsable", count(src, "if not lfm.verdictUsable(e, offender,"), 1)
   check("glue: dispatch freshness uses verdictUsable",
-    src:find("local fresh = lfm.verdictUsable(cached, lastOffender,", 1, true) ~= nil, true)
+    count(src, "local fresh = lfm.verdictUsable(cached, lastOffender,"), 1)
+  check("glue: verdictUsable has exactly those two call sites", count(src, "lfm.verdictUsable("), 2)
   check("glue: wait deferral is time-bound",
-    src:find("lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)", 1, true) ~= nil, true)
-  check("glue: no wait counter bound remains", src:find("streak >= 3", 1, true), nil)
+    count(src, "lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)"), 1)
+  check("glue: the deferral step is the only deferral call", count(src, "lfm.deferral"), 1)
+  check("glue: no wait counter bound remains", count(src, "streak >= 3"), 0)
   -- The deferral clock is the decision tick's: passed in, never re-read
   -- after the probe forks inside the decision.
   local function fnBody(header)
@@ -1579,9 +1592,9 @@ do
   end
   local resolveBody = fnBody("resolveUnattendedAction = function(mode, offender, now)")
   check("glue: resolveUnattendedAction takes the tick's clock", #resolveBody > 500, true)
-  check("glue: the decision passes the tick's clock",
-    src:find("resolveUnattendedAction(mode, offender, now)", 1, true) ~= nil, true)
-  check("glue: the decision never re-reads the clock", resolveBody:find("secondsSinceEpoch", 1, true), nil)
+  check("glue: the decision passes the tick's clock", count(src, "resolveUnattendedAction(mode, offender, now)"), 1)
+  check("glue: that decision is the only caller", count(src, "resolveUnattendedAction("), 1)
+  check("glue: the decision never re-reads the clock", count(resolveBody, "secondsSinceEpoch"), 0)
   -- Absent pids are pruned only after a fresh, complete sample; signal
   -- records age out first, whatever the sampler is doing.
   local function prunesOnlyWhenFresh(text)
@@ -1595,11 +1608,15 @@ do
       .. "if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end\n"), false)
   check("glue: absent pids are pruned only after a fresh, complete sample",
     prunesOnlyWhenFresh(fnBody("gcUnattendedState = function(now)")), true)
-  check("glue: cache entries record the dispatch kind",
-    src:find("kind = offender.kind, snapshot = user,", 1, true) ~= nil, true)
-  check("glue: names redacted on both paths",
-    src:find("lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })", 1, true) ~= nil, true)
-  check("glue: no remote-only redaction remains", src:find("redactNames = remote and", 1, true), nil)
+  check("glue: cache entries record the dispatch kind", count(src, "kind = offender.kind, snapshot = user,"), 1)
+  check("glue: names redacted on every serialize call",
+    count(src, "lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })"), 3)
+  check("glue: every serialize call is the redacted form", count(src, "lfm.serializeSnapshot("), 3)
+  check("glue: no remote-only redaction remains", count(src, "redactNames = remote and"), 0)
+  check("glue: the in-flight record is exactly { nonce, pid, hash, at }",
+    count(src, "lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }"), 1)
+  check("glue: the in-flight record is built in one place", count(src, "lfmInFlight = {"), 1)
+  check("lfm: names are redacted by default", lfm.cfg.redactNames, true)
 end
 
 if fails == 0 then

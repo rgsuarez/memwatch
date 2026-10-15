@@ -1088,6 +1088,44 @@ do
   check("systemone parse: non-JSON is refused", (lfm.parseSystemOne("not json")), nil)
   check("systemone parse: empty is refused", (lfm.parseSystemOne("")), nil)
   check("systemone parse: oversized is refused", (lfm.parseSystemOne(("x"):rep(70000))), nil)
+
+  -- Token-probability confidence (/completion with raw n_probs): the value
+  -- of "action" begins right after the key's ":" token, and its first token
+  -- tells the options apart.
+  local cb = lfm.jsonDecode(lfm.completionBody("PROMPT"))
+  check("tokenprob body: raw probabilities, never post-sampling", cb.post_sampling_probs, false)
+  check("tokenprob body: temperature 0", cb.temperature, 0)
+  check("tokenprob body: the verdict schema as a grammar", cb.json_schema and cb.json_schema.properties.action ~= nil, true)
+  check("tokenprob body: top probabilities requested", cb.n_probs, 10)
+  local function pos(tok, cands)
+    local tl = {}
+    for _, c in ipairs(cands or {}) do tl[#tl + 1] = { token = c[1], logprob = math.log(c[2]) } end
+    return { token = tok, logprob = 0, top_logprobs = lfm.jsonArray(tl) }
+  end
+  local function tpReply(valueTok, cands, keyToks)
+    local ps = {}
+    for _, t in ipairs(keyToks or { '{"', "action", '":"' }) do ps[#ps + 1] = pos(t, { { t, 0.99 } }) end
+    ps[#ps + 1] = pos(valueTok, cands)
+    ps[#ps + 1] = pos('","', { { '","', 0.99 } })
+    return lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray(ps) })
+  end
+  local tv = lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.994 }, { "free", 0.005 }, { "termin", 0.0005 } }))
+  check("tokenprob parse: the chosen option", tv and tv.action, "wait")
+  check("tokenprob parse: P(wait) renormalized over the options",
+    tv ~= nil and math.abs(tv.pWait - 0.994 / 0.9995) < 1e-6, true)
+  check("tokenprob parse: freeze from its first token",
+    (lfm.parseTokenProbs(tpReply("free", { { "free", 0.7 }, { "wait", 0.3 } })) or {}).action, "freeze")
+  check("tokenprob parse: terminate from its first token",
+    (lfm.parseTokenProbs(tpReply("termin", { { "termin", 0.6 }, { "free", 0.4 } })) or {}).action, "terminate")
+  check("tokenprob parse: the key split differently still finds the value",
+    (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.9 }, { "free", 0.1 } }, { '{"', 'act', 'ion', '":', '"' })) or {}).action, "wait")
+  check("tokenprob parse: options carrying too little probability are refused",
+    (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.2 }, { "maybe", 0.7 } }))), nil)
+  check("tokenprob parse: a reply without the action value is refused",
+    (lfm.parseTokenProbs(lfm.jsonEncode({ completion_probabilities = lfm.jsonArray({ pos("x", { { "x", 1 } }) }) }))), nil)
+  check("tokenprob parse: no probabilities is refused", (lfm.parseTokenProbs('{"content":"x"}')), nil)
+  check("tokenprob parse: non-JSON is refused", (lfm.parseTokenProbs("nope")), nil)
+  check("tokenprob parse: oversized is refused", (lfm.parseTokenProbs(("x"):rep(70000))), nil)
 end
 
 if fails == 0 then

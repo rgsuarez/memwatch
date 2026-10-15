@@ -682,6 +682,71 @@ function M.parseSystemOne(text)
            confidence = type(answer.confidence) == "number" and answer.confidence or nil }
 end
 
+-- A /completion request for token-probability confidence: the chat prompt
+-- as the server's own template renders it (/apply-template), the verdict
+-- schema as a grammar, temperature 0, and the top nProbs RAW token
+-- probabilities at every position. Post-sampling probabilities are
+-- degenerate at temperature 0 (the chosen token at p = 1), so they are
+-- never requested.
+function M.completionBody(prompt, opts)
+  opts = opts or {}
+  return M.jsonEncode({
+    prompt = prompt, temperature = 0, n_predict = opts.maxTokens or 128,
+    n_probs = opts.nProbs or 10, post_sampling_probs = false, cache_prompt = true,
+    json_schema = M.OUTPUT_SCHEMA,
+  })
+end
+
+local OPTION_PREFIX = { { "wait", "wait" }, { "free", "freeze" }, { "termin", "terminate" } }
+local function optionOf(tok)
+  if type(tok) ~= "string" then return nil end
+  tok = tok:gsub("^%s+", "")
+  for _, op in ipairs(OPTION_PREFIX) do
+    if tok:sub(1, #op[1]) == op[1] or op[1]:sub(1, #tok) == tok and #tok >= 3 then return op[2] end
+  end
+  return nil
+end
+
+-- P(wait) from a /completion reply's token probabilities. The value of
+-- "action" starts right after the key's ":" token, and its first token alone
+-- tells the options apart ("wait", "free..." for freeze, "termin..." for
+-- terminate), so the three options' probabilities there, renormalized over
+-- the options, are the model's own distribution over the decision. Bounded
+-- by the decoder (64 KB, depth 8). Returns { action, pWait, pFreeze,
+-- pTerminate, mass } or nil, err.
+function M.parseTokenProbs(text)
+  if type(text) ~= "string" or text == "" then return nil, "tokenprob: empty reply" end
+  local doc, err = M.jsonDecode(text)
+  if type(doc) ~= "table" then return nil, "tokenprob: " .. tostring(err) end
+  local positions = doc.completion_probabilities
+  if type(positions) ~= "table" then return nil, "tokenprob: no token probabilities" end
+  local seen, at = "", nil
+  for i, pos in ipairs(positions) do
+    if type(pos) ~= "table" or type(pos.token) ~= "string" then
+      return nil, "tokenprob: malformed position"
+    end
+    seen = seen .. pos.token
+    if seen:find('"action"%s*:%s*"$') then at = positions[i + 1]; break end
+    if #seen > 256 then break end
+  end
+  if type(at) ~= "table" then return nil, "tokenprob: no action value" end
+  local cands = at.top_logprobs or at.top_probs
+  if type(cands) ~= "table" then return nil, "tokenprob: no candidates at the action value" end
+  local p = { wait = 0, freeze = 0, terminate = 0 }
+  for _, c in ipairs(cands) do
+    local op = type(c) == "table" and optionOf(c.token) or nil
+    local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
+      or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
+    if op and pr and pr >= 0 then p[op] = p[op] + pr end
+  end
+  local mass = p.wait + p.freeze + p.terminate
+  if mass < 0.5 then return nil, "tokenprob: the options carry too little probability" end
+  local chosen = optionOf(at.token)
+  if not chosen then return nil, "tokenprob: the chosen token is not an option" end
+  return { action = chosen, pWait = p.wait / mass, pFreeze = p.freeze / mass,
+           pTerminate = p.terminate / mass, mass = mass }
+end
+
 ------------------------------------------------------------------------------
 -- Request body: chat-completions with temperature 0 and server-side
 -- constrained decoding (response_format json_schema). The exact

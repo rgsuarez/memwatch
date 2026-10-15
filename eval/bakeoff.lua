@@ -387,9 +387,12 @@ end
 -- freeze (no model holds terminate authority; the freeze ceiling caps it);
 -- an invalid reply records the deterministic freeze. Chat verdicts carry no
 -- P(wait) (a self-reported confidence never qualifies for the wait rail);
--- decision models carry their option probability.
+-- decision models carry their option probability, and --api completion
+-- reads a local model's own token probability for the action value (the
+-- server's /apply-template renders the chat prompt, then /completion with
+-- raw n_probs; see lfm.parseTokenProbs).
 --   lua eval/bakeoff.lua episodes --server URL --label NAME --dir <episodes>
---     [--api chat|systemone] [--variant discriminate] [--model M]
+--     [--api chat|systemone|completion] [--variant discriminate] [--model M]
 --     [--api-key-env VAR] [--timeout 60] [--max-tokens 128] [--out rows.jsonl]
 ------------------------------------------------------------------------------
 
@@ -398,7 +401,8 @@ local function episodesMode(args)
   local label = assert(args.label, "--label required")
   local dir = assert(args.dir, "--dir <episodes> required")
   local api = args.api or "chat"
-  assert(api == "chat" or api == "systemone", "--api must be chat or systemone")
+  assert(api == "chat" or api == "systemone" or api == "completion",
+    "--api must be chat, systemone or completion")
   local variant = args.variant or "discriminate"
   local out = args.out or string.format("eval/results/episodes-%s-%s.jsonl", label, api)
   local timeout = tonumber(args.timeout) or 60
@@ -409,27 +413,48 @@ local function episodesMode(args)
   local tag = (label .. "-" .. api .. "-" .. tostring(os.time())):gsub("[^%w%-]", "_")
   local reqPath = "eval/tmp/ereq-" .. tag .. ".json"
   local respPath = "eval/tmp/eresp-" .. tag .. ".json"
-  local url = server .. (api == "systemone" and "/v1/systemone" or "/v1/chat/completions")
+  local url = server .. ((api == "systemone") and "/v1/systemone"
+    or (api == "completion") and "/completion" or "/v1/chat/completions")
+  local tmplPath = "eval/tmp/etmpl-" .. tag .. ".json"
   local n, valid = 0, 0
   withAuthHeader(readKey(args), function(hdr)
     local of = assert(io.open(out, "w"))
     for _, fname in ipairs(files) do
       local ep = assert(lfm.jsonDecode(readFile(dir .. "/" .. fname)))
       for _, st in ipairs(ep.steps) do
-        local body
+        local body, tmplMs
         if api == "systemone" then
           body = assert(lfm.systemOneBody(st.snapshot, { model = args.model }))
+        elseif api == "completion" then
+          local user = assert(lfm.serializeSnapshot(st.snapshot, { redactNames = lfm.cfg.redactNames }))
+          local msgs = assert(lfm.jsonEncode({ messages = lfm.jsonArray({
+            { role = "system", content = systemPrompt }, { role = "user", content = user } }) }))
+          local tmpl
+          tmpl, tmplMs = postJson(server .. "/apply-template", msgs, reqPath, tmplPath, hdr, timeout)
+          local doc = lfm.jsonDecode(tmpl)
+          body = (type(doc) == "table" and type(doc.prompt) == "string")
+            and assert(lfm.completionBody(doc.prompt, { maxTokens = tonumber(args.max_tokens) or 128 }))
+            or nil
         else
           local user = assert(lfm.serializeSnapshot(st.snapshot, { redactNames = lfm.cfg.redactNames }))
           body = assert(lfm.buildRequestBody(systemPrompt, user, {
             maxTokens = tonumber(args.max_tokens) or 128, schema = true, model = args.model,
             temperature = tonumber(args.temperature) }))
         end
-        local resp, wallMs = postJson(url, body, reqPath, respPath, hdr, timeout)
+        local resp, wallMs = "", -1
+        if body then resp, wallMs = postJson(url, body, reqPath, respPath, hdr, timeout) end
         local action, pWait, err
         if api == "systemone" then
           local v, perr = lfm.parseSystemOne(resp)
           if v then action, pWait = v.action, v.pWait else err = perr end
+        elseif api == "completion" then
+          local v, perr = body and lfm.parseTokenProbs(resp)
+          if v then
+            action, pWait = (v.action == "wait") and "wait" or "freeze", v.pWait
+          else
+            err = body and perr or "apply-template failed"
+          end
+          if wallMs >= 0 and tmplMs and tmplMs >= 0 then wallMs = wallMs + tmplMs end
         else
           local raw, perr = lfm.parseResponse(resp)
           local v = raw and lfm.validateVerdict(raw) or nil
@@ -446,6 +471,7 @@ local function episodesMode(args)
   end)
   os.remove(reqPath)
   os.remove(respPath)
+  os.remove(tmplPath)
   io.write(string.format("%s/%s: %d decision points, %d valid -> %s\n", label, api, n, valid, out))
 end
 

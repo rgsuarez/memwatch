@@ -49,6 +49,17 @@ The model is an advisor inside hard rails, never an autonomous authority.
   now sees. A verdict about a large, steady bystander is never applied to
   the same process after it has been caught in a runaway; the offender is
   re-adjudicated instead. Entries without a recorded kind are never used.
+- **A verdict is filed only under its own process.** The snapshot is built
+  from the tracker's data for a pid, and the request is skipped when the
+  probed process is provably not the one that data came from (a pid taken
+  over since the last sample). A verdict whose process cannot be tied to its
+  snapshot (a process too young for its start window, or one only the top
+  stream has named that no alert has bound yet) is asked and logged, but
+  never drives a decision, in any mode: the deterministic policy acts. It is
+  not counted as fresh, so the offender is asked again once the alert has
+  bound it.
+- **A clock stepped back never extends a wait.** A verdict or a first model
+  wait stamped after now reads as stale, or as spent.
 - **A model wait is bounded in time.** A model wait defers the
   deterministic policy, but only for `maxDeferSec` (120 s by default)
   from the first wait on that offender; after that the deterministic

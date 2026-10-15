@@ -219,7 +219,7 @@ The observed process's identity is the start window of its latest process
 sample; for a process only the streaming top has named (the process
 sampler stalled), the start time the alert bound to it, unless that time
 falls in the hour a daylight-saving fold repeats. Each row says which in
-`identityBasis` (`window` or `lstart`; absent when it had neither, so its
+`identityBasis` (`window`, `lstart`, or `none`, when it had neither, so its
 follow-ups can only read `unknown` or `exited`). A process table counts as
 whole, so that a process missing from it has exited, only when the sampler
 exited cleanly and the table lists memwatch's own process.
@@ -237,21 +237,23 @@ The fate is one of:
   but the frozen ledger's entry for its pid cannot be told apart from
   another process), or `clock-step` (the wall clock stepped back after the
   observation, so nothing in its record can be placed before or after a
-  horizon; such follow-ups carry no readings).
+  horizon; such follow-ups carry no readings, and an exit proven before the
+  step still reads `exited`). The reason is the one known by the horizon.
 
 Each follow-up also carries:
-- the weight at the horizon, and `peakSinceMB` through it (kept even if the
-  process leaves the tracker);
+- the weight at the horizon (a reading delivered within 15 s of it), and
+  `peakSinceMB` through it (kept even if the process leaves the tracker);
 - `sampleAgeSec`, the horizon's distance from the freshest sighting
   (negative when that sighting came after the horizon);
 - available memory and state as of the horizon, from the last tick at or
   within 15 s before it (absent when ticks had stalled), and kernel jetsam
   reports by file time;
 - `frozenLedger` as of the horizon (absent when it cannot be told);
-- `operatorActionsSince` (any operator action) and `operatorTouchesSince`
-  (actions on this process), through the horizon; `operatorTouchesUncertain`
-  counts actions whose process could not be told apart from a newcomer on
-  the pid;
+- `operatorActionsSince` (any menu, HUD or banner action) and
+  `operatorTouchesSince` (actions on this process), through the horizon;
+  `operatorTouchesUncertain` counts actions whose process could not be told
+  apart from a newcomer on the pid, and `operatorActionsDropped` says the
+  count is a lower bound (a record keeps at most 256 action times);
 - `memwatchSignalSince`, the last signal memwatch itself sent to this
   process by the horizon: `freeze` (a STOP, including one sent again after a
   quit could not be), `continue` (the CONT a quit sends a frozen process
@@ -264,7 +266,8 @@ window (a young process, or a stalled sample) the match is uncertain.
 
 Pending follow-ups do not survive a reload. A record whose follow-up
 timers never run (a stalled run loop) stops collecting ten minutes after its
-last horizon. A rotation that cannot finish is counted as an error, and past
+last horizon; it keeps each horizon's machine reading, so a follow-up that
+runs later still reports it. A rotation that cannot finish is counted as an error, and past
 twice the 4 MB cap rows are refused rather than written.
 
 It never forks, never acts and never leaves the machine. It exists so that

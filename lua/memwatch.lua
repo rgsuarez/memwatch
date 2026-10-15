@@ -152,6 +152,7 @@ local obs = {
   -- time, which tells a clock stepped back.
   ticks      = {},
   lastTickAt = nil,
+  lastTickMono = nil,
   path       = os.getenv("HOME") .. "/projects/memwatch/memwatch-observe.jsonl",
   jetsamDir  = "/Library/Logs/DiagnosticReports",
 }
@@ -165,7 +166,7 @@ function obs.noteSignal(pid, action, proc)
   local ok, err = pcall(function()
     local sig = { action = action, at = hs.timer.secondsSinceEpoch(),
                   comm = proc and proc.comm or nil,
-                  startEpoch = proc and observe.lstartEpoch(proc.lstart) or nil }
+                  startEpoch = proc and observe.lstartEpochUnambiguous(proc.lstart) or nil }
     for _, ev in pairs(obs.pending) do
       if ev.pid == pid then observe.foldSignal(ev, sig) end
     end
@@ -183,7 +184,7 @@ function obs.noteTouch(off)
     local comm = (e and e.comm and off.name and core.sameName(procs.friendlyName(e.comm), off.name))
       and e.comm or nil
     local t = { at = hs.timer.secondsSinceEpoch(), comm = comm,
-                startEpoch = observe.lstartEpoch(off.lstart) }
+                startEpoch = observe.lstartEpochUnambiguous(off.lstart) }
     for _, ev in pairs(obs.pending) do
       if ev.pid == off.pid then observe.foldTouch(ev, t) end
     end
@@ -219,23 +220,38 @@ function obs.noteFrozen()
   if not ok then M.logSnapshot("observe-frozen-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
 end
 
--- Each tick: log the machine's reading for the follow-ups, and tell a wall
--- clock stepped back (wake-time NTP, a VM resume) from the last tick. After
--- such a step no pending observation can place its events before or after
--- its horizons, so each one not already proven gone says so (clockStep)
--- rather than mix readings from both sides of the step.
-function obs.noteTick(now, availPct, state)
-  if obs.lastTickAt and now < obs.lastTickAt - observe.cfg.clockSlackSec then
-    for _, ev in pairs(obs.pending) do
-      if not ev.gone then ev.clockStep = true end
+-- Each tick: log the machine's reading for the follow-ups, keep each
+-- collecting record's horizon readings in the record, and tell a wall clock
+-- stepped back (wake-time NTP, a VM resume). The wall clock's advance is
+-- read against the monotonic clock's (mono, seconds since boot): one that
+-- advanced less than it, by more than clockStepSec, stepped back, at any
+-- size (a sleep only makes the wall advance more). After a step no
+-- collecting record can place what arrives against its horizons, so each
+-- one stops collecting and says so (clockStep), gone or not.
+function obs.noteTick(now, availPct, state, mono)
+  local stepped = false
+  if obs.lastTickAt then
+    if mono and obs.lastTickMono then
+      stepped = (now - obs.lastTickAt) < (mono - obs.lastTickMono) - observe.cfg.clockStepSec
+    else
+      stepped = now < obs.lastTickAt - observe.cfg.clockStepSec
     end
+  end
+  if stepped then
+    for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
     -- The cadence stamps from before the step re-base to it, so the
     -- advisory cadence and each process's decision window run on from here
     -- instead of waiting for the wall clock to catch up.
     obs.lastAt = math.min(obs.lastAt, now)
     for _, st in pairs(obs.decisionAt) do st.at = math.min(st.at, now) end
   end
-  obs.lastTickAt = now
+  obs.lastTickAt, obs.lastTickMono = now, mono
+  local log = obs.ticks
+  log[#log + 1] = { at = now, availPct = availPct, state = state }
+  -- Each collecting record keeps the readings of the horizons it has passed,
+  -- before it can expire and the log below be cut back: a follow-up that
+  -- runs later still reads its own horizon.
+  for _, ev in pairs(obs.pending) do observe.snapshotHorizons(ev, log, now) end
   -- A pending record whose follow-up timers never ran (a stalled run loop)
   -- stops collecting once it is far past its last horizon: its follow-ups
   -- read only up to their horizons, so nothing they need is lost, and
@@ -243,8 +259,6 @@ function obs.noteTick(now, availPct, state)
   for seq, ev in pairs(obs.pending) do
     if ev.expiresAt and now > ev.expiresAt then obs.pending[seq] = nil end
   end
-  local log = obs.ticks
-  log[#log + 1] = { at = now, availPct = availPct, state = state }
   -- Keep what a pending observation can still ask for: readings from its
   -- observation on (and the freshness window before it). With none
   -- pending, only this reading.
@@ -1270,17 +1284,17 @@ local function buildMenu()
   items[#items + 1] = { title = "Open Activity Monitor",
     fn = obs.byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) }
   items[#items + 1] = { title = "Log snapshot now",
-    fn = function() M.logSnapshot("manual") end }
+    fn = obs.byOperator(function() M.logSnapshot("manual") end) }
   items[#items + 1] = { title = string.format("Desktop alerts: %s", alertsEnabled and "on" or "off"),
-    fn = function() M.setAlertsEnabled(not alertsEnabled) end }
+    fn = obs.byOperator(function() M.setAlertsEnabled(not alertsEnabled) end) }
   items[#items + 1] = { title = string.format("LFM adjudication: %s",
       lfm.cfg.enabled
         and (lfmRemoteActive() and ("on (remote: " .. lfm.cfg.remoteModel .. ")")
              or (lfmServerReady and "on (warm)" or "on"))
         or "off"),
-    fn = function() M.setLfmEnabled(not lfm.cfg.enabled) end }
+    fn = obs.byOperator(function() M.setLfmEnabled(not lfm.cfg.enabled) end) }
   items[#items + 1] = { title = "Open value report",
-    fn = function() M.report() end }
+    fn = obs.byOperator(function() M.report() end) }
   return items
 end
 
@@ -1860,7 +1874,8 @@ local function alertSurfaces(state, now)
       obs.decisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,
                                           start = observe.startOf(decEntry) }
       local okObs, errObs = pcall(obs.writeObservation, "decision", offender, now,
-        { graceElapsedSec = decGrace and decGrace.sec or 0, lstart = hudOffender.lstart })
+        { graceElapsedSec = decGrace and decGrace.sec or 0,
+          lstart = (hudOffender and hudOffender.pid == offender.pid) and hudOffender.lstart or nil })
       if not okObs then logError("observe-decision", errObs) end
     end
     unattendedStep(offender, now)
@@ -1899,9 +1914,11 @@ local function tick()
 
   local sig = core.signals(m, lastRates, lastKern, lastExtreme)
   local state, changed, reason = core.smStep(smState, sig, now)
-  -- The reading the observation follow-ups read as of their horizons.
+  -- The reading the observation follow-ups read as of their horizons, with
+  -- the monotonic clock beside the wall clock to tell a step back.
   -- Bookkeeping: it never interrupts the tick.
-  local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state)
+  local mono = hs.timer.absoluteTime and hs.timer.absoluteTime() / 1e9 or nil
+  local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state, mono)
   if not okTick then logError("observe-tick", errTick) end
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
   if changed then M.logSnapshot("state:" .. reason) end
@@ -1918,7 +1935,9 @@ local function tick()
   if obs.enabled and state ~= "ok" and lastOffender
      and (now - obs.lastAt) >= observe.cfg.intervalSec then
     obs.lastAt = now
-    local okObs, errObs = pcall(obs.writeObservation, "advisory", lastOffender, now)
+    local okObs, errObs = pcall(obs.writeObservation, "advisory", lastOffender, now,
+      { lstart = lastOffender.lstart
+          or ((hudOffender and hudOffender.pid == lastOffender.pid) and hudOffender.lstart or nil) })
     if not okObs then logError("observe-advisory", errObs) end
   end
   -- Frozen-ledger liveness sweep, in every state: a frozen pid is no
@@ -3142,7 +3161,7 @@ obs.writeObservation = function(point, offender, now, extra)
   local start0, identityBasis = observe.startOf(e0), "window"
   if not start0 then
     start0 = observe.startFromLstart(extra.lstart, now)
-    identityBasis = start0 and "lstart" or nil
+    identityBasis = start0 and "lstart" or "none"
   end
   local row = observe.row({
     at = obsIso, session = obs.session, seq = seq, point = point, synthetic = extra.synthetic,
@@ -3174,11 +3193,11 @@ obs.writeObservation = function(point, offender, now, extra)
   -- and the follow-ups read it, and the tick log, as of their horizons:
   -- never point-in-time state as a late timer finds it.
   local weight0 = offender.weightMB or 0
+  local horizons = extra.horizons or observe.cfg.horizons
   local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
                                    start0 = start0, obsAt = now, weightMB = weight0,
-                                   minSeq = sampler.nextSeq + 1 })
+                                   minSeq = sampler.nextSeq + 1, horizons = horizons })
   observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))
-  local horizons = extra.horizons or observe.cfg.horizons
   ev.expiresAt = now + (horizons[#horizons] or 0) + 600
   obs.pending[seq] = ev
   local avail0 = lastMetrics.availPct or 0
@@ -3189,7 +3208,15 @@ obs.writeObservation = function(point, offender, now, extra)
       local tH = now + h
       local fate, detail = observe.fateAt(ev, tH)
       local at = observe.asOf(ev, tH) or {}   -- empty after a clock step
-      local mt = not ev.clockStep and observe.metricAt(obs.ticks, tH) or nil
+      -- The horizon's reading as the record kept it (snapshotHorizons), or
+      -- from the log when no tick has passed the horizon yet; none after a
+      -- clock step.
+      local mt = nil
+      if not ev.clockStep then
+        local kept = ev.metricsAt[h]
+        if kept == nil then kept = observe.metricAt(obs.ticks, tH) end
+        mt = kept or nil
+      end
       local present = fate == "alive" or fate == "frozen"
       local weightNow = present and at.weightMB or nil
       local sig = at.signal
@@ -3214,7 +3241,8 @@ obs.writeObservation = function(point, offender, now, extra)
         memwatchSignalSince = sig and sig.action or nil,
         memwatchSignalUncertain = sig and sig.uncertain or nil,
         memwatchSignalCount = (at.signalCount or 0) > 1 and at.signalCount or nil,
-        jetsamSince = obs.jetsamSince(now, tH),
+        jetsamSince = (not ev.clockStep) and obs.jetsamSince(now, tH) or nil,
+        operatorActionsDropped = at.actionsDropped,
       })
       if obs.appendObserve(fline) then obs.stats.followups = obs.stats.followups + 1 end
     end))
@@ -3449,6 +3477,7 @@ lfmTick = function(state, now, interesting)
     -- re-adjudicates at critical instead of waiting out the old verdict.
     local cached = verdictCache[lastOffender.pid]
     local fresh = lfm.verdictUsable(cached, lastOffender, now, lfm.cfg.verdictFreshSec)
+      and cached.ident ~= nil and cached.ident.verified == true
     local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
     if (lfm.cfg.advisory and due) or (state == "critical" and not fresh and not lfmInFlight) then
       lfmLastAdvisoryAt = now

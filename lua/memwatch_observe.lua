@@ -30,6 +30,8 @@ M.cfg = {
   sampleFreshSec = 15,              -- ps data older than this cannot decide a fate
   clockSlackSec  = 1,               -- timestamp granularity allowed when comparing start windows
   maxLineBytes   = 60000,           -- a longer row drops its snapshot (the decoder rejects > 64 KB)
+  maxActions     = 256,             -- operator action times kept per record (more are counted)
+  clockStepSec   = 2,               -- a wall clock that falls this far behind the monotonic one stepped back
 }
 
 local function floorOrNil(v)
@@ -263,15 +265,24 @@ end
 -- only this record, as of its horizon, so a delivery stall, a late timer,
 -- an expired tracker entry, a reused pid or an event from before the
 -- observation cannot change what it reports.
--- a: { pid, comm0, start0, obsAt, weightMB, minSeq }. minSeq is the first
--- sampler sequence launched after the observation (nil: decide by launch
--- time); see foldSample.
+-- a: { pid, comm0, start0, obsAt, weightMB, minSeq, horizons }. minSeq is
+-- the first sampler sequence launched after the observation (nil: decide by
+-- launch time); see foldSample. horizons are the follow-up offsets, whose
+-- machine readings are kept in the record (snapshotHorizons).
 function M.newEvidence(a)
   return { pid = a.pid, comm0 = a.comm0, start0 = a.start0, obsAt = a.obsAt, minSeq = a.minSeq,
+           horizons = a.horizons or M.cfg.horizons, metricsAt = {},
            weight0 = a.weightMB, peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil,
-           gone = nil, lastMiss = nil, samples = {}, signals = {},
-           touches = 0, touchesUncertain = 0, touchLog = {}, actions = {}, frozenLog = {},
-           clockStep = nil }
+           gone = nil, lastMiss = nil, misses = {}, samples = {}, signals = {},
+           touches = 0, touchesUncertain = 0, touchLog = {}, actions = {}, actionsDropped = 0,
+           frozenLog = {}, clockStep = nil }
+end
+
+-- Why the record has no fresh sighting, dated when that became known, so a
+-- follow-up reads the reason as of its horizon.
+local function noteMiss(ev, why, at)
+  ev.lastMiss = why
+  ev.misses[#ev.misses + 1] = { at = at, why = why }
 end
 
 -- Fold one ps sample. s: { complete, row (the pid's row or nil), start1
@@ -292,7 +303,7 @@ end
 -- table; absence from a partial table proves nothing. The proof is dated by
 -- its delivery: the table was read by then.
 function M.foldSample(ev, s)
-  if ev.gone then return end
+  if ev.gone or ev.clockStep then return end
   local pre
   if type(ev.minSeq) == "number" and type(s.seq) == "number" then
     pre = s.seq < ev.minSeq
@@ -301,7 +312,7 @@ function M.foldSample(ev, s)
   end
   if pre or type(s.launchedAt) ~= "number" then
     -- Only while nothing better is known: it never hides a later reason.
-    if ev.seenAcq == nil and ev.lastMiss == nil then ev.lastMiss = "pre-observation-sample" end
+    if ev.seenAcq == nil and ev.lastMiss == nil then noteMiss(ev, "pre-observation-sample", s.deliveredAt) end
     return
   end
   if s.launchedAt < ev.obsAt - M.cfg.clockSlackSec
@@ -317,7 +328,7 @@ function M.foldSample(ev, s)
       return
     end
     if M.identity(ev.start0, s.start1) ~= "same" then
-      ev.lastMiss = "identity-uncertain"
+      noteMiss(ev, "identity-uncertain", s.deliveredAt)
       return
     end
     if ev.seenAcq == nil or s.launchedAt > ev.seenAcq then ev.seenAcq = s.launchedAt end
@@ -332,7 +343,7 @@ function M.foldSample(ev, s)
   elseif s.complete then
     ev.gone = { how = "exited", at = s.deliveredAt }
   else
-    ev.lastMiss = "incomplete-sample"
+    noteMiss(ev, "incomplete-sample", s.deliveredAt)
   end
 end
 
@@ -340,6 +351,7 @@ end
 -- process it verified before signaling. Only a signal to this same process
 -- counts; one whose process cannot be told apart is kept, marked uncertain.
 function M.foldSignal(ev, sig)
+  if ev.clockStep then return end
   local m = M.matchStart(ev.start0, ev.comm0, sig.startEpoch, sig.comm)
   if m == "different" then return end
   ev.signals[#ev.signals + 1] = { action = sig.action, at = sig.at, uncertain = (m ~= "same") or nil }
@@ -350,6 +362,7 @@ end
 -- count, and one whose process cannot be told apart counts apart, as
 -- uncertain.
 function M.foldTouch(ev, t)
+  if ev.clockStep then return end
   local m = M.matchStart(ev.start0, ev.comm0, t and t.startEpoch, t and t.comm)
   if m == "different" then return end
   local uncertain = m ~= "same"
@@ -358,8 +371,15 @@ function M.foldTouch(ev, t)
 end
 
 -- Fold one operator action (any surface, any process) taken at `at`: a
--- follow-up counts those through its own horizon.
+-- follow-up counts those through its own horizon. A record keeps at most
+-- M.cfg.maxActions times; beyond that it only counts how many it dropped,
+-- and its follow-ups say their count is a lower bound.
 function M.foldAction(ev, at)
+  if ev.clockStep then return end
+  if #ev.actions >= M.cfg.maxActions then
+    ev.actionsDropped = (ev.actionsDropped or 0) + 1
+    return
+  end
   ev.actions[#ev.actions + 1] = at
 end
 
@@ -367,6 +387,7 @@ end
 -- `at` on: held is frozenMatches' answer (true, false, or nil when the
 -- entry's process cannot be told apart). Only changes are kept.
 function M.foldFrozen(ev, at, held)
+  if ev.clockStep then return end
   local log = ev.frozenLog
   local last = log[#log]
   if last and last.held == held then return end
@@ -381,6 +402,15 @@ function M.frozenAt(ev, t)
     if type(f.at) == "number" and f.at <= t then held = f.held end
   end
   return held
+end
+
+-- The wall clock stepped back after the observation: from here on nothing
+-- that arrives can be dated against the record's horizons, so the record
+-- stops collecting (every fold returns) and its follow-ups carry no
+-- readings. An exit proven before the step was dated on one clock and
+-- still stands.
+function M.noteClockStep(ev)
+  ev.clockStep = true
 end
 
 -- What became of the observed process by horizon instant t (the
@@ -400,7 +430,7 @@ end
 --             record can be placed before or after t)
 -- An event with no time is never placed before t.
 function M.fateAt(ev, t)
-  if ev.clockStep then return "unknown", "clock-step" end
+  if ev.clockStep and not ev.gone then return "unknown", "clock-step" end
   if ev.gone and type(ev.gone.at) == "number" and ev.gone.at <= t then
     return "exited", (ev.gone.how == "pid-reused") and "pid-reused" or nil
   end
@@ -410,7 +440,12 @@ function M.fateAt(ev, t)
     if held then return "frozen", nil end
     return "alive", nil
   end
-  return "unknown", ev.lastMiss or "stale-sample"
+  -- The reason as of t: the last miss known by then.
+  local why
+  for _, m in ipairs(ev.misses or {}) do
+    if type(m.at) == "number" and m.at <= t then why = m.why end
+  end
+  return "unknown", why or "stale-sample"
 end
 
 -- The evidence as of horizon instant t: the weight of the last sighting
@@ -426,7 +461,9 @@ function M.asOf(ev, t)
                 touches = 0, touchesUncertain = 0, actions = 0 }
   for _, s in ipairs(ev.samples or {}) do
     if by(s.at) then
-      out.weightMB = s.weightMB
+      -- The weight at t is a reading delivered within the freshness window;
+      -- an older one is no reading at t (the peak still counts it).
+      out.weightMB = (s.at >= t - M.cfg.sampleFreshSec) and s.weightMB or nil
       if out.peakMB == nil or s.weightMB > out.peakMB then out.peakMB = s.weightMB end
     end
   end
@@ -441,7 +478,22 @@ function M.asOf(ev, t)
   for _, a in ipairs(ev.actions or {}) do
     if by(a) then out.actions = out.actions + 1 end
   end
+  out.actionsDropped = (ev.actionsDropped or 0) > 0 and ev.actionsDropped or nil
   return out
+end
+
+-- Keep each horizon's machine reading in the record once the horizon has
+-- passed (from the tick log, while the log still holds it), so a follow-up
+-- that runs after the record stopped collecting, or after the log was cut
+-- back, still reads its horizon. false records "no reading at that horizon".
+function M.snapshotHorizons(ev, log, now, freshSec)
+  if ev.clockStep then return end
+  for _, h in ipairs(ev.horizons or {}) do
+    local tH = ev.obsAt + h
+    if ev.metricsAt[h] == nil and now >= tH then
+      ev.metricsAt[h] = M.metricAt(log, tH, freshSec) or false
+    end
+  end
 end
 
 -- The machine's reading as of instant t from the glue's tick log (entries
@@ -469,7 +521,9 @@ function M.sameSource(entry, probe, boundLstart)
   if type(probe) ~= "table" then return "unknown" end
   local w = M.startOf(entry)
   if w then
-    return M.matchStart(w, entry.comm, M.lstartEpoch(probe.lstart), probe.comm)
+    -- A start time in a daylight-saving fold cannot be placed: unknown, not
+    -- a takeover.
+    return M.matchStart(w, entry.comm, M.lstartEpochUnambiguous(probe.lstart), probe.comm)
   end
   if type(boundLstart) == "string" and type(probe.lstart) == "string" then
     return (boundLstart == probe.lstart) and "same" or "different"
@@ -482,7 +536,9 @@ end
 -- cannot be told.
 function M.frozenMatches(entry, start0, comm0)
   if type(entry) ~= "table" then return false end
-  local m = M.matchStart(start0, nil, M.lstartEpoch(entry.lstart), nil)
+  -- An entry started in a daylight-saving fold names two epochs: it cannot
+  -- be placed, so it is nil (uncertain), never a confident false.
+  local m = M.matchStart(start0, nil, M.lstartEpochUnambiguous(entry.lstart), nil)
   if m == "unknown" then return nil end
   return m == "same"
 end

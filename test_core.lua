@@ -2073,7 +2073,9 @@ do
   local sq = ev0(5)
   sight(sq, 100, 2000, 2001, 4)
   check("launch order: an earlier sampler is ignored whatever its wall time", sq.seenAcq, nil)
-  check("launch order: and says so", select(2, observe.fateAt(sq, 1060)), "pre-observation-sample")
+  check("launch order: and says so, once that table had come in", select(2, observe.fateAt(sq, 2001)), "pre-observation-sample")
+  check("launch order: a reason is read as of the horizon, not before it was known",
+    select(2, observe.fateAt(sq, 1060)), "stale-sample")
   sight(sq, 100, 1001, 1002, 5)
   check("launch order: the first sampler after the observation counts", sq.seenAcq, 1001)
   local st = ev0(5)
@@ -2163,6 +2165,99 @@ do
 
   local rowB = observe.row({ offender = { pid = 1 }, identityBasis = "lstart" })
   check("row: the identity basis is recorded", rowB.identityBasis, "lstart")
+end
+
+-- ---- (round 5) records keep their horizons; a step closes any record ----
+do
+  local observe = require("memwatch_observe")
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  local same = { lo = 999, hi = 1001 }
+  local function ev0(horizons)
+    return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000,
+                                 weightMB = 100, horizons = horizons or { 60, 120 } })
+  end
+  -- Horizon readings are kept in the record once each horizon passes.
+  local log = { { at = 1000, availPct = 5, state = "critical" }, { at = 1058, availPct = 6, state = "critical" },
+                { at = 1118, availPct = 30, state = "elevated" } }
+  local hz = ev0()
+  observe.snapshotHorizons(hz, log, 1061)
+  check("snapshot: a passed horizon's reading is kept", hz.metricsAt[60] and hz.metricsAt[60].availPct, 6)
+  check("snapshot: a horizon not reached yet is not", hz.metricsAt[120], nil)
+  observe.snapshotHorizons(hz, { { at = 1200, availPct = 50, state = "ok" } }, 1200)
+  check("snapshot: a kept reading is never replaced", hz.metricsAt[60].availPct, 6)
+  check("snapshot: a horizon with no fresh reading is kept as none", hz.metricsAt[120], false)
+  local st = ev0()
+  observe.noteClockStep(st)
+  observe.snapshotHorizons(st, log, 1200)
+  check("snapshot: none after a clock step", st.metricsAt[60], nil)
+
+  -- A step closes a record whose exit was already proven: the exit stands,
+  -- nothing after the step is folded, and nothing is read as of a horizon.
+  local gone = ev0()
+  observe.foldSample(gone, { complete = true, row = nil, launchedAt = 1010, deliveredAt = 1020, seq = 2 })
+  observe.noteClockStep(gone)
+  observe.foldAction(gone, 960)
+  observe.foldSignal(gone, { action = "freeze", at = 950, comm = "/bin/x", startEpoch = nil })
+  check("gone then step: the exit proven before the step stands", (observe.fateAt(gone, 1060)), "exited")
+  check("gone then step: an action after the step is not folded", #gone.actions, 0)
+  check("gone then step: nor a signal", #gone.signals, 0)
+  check("gone then step: nothing is read as of a horizon", observe.asOf(gone, 1060), nil)
+  local live = ev0()
+  observe.noteClockStep(live)
+  check("step: a record not proven gone is unknown", select(2, observe.fateAt(live, 1060)), "clock-step")
+
+  -- The weight at a horizon is a reading delivered within the freshness
+  -- window; the peak still counts older ones.
+  local w = ev0()
+  observe.foldSample(w, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                          weightMB = 500, launchedAt = 1000, deliveredAt = 1001, seq = 2 })
+  check("stale weight: a reading from long before the horizon is no weight at it", observe.asOf(w, 1060).weightMB, nil)
+  check("stale weight: but it is in the peak", observe.asOf(w, 1060).peakMB, 500)
+  check("stale weight: a fresh one is the weight (control)", observe.asOf(w, 1010).weightMB, 500)
+
+  -- Operator action times are bounded per record; the rest are counted.
+  local many = ev0()
+  for i = 1, observe.cfg.maxActions + 44 do observe.foldAction(many, 1000 + i * 0.01) end
+  check("actions: at most maxActions times are kept", #many.actions, observe.cfg.maxActions)
+  check("actions: the rest are counted", observe.asOf(many, 2000).actionsDropped, 44)
+  check("actions: a record under the cap drops none (control)", observe.asOf(ev0(), 2000).actionsDropped, nil)
+
+  -- The daylight-saving fold, in a zone that has one whatever this
+  -- machine's: a child Lua with TZ fixed runs the fold cases and prints them.
+  local lua = (arg and arg[-1]) or "lua"
+  local child = [[
+package.path = "lua/?.lua;" .. package.path
+local o = require("memwatch_observe")
+local t0 = os.time({ year = 2026, month = 1, day = 1, hour = 12 })
+local fb
+for i = 0, 365 * 24 do
+  local a, b = os.date("*t", t0 + i * 3600), os.date("*t", t0 + (i + 1) * 3600)
+  if a.isdst and not b.isdst then fb = t0 + (i + 1) * 3600; break end
+end
+if not fb then print("NOFOLD"); return end
+local twice = os.date("%a %b %e %H:%M:%S %Y", fb - (fb % 3600) + 1800)
+local ok = os.date("%a %b %e %H:%M:%S %Y", fb + 7200)
+local e1 = o.lstartEpoch(twice)
+local win = { lo = e1 - 1, hi = e1 + 1, etimeSec = 9000 }
+print("strict", o.lstartEpochUnambiguous(twice) == nil, o.lstartEpochUnambiguous(ok) ~= nil)
+print("seed", o.startFromLstart(twice, fb + 7200) == nil)
+print("frozen", tostring(o.frozenMatches({ lstart = twice }, win)))
+print("source", o.sameSource({ comm = "/bin/x", startLo = win.lo, startHi = win.hi, etimeSec = 9000 },
+  { comm = "/bin/x", lstart = twice }))
+]]
+  local cf = os.tmpname()
+  local fh = assert(io.open(cf, "w")); fh:write(child); fh:close()
+  local p = io.popen("TZ=America/New_York " .. lua .. " " .. cf .. " 2>&1")
+  local out = p and p:read("a") or ""
+  if p then p:close() end
+  os.remove(cf)
+  check("fold (TZ=America/New_York): the zone has a fold to test", out:find("NOFOLD", 1, true), nil)
+  check("fold: a repeated time is refused, an ordinary one read", out:find("strict\ttrue\ttrue", 1, true) ~= nil, true)
+  check("fold: no window is seeded from it", out:find("seed\ttrue", 1, true) ~= nil, true)
+  check("fold: a frozen entry started then cannot be told (nil), never a confident false",
+    out:find("frozen\tnil", 1, true) ~= nil, true)
+  check("fold: a probe started then is unknown at dispatch, not a takeover",
+    out:find("source\tunknown", 1, true) ~= nil, true)
 end
 
 -- ---- observation glue: fork-free, error-bounded, mode-independent ----
@@ -2334,7 +2429,7 @@ do
       #b > 50 and b:find("pcall(function()", 1, true) ~= nil, true)
   end
   check("observe glue: the tick's log call is error-bounded",
-    src:find("local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state)", 1, true) ~= nil, true)
+    src:find("local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state, mono)", 1, true) ~= nil, true)
   local _, recordSites = src:gsub('noteSignal%(pid, "', "")
   -- (A quit whose TERM cannot be sent re-freezes through M.freezePid, so
   -- that STOP is recorded at the freeze site.)
@@ -2436,7 +2531,12 @@ do
     countUnwrapped('{ title = "x", fn = obs.byOperator(function() M.killPid(pid, name) end) }'), 0)
   check("operator actions: every menu process action is wrapped", countUnwrapped(src), 0)
   local _, wrapped = src:gsub("fn = obs%.byOperator%(function%(%)", "")
-  check("operator actions: the ten menu actions are wrapped", wrapped, 10)
+  check("operator actions: all fourteen menu actions are wrapped", wrapped, 14)
+  local m0 = src:find("local function buildMenu(", 1, true)
+  local m1 = m0 and src:find("\nend\n", m0, true)
+  local menuBody = (m0 and m1) and src:sub(m0, m1) or ""
+  check("operator actions: no menu action calls its handler directly",
+    #menuBody > 500 and menuBody:find("fn = function()", 1, true) == nil, true)
   local hs0 = src:find('if evt ~= "mouseUp" then return end', 1, true)
   check("operator actions: HUD clicks count",
     hs0 ~= nil and src:sub(hs0, hs0 + 80):find("obs.noteAction()", 1, true) ~= nil, true)

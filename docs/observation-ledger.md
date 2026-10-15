@@ -13,23 +13,29 @@ can be checked against them.
 | State | Entered when | Left when |
 |---|---|---|
 | written | its row is appended (a row that cannot be written gets no follow-ups) | at once |
-| collecting | the row is written: its record is in `obs.pending` | its last horizon's follow-up runs, or 10 min after that horizon (`expiresAt`) |
+| collecting | the row is written: its record is in `obs.pending` | its last horizon's follow-up runs, 10 min after that horizon (`expiresAt`), or a clock step closes it |
 | reporting | each horizon timer runs | the follow-up line is appended |
 | done | collecting ends | (the timers' closures keep the record for a timer that runs later) |
 
 While collecting, every event that can bear on the observed process folds
 into its record (`observe.newEvidence`): each process table, each signal
 memwatch sends, each operator touch on that process, each operator action
-anywhere, and each change in whether the frozen ledger holds the process.
-Each tick also logs the machine's available memory and state
-(`obs.ticks`), kept only as far back as a collecting record can ask.
+anywhere (every menu, HUD and banner action; at most 256 times per record,
+the rest counted), and each change in whether the frozen ledger holds the
+process. Each tick also logs the machine's available memory and state
+(`obs.ticks`), and each collecting record keeps the reading of every
+horizon it has passed (`observe.snapshotHorizons`), so a follow-up that
+runs after its record stopped collecting still reads its own horizon.
 
 ## Invariants
 
-1. **As of the horizon.** A follow-up is a function of its record, the tick
-   log and its horizon instant `tH = observed + h`, and of nothing read when
-   its timer runs. A late timer reports the horizon it names. (The jetsam
-   count reads the reports directory, filtered by file time up to `tH`.)
+1. **As of the horizon.** A follow-up is a function of its record (with the
+   horizon readings it kept) and its horizon instant `tH = observed + h`,
+   and of nothing read when its timer runs. A late timer reports the horizon
+   it names: the fate, the reason for an unknown one, the weight (a reading
+   delivered within 15 s of the horizon), the peak, the counts and the
+   machine's reading are each the ones known by `tH`. (The jetsam count
+   reads the reports directory, filtered by file time up to `tH`.)
 2. **Identity before attribution.** An event counts for the observation only
    when it is provably the observed process: same program, and a start time
    inside the observation's start window when that window could not also
@@ -39,9 +45,10 @@ Each tick also logs the machine's available memory and state
 3. **Order, then dates.** Which tables came after the observation is decided
    by the sampler's launch order. Wall-clock times date events against a
    horizon. A wall clock stepped back after the observation makes that
-   dating impossible: the record says `clock-step` and its follow-ups carry
-   no readings. A forward step (a sleep) is harmless: a process seen after
-   it was alive before it.
+   dating impossible: the record stops collecting, and its follow-ups carry
+   no readings (jetsam included); its fate is `unknown` (`clock-step`)
+   unless an exit was proven before the step, which stands. A forward step
+   (a sleep) is harmless: a process seen after it was alive before it.
 4. **Whole tables only prove absence.** A process missing from a table has
    exited only if the sampler exited cleanly and the table lists memwatch's
    own process. A partial table proves nothing.
@@ -61,24 +68,31 @@ Each tick also logs the machine's available memory and state
 - A process's start window comes from `ps` etime, a duration on the wall
   clock: `[launch - etime - 1, delivery - etime]`, spanning both sides when
   the clock stepped back while the table was in flight.
-- A backward step is seen at the next tick, or in a table launched after the
-  observation that reads earlier, or delivered before its own launch. Then
-  every collecting record not already proven gone is marked, and the
-  advisory cadence and decision windows re-base to the step.
+- A backward step is seen at the next tick, by comparing how far the wall
+  clock advanced with how far the monotonic clock did (any size beyond 2 s;
+  a sleep only makes the wall advance more), or in a table launched after
+  the observation that reads earlier, or delivered before its own launch.
+  Then every collecting record is closed, and the advisory cadence and
+  decision windows re-base to the step.
 
 ## Identity model
 
 - The observed process: the start window of its latest process sample
   (`identityBasis: window`); for a process only the top stream named, the
-  start time the alert bound, unless it falls in a daylight-saving fold
-  (`lstart`); otherwise none, and its follow-ups can only read `unknown`
-  or `exited`.
+  start time the alert bound (on decision and advisory rows alike), unless
+  it falls in a daylight-saving fold (`lstart`); otherwise `none`, and its
+  follow-ups can only read `unknown` or `exited`.
 - A sample: the same program in an overlapping window that rules out a
   successor is a sighting; another program or a disjoint window is a reuse
   (the observed process is gone); anything else is `identity-uncertain`.
 - A signal or touch: matched by the target's program and start time.
 - The frozen ledger: matched by the entry's start time; an entry that cannot
-  be told apart makes a living process `frozen-uncertain`.
+  be told apart makes a living process `frozen-uncertain`. `frozen` means
+  the ledger held the process at the horizon, including a freeze still
+  inside its verify window.
+- A start time in a daylight-saving fold names two epochs, so it is never
+  placed: a signal, touch or ledger entry started then counts as uncertain,
+  never as another process.
 
 ## Deliberately not done
 

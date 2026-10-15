@@ -2027,20 +2027,26 @@ end)
 scenario("ledger: a clock stepped back leaves its follow-ups unknown", nil, function(W, mw)
   local row = toDecision(W, 4242)
   if not row then check("step: decision row", false, true); return end
+  W.jetsam = { ["JetsamEvent-2026-a.ips"] = W.now + 5 }   -- a report dated inside the window
   W.run(10)
   local before = 0
   for _, r in ipairs(ledgerRows(W)) do if r.seq and r.seq > before then before = r.seq end end
   W.wallOffset = -120
-  local after
-  runUntil(W, 60, function()
+  local after, nextDecision
+  runUntil(W, 75, function()
     for _, r in ipairs(ledgerRows(W)) do
-      if r.pid == 4242 and r.point and r.seq > before then after = r; return true end
+      if r.pid == 4242 and r.point and r.seq > before then
+        after = after or r
+        if r.point == "decision" then nextDecision = r end
+      end
     end
-    return false
+    return nextDecision ~= nil
   end)
   -- The cadence stamps from before the step re-based to it: rows go on
-  -- within the advisory interval, not once the wall clock has caught up.
+  -- within the advisory interval, and the next decision row comes one grace
+  -- window after the step, not once the wall clock has caught up.
   check("step: a row is written within a minute of the step", after ~= nil, true)
+  check("step: the next decision row comes within a grace window of the step", nextDecision ~= nil, true)
   W.run(200)
   local fu = followups(W, row.seq)
   check("step: three follow-ups", #fu, 3)
@@ -2049,12 +2055,15 @@ scenario("ledger: a clock stepped back leaves its follow-ups unknown", nil, func
     if r.fate == "unknown" then unknown = unknown + 1 end
     if r.fateDetail == "clock-step" then stepped = stepped + 1 end
     if r.fate == "exited" then exited = exited + 1 end
-    if r.availPct ~= nil or r.peakSinceMB ~= nil or r.operatorActionsSince ~= nil then metrics = metrics + 1 end
+    if r.availPct ~= nil or r.peakSinceMB ~= nil or r.operatorActionsSince ~= nil or r.jetsamSince ~= nil then
+      metrics = metrics + 1
+    end
   end
   check("step: every follow-up is unknown", unknown, 3)
   check("step: and says the clock stepped", stepped, 3)
   check("step: none calls the living process exited", exited, 0)
-  check("step: none reports a reading it cannot place", metrics, 0)
+  check("step: none reports a reading it cannot place (jetsam included)", metrics, 0)
+
   check("step: the process is alive throughout", W.procs[4242] ~= nil, true)
   -- A row written after the step has ordinary follow-ups (control).
   local fa = after and followups(W, after.seq) or {}
@@ -2290,11 +2299,139 @@ scenario("a verdict whose snapshot is not its process's own never acts", REMOTE_
   local asked = runUntil(W, 120, function() return mw.debug().lfm.cached >= 1 end)
   check("unverified: the adjudicator answered about the top-born offender", asked, true)
   check("unverified: the alert's bind probe was the one that failed", W.probeFailsOnce, 0)
+  -- An unverified verdict is not fresh, so it is asked again once the alert
+  -- has bound the process; that answer never comes here, so the cached,
+  -- unverified one is all there is at grace expiry.
+  local posts = #W.httpPosts
+  W.httpReply = nil
   runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  check("unverified: it was asked again", #W.httpPosts > posts, true)
   check("unverified: the deterministic freeze ran at grace expiry", W.signalsTo(4242), "STOP")
   check("unverified: the decision was not the model's", unattendedRow(W, "lfm"), nil)
   check("unverified: it was the deterministic policy's",
     unattendedRow(W, "deterministic-fallback") ~= nil, true)
+end)
+
+-- ---- PR round 5: kept horizons, closed records, the launch-order line ----
+-- A follow-up that runs after its record stopped collecting still reads
+-- the machine at its horizon (the record kept it).
+scenario("ledger: a follow-up that runs after its record expired keeps its horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("expired: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq, 900)   -- its timers run 900 s late, past the record's 780 s
+  if not adv then check("expired: advisory row", false, true); return end
+  W.run(1100)
+  local fu = followups(W, adv.seq)
+  check("expired: the +60 follow-up ran after the record expired", fu[1] ~= nil, true)
+  check("expired: it still reads available memory at +60", fu[1] ~= nil and fu[1].availPct ~= nil, true)
+  check("expired: and the state", fu[1] and fu[1].state, "critical")
+end)
+
+-- A clock stepped back after the process's exit was proven: the exit
+-- stands, and nothing after the step is read.
+scenario("ledger: a step after a proven exit keeps the exit and reads nothing", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("gone-step: decision row", false, true); return end
+  W.procs[4242] = nil               -- it exits
+  W.run(10)                         -- a whole table proves it
+  W.wallOffset = -120
+  W.run(30)
+  local procRow = W.menuItem("Log snapshot")
+  if procRow and procRow.fn then procRow.fn() end   -- an operator action after the step
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("gone-step: three follow-ups", #fu, 3)
+  local exited, readings = 0, 0
+  for _, r in ipairs(fu) do
+    if r.fate == "exited" then exited = exited + 1 end
+    if r.availPct ~= nil or r.operatorActionsSince ~= nil or r.jetsamSince ~= nil or r.peakSinceMB ~= nil then
+      readings = readings + 1
+    end
+  end
+  check("gone-step: the exit proven before the step stands", exited, 3)
+  check("gone-step: and no follow-up reads anything it cannot place", readings, 0)
+end)
+
+-- Launch order is the line, not the wall clock: tables that land 8 s late
+-- (launched before an observation, delivered after it) are not read as a
+-- clock step.
+scenario("ledger: late tables are not a clock step", nil, function(W)
+  W.samplerDelay = 8
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(400)
+  local stepped, alive = 0, 0
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.followup_for then
+      if r.fateDetail == "clock-step" then stepped = stepped + 1 end
+      if r.fate == "alive" then alive = alive + 1 end
+    end
+  end
+  check("late tables: follow-ups were written", alive > 5, true)
+  check("late tables: none reads as a clock step", stepped, 0)
+end)
+
+-- A small step (3 s, under a tick) is seen against the monotonic clock.
+scenario("ledger: a small step back is seen too", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("small-step: decision row", false, true); return end
+  W.run(12.3)                       -- between ticks, with no table in flight
+  W.wallOffset = -3
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("small-step: the follow-ups say the clock stepped", fu[3] and fu[3].fateDetail, "clock-step")
+end)
+
+-- A top-born process's advisory rows carry the alert's bound start time too.
+scenario("ledger: a top-born offender's advisory rows are told apart too", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  local adv
+  runUntil(W, 200, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point == "advisory" and r.identityBasis == "lstart" then adv = r end
+    end
+    return adv ~= nil
+  end)
+  check("top-born advisory: an advisory row bound by the alert's start time", adv ~= nil, true)
+end)
+
+-- Every menu action counts, toggles included.
+scenario("ledger: a menu toggle counts as an operator action", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("toggle: decision row", false, true); return end
+  local item = W.menuItem("Log snapshot")
+  check("toggle: the menu offers Log snapshot now", item ~= nil and item.fn ~= nil, true)
+  if item and item.fn then item.fn() end
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("toggle: counted as an operator action", fu[1] and fu[1].operatorActionsSince, 1)
+end)
+
+-- In kill mode, a verdict that cannot be tied to its process leaves the
+-- decision to the deterministic policy: a terminate.
+scenario("a verdict whose snapshot is not its process's own never acts, in kill mode",
+         '{"unattended":"kill","lfm":{"enabled":true,"advisoryIntervalSec":600,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
+           .. LFM_KEYFILE .. '"}}', function(W, mw)
+  W.frontmost = { name = "Terminal", pid = 760 }
+  W.httpReply = cannedVerdict("wait")
+  W.kern = 2
+  runUntil(W, 60, function() return mw.debug().state == "elevated" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.probeFailsOnce = 1
+  W.addProc(4242, "topborn", 2000)
+  W.grow(4242, 220)
+  runUntil(W, 120, function() return mw.debug().lfm.cached >= 1 end)
+  W.httpReply = nil
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  check("unverified kill: the deterministic terminate ran", W.signalsTo(4242):sub(1, 4), "TERM")
+  check("unverified kill: the decision was not the model's", unattendedRow(W, "lfm"), nil)
 end)
 
 -- ---- round 4: interactions the design pass introduced ----

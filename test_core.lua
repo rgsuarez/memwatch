@@ -892,6 +892,31 @@ do
     core.identityHolds({ pid = 4100, lstart = "L" }, "present", "L", "anything"), true)
 end
 
+-- ---- identity: exact identity, and records that never transfer ----
+do
+  local A  = { pid = 7, name = "node", lstart = "L1" }
+  local A2 = { pid = 7, name = "node", lstart = "L1" }
+  local B  = { pid = 7, name = "node", lstart = "L2" }
+  local U  = { pid = 7, name = "node" }
+  check("exact: the same bound process", core.sameIdentity(A, A2), true)
+  check("exact: another start time on the pid is not it", core.sameIdentity(A, B), false)
+  check("exact: an unbound side never matches", core.sameIdentity(A, U), false)
+  check("exact: two unbound readings do not match either", core.sameIdentity(U, { pid = 7, name = "node" }), false)
+  check("exact: a truncated name of the same bound process matches",
+    core.sameIdentity({ pid = 7, name = "Google Chrome He", lstart = "L1" },
+                      { pid = 7, name = "Google Chrome Helper (Renderer)", lstart = "L1" }), true)
+  check("exact: nil is never a match", core.sameIdentity(nil, A), false)
+  check("record: made for this bound process", core.recordDescribes({ name = "node", lstart = "L1" }, A), true)
+  check("record: made while unbound does not transfer once it binds",
+    core.recordDescribes({ name = "node" }, A), false)
+  check("record: made for a bound process does not serve an unbound reading",
+    core.recordDescribes({ name = "node", lstart = "L1" }, U), false)
+  check("record: made while unbound serves the unbound reading", core.recordDescribes({ name = "node" }, U), true)
+  check("record: another process's record does not", core.recordDescribes({ name = "node", lstart = "L1" }, B), false)
+  check("record: two names sharing 15 characters are different processes",
+    core.recordDescribes({ name = "Chrome Helper (GPU)" }, { pid = 7, name = "Chrome Helper (Renderer)" }), false)
+end
+
 -- ---- identity: continuity versus memory ----
 do
   local full = "Google Chrome Helper (Renderer)"
@@ -1279,6 +1304,19 @@ do
   check("banner glue: no unbound kill remains",
     forbids("local function notifyCrit(m)", "M.killPid(off.pid, off.name)\n",
       "local function notifyCrit(m)\n  critNotif = hs.notify.new(function()\n    M.killPid(off.pid, off.name)\n  end)\nend\n"), true)
+  -- (round 5) An outcome from the menu or a banner answers only a HUD bound
+  -- to its very process; a refusal with no start time withdraws only an
+  -- unbound banner.
+  local SURF = "local function surfaceUpdate(target)"
+  check("surface glue: an outcome answers only a HUD bound to its very process",
+    body(SURF):find("core.sameIdentity(hudOffender, target)", 1, true) ~= nil
+      and forbids(SURF, "core.sameOffender(hudOffender, target)",
+        SURF .. "\n    if hudOffender and core.sameOffender(hudOffender, target) then end\nend\n"), true)
+  local REFUSED = "local function identityRefused(target)"
+  check("refusal glue: an unbound refusal never withdraws a bound banner",
+    body(REFUSED):find("(critNotifOff.lstart == nil or (target.lstart ~= nil and critNotifOff.lstart == target.lstart))", 1, true) ~= nil
+      and forbids(REFUSED, "target.lstart == nil or critNotifOff.lstart == nil",
+        REFUSED .. "\n     and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then\nend\n"), true)
   local surfaces = body("local function alertSurfaces(state, now)")
   check("hud glue: alertSurfaces located", #surfaces > 400, true)
   check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)

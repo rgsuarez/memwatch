@@ -372,8 +372,67 @@ scenario("unattended needs identity", UNATTENDED_FREEZE, function(W)
   W.run(80)
   check("identity: no unattended signal while identity cannot be bound", W.signalsTo(4242), "")
   W.probeFails = false
+  local recoveredAt = W.now
   check("identity: once it binds, the unattended freeze lands",
-    runUntil(W, 40, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+    runUntil(W, 100, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+  -- (round 5) Grace earned while unbound does not carry over to the bound
+  -- process: the pid could hold a newcomer by then. A full grace from the
+  -- bind (within one bind retry of recovery).
+  check("identity: after a full grace of its own, none carried over from while unbound",
+    W.sigs[#W.sigs] ~= nil and W.sigs[#W.sigs].t - recoveredAt >= 59, true)
+end)
+
+-- (round 5) While probes fail, an unbound runaway accrues grace; it exits
+-- and a same-name process takes its pid. When probes recover and the HUD
+-- binds the newcomer, none of that grace is its.
+scenario("unbound grace does not pass to a newcomer on the pid", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.run(50)                         -- about 50 s of grace accrues while unbound
+  W.reusePid(4242, "node", 2000)
+  W.grow(4242, 220)
+  W.probeFails = false
+  local recoveredAt = W.now
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  check("unbound-grace: the newcomer is frozen in the end", W.signalsTo(4242), "STOP")
+  check("unbound-grace: only after a full grace of its own",
+    W.sigs[#W.sigs] ~= nil and W.sigs[#W.sigs].t - recoveredAt >= 59, true)
+end)
+
+-- (round 5) An operator answer given while unbound (here, opening
+-- Activity Monitor) does not stand a bound newcomer on the pid down.
+scenario("an unbound answer does not stand a newcomer down", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid") end)
+  W.click("monitor")
+  W.run(5)
+  W.reusePid(4242, "node", 2000)
+  W.grow(4242, 220)
+  W.probeFails = false
+  check("unbound-answer: the newcomer is acted on once its own grace passes",
+    runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
+end)
+
+-- (round 5) Two helpers whose names share their first 15 characters are
+-- different processes: an ignore of one never hides the other on its pid.
+scenario("an ignore names one process, not a name prefix", nil, function(W)
+  W.addProc(4242, "Chrome Helper (GPU)", 2000)
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "Chrome Helper (GPU) (pid") end)
+  W.click("ignore")
+  W.run(3)
+  W.reusePid(4242, "Chrome Helper (Renderer)", 2000)
+  W.grow(4242, 220)
+  check("prefix: the other helper on the pid is alerted",
+    runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "Chrome Helper (Renderer) (pid") end), true)
 end)
 
 -- ---- self-test surfaces never signal a real process ----

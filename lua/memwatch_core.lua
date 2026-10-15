@@ -504,6 +504,26 @@ function M.sameRecord(rec, cand)
   return rec.lstart == cand.lstart
 end
 
+-- Exact identity, for routing an action's outcome to a surface ("is this
+-- the very process the action was on?"): pid, name, and both start times
+-- bound and equal. A missing start time never matches here: an outcome
+-- must not answer a surface that might name another process.
+function M.sameIdentity(a, b)
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  if a.pid ~= b.pid or not M.sameName(a.name, b.name) then return false end
+  return a.lstart ~= nil and a.lstart == b.lstart
+end
+
+-- A per-process record (a grace clock, an interaction mark) describes this
+-- process only when it was made for it: the same name, and the same start
+-- time, bound or not. A record made while unbound never transfers to the
+-- process once it binds (the pid may hold a newcomer by then), and one
+-- made for a bound process never serves an unbound reading of the pid.
+function M.recordDescribes(rec, off)
+  if type(rec) ~= "table" or type(off) ~= "table" then return false end
+  return M.sameName(rec.name, off.name) and rec.lstart == off.lstart
+end
+
 -- Severity of an offender kind, for escalation: a process that moves up
 -- this ladder is new information even if it is the same process.
 local KIND_RANK = { hog = 1, absolute = 2, sustained = 3, extreme = 4 }

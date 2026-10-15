@@ -56,15 +56,20 @@ local runGen        = 0     -- bumped by start/stop: a held resume from an older
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
-local ignoredUntil = {}   -- [answerKey] = epoch when the ignore expires
-local goneUntil    = {}   -- [answerKey] = { untilAt, at, lstart }: verified gone, kept
+local ignoredUntil = {}   -- [pid] = { pid, name, lstart, untilAt }: ignored for its window
+local goneUntil    = {}   -- [pid] = { pid, name, lstart, untilAt, at }: verified gone, kept
                           -- off the candidates while its last samples age out
 local GONE_SEC     = 20   -- runawayFreshSec plus a sample period
 local REVEAL_RISES = 3    -- rises after a frozen or gone mark that only a running process makes
--- The ignore and gone lists' key: the pid and the name's first 15
--- characters (core.sameName's rule), so a name top truncated and the full
--- name ps fills in later key the same process.
-local function answerKey(pid, name) return pid .. "|" .. (name or ""):sub(1, 15) end
+-- An ignore or gone mark names one process: kept per pid with the name
+-- (and start time, when bound) it was made for, and matched by
+-- core.sameOffender, so a name top truncated and the full name ps fills in
+-- later are one process, and two names that share a prefix are not.
+local function markFor(map, off)
+  local m = off and off.pid and map[off.pid]
+  if m and core.sameOffender(m, off) then return m end
+  return nil
+end
 local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
@@ -75,7 +80,7 @@ local lastFrozenSweepAt = 0 -- liveness sweep bookkeeping
 -- A verified exit keeps the process off the candidates while its last
 -- samples age out. The mark carries the start time when one was bound.
 local function markGone(off, now)
-  goneUntil[answerKey(off.pid, off.name)] = { untilAt = now + GONE_SEC, at = now, lstart = off.lstart }
+  goneUntil[off.pid] = { pid = off.pid, name = off.name, lstart = off.lstart, untilAt = now + GONE_SEC, at = now }
 end
 -- Does a frozen or gone mark still describe the process at its pid? Not
 -- when that process has another bound start time, and not when it has
@@ -377,9 +382,9 @@ local function assessProcesses(now)
   -- gone mark yields as soon as the pid shows growth since the mark: that
   -- is a newcomer (or a process running again), never the one marked.
   local function heldBack(p)
-    local key = answerKey(p.pid, p.name)
-    if (ignoredUntil[key] or 0) >= now or protectedPids[p.pid] then return true end
-    local g = goneUntil[key]
+    local ig = markFor(ignoredUntil, p)
+    if (ig and ig.untilAt >= now) or protectedPids[p.pid] then return true end
+    local g = markFor(goneUntil, p)
     if g and g.untilAt >= now and markHolds(g, g.at, p.pid, nil) then return true end
     local f = frozen[p.pid]
     return f ~= nil and markHolds(f, f.frozenAt or 0, p.pid, nil)
@@ -534,28 +539,28 @@ end
 local hud            = nil
 -- The grace clock and the answered mark are per process, so a handoff, an
 -- alternation or a newly named offender never borrows another process's
--- clock. Records are filed under pid and the name's first 15 characters
--- (which top's truncation preserves) and carry the start time they were
--- made for: a record made for one bound process never serves another (a
--- same-name process that reused the pid starts over), and one made while
--- unbound is adopted when its process binds. Both start over at every raise.
-local exposure       = {}     -- [key] = { sec, lstart }: time it headed the active alert as extreme
-local interacted     = {}     -- [key] = { lstart }: the operator acted on it since the raise
+-- clock. Records are filed under the pid and carry the name and start time
+-- they were made for (core.recordDescribes): a record made for one process
+-- never serves another, and one made while unbound never transfers to the
+-- process once it binds (the pid may hold a newcomer by then): that
+-- process's grace and answers start over. Both start over at every raise.
+local exposure       = {}     -- [pid] = { name, lstart, sec }: time it headed the active alert as extreme
+local interacted     = {}     -- [pid] = { name, lstart, confirmed, pendingUntil }: the operator acted on it
 local exposureTickAt = nil    -- the previous critical tick (nil: none yet)
 local exposureHead   = nil    -- the record whose process headed the alert since that tick
 local EXPOSURE_STEP_MAX = 15  -- a stalled tick counts at most this much grace
-local function procKey(off)
-  return off and off.pid and answerKey(off.pid, off.name) or nil
-end
--- The record in `map` for this process, or nil: a record made for a
--- different bound process does not count (create replaces it).
+-- The record in `map` (kept per pid) for this process, or nil: a record
+-- made for another identity does not count (core.recordDescribes), and
+-- create replaces it with a fresh one. Nothing made while unbound carries
+-- over to the bound process: its grace and answers start over.
 local function recordFor(map, off, create)
-  local k = procKey(off)
-  if not k then return nil end
-  local r = map[k]
-  if r and r.lstart and off.lstart and r.lstart ~= off.lstart then r = nil end
-  if not r and create then r = {}; map[k] = r end
-  if r and r.lstart == nil and off.lstart then r.lstart = off.lstart end
+  if not off or not off.pid then return nil end
+  local r = map[off.pid]
+  if r and not core.recordDescribes(r, off) then r = nil end
+  if not r and create then
+    r = { name = off.name, lstart = off.lstart }
+    map[off.pid] = r
+  end
   return r
 end
 local hudHold        = false  -- a kill narrative owns the body text
@@ -580,7 +585,7 @@ local function settleInteraction(target, outcome)
   local r = recordFor(interacted, target, false)
   if not r or r.confirmed then return end
   if outcome == "unverified" then
-    interacted[procKey(target)] = nil
+    interacted[target.pid] = nil
   else
     r.confirmed, r.pendingUntil = true, nil
   end
@@ -652,12 +657,12 @@ end
 -- never probes.
 local function isAnswered(off, now)
   if not off or not off.pid then return false end
-  local key = answerKey(off.pid, off.name)
   local f = frozen[off.pid]
   if f and markHolds(f, f.frozenAt or 0, off.pid, off.lstart) then return true end
-  local g = goneUntil[key]
+  local g = markFor(goneUntil, off)
   if g and g.untilAt > now and markHolds(g, g.at, off.pid, off.lstart) then return true end
-  return (ignoredUntil[key] or 0) > now
+  local ig = markFor(ignoredUntil, off)
+  return ig ~= nil and ig.untilAt > now
 end
 
 local HUD_W, HUD_H = 380, 176
@@ -705,15 +710,15 @@ local function identityRefused(target)
   hudStalePid = target.pid
   -- Only the refused process's own records go: a record already made for
   -- the process now holding the pid is that process's, not this one's.
-  local k = procKey(target)
-  if recordFor(exposure, target, false) then exposure[k] = nil end
-  if recordFor(interacted, target, false) then interacted[k] = nil end
+  if recordFor(exposure, target, false) then exposure[target.pid] = nil end
+  if recordFor(interacted, target, false) then interacted[target.pid] = nil end
   -- The banner goes only when it names the refused process: the same pid
-  -- and name, and its start time when both are known. A banner already
-  -- bound to the process now holding the pid stays.
+  -- and name, and either it never bound or it bound that very start time.
+  -- A refusal with no start time takes down only an unbound banner, never
+  -- one already bound to whatever holds the pid now.
   if critNotif and critNotifOff and critNotifOff.pid == target.pid
      and core.sameName(critNotifOff.name, target.name)
-     and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then
+     and (critNotifOff.lstart == nil or (target.lstart ~= nil and critNotifOff.lstart == target.lstart)) then
     pcall(function() critNotif:withdraw() end)
     critNotif, critNotifOff = nil, nil
   end
@@ -765,7 +770,9 @@ local function surfaceUpdate(target)
     if answer == "rebind" then
       identityRefused(target)
     elseif (answer == "done" or answer == "snooze")
-       and hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
+       and core.sameIdentity(hudOffender, target) and not hudHold then
+      -- Only a HUD bound to this very process: an outcome never answers a
+      -- HUD that might name another process (unbound, or rebound).
       dismissHud(answer, hudOffender)
     end
   end
@@ -874,7 +881,7 @@ local function buildHud()
     elseif id == "ignore" or id == "ignore-label" then
       markInteracted(hudOffender)
       if hudOffender and not hudOffender.synthetic then
-        M.ignore(hudOffender.pid, hudOffender.name)
+        M.ignore(hudOffender.pid, hudOffender.name, hudOffender.lstart)
       end
       dismissHud("done")
     elseif id == "monitor" or id == "monitor-label" then
@@ -978,9 +985,14 @@ local function buildMenu()
             M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
           end },
         { title = "Ignore for 30 min",
-          fn = function() M.ignore(pid, name) end },
+          fn = function() M.ignore(pid, name, lst) end },
         { title = "Show in Activity Monitor",
-          fn = function() hs.application.launchOrFocus("Activity Monitor") end },
+          -- Opening Activity Monitor on this process answers it, as the
+          -- HUD's button does.
+          fn = function()
+            markInteracted(target)
+            hs.application.launchOrFocus("Activity Monitor")
+          end },
       },
     }
   end
@@ -1001,8 +1013,11 @@ local function buildMenu()
           { title = "Resume " .. (e.name or "?"),
             fn = function() M.resumePid(pid) end },
           { title = "Force Quit " .. (e.name or "?"),
+            -- The identity this row shows: a pid frozen again for another
+            -- process since the menu opened is refused, not quit.
             fn = function()
-              M.killPid(pid, e.name, surfaceUpdate({ pid = pid, name = e.name, lstart = e.lstart }))
+              M.killPid(pid, e.name, surfaceUpdate({ pid = pid, name = e.name, lstart = e.lstart }),
+                { expectedLstart = e.lstart })
             end },
         },
       }
@@ -1047,7 +1062,7 @@ local function buildMenu()
         M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
       end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
-      fn = function() M.ignore(off.pid, off.name) end }
+      fn = function() M.ignore(off.pid, off.name, bound) end }
     items[#items + 1] = { title = "-" }
   end
   items[#items + 1] = { title = "Open Activity Monitor",
@@ -2889,8 +2904,9 @@ function M.killPid(pid, expectedName, onUpdate, opts)
 end
 
 -- Silence alerts for one process for the standard window.
-function M.ignore(pid, name)
-  ignoredUntil[answerKey(pid, name)] = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec
+function M.ignore(pid, name, lstart)
+  ignoredUntil[pid] = { pid = pid, name = name, lstart = lstart,
+                        untilAt = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec }
   M.logSnapshot(string.format("ignore:%s(%d)", name, pid))
   if lastOffender and lastOffender.pid == pid then
     lastOffender = nil

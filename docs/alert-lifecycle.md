@@ -48,7 +48,7 @@ only cause a refusal, never a wrong signal. **A refusal from any surface
 rebinds every surface:** the HUD binds fresh and treats the process holding
 the pid as a new question, and a banner naming the old process is withdrawn.
 
-Two comparisons are kept apart:
+Three comparisons are kept apart:
 
 - *Continuity* ("is this still the process on screen?") compares pid and
   name, and the start time when both sides have one. Names compare with the
@@ -58,6 +58,17 @@ Two comparisons are kept apart:
   without a start time never vouches for a process whose start time is
   known. A banner record made while unbound is upgraded in place when that
   banner binds.
+- *Exact identity* ("is this the very process the action was on?") routes an
+  action's outcome from the menu or a banner to the HUD: pid, name, and
+  both start times bound and equal. An unbound HUD is never answered by an
+  outcome; it rebinds on its own.
+
+Per-process records (grace clocks, interaction marks) are filed by pid and
+carry the name and start time they were made for. A record made while
+unbound never transfers to the process once it binds, because the pid may
+hold a newcomer by then: that process's grace and answers start over. The
+ignore and gone marks carry their process's name (and start time when
+bound), so two processes whose names share a prefix are never one mark.
 
 ## Answers
 
@@ -86,10 +97,12 @@ memwatch failed to stop, is alertable again.
 
 A frozen or gone mark is about one process, not a pid. It stops counting
 as soon as the pid shows a run of growth after the mark (a stopped process
-cannot grow, and an exited one makes no samples), or the process there has
-a different bound start time. Either way a newcomer holds the pid, and it
-is alertable at once, without waiting for the frozen-ledger sweep, which
-cannot run while probes fail. A freeze click answers "already frozen" only
+cannot grow, and an exited one makes no samples), or, on a surface that
+has bound the process there, a different start time. Either way a
+newcomer holds the pid, and it is alertable at once, without waiting for
+the frozen-ledger sweep, which cannot run while probes fail. Candidates
+themselves carry no start time, so a newcomer that does not grow stays
+behind a frozen mark until the sweep proves the mark stale. A freeze click answers "already frozen" only
 for the same process verified stopped; a freeze still being verified
 stands; a ledger entry for another start time is dropped and the newcomer
 is frozen.
@@ -98,11 +111,10 @@ is frozen.
   or at once if it escalates.
 - **Ignore 30m** puts the process on the ignore list for 30 minutes; it is no
   candidate for the HUD, the banner or the largest-process fallback while
-  the ignore lasts. The ignore and gone lists key a process by its pid and
-  the first 15 characters of its name, so a name `top` truncated and the
-  full name `ps` reports later are one entry. The ignore carries no start
-  time: a same-name process that reuses the pid inside the window is
-  ignored too.
+  the ignore lasts. A name `top` truncated and the full name `ps` reports
+  later are one process (the prefix rule); two different names are not,
+  even when they share a prefix. Candidates carry no start time, so a
+  same-name process that reuses the pid inside the window is ignored too.
 - **Resume** returns a frozen process to the candidates.
 
 ## Grace and interaction

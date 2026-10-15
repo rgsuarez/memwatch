@@ -2540,6 +2540,10 @@ do
     src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time, and the raw delivery reading for its windows",
     src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)", 1, true) ~= nil, true)
+  -- The fake cannot build an unbound offender table beside a bound alert,
+  -- so the recorded binding's fallback to the alert's is pinned by text.
+  check("re-ask: a verdict records the alert's binding when its offender table is unbound",
+    src:find("boundLstart = offender.lstart or bound", 1, true) ~= nil, true)
   check("sampler glue: the launch time for windows is the raw reading, not the callback's basis",
     src:find("local launchedAt = clock.wallAt", 1, true) ~= nil, true)
 end

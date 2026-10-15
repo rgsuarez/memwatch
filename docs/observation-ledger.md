@@ -131,7 +131,11 @@ runs after its record stopped collecting still reads its own horizon.
   as well, since the stepped clock reaches the same instants a second time,
   so it cannot tell the observed process from its pid's next one. The clock
   keeps that stretch as one span over every step since load; a process
-  older than the step keeps its identity.
+  older than the step keeps its identity. A sample's own window in that
+  stretch is no evidence either: a process born since the step starts
+  there, and an age taken before the step overstates how late the pid's
+  next process could start on the stepped clock, so the sample reads as
+  `identity-uncertain`, never as a sighting.
 - A sample: the same program in an overlapping window that rules out a
   successor is a sighting; another program or a disjoint window is a reuse
   (the observed process is gone); anything else is `identity-uncertain`.

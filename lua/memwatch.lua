@@ -1653,12 +1653,17 @@ local function onSample(blob, exitCode, launchedAt, seq)
       -- start record (and read as a reuse). Either way the sample is no
       -- evidence of identity.
       local placeable = row and type(row.etimeSec) == "number" and row.etimeSec > 0
+      -- No identity evidence from a table whose launch record is gone (how
+      -- far the clock moved since its launch is unknown), nor from a window
+      -- in wall time a step back replayed: a process born since the step
+      -- can start there, while the observation's age, taken before the step,
+      -- overstates how late the pid's next process could start on this clock.
+      local start1 = placeable and steppedSec ~= nil
+        and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil
+      if start1 and obs.startReplayed(start1) then start1 = nil end
       observe.foldSample(ev, {
         complete = sampler.complete, row = row,
-        -- No identity evidence from a table whose launch record is gone:
-        -- how far the clock moved since its launch is unknown.
-        start1 = placeable and steppedSec ~= nil
-          and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil,
+        start1 = start1,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
         -- Ordering and the fold's own step check compare the launch with
         -- the observation's time, so they read the launch record the shift

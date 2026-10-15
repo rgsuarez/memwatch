@@ -31,6 +31,12 @@ local function scenario(name, localConfig, fn)
     print("FAIL  " .. name .. " raised: " .. tostring(err))
     fails = fails + 1
   end
+  -- Every command the glue issued is one the fake models: an unmodeled one
+  -- reads as an empty answer, which would let a scenario pass on nothing.
+  if #W.unknown > 0 then
+    print("FAIL  " .. name .. " issued unmodeled commands: " .. table.concat(W.unknown, " | "):sub(1, 240))
+    fails = fails + 1
+  end
   pcall(function() if _G.memwatch then _G.memwatch.stop() end end)
   F.cleanup(W)
 end
@@ -376,14 +382,16 @@ scenario("self-test is inert", nil, function(W, mw)
   W.run(6)
   mw.test("critical", 20)
   W.run(2)
+  check("selftest: the HUD shows the synthetic offender", W.hudShowing() and bodyNames(W, "FakeProc"), true)
   W.click("kill")
+  check("selftest: a button says nothing was signaled", W.hudBody(), "Self-test: nothing was signaled.")
   W.run(8)
   W.click("freeze")
   W.run(3)
   check("selftest: the HUD's buttons signal nothing", W.signalsTo(99999), "")
-  for _, b in ipairs(W.liveBanners()) do
-    check("selftest: the banner offers no Force Quit", b.attrs.hasActionButton == true, false)
-  end
+  local live = W.liveBanners()
+  check("selftest: one banner is up", #live, 1)
+  check("selftest: and it offers no Force Quit", live[1] ~= nil and live[1].attrs.hasActionButton ~= true, true)
 end)
 
 -- ---- lifecycle: overlapping self-tests leave one poller; stop clears ----

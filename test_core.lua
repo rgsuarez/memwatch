@@ -294,6 +294,32 @@ local runsBig = procs.runaways(trBig, 25, "critical", 36864)
 check("absolute fires at critical", #runsBig, 1)
 check("absolute kind", runsBig[1].kind, "absolute")
 
+-- risingSince: a run of rises after a mark (a freeze, a verified exit)
+-- means the pid holds a running process; a held or compressing one never
+-- makes a run. Three cases plus the empty one.
+do
+  local function series(values, comm)
+    local sr = {}
+    for i, v in ipairs(values) do sr[#sr + 1] = { t = (i - 1) * 5, list = { row(60, v, comm or "node") } } end
+    return feed(sr)
+  end
+  -- Frozen at t=12: big and flat before it, a newcomer growing after it.
+  local trNew = series({ 9000, 9000, 9000, 2000, 2300, 2600, 2900, 3200 })
+  check("risingSince: a grower after the mark is a run", procs.risingSince(trNew, 60, 12) >= 3, true)
+  check("risingSince: the mark bounds the count (rises before it do not count)",
+    procs.risingSince(series({ 1000, 1400, 1800, 2200, 2200, 2200 }), 60, 12), 0)
+  -- A held process whose pages compress: each drop is caught up by one rise.
+  local trHeld = series({ 9000, 9000, 8000, 8300, 7500, 7800, 7000, 7300 })
+  check("risingSince: a compressing held process never makes a run", procs.risingSince(trHeld, 60, 0) < 3, true)
+  -- (round 5) A held process whose figure catches up on alternate samples:
+  -- rise, flat, rise, flat, rise is no run (growth()'s one-flat grace does
+  -- not apply here).
+  local trAlt = series({ 9000, 9100, 9100, 9200, 9200, 9300 })
+  check("risingSince: alternate catch-ups are not a run", procs.risingSince(trAlt, 60, 0), 1)
+  check("risingSince: no samples after the mark", procs.risingSince(trNew, 60, 999), 0)
+  check("risingSince: an untracked pid", procs.risingSince(trNew, 61, 0), 0)
+end
+
 -- weight rings: cmprs from top joins rss and sticks between top refreshes,
 -- so a runaway whose pages are compressed away in real time stays visible.
 local trW = procs.newTracker(PC)
@@ -812,34 +838,210 @@ local function earlyRefs(path)
   return bad
 end
 
+-- ---- tri-state process probe: a failed probe is never an exit ----
+-- memwatch's own pid rides in every probe as the positive control, so a
+-- missing row means "gone" only when the control row came back.
+do
+  local SELF = 777
+  local out = table.concat({
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon",
+    " 4242   501 T    Mon Oct  5 10:00:01 2026 /usr/local/bin/node",
+    " 5151   501 R+   Tue Oct 13 11:22:33 2026 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)",
+  }, "\n") .. "\n"
+  local rows = core.parseProbeRows(out, SELF)
+  check("probe: the reply parses", rows ~= nil, true)
+  local st, p = core.probeResult(rows, 4242)
+  check("probe: a listed pid is present", st, "present")
+  check("probe: its start time is kept", p and p.lstart, "Mon Oct  5 10:00:01 2026")
+  check("probe: its state is kept", p and p.state, "T")
+  check("probe: a T state is stopped", core.isStopped(p), true)
+  local _, chrome = core.probeResult(rows, 5151)
+  check("probe: a comm with spaces is kept whole", chrome and chrome.comm,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)")
+  check("probe: R+ is not stopped", core.isStopped(chrome), false)
+  check("probe: a missing pid with the control row present is absent", (core.probeResult(rows, 9999)), "absent")
+  check("probe: an empty reply is unknown, not absent",
+    (core.probeResult(core.parseProbeRows("", SELF), 4242)), "unknown")
+  check("probe: a reply without the control row is unknown",
+    (core.probeResult(core.parseProbeRows(" 4242   501 S    Mon Oct  5 10:00:01 2026 /usr/local/bin/node\n", SELF), 4242)),
+    "unknown")
+  check("probe: a nil reply (the fork raised) is unknown", (core.probeResult(core.parseProbeRows(nil, SELF), 4242)), "unknown")
+  check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
+  check("probe: the control row beside a cut-off line is unknown, not absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n 4242   50", SELF), 4242)),
+    "unknown")
+  check("probe: a complete reply that omits the pid is absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF), 4242)),
+    "absent")
+  local selfOnly = core.parseProbeRows(
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF)
+  check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
+end
+
+-- ---- identity: a recorded process may be signaled only while it holds ----
+do
+  local ident = { pid = 4100, lstart = "Mon Oct 12 10:00:01 2026", name = "llama-server" }
+  check("holds: the recorded process, probed present", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "llama-server"), true)
+  check("holds: another start time on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:09:09 2026", "llama-server"), false)
+  check("holds: a probe that could not tell is refused", core.identityHolds(ident, "unknown", nil, nil), false)
+  check("holds: an exited process is refused", core.identityHolds(ident, "absent", nil, nil), false)
+  check("holds: a record without a start time never signals",
+    core.identityHolds({ pid = 4100, name = "llama-server" }, "present", "Mon Oct 12 10:00:01 2026", "llama-server"), false)
+  check("holds: another name on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "python3"), false)
+  check("holds: a record without a name compares start time alone",
+    core.identityHolds({ pid = 4100, lstart = "L" }, "present", "L", "anything"), true)
+end
+
+-- ---- identity: exact identity, and records that never transfer ----
+do
+  local A  = { pid = 7, name = "node", lstart = "L1" }
+  local A2 = { pid = 7, name = "node", lstart = "L1" }
+  local B  = { pid = 7, name = "node", lstart = "L2" }
+  local U  = { pid = 7, name = "node" }
+  check("exact: the same bound process", core.sameIdentity(A, A2), true)
+  check("exact: another start time on the pid is not it", core.sameIdentity(A, B), false)
+  check("exact: an unbound side never matches", core.sameIdentity(A, U), false)
+  check("exact: two unbound readings do not match either", core.sameIdentity(U, { pid = 7, name = "node" }), false)
+  check("exact: a truncated name of the same bound process matches",
+    core.sameIdentity({ pid = 7, name = "Google Chrome He", lstart = "L1" },
+                      { pid = 7, name = "Google Chrome Helper (Renderer)", lstart = "L1" }), true)
+  check("exact: nil is never a match", core.sameIdentity(nil, A), false)
+  check("record: made for this bound process", core.recordDescribes({ name = "node", lstart = "L1" }, A), true)
+  check("record: made while unbound does not transfer once it binds",
+    core.recordDescribes({ name = "node" }, A), false)
+  check("record: made for a bound process does not serve an unbound reading",
+    core.recordDescribes({ name = "node", lstart = "L1" }, U), false)
+  check("record: made while unbound serves the unbound reading", core.recordDescribes({ name = "node" }, U), true)
+  check("record: another process's record does not", core.recordDescribes({ name = "node", lstart = "L1" }, B), false)
+  check("record: two names sharing 15 characters are different processes",
+    core.recordDescribes({ name = "Chrome Helper (GPU)" }, { pid = 7, name = "Chrome Helper (Renderer)" }), false)
+end
+
+-- ---- identity: continuity versus memory ----
+do
+  local full = "Google Chrome Helper (Renderer)"
+  check("name: a top-truncated name matches its full name",
+    core.sameName("Google Chrome He", full), true)
+  check("name: either way round", core.sameName(full, "Google Chrome He"), true)
+  check("name: short names must match exactly", core.sameName("node", "node2"), false)
+  check("name: a short prefix is not enough", core.sameName("Google", full), false)
+  check("name: a 15-character prefix matches a 20-character name",
+    core.sameName("Chrome Helper (", "Chrome Helper (GPU)1"), true)
+  check("name: two long names that differ inside the prefix do not",
+    core.sameName("Chrome Helper (Renderer)", "Chrome Helpers (GPU)"), false)
+  check("continuity: a truncated name is the same offender",
+    core.sameOffender({ pid = 7, name = "Google Chrome He" }, { pid = 7, name = full, lstart = "L1" }), true)
+  local bound, other = { pid = 7, name = "node", lstart = "L1" }, { pid = 7, name = "node", lstart = "L2" }
+  local unbound = { pid = 7, name = "node" }
+  check("continuity: an unbound side matches while identity is being established",
+    core.sameOffender(unbound, bound), true)
+  check("memory: a bound record matches the same start time", core.sameRecord(bound, { pid = 7, name = "node", lstart = "L1" }), true)
+  check("memory: a different start time is a different process", core.sameRecord(bound, other), false)
+  check("memory: an unbound record never vouches for a bound process", core.sameRecord(unbound, bound), false)
+  check("memory: an unbound candidate compares by pid and name", core.sameRecord(bound, unbound), true)
+  check("memory: two unbound records compare by pid and name", core.sameRecord(unbound, { pid = 7, name = "node" }), true)
+  check("memory: another pid never matches", core.sameRecord(bound, { pid = 8, name = "node", lstart = "L1" }), false)
+end
+
+-- ---- held pollers: a give-up is never a success ----
+do
+  local st = {}
+  check("until: a poll that reports done is done", core.untilStep(st, true, true, 0, 120), "done")
+  check("until: a poll that runs but is not done polls again", core.untilStep(st, true, false, 1, 120), "poll")
+  check("until: an error polls again (escalations live in predicates)", core.untilStep(st, false, "boom", 10, 120), "poll")
+  check("until: still polling just under the budget", core.untilStep(st, false, "boom", 129, 120), "poll")
+  check("until: a continuous error run gives up at the budget", core.untilStep(st, false, "boom", 130, 120), "giveup")
+  local st2 = {}
+  core.untilStep(st2, false, "boom", 0, 120)
+  core.untilStep(st2, true, false, 100, 120)
+  check("until: a poll that runs ends the error run", core.untilStep(st2, false, "boom", 150, 120), "poll")
+end
+
+-- ---- an action's outcome is the alert's answer ----
+do
+  check("answer: frozen is done",            core.answerFor("frozen"), "done")
+  check("answer: terminated is done",        core.answerFor("terminated"), "done")
+  check("answer: exited is done",            core.answerFor("exited"), "done")
+  check("answer: a reused pid rebinds",      core.answerFor("stale"), "rebind")
+  check("answer: a policy refusal snoozes",  core.answerFor("refused"), "snooze")
+  check("answer: a survivor snoozes",        core.answerFor("failed"), "snooze")
+  check("answer: unverified stands",         core.answerFor("unverified"), "stand")
+  check("answer: unconfirmed stands",        core.answerFor("unconfirmed"), "stand")
+  check("answer: no outcome stands",         core.answerFor(nil), "stand")
+  check("answer: an unknown outcome stands", core.answerFor("bogus"), "stand")
+end
+
 -- ---- frozen-ledger prune (calm-state liveness sweep, 2026-07-09 field fix) ----
 -- Three-case floor: exited / identity-changed / healthy-kept, plus the
--- resumed-externally drop and the empty no-op.
+-- resumed-externally drop, the unknown keep and the empty no-op.
 do
   local entries = {
     [100] = { pid = 100, name = "vm-host", lstart = "Tue Jul  7 07:24:43 2026" },
     [200] = { pid = 200, name = "leaky",   lstart = "Wed Jul  8 10:00:00 2026" },
     [300] = { pid = 300, name = "runner",  lstart = "Wed Jul  8 11:00:00 2026" },
     [400] = { pid = 400, name = "steady",  lstart = "Wed Jul  8 12:00:00 2026" },
+    [500] = { pid = 500, name = "held",    lstart = "Wed Jul  8 13:00:00 2026" },
   }
   local probes = {
-    -- [100] absent: exited
-    [200] = { lstart = "Thu Jul  9 09:00:00 2026", state = "T" }, -- pid recycled
-    [300] = { lstart = "Wed Jul  8 11:00:00 2026", state = "R" }, -- resumed externally
-    [400] = { lstart = "Wed Jul  8 12:00:00 2026", state = "T" }, -- still frozen
+    [100] = { "absent" },                                                        -- exited
+    [200] = { "present", { lstart = "Thu Jul  9 09:00:00 2026", state = "T" } },  -- pid recycled
+    [300] = { "present", { lstart = "Wed Jul  8 11:00:00 2026", state = "R" } },  -- resumed externally
+    [400] = { "present", { lstart = "Wed Jul  8 12:00:00 2026", state = "T" } },  -- still frozen
+    [500] = { "unknown" },                                                       -- probe could not run
   }
-  local kept, dropped = core.pruneFrozen(entries, function(pid) return probes[pid] end)
+  local kept, dropped = core.pruneFrozen(entries, function(pid) return table.unpack(probes[pid]) end)
   check("prune: exited dropped",       kept[100], nil)
   check("prune: recycled dropped",     kept[200], nil)
   check("prune: resumed dropped",      kept[300], nil)
   check("prune: live frozen kept",     kept[400] ~= nil, true)
+  check("prune: an unknown probe keeps the entry", kept[500] ~= nil, true)
   local whys = {}
   for _, d in ipairs(dropped) do whys[d.entry.pid] = d.why end
   check("prune: exited reason",        whys[100], "exited")
   check("prune: recycled reason",      whys[200], "pid-recycled")
   check("prune: resumed reason",       whys[300], "resumed-externally")
-  local k2, d2 = core.pruneFrozen({}, function() return nil end)
+  check("prune: nothing dropped for the unknown one", whys[500], nil)
+  local pend = { [600] = { pid = 600, name = "settling", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
+  local probed = false
+  local k3 = core.pruneFrozen(pend, function() probed = true; return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1010)
+  check("prune: a freeze still being verified is kept", k3[600] ~= nil, true)
+  check("prune: and not even probed", probed, false)
+  local k4 = core.pruneFrozen(pend, function() return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1040)
+  check("prune: once its verify window passes it is checked like any other", k4[600], nil)
+  local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
+  -- Pure: a freeze its own verifier could not confirm stays as it was once
+  -- its window passes (no longer pending only because the window ended),
+  -- and the reducer returns no third value.
+  local unconf = { [700] = { pid = 700, name = "unconfirmed", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
+  local k5, d5, extra = core.pruneFrozen(unconf, function()
+    return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
+  check("prune: a stopped entry past its window is kept", k5[700] ~= nil and #d5 == 0, true)
+  check("prune: and the entry is not changed (pure)", unconf[700].pendingUntil, 1030)
+  check("prune: no third return", extra, nil)
+  -- An entry whose STOP never went out is no freeze of memwatch's, whatever
+  -- the process's state: dropped without a probe, inside its window or not.
+  for _, case in ipairs({ { at = 1010, label = "inside its window" }, { at = 1040, label = "past its window" } }) do
+    local unsent = { [800] = { pid = 800, name = "unsent", lstart = "Wed Jul  8 14:00:00 2026",
+                               pendingUntil = 1030, stopSent = false } }
+    local asked = false
+    local k7, d7 = core.pruneFrozen(unsent, function()
+      asked = true
+      return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, case.at)
+    check("prune: an unsent STOP's entry is dropped " .. case.label, k7[800], nil)
+    check("prune: as stop-never-sent " .. case.label, d7[1] and d7[1].why, "stop-never-sent")
+    check("prune: with no probe " .. case.label, asked, false)
+  end
+  -- Control: the same stopped process with its STOP sent stays.
+  local sent = { [801] = { pid = 801, name = "sent", lstart = "Wed Jul  8 14:00:00 2026", stopSent = true } }
+  local k8 = core.pruneFrozen(sent, function()
+    return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
+  check("prune: a sent STOP's stopped process is kept (control)", k8[801] ~= nil, true)
 end
 
 -- ---- plateaued-runaway evidence: peak slope (2026-07-13 live-drill finding) ----
@@ -969,6 +1171,635 @@ for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwat
   local bad = earlyRefs(path)
   for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end
   check("split-scope clean: " .. path, #bad, 0)
+end
+
+-- ---- held-timer guard ----
+-- hs.timer handles are garbage-collected when unreferenced, and a collected
+-- timer never fires (2026-07-15 field incident: a collected self-test resume
+-- timer left sampling paused and the watcher blind under real pressure; the
+-- same bare pattern carried the TERM->KILL escalation and the adjudicator
+-- timeout). Transient timers must go through the held helpers; exactly one
+-- bare constructor of each kind may exist, inside the helper itself.
+do
+  -- Count constructors in CODE only: a comment quoting one (the incident
+  -- narratives here do) must neither trip nor satisfy the pin.
+  local function stripComments(text)
+    text = text:gsub("%-%-%[(=*)%[.-%]%1%]", "")   -- block comments
+    return (text:gsub("%-%-[^\n]*", ""))           -- line comments
+  end
+  local function count(text, pat)
+    local _, n = stripComments(text):gsub(pat, "")
+    return n
+  end
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  check("held-timer: doAfter only inside afterHeld", count(src, "hs%.timer%.doAfter%("), 1)
+  check("held-timer: doUntil only inside untilHeld", count(src, "hs%.timer%.doUntil%("), 1)
+  check("held-timer: a commented constructor is not counted (control)",
+    count("-- hs.timer.doAfter(5, f)\n--[[ hs.timer.doUntil(p) ]]\n", "hs%.timer%.do%a+%("), 0)
+  check("held-timer: a real constructor is counted (control)",
+    count("local t = hs.timer.doAfter(5, f) -- note\n", "hs%.timer%.doAfter%("), 1)
+end
+
+-- ---- alert surfaces: offender identity, banner steps, HUD raises ----
+do
+  local A  = { pid = 10, name = "node", lstart = "Mon Oct 12 10:00:00 2026" }
+  local A2 = { pid = 10, name = "node" }                                  -- same, unbound
+  local Ar = { pid = 10, name = "node", lstart = "Mon Oct 12 11:30:00 2026" } -- pid reused
+  local B  = { pid = 11, name = "python3" }
+  check("offender: same process, both bound", core.sameOffender(A, { pid = 10, name = "node", lstart = A.lstart }), true)
+  check("offender: an unbound start time never forces a mismatch", core.sameOffender(A, A2), true)
+  check("offender: a reused pid with a new start time differs", core.sameOffender(A, Ar), false)
+  check("offender: a renamed pid differs", core.sameOffender(A, { pid = 10, name = "rg" }), false)
+  check("offender: a different pid differs", core.sameOffender(A, B), false)
+  check("offender: none equals none", core.sameOffender(nil, nil), true)
+  check("offender: none differs from one", core.sameOffender(nil, A), false)
+
+  check("kind: severity rises from hog to extreme",
+    core.kindRank("hog") < core.kindRank("absolute") and core.kindRank("absolute") < core.kindRank("sustained")
+      and core.kindRank("sustained") < core.kindRank("extreme"), true)
+  check("kind: an unknown kind ranks lowest", core.kindRank(nil), 0)
+
+  -- W = withdraw, P = post (after the cooldown), R = replace in place now.
+  local function step(a)
+    local s = core.bannerStep(a)
+    return (s.withdraw and "W" or "-") .. (s.post and "P" or "-") .. (s.replace and "R" or "-")
+  end
+  local Ab = { pid = 10, name = "node", lstart = A.lstart, kind = "extreme", canAct = true }
+  local Au = { pid = 10, name = "node", kind = "extreme", canAct = false }   -- posted unbound
+  local Ah = { pid = 10, name = "node", lstart = A.lstart, kind = "hog", canAct = true }
+  local base = { sinceLastPostSec = 1e9, cooldownSec = 180 }
+  local function with(over)
+    local t = {}
+    for k, v in pairs(base) do t[k] = v end
+    for k, v in pairs(over) do t[k] = v end
+    return t
+  end
+  -- Happy: the first post; the live banner for the same offender stays.
+  check("banner: first post of an episode", step(with({ hasBanner = false, offender = A })), "-P-")
+  check("banner: the current offender's banner stays",
+    step(with({ hasBanner = true, banner = Ab, offender = A2, canAct = true })), "---")
+  -- Upgrades in place, without the cooldown: identity bound, kind escalated,
+  -- a generic banner gaining a name.
+  check("banner: an unbound banner upgrades once identity binds",
+    step(with({ hasBanner = true, banner = Au, offender = A, canAct = true, sinceLastPostSec = 5 })), "--R")
+  check("banner: a hog banner upgrades when it escalates",
+    step(with({ hasBanner = true, banner = Ah, offender = { pid = 10, name = "node", kind = "extreme" },
+               canAct = true, sinceLastPostSec = 5 })), "--R")
+  check("banner: a generic banner gains the offender's name at once",
+    step(with({ hasBanner = true, banner = nil, offender = A, canAct = true, sinceLastPostSec = 5 })), "--R")
+  -- Changed: a stale banner goes at once; its replacement waits the cooldown.
+  check("banner: a new offender withdraws the stale banner at once",
+    step(with({ hasBanner = true, banner = Ab, offender = B, sinceLastPostSec = 30 })), "W--")
+  check("banner: the replacement posts once the cooldown allows",
+    step(with({ hasBanner = false, offender = B, sinceLastPostSec = 181 })), "-P-")
+  check("banner: a reused pid is a different offender",
+    step(with({ hasBanner = true, banner = Ab, offender = Ar, sinceLastPostSec = 30 })), "W--")
+  -- History: an offender already announced this episode stays quiet.
+  check("banner: a returning offender already announced stays quiet",
+    step(with({ hasBanner = false, offender = A, notified = true })), "---")
+  check("banner: and a stale banner still goes when it returns",
+    step(with({ hasBanner = true, banner = { pid = 11, name = "python3" }, offender = A, notified = true })), "W--")
+  -- A banner naming a process since answered (frozen, gone, ignored) goes,
+  -- whoever heads the episode now (an answered process is no candidate).
+  check("banner: an answered process's banner goes when another heads the episode",
+    step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = B, sinceLastPostSec = 200 })), "WP-")
+  check("banner: even once no offender is named",
+    step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = nil, notified = true })), "W--")
+  -- Degraded: the offender vanishes mid-episode; the banner stays (no churn).
+  check("banner: a vanished offender keeps its banner",
+    step(with({ hasBanner = true, banner = Ab, offender = nil })), "---")
+  check("banner: a generic banner stays while no offender is named",
+    step(with({ hasBanner = true, banner = nil, offender = nil })), "---")
+  check("banner: a generic banner posts once per episode",
+    step(with({ hasBanner = false, offender = nil, notified = true })), "---")
+
+  local function raise(a) return core.hudRaiseDue(a) end
+  local snoozed = { off = A, kind = "extreme", untilAt = 1060 }
+  check("hud: never re-raises an episode already up",
+    raise({ visible = true, offender = B, episode = A, sinceRaiseSec = 1e9, raiseSec = 60 }), false)
+  check("hud: an episode's first offender raises at once",
+    raise({ visible = false, offender = A, episode = nil, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: a snoozed offender stays down until the snooze ends",
+    raise({ visible = false, offender = A2, episode = A, snooze = snoozed, now = 1030, sinceRaiseSec = 999, raiseSec = 60 }), false)
+  check("hud: and returns when it ends",
+    raise({ visible = false, offender = A2, episode = A, snooze = snoozed, now = 1061, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: an escalation preempts the snooze",
+    raise({ visible = false, offender = { pid = 10, name = "node", kind = "extreme" }, episode = A,
+            snooze = { off = A, kind = "hog", untilAt = 2000 }, now = 1010, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: a new offender preempts the cooldown",
+    raise({ visible = false, offender = B, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), true)
+  check("hud: the same offender again waits the cooldown",
+    raise({ visible = false, offender = A2, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), false)
+  check("hud: no named offender stays cooldown-gated",
+    raise({ visible = false, offender = nil, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), false)
+end
+
+-- ---- alert-surface glue: identity binding and lifecycle ----
+-- Source pins (the behavioral harness, test_glue.lua, drives the glue;
+-- these pin shapes it cannot reach or that must never come back). A
+-- forbidden shape is checked with a real control: the same extractor run
+-- over a pre-fix body must find it, so neither a vacuous extraction nor a
+-- scan that cannot see the shape passes.
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local function bodyIn(text, startPat, endPat)
+    local s = text:find(startPat, 1, true)
+    local e = s and text:find(endPat or "\nend\n", s, true)
+    return (s and e) and text:sub(s, e) or ""
+  end
+  local function body(startPat, endPat) return bodyIn(src, startPat, endPat) end
+  -- The live body has no `bad`; a pre-fix body, extracted the same way, has it.
+  local function forbids(startPat, bad, preFix, endPat)
+    local live, old = bodyIn(src, startPat, endPat), bodyIn(preFix, startPat, endPat)
+    return #live > 0 and live:find(bad, 1, true) == nil and old:find(bad, 1, true) ~= nil
+  end
+  check("source pins: the control rejects a live body that still has the shape",
+    (function()
+      local saved = src
+      src = "local function probe()\n  bad()\nend\n"
+      local verdict = forbids("local function probe()", "bad()", src)
+      src = saved
+      return verdict
+    end)(), false)
+  local notify = body("local function notifyCrit(m)")
+  check("banner glue: notifyCrit located", #notify > 400, true)
+  check("banner glue: steps through core.bannerStep", notify:find("core.bannerStep(", 1, true) ~= nil, true)
+  check("banner glue: Force Quit passes the bound start time",
+    notify:find("local target = { pid = off.pid, name = off.name, lstart = lstart }", 1, true) ~= nil
+      and notify:find("surfaceUpdate(target, click), { expectedLstart = lstart })", 1, true) ~= nil, true)
+  check("banner glue: the button exists only when identity is bound",
+    notify:find("hasActionButton   = canAct,", 1, true) ~= nil, true)
+  check("banner glue: no unbound kill remains",
+    forbids("local function notifyCrit(m)", "M.killPid(off.pid, off.name)\n",
+      "local function notifyCrit(m)\n  critNotif = hs.notify.new(function()\n    M.killPid(off.pid, off.name)\n  end)\nend\n"), true)
+  -- (round 5) An outcome from the menu or a banner answers only a HUD bound
+  -- to its very process; a refusal with no start time withdraws only an
+  -- unbound banner.
+  local SURF = "local function surfaceUpdate(target, click)"
+  check("surface glue: an outcome answers only a HUD bound to its very process",
+    body(SURF):find("core.sameIdentity(hudOffender, target)", 1, true) ~= nil
+      and forbids(SURF, "core.sameOffender(hudOffender, target)",
+        SURF .. "\n    if hudOffender and core.sameOffender(hudOffender, target) then end\nend\n"), true)
+  local REFUSED = "local function identityRefused(target)"
+  check("refusal glue: an unbound refusal never withdraws a bound banner",
+    body(REFUSED):find("(critNotifOff.lstart == nil or (target.lstart ~= nil and critNotifOff.lstart == target.lstart))", 1, true) ~= nil
+      and forbids(REFUSED, "target.lstart == nil or critNotifOff.lstart == nil",
+        REFUSED .. "\n     and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then\nend\n"), true)
+  local surfaces = body("local function alertSurfaces(state, now)")
+  check("hud glue: alertSurfaces located", #surfaces > 400, true)
+  check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)
+  check("hud glue: a refresh inherits the bound identity",
+    surfaces:find("bindOffender(offender, hudOffender, now, false)", 1, true) ~= nil, true)
+  check("hud glue: a retarget binds anew",
+    surfaces:find("if not core.sameOffender(hudOffender, offender) then", 1, true) ~= nil
+      and surfaces:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
+  check("hud glue: the grace is per process (the single shared clock is gone)",
+    forbids("local function unattendedStep(offender, now)", "hudShownAt",
+      "local function unattendedStep(offender, now)\n  if (now - hudShownAt) < core.cfg.cool.autoKillGraceSec then return end\nend\n")
+      and src:find("hudShownAt", 1, true) == nil
+      and surfaces:find("exposureHead.sec = (exposureHead.sec or 0)", 1, true) ~= nil, true)
+  check("hud glue: the refresh never drops the bound table",
+    forbids("local function alertSurfaces(state, now)", "hudOffender = offender or hudOffender",
+      "local function alertSurfaces(state, now)\n      hudOffender = offender or hudOffender\nend\n"), true)
+  local reset = body("local function resetEpisode()")
+  check("episode glue: resetEpisode located", #reset > 100, true)
+  check("episode glue: the episode's end forgets its HUD memory",
+    reset:find("hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil", 1, true) ~= nil
+      and reset:find("exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil", 1, true) ~= nil, true)
+  check("episode glue: the episode ends at settle",
+    surfaces:find("if settled and not hudHold then resetEpisode() end", 1, true) ~= nil, true)
+  check("episode glue: and with the run", body("function M.stop()"):find("resetEpisode()", 1, true) ~= nil, true)
+  check("episode glue: stop drops a pending model request",
+    body("function M.stop()"):find("lfmInFlight = nil", 1, true) ~= nil, true)
+  local closeAt = src:find('elseif id == "close" then', 1, true)
+  local closeBody = closeAt and src:sub(closeAt, closeAt + 260) or ""
+  check("hud glue: a close is a snooze", closeBody:find('dismissHud("snooze")', 1, true) ~= nil, true)
+  local clicks = body('hud:mouseCallback(guard("hud-click"', "\n  end))")
+  check("hud glue: no click handler hides the HUD without answering it",
+    #clicks > 0 and forbids('hud:mouseCallback(guard("hud-click"', "M.hideHud()",
+      'hud:mouseCallback(guard("hud-click", function(_, evt, id)\n    if id == "close" then M.hideHud() end\n  end))',
+      "\n  end))"), true)
+  check("hud glue: a click acts only on a bound identity",
+    clicks:find("if not target.lstart then", 1, true) ~= nil, true)
+  local poll = body("local function untilHeld(pred, action, interval, onGiveUp)")
+  check("poller glue: untilHeld located", #poll > 200, true)
+  check("poller glue: a give-up calls the owner's handler, never the success action",
+    poll:find('if step == "giveup" then', 1, true) ~= nil and poll:find("pcall(onGiveUp)", 1, true) ~= nil, true)
+  check("poller glue: an error no longer ends the poller",
+    forbids("local function untilHeld(pred, action, interval, onGiveUp)", "or not ok",
+      "local function untilHeld(pred, action, interval, onGiveUp)\n    done = done == true or not ok\nend\n"), true)
+  check("poller glue: a continuous error run gives up", poll:find("UNTIL_GIVEUP_SEC", 1, true) ~= nil, true)
+  local retire = body("local function retireLfmServer(reason)")
+  local RETIRE = "local function retireLfmServer(reason)"
+  check("lfm glue: the retire TERM and KILL both check the recorded server identity",
+    retire:find('local sent = tracked == "ours" and send(sig, pid)', 1, true) ~= nil
+      and retire:find('if owner and not (owner == pid and (sent or tracked == "other")) and listenerIsOurs(owner) then', 1, true) ~= nil
+      and retire:find("core.identityHolds(ident, st,", 1, true) ~= nil
+      and forbids(RETIRE, 'sig == "TERM" or',
+        RETIRE .. '\n    if pid and (sig == "TERM" or trackedIsOurs()) then\nend\n'), true)
+  check("lfm glue: a listener on the tracked pid gets no shortcut",
+    forbids(RETIRE, "if owner == pid then return true end",
+      RETIRE .. "\n    if owner == pid then return true end\nend\n"), true)
+  check("lfm glue: the identity is the one recorded at start, not probed at retire",
+    forbids(RETIRE, "local ident = probePid(pid)", RETIRE .. "\n  local ident = probePid(pid)\nend\n")
+      and src:find("recordLfmServer(owner)", 1, true) ~= nil, true)
+  local start = body("function M.start()")
+  check("lfm glue: a later probe that cannot answer keeps the recorded start time",
+    body("local function recordLfmServer(pid)"):find(
+      "lstart = probed and probed.lstart or (prev and prev.lstart) or nil", 1, true) ~= nil, true)
+  check("ledger glue: an entry with no start time is owned by no writer",
+    src:find("return cur == nil or (cur.lstart ~= nil and cur.lstart == lstart)", 1, true) ~= nil, true)
+  local rls = body("local function recordLfmServer(pid)")
+  check("lfm glue: only the start time carries over a failed probe, never the name",
+    rls:find("name = probed and procs.friendlyName(probed.comm) or nil", 1, true) ~= nil
+      and rls:find("prev and prev.name", 1, true) == nil, true)
+  check("lfm glue: no pidfile is written without a start time",
+    rls:find("local rec = lfmServerIdent.lstart and lfm.jsonEncode(", 1, true) ~= nil, true)
+  check("lfm glue: the orphan sweep requires the recorded start time",
+    start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
+      and forbids("function M.start()", "not rec.lstart or",
+        "function M.start()\n           and (not rec.lstart or info:find(rec.lstart, 1, true)) then\nend\n"), true)
+  check("lfm glue: the health poll's give-up retires the server",
+    src:find('retireLfmServer("health-giveup")', 1, true) ~= nil, true)
+  check("poller glue: the retire probe cannot skip the KILL deadline",
+    src:find("local okGone, gone = pcall(function()", 1, true) ~= nil, true)
+  local police = src:find('"memwatch: adjudicator over budget"', 1, true)
+  check("receipt glue: the over-budget notice ignores the mute",
+    police ~= nil and not src:sub(police - 200, police):find("if alertsEnabled then", 1, true), true)
+  check("banner glue: the episode history gates every post",
+    notify:find("canAct = canAct, notified = notified,", 1, true) ~= nil, true)
+  check("banner glue: every post joins the episode history",
+    notify:find("critNotified[#critNotified + 1] = critNotifOff or { none = true }", 1, true) ~= nil, true)
+  check("banner glue: the episode's end clears the history", reset:find("critNotified = {}", 1, true) ~= nil, true)
+  local raiseBody = body("local function raiseHud(offender, titleText)")
+  check("hud glue: a fresh raise binds identity anew",
+    raiseBody:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
+  check("hud glue: a raise no longer inherits across the episode",
+    forbids("local function raiseHud(offender, titleText)", "bindOffender(offender, hudEpisodeOff)",
+      "local function raiseHud(offender, titleText)\n  bindOffender(offender, hudEpisodeOff)\nend\n"), true)
+  local test = body("function M.test(level, seconds)")
+  local clearAt = test:find("resetEpisode()", 1, true)
+  local postAt = test:find("notifyCrit(lastMetrics)", 1, true)
+  check("self-test glue: a fresh run clears the previous banner first",
+    clearAt ~= nil and postAt ~= nil and clearAt < postAt, true)
+  check("self-test glue: a stale resume is a no-op", test:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
+  local sim = body("function M.simulate(seconds)")
+  check("simulate glue: a stale resume is a no-op", sim:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
+  local stop = body("function M.stop()")
+  check("lifecycle glue: stop orphans pending resumes", stop:find("runGen = runGen + 1", 1, true) ~= nil, true)
+  -- The LFM pollers (not reachable from the behavioral harness).
+  check("lfm glue: a health poller ends when its server is no longer current",
+    src:find("if not myTask or lfmServerTask ~= myTask then return true end", 1, true) ~= nil, true)
+  check("lfm glue: the retire KILL survives a failing listener lookup",
+    src:find('local okKill, kerr = pcall(signalTargets, "KILL")', 1, true) ~= nil, true)
+  check("config glue: an undecodable local config is never rewritten",
+    src:find('logError("local-config-save"', 1, true) ~= nil, true)
+  local mute = body("function M.setAlertsEnabled(on)")
+  check("mute glue: unmuting lets the banner return with the HUD", mute:find("lastNotifyAt = 0", 1, true) ~= nil, true)
+  check("mute glue: muting forgets the episode history so unmute restores the banner",
+    mute:find("critNotified = {}", 1, true) ~= nil, true)
+  check("self-test glue: a fresh run clears the episode history", test:find("resetEpisode()", 1, true) ~= nil, true)
+  check("simulate glue: a simulation starts a fresh episode too",
+    body("function M.simulate(seconds)"):find("resetEpisode()", 1, true) ~= nil, true)
+end
+
+-- ---- episode banner: the cooldown ends with the episode ----
+-- A cooldown carried past recovery silenced the next episode's banner when
+-- it began within notifyCooldownSec of the last one. The settle branch must
+-- reset it whether or not a banner is still up.
+do
+  -- True when the settle branch resets the cooldown under the settle gate
+  -- itself, not under a live-banner condition that skips it.
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local rs = src:find("local function resetEpisode()", 1, true)
+  local re = rs and src:find("\nend\n", rs, true)
+  local resetBody = (rs and re) and src:sub(rs, re) or ""
+  local function resetsOnSettle(body)
+    local gate = body:find("if settled then", 1, true) or body:find("if settled and not hudHold then", 1, true)
+    local reset = body:find("lastNotifyAt = 0", 1, true)
+    local viaEpisode = body:find("resetEpisode()", 1, true)
+    if gate and viaEpisode and gate < viaEpisode then
+      return resetBody:find("lastNotifyAt = 0", 1, true) ~= nil
+    end
+    return gate ~= nil and reset ~= nil and gate < reset
+  end
+  local s = src:find("local settled = (now - hudBelowCritSince) >= 10", 1, true)
+  local e = s and src:find("\nend\n", s, true)
+  local body = (s and e) and src:sub(s, e) or ""
+  check("episode banner: settle branch located", #body > 100, true)
+  check("episode banner: settle resets the cooldown", resetsOnSettle(body), true)
+  -- Positive control: the same scan rejects the pre-fix shape, where the
+  -- banner was withdrawn and the cooldown kept.
+  local preFix = table.concat({
+    "local settled = (now - hudBelowCritSince) >= 10",
+    "if critNotif and settled then",
+    "  pcall(function() critNotif:withdraw() end)",
+    "  critNotif, critNotifPid = nil, nil",
+    "end" }, "\n")
+  check("episode banner: scan rejects the pre-fix shape (positive control)",
+    resetsOnSettle(preFix), false)
+end
+
+-- ---- start times as ps prints them (lstartEpoch) ----
+-- Dating an old frozen entry rests on this parse, so it is pinned against
+-- hand-written fields, and it must fail closed (nil) on anything that does
+-- not name exactly one instant.
+do
+  local names = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+  local allMonths = true
+  for m, mon in ipairs(names) do
+    -- Noon is never inside a daylight saving change, in any zone.
+    for _, day in ipairs({ 5, 15 }) do
+      local text = string.format("Mon %s %2d 12:00:00 2026", mon, day)
+      local want = os.time({ year = 2026, month = m, day = day, hour = 12, min = 0, sec = 0 })
+      if core.lstartEpoch(text) ~= want then
+        allMonths = false
+        print("  lstartEpoch mismatch: " .. text)
+      end
+    end
+  end
+  check("lstartEpoch: all twelve months, one- and two-digit days, match hand-written fields", allMonths, true)
+  check("lstartEpoch: one second apart reads one second apart",
+    (core.lstartEpoch("Mon Oct  5 10:00:02 2026") or 0) - (core.lstartEpoch("Mon Oct  5 10:00:01 2026") or 0), 1)
+  local bad = {
+    { "nil", nil }, { "a number", 1791212401 }, { "an unknown month", "Mon Foo  5 10:00:01 2026" },
+    { "missing seconds", "Mon Oct  5 10:00 2026" }, { "trailing junk", "Mon Oct  5 10:00:01 2026 x" },
+    { "a date that does not exist", "Mon Feb 30 10:00:00 2026" }, { "hour 25", "Mon Oct  5 25:00:00 2026" },
+    { "empty", "" },
+  }
+  for _, c in ipairs(bad) do
+    check("lstartEpoch: " .. c[1] .. " is nil", core.lstartEpoch(c[2]), nil)
+  end
+  -- The daylight saving fold and gap, in a child with a fixed zone (this
+  -- process cannot change its own). A child that does not answer fails the
+  -- checks: a silent child is never read as a pass.
+  -- The interpreter is the lowest arg index (options sit between it and
+  -- the script).
+  local lua = "lua"
+  if arg then
+    local i = -1
+    while arg[i - 1] ~= nil do i = i - 1 end
+    lua = arg[i] or lua
+  end
+  local code = 'package.path = "lua/?.lua;" .. package.path; local c = require("memwatch_core"); '
+    .. 'local function s(v) return v == nil and "nil" or "num" end; '
+    .. 'print("ctl " .. s(c.lstartEpoch("Sun Nov  1 03:00:00 2026")) .. " fold " .. s(c.lstartEpoch("Sun Nov  1 01:30:00 2026")) '
+    .. '.. " gap " .. s(c.lstartEpoch("Sun Mar  8 02:30:00 2026")))'
+  local function child(tz)
+    local h = io.popen(string.format("TZ=%s %s -e '%s' 2>&1", tz, lua, code))
+    local out = h and h:read("a") or ""
+    if h then h:close() end
+    return out
+  end
+  local chicago = child("America/Chicago")
+  check("lstartEpoch: the child answered (positive control)", chicago:match("^ctl num") ~= nil, true)
+  check("lstartEpoch: the hour repeated when daylight saving ends is nil", chicago:match(" fold (%a+)"), "nil")
+  check("lstartEpoch: the hour skipped when it starts is nil", chicago:match(" gap (%a+)"), "nil")
+  local utc = child("UTC")
+  check("lstartEpoch: the same times parse where no clock changes (control)",
+    utc:match("^ctl num fold num gap num") ~= nil, true)
+end
+
+-- ---- rule 8: clock.shift covers every wall stamp memwatch keeps ----
+-- A stamp the shift misses keeps the old basis after a step back, so its
+-- wait runs long by the step. Every top-level local and every field named
+-- as a time (...At, ...Since, ...Until, ...Seen), in the glue and in the
+-- tracker, must be named in clock.shift, unless it is listed here with the
+-- reason it is not a wall stamp.
+do
+  local notWall = {
+    erroringSince = "an error run is a duration, timed on the monotonic clock",
+    wallAt = "the detector's own last reading",
+    monoAt = "the detector's own last reading (monotonic)",
+  }
+  local function read(path)
+    local f = assert(io.open(path, "r")); local t = f:read("a"); f:close(); return t
+  end
+  local src, psrc = read("lua/memwatch.lua"), read("lua/memwatch_procs.lua")
+  local a = src:find("function clock.shift(delta)", 1, true)
+  local z = a and src:find("\nend\n", a, true)
+  local body = (a and z) and src:sub(a, z) or ""
+  check("clock.shift: located", #body > 200, true)
+  local function timeName(n)
+    return (n:match("At$") or n:match("Since$") or n:match("Until$") or n:match("Seen$")) and not notWall[n]
+  end
+  local function unshifted(text, shiftBody)
+    local miss, seen, calls = {}, {}, {}
+    for n in text:gmatch("%.([%a_][%w_]*)%s*%(") do calls[n] = true end   -- functions, not stamps
+    for line in text:gmatch("[^\n]+") do
+      if not line:match("^local%s+function") then
+        local names = line:match("^local%s+([%w_,%s]-)%s*=") or line:match("^local%s+([%w_]+)%s*$")
+        for n in (names or ""):gmatch("[%w_]+") do
+          if timeName(n) and not seen[n] then
+            seen[n] = true
+            if not shiftBody:find("%f[%w_]" .. n .. "%f[^%w_]") then miss[#miss + 1] = n end
+          end
+        end
+      end
+    end
+    for n in text:gmatch("%.([%a_][%w_]*)") do
+      if timeName(n) and not calls[n] and not seen[n] then
+        seen[n] = true
+        if not shiftBody:find("%f[%w_]" .. n .. "%f[^%w_]") then miss[#miss + 1] = n end
+      end
+    end
+    return miss
+  end
+  local m1, m2 = unshifted(src, body), unshifted(psrc, body)
+  check("clock.shift: every time-named stamp in the glue is shifted (" .. table.concat(m1, ",") .. ")", #m1, 0)
+  check("clock.shift: every time-named stamp the tracker keeps is shifted (" .. table.concat(m2, ",") .. ")", #m2, 0)
+  check("clock.shift: the tracker's ring times are shifted", body:find("smp.t = sh(smp.t)", 1, true) ~= nil, true)
+  check("clock.shift: the scan sees a missing local (positive control)",
+    #unshifted("local fooAt = 0\n", body), 1)
+  check("clock.shift: the scan sees a missing field (positive control)",
+    #unshifted("e.fooUntil = now + 1\n", body), 1)
+  check("clock.shift: a function call is not a stamp (control)",
+    #unshifted("x = procs.fooSince(t)\n", body), 0)
+  -- Fields named plainly at, since or t are stamps too. Each holder that
+  -- writes one is listed with the shift step that covers it, or the scan
+  -- fails: a new holder is a reviewed decision.
+  local lowerHolders = {
+    topCache = "sampler", goneUntil = "gone", fired = "unattended (an unattendedFiredFor record)",
+    unattendedFiredFor = "unattended", lfmInFlight = "adjudicator", verdictCache = "verdicts",
+    smState = "state", ring = "tracker (its samples)",
+  }
+  local function lowerStamps(text)
+    local sa = text:find("function clock.shift(delta)", 1, true)
+    local sz = sa and text:find("\nend\n", sa, true)
+    if sa and sz then text = text:sub(1, sa - 1) .. text:sub(sz) end
+    local miss, ctor, depth = {}, nil, 0
+    for line in text:gmatch("[^\n]+") do
+      -- The table a constructor builds: the name right before "= {", or
+      -- before its index ("finals[pid] = {"). A field line counts toward it
+      -- only while that constructor is still open.
+      local open = line:match("([%a_][%w_]*)%s*%b[]%s*=%s*{") or line:match("([%a_][%w_]*)%s*=%s*{")
+      if open then ctor, depth = open, 0 end
+      -- A log row's ISO time (os.date) is a string written out, never a
+      -- held stamp: skipped by its value, not by a holder's name.
+      local iso = line:find("=%s*os%.date%(")
+      local holder = line:match("([%a_][%w_]*)%.at%s*=[^=]") or line:match("([%a_][%w_]*)%.since%s*=[^=]")
+        or line:match("([%a_][%w_]*)%.t%s*=[^=]")
+      if not holder and not iso and (line:match("[{,]%s*at%s*=[^=]") or line:match("^%s*at%s*=[^=]")
+          or line:match("[{,]%s*since%s*=[^=]") or line:match("[{,]%s*t%s*=[^=]")) then
+        holder = (ctor and depth >= 0) and ctor or "?"
+      end
+      if holder and not lowerHolders[holder] then miss[#miss + 1] = holder end
+      if ctor then
+        local _, opens = line:gsub("{", "")
+        local _, closes = line:gsub("}", "")
+        depth = depth + opens - closes
+        if depth <= 0 and not open then ctor = nil end
+        if open and depth <= 0 then ctor = nil end
+      end
+    end
+    return miss
+  end
+  local w1, w2 = lowerStamps(src), lowerStamps(psrc)
+  check("clock.shift: every holder of an at, since or t stamp is reviewed (" .. table.concat(w1, ",")
+    .. table.concat(w2, ",") .. ")", #w1 + #w2, 0)
+  check("clock.shift: the scan sees a new holder's at (positive control)", #lowerStamps("  newHolder.at = now\n"), 1)
+  check("clock.shift: and one built with it (positive control)",
+    #lowerStamps("  local fresh = {\n    pid = 1,\n    at = now,\n  }\n"), 1)
+  check("clock.shift: a field after a closed constructor is not credited to it (positive control)",
+    #lowerStamps("  local topCache = { map = nil }\n  register({\n    at = now,\n  })\n"), 1)
+  check("clock.shift: a log row's ISO time is not a stamp (control)",
+    #lowerStamps("  local row = {\n    at = os.date(\"!%Y\"),\n  }\n"), 0)
+  check("clock.shift: a constructor is named by the table it builds, not the statement around it",
+    table.concat(lowerStamps("  if ok then fresh[pid] = { at = now } end\n"), ","), "fresh")
+  -- A name is matched whole: one that appears in the shift only inside a
+  -- longer name is not shifted.
+  check("clock.shift: a name inside a longer one does not count (positive control)",
+    #unshifted("local sampleAt = 0\n", "lastSampleAt = sh(lastSampleAt)"), 1)
+  check("clock.shift: each holder is shifted under its own pcall",
+    body:find("local ok, err = pcall(step[2])", 1, true) ~= nil
+      and body:find('logError("clock-shift:" .. step[1], err)', 1, true) ~= nil, true)
+  -- A stamp written two holders deep is matched by its whole path: a field
+  -- of the same name on another holder (obs.lastAt) does not cover it.
+  local function nestedUnshifted(text, shiftBody)
+    local miss, seen = {}, {}
+    for chain in text:gmatch("([%a_][%w_]*%.[%a_][%w_]*%.[%a_][%w_%.]*)%s*=[^=]") do
+      if timeName(chain:match("([%a_][%w_]*)$")) and not seen[chain] then
+        seen[chain] = true
+        if not shiftBody:find(chain, 1, true) then miss[#miss + 1] = chain end
+      end
+    end
+    return miss
+  end
+  local n1, n2 = nestedUnshifted(src, body), nestedUnshifted(psrc, body)
+  check("clock.shift: every nested stamp is shifted by its whole path (" .. table.concat(n1, ",")
+    .. table.concat(n2, ",") .. ")", #n1 + #n2, 0)
+  check("clock.shift: a nested stamp is not covered by a namesake (positive control)",
+    #nestedUnshifted("obs.stats.lastAt = now\n", "obs.lastAt = sh(obs.lastAt)"), 1)
+  check("clock.shift: a stamp four holders deep is matched by its whole path (positive control)",
+    #nestedUnshifted("cache.entry.offender.lastAt = now\n", "offender.lastAt = sh(offender.lastAt)"), 1)
+  check("clock.shift: a nested read is not a stamp (control)",
+    #nestedUnshifted("if a.e.frozenAt < b.e.frozenAt then end\n", body), 0)
+  -- A wall reading kept in a function's local is out of the shift's reach
+  -- (a callback that captures it keeps the old basis), so a duration timed
+  -- from one belongs on the monotonic clock. Every time-named local inside
+  -- a function is listed here with how it is used, or the scan fails.
+  local functionLocal = {
+    sentAt = "dispatch: copied into lfmInFlight.at (shifted) in the same call; latency: a monotonic reading",
+  }
+  local function localStamps(text)
+    local miss = {}
+    for line in text:gmatch("[^\n]+") do
+      local names = line:match("^%s+local%s+([%w_,%s]-)%s*=") or line:match("^%s+local%s+([%w_]+)%s*$")
+      for n in (names or ""):gmatch("[%w_]+") do
+        if timeName(n) and not functionLocal[n] then miss[#miss + 1] = n end
+      end
+    end
+    return miss
+  end
+  local l1, l2 = localStamps(src), localStamps(psrc)
+  check("closures: every time-named function local is reviewed (" .. table.concat(l1, ",")
+    .. table.concat(l2, ",") .. ")", #l1 + #l2, 0)
+  check("closures: the scan sees an indented stamp (positive control)",
+    #localStamps("  local spawnAt = lfmSpawnedAt\n"), 1)
+  -- Pure durations never need shifting: they run on the monotonic clock.
+  check("monotonic: a poller's error run", src:find("core.untilStep(run, ok, done, clock.mono(), UNTIL_GIVEUP_SEC)", 1, true) ~= nil, true)
+  check("monotonic: the retire's KILL deadline",
+    src:find("local deadline = clock.mono() + 5", 1, true) ~= nil and src:find("if clock.mono() > deadline then", 1, true) ~= nil, true)
+  check("monotonic: the server's health deadline",
+    src:find("local healthDeadline = clock.mono() + 60", 1, true) ~= nil
+      and src:find("if clock.mono() > healthDeadline then", 1, true) ~= nil, true)
+  check("monotonic: request latency", src:find("math.floor((clock.mono() - sentMono) * 1000)", 1, true) ~= nil, true)
+  -- Rule 4: a click's "nothing done" reaches it at the click (its probe),
+  -- so no engine reports it after the backstop has released the action;
+  -- should one ever do so, a released action is still never revived.
+  check("veto: a withdrawal needs the action still in flight",
+    src:find("if openReceipts[owed] and not owed.finished and not owed.vetoFinal", 1, true) ~= nil, true)
+  check("monotonic: the fast-crash window, keyed to this very spawn",
+    src:find("if lfmSpawn == spawn\n         and (clock.mono() - spawn.mono) < 10 then", 1, true) ~= nil, true)
+  check("monotonic: the error log's rate limit", src:find("local now = clock.mono()\n  if lastErrorMono[label]", 1, true) ~= nil, true)
+  -- A shift that throws never aborts the read that found the step, and
+  -- never runs again for the same step: the readings move first.
+  local ra = src:find("function clock.now()", 1, true)
+  local rz = ra and src:find("\nend\n", ra, true)
+  local reader = (ra and rz) and src:sub(ra, rz) or ""
+  local aa = src:find("function clock.apply(delta)", 1, true)
+  local az = aa and src:find("\nend\n", aa, true)
+  local applier = (aa and az) and src:sub(aa, az) or ""
+  local moved = reader:find("clock.wallAt, clock.monoAt = wall, mono", 1, true)
+  local applied = reader:find("clock.apply(delta)", 1, true)
+  check("clock.now: a step is applied only after the readings move",
+    moved ~= nil and applied ~= nil and moved < applied, true)
+  local counted = applier:find("clock.stepTotal = clock.stepTotal + delta", 1, true)
+  local guarded = applier:find("pcall(clock.shift, delta)", 1, true)
+  check("clock.apply: the step is counted, then the shift runs under pcall",
+    counted ~= nil and guarded ~= nil and counted < guarded, true)
+  -- A callback is never shifted under: a step seen mid-callback is held and
+  -- applied when it ends, and reads inside it stay on its starting basis.
+  check("clock frames: guard brackets every callback",
+    src:find("    clock.enter()\n    local ok, err = pcall(fn, ...)\n    clock.leave()", 1, true) ~= nil, true)
+  check("clock frames: a step seen anywhere inside a frame waits for its end",
+    reader:find("if clock.depth > 0 then\n      clock.pending = clock.pending + delta", 1, true) ~= nil, true)
+  check("clock frames: reads inside the frame stay on its basis", reader:find("return wall - clock.pending", 1, true) ~= nil, true)
+  -- Every entry point is a frame: the top stream's data callback (which
+  -- guard cannot wrap: the stream needs its true back) and the immediate
+  -- first tick at start, as well as every guarded callback.
+  check("clock frames: the top stream's data callback is one",
+    src:find("      clock.enter()\n      local ok, err = pcall(function()\n        local published = procs.feedTopStream", 1, true) ~= nil
+      and src:find("      end)\n      clock.leave()\n      if not ok then logError(\"topstream\", err) end", 1, true) ~= nil, true)
+  local _, rawTicks = src:gsub("\n%s+tick%(%)", "")
+  check("clock frames: no tick runs outside one", rawTicks, 0)
+  local _, everies = src:gsub("hs%.timer%.doEvery%(", "")
+  local _, framedEveries = src:gsub("hs%.timer%.doEvery%([^\n]-guard%(", "")
+  check("clock frames: every repeating timer's callback is guarded (" .. framedEveries .. "/" .. everies .. ")",
+    everies > 0 and framedEveries == everies, true)
+  check("clock frames: the held one-shot and the held poller each run one frame",
+    src:find("    clock.enter()\n    local ok, err = pcall(fn)\n    clock.leave()", 1, true) ~= nil
+      and src:find("    clock.enter()\n    local ok, finished = pcall(poll)\n    clock.leave()", 1, true) ~= nil, true)
+  check("clock frames: the menu's build and every item are frames",
+    src:find("    clock.enter()\n    local ok, items = pcall(buildMenu)\n    clock.leave()", 1, true) ~= nil
+      and src:find('it.fn = guard("menu-item", it.fn)', 1, true) ~= nil, true)
+  -- The stale-row branch answers for the process the row showed.
+  check("resume: a stale row over another frozen process answers for the one it showed",
+    src:find("if shown and not core.sameIdentity(shown, e) then\n    markInteracted(shown, nil, true)", 1, true) ~= nil, true)
+  check("resume: a stale row's Resume still answers for the process it showed",
+    src:find("if shown then markInteracted(shown, nil, true) end", 1, true) ~= nil, true)
+  check("clock.shift: the wait streak is a count, never indexed as a stamp", body:find("unattendedWaitStreak", 1, true), nil)
+  check("unattended grace: a future stamp restarts from now (fails closed)",
+    src:find("if fired and type(fired.at) == \"number\" and fired.at > now then fired.at = now end", 1, true) ~= nil, true)
+  -- One reader of the wall clock: clock.now. clock.mono reads the
+  -- monotonic clock, or the wall clock through clock.now when there is
+  -- none, and nothing reads os.time.
+  local _, raw = src:gsub("hs%.timer%.secondsSinceEpoch%(%)", "")
+  check("wall reads: only clock.now reads the wall clock raw", raw, 1)
+  local _, osTime = src:gsub("os%.time%(%)", "")
+  check("wall reads: no os.time", osTime, 0)
+  local ma = src:find("function clock.mono()", 1, true)
+  local mz = ma and src:find("\nend\n", ma, true)
+  local mono = (ma and mz) and src:sub(ma, mz) or ""
+  check("clock.mono: without a monotonic clock, the wall through the detector, steps added back",
+    mono:find("return clock.now() - clock.stepTotal", 1, true) ~= nil, true)
+
 end
 
 if fails == 0 then

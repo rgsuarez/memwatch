@@ -262,6 +262,31 @@ local function growth(ring, eps)
 end
 M.growth = growth -- exposed for tests
 
+-- How many consecutive rising samples a pid has made since time `since`,
+-- counted over the samples taken after it (growth()'s rising tail). A
+-- process memwatch stopped cannot grow, and one that exited makes no new
+-- samples, so a run of rises after such a mark means the pid now holds a
+-- running process: a newcomer, or one the mark no longer describes. A
+-- stopped process whose pages are being compressed can show one rise when
+-- the compressed figure catches up, never a run.
+function M.risingSince(tr, pid, since)
+  local e = tr and tr.procs[pid]
+  if not e or not since then return 0 end
+  local after = {}
+  for _, s in ipairs(e.ring) do
+    if s.t > since then after[#after + 1] = s end
+  end
+  -- Strict: consecutive rises at the tail, any flat sample ends the run.
+  -- (growth() tolerates one flat tick for live runaway detection; here a
+  -- stopped process whose compressed figure catches up on alternate
+  -- samples, rise, flat, rise, must not read as a run.)
+  local eps, n = tr.cfg.risingEpsMB, 0
+  for i = #after, 2, -1 do
+    if after[i].v - after[i - 1].v > eps then n = n + 1 else break end
+  end
+  return n
+end
+
 -- Classify runaways. Returns a sorted array of
 --   { pid, name, comm, uid, rssMB, slopeMBmin, kind }
 -- kind: "extreme" (fires even at ok), "sustained" (watch at ok, alert once

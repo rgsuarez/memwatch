@@ -56,7 +56,7 @@ M.cfg = {
     ignoreSec        = 1800, -- per-offender "Ignore 30 min"
     hudRaiseSec      = 60,   -- min seconds between HUD raises (a new offender preempts)
     autoKillGraceSec = 60,   -- HUD unanswered this long before auto-kill (if enabled)
-    frozenSweepSec   = 60,   -- calm-state frozen-ledger liveness sweep cadence
+    frozenSweepSec   = 60,   -- frozen-ledger liveness sweep cadence (every state)
   },
   -- Unattended action at critical + grace expiry. The deterministic
   -- autonomous layer (successor to autoKill), model-free and shipping in
@@ -387,24 +387,87 @@ function M.topStreamStale(alive, lastPublishAt, startedAt, lastRespawnAt, now, s
   return true
 end
 
--- Frozen-ledger liveness decision (pure): given the persisted frozen map
--- ([pid] = entry carrying lstart) and probe(pid) -> { lstart, state } | nil,
--- partition into entries still identity-valid AND stopped versus dead wood,
--- with a named reason per drop. The startup reconcile validates at load;
--- this is the same decision for the calm-state sweep, because a frozen
--- process that exits BETWEEN reloads must not haunt the ledger (2026-07-09
--- field finding: a dead VM pid held frozenCount=1 for two days).
-function M.pruneFrozen(entries, probe)
+-- Parse one `ps -p <pids>,<self> -o pid=,uid=,state=,lstart=,comm=` reply.
+-- memwatch's own pid is always in the list as a positive control: without
+-- its row the probe did not run (a fork failed under pressure, or the reply
+-- is cut short), so nothing in the reply may be read as a process being
+-- gone. Every line must parse: one that does not is a reply cut off or
+-- garbled, and a missing row beside it proves nothing either. Returns
+-- pid -> { pid, uid, state, lstart, comm }, or nil (unknown).
+function M.parseProbeRows(out, selfPid)
+  if type(out) ~= "string" then return nil end
+  local rows = {}
+  for line in out:gmatch("[^\n]+") do
+    if line:match("%S") then
+      local pid, uid, state, lstart, comm = line:match(
+        "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
+      if not pid then return nil end
+      pid = tonumber(pid)
+      rows[pid] = { pid = pid, uid = tonumber(uid), state = state, lstart = lstart, comm = comm }
+    end
+  end
+  if selfPid == nil or rows[selfPid] == nil then return nil end
+  return rows
+end
+
+-- One pid's probe result: "present", proc | "absent" | "unknown". Absent
+-- needs the control row; a probe that did not run is never an exit.
+function M.probeResult(rows, pid)
+  if rows == nil then return "unknown" end
+  local p = rows[pid]
+  if p then return "present", p end
+  return "absent"
+end
+
+-- May a signal go to a process memwatch recorded (ident: pid, lstart and
+-- optionally name), given a fresh probe of its pid (status, and the live
+-- start time and name)? Only when the probe saw it with the recorded start
+-- time (and name). A record without a start time, or a probe that could
+-- not tell, never allows a signal: the pid may hold another process.
+function M.identityHolds(ident, status, liveLstart, liveName)
+  if type(ident) ~= "table" or ident.lstart == nil then return false end
+  if status ~= "present" or liveLstart ~= ident.lstart then return false end
+  return ident.name == nil or M.sameName(liveName, ident.name)
+end
+
+-- A probed process is stopped (SIGSTOP): its state starts with T.
+function M.isStopped(proc)
+  return proc ~= nil and type(proc.state) == "string" and proc.state:sub(1, 1) == "T"
+end
+
+-- Frozen-ledger liveness decision (pure: it changes no entry): given the
+-- persisted frozen map ([pid] = entry carrying lstart) and probe(pid) ->
+-- "present", { lstart, state } | "absent" | "unknown", partition into entries
+-- still identity-valid AND stopped versus dead wood, with a named reason per
+-- drop. The startup reconcile validates at load; this is the same decision
+-- for the calm-state sweep, because a frozen process that exits BETWEEN
+-- reloads must not haunt the ledger (2026-07-09 field finding: a dead VM pid
+-- held frozenCount=1 for two days).
+-- An entry whose STOP never went out is no freeze of memwatch's, whatever
+-- the process's state: it goes without a probe (a stop by anyone else is
+-- not memwatch's to resume).
+-- Unknown keeps the entry: a probe that could not run proves nothing, and
+-- dropping a live entry would strand a stopped process with no way back.
+-- A freeze still being verified (pendingUntil in the future) is kept as it
+-- is: the STOP may not have taken effect yet, and its verifier decides.
+-- Once that window ends, the entry is simply no longer pending.
+function M.pruneFrozen(entries, probe, now)
   local kept, dropped = {}, {}
   for pid, e in pairs(entries or {}) do
-    local p = probe(pid)
     local why = nil
-    if not p then
-      why = "exited"
-    elseif e.lstart and p.lstart and e.lstart ~= p.lstart then
-      why = "pid-recycled"
-    elseif p.state ~= "T" then
-      why = "resumed-externally"
+    if e.stopSent == false then
+      why = "stop-never-sent"
+    elseif not (e.pendingUntil and now and now < e.pendingUntil) then
+      local st, p = probe(pid)
+      if st == "absent" then
+        why = "exited"
+      elseif st == "present" then
+        if e.lstart and p.lstart and e.lstart ~= p.lstart then
+          why = "pid-recycled"
+        elseif not M.isStopped(p) then
+          why = "resumed-externally"
+        end
+      end
     end
     if why then
       dropped[#dropped + 1] = { entry = e, why = why }
@@ -413,6 +476,199 @@ function M.pruneFrozen(entries, probe)
     end
   end
   return kept, dropped
+end
+
+-- A start time as ps prints it ("Mon Oct  5 10:00:01 2026", local time) as
+-- an epoch; nil when it does not name exactly one instant: text that does
+-- not parse, a date that does not exist (Feb 30), a local time skipped by a
+-- clock change, or one that happens twice (the hour repeated when daylight
+-- saving time ends). A caller dating by it must fail closed on nil.
+local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
+                 Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+function M.lstartEpoch(s)
+  if type(s) ~= "string" then return nil end
+  local mon, d, h, mi, sec, y = s:match("^%a+%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)%s+(%d+)$")
+  if not mon or not MONTHS[mon] then return nil end
+  local want = { year = tonumber(y), month = MONTHS[mon], day = tonumber(d),
+                 hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) }
+  -- Read it both ways (standard time and daylight time) and keep each
+  -- reading that names this very wall-clock time: none means it does not
+  -- exist here, two different ones mean it is ambiguous.
+  local found = nil
+  for _, dst in ipairs({ false, true }) do
+    local ok, t = pcall(os.time, { year = want.year, month = want.month, day = want.day,
+      hour = want.hour, min = want.min, sec = want.sec, isdst = dst })
+    local back = ok and t and os.date("*t", t)
+    if back and back.year == want.year and back.month == want.month and back.day == want.day
+       and back.hour == want.hour and back.min == want.min and back.sec == want.sec then
+      if found and found ~= t then return nil end
+      found = t
+    end
+  end
+  return found
+end
+
+-- Process names from the top stream are truncated at ~16 characters, so a
+-- long name may be a prefix of the full one from ps (the same rule the
+-- signal path applies); shorter names must match exactly.
+function M.sameName(a, b)
+  if a == b then return true end
+  if type(a) ~= "string" or type(b) ~= "string" then return false end
+  if #a > #b then a, b = b, a end
+  return #a >= 15 and b:sub(1, #a) == a
+end
+
+-- Continuity for the alert surfaces ("is this still the process on
+-- screen?"): pid and name, plus the start time (lstart) when both sides
+-- have one bound. A missing start time never forces a mismatch (it is
+-- bound lazily), but two bound ones must agree, so a pid reused by a
+-- same-name process reads as a different offender.
+function M.sameOffender(a, b)
+  if a == nil or b == nil then return a == b end
+  if a.pid ~= b.pid or not M.sameName(a.name, b.name) then return false end
+  return a.lstart == nil or b.lstart == nil or a.lstart == b.lstart
+end
+
+-- Memory ("was this exact process here before?"), for records that last
+-- the whole episode: a record made without a start time never vouches for
+-- a process whose start time is known (the pid may have been reused in
+-- between). With both bound they must agree; with the candidate unbound,
+-- pid and name are all anyone knows about it.
+function M.sameRecord(rec, cand)
+  if rec == nil or cand == nil then return false end
+  if rec.pid ~= cand.pid or not M.sameName(rec.name, cand.name) then return false end
+  if cand.lstart == nil then return true end
+  return rec.lstart == cand.lstart
+end
+
+-- Exact identity, for routing an action's outcome to a surface ("is this
+-- the very process the action was on?"): pid, name, and both start times
+-- bound and equal. A missing start time never matches here: an outcome
+-- must not answer a surface that might name another process.
+function M.sameIdentity(a, b)
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  if a.pid ~= b.pid or not M.sameName(a.name, b.name) then return false end
+  return a.lstart ~= nil and a.lstart == b.lstart
+end
+
+-- A per-process record (a grace clock, an interaction mark) describes this
+-- process only when it was made for it: the same name, and the same start
+-- time, bound or not. A record made while unbound never transfers to the
+-- process once it binds (the pid may hold a newcomer by then), and one
+-- made for a bound process never serves an unbound reading of the pid.
+function M.recordDescribes(rec, off)
+  if type(rec) ~= "table" or type(off) ~= "table" then return false end
+  return M.sameName(rec.name, off.name) and rec.lstart == off.lstart
+end
+
+-- Severity of an offender kind, for escalation: a process that moves up
+-- this ladder is new information even if it is the same process.
+local KIND_RANK = { hog = 1, absolute = 2, sustained = 3, extreme = 4 }
+function M.kindRank(kind) return KIND_RANK[kind] or 0 end
+
+-- The critical banner's next step. One banner per offender per episode:
+--   * a live banner for the current offender stays (never re-posted, even
+--     after a manual dismissal, which macOS does not report), except that it
+--     is replaced in place, without the cooldown, when it gains a bound
+--     identity (its Force Quit becomes safe to offer) or its kind escalates;
+--   * a live generic banner (no offender identified) is replaced in place as
+--     soon as an offender is named: the episode's breadcrumb gains a name;
+--   * a live banner naming someone else goes at once, so its Force Quit can
+--     never act on a process the alerts have moved off; the new offender's
+--     banner follows when the cooldown allows (damping offender flap; the
+--     episode's end resets it) and only if it has not had one this episode;
+--   * with no offender named, whatever is up stays (no churn), and a
+--     generic banner is posted at most once per episode;
+--   * a live banner naming a process since answered (memwatch holds it
+--     frozen, it is gone, or it is ignored) goes, even once the episode has
+--     no named offender at all. An answered process is never the offender.
+-- a: { hasBanner, banner = {pid,name,lstart,kind,canAct}|nil (nil with
+--      hasBanner means a generic banner is up), bannerHandled (the live
+--      banner's process is answered), offender = {pid,name,lstart,kind}|nil,
+--      canAct (the offender's identity is bound now), notified,
+--      sinceLastPostSec, cooldownSec }
+--   -> { withdraw = bool, post = bool, replace = bool }; replace means
+--      withdraw and post now, regardless of the cooldown.
+function M.bannerStep(a)
+  local off, b = a.offender, a.banner
+  local cooled = (a.sinceLastPostSec or math.huge) >= (a.cooldownSec or 0)
+  local keep = { withdraw = false, post = false, replace = false }
+  -- Whether a new banner may go up for the current offender (or a generic
+  -- one when none is named), with nothing in the way.
+  local function mayPost() return (not a.notified) and cooled end
+  if a.hasBanner and a.bannerHandled then
+    -- The live banner names an offender already answered: it goes, whoever
+    -- heads the episode now.
+    return { withdraw = true, post = mayPost(), replace = false }
+  end
+  if a.hasBanner then
+    if off == nil then return keep end
+    if b ~= nil and M.sameOffender(b, off) then
+      if (a.canAct and not b.canAct) or M.kindRank(off.kind) > M.kindRank(b.kind) then
+        return { withdraw = false, post = false, replace = true }
+      end
+      return keep
+    end
+    if b == nil then return { withdraw = false, post = false, replace = true } end
+    return { withdraw = true, post = mayPost(), replace = false }
+  end
+  return { withdraw = false, post = mayPost(), replace = false }
+end
+
+-- One poll of a held predicate (the glue's untilHeld): "done" when it ran
+-- and reported done, "giveup" once it has errored continuously for
+-- giveUpSec (never a success), else "poll" again. An erroring poll keeps
+-- polling because escalations live inside predicates; a poll that runs
+-- ends the error run. st carries the run across polls.
+function M.untilStep(st, ok, done, now, giveUpSec)
+  if ok then
+    st.erroringSince = nil
+    return (done == true) and "done" or "poll"
+  end
+  st.erroringSince = st.erroringSince or now
+  if (now - st.erroringSince) >= giveUpSec then return "giveup" end
+  return "poll"
+end
+
+-- What an action's outcome means for the alert that asked for it (the
+-- signal engines report the outcome; nothing is re-probed after the fact):
+--   done    frozen, terminated, or verified gone before any signal
+--   rebind  the pid holds another process (stale: refused before any
+--           signal; replaced: the target was terminated and another
+--           process holds the pid): forget the binding, and treat whoever
+--           holds the pid now as a new question
+--   snooze  refused by policy, or signaled but survived: ask again later
+--   stand   unverified (or unknown): nothing is concluded, and the alert
+--           stays as it was, visible and retryable
+--   (unconfirmed, a signal sent whose result could not be verified, also
+--   stands; unlike unverified, something may have changed, so it is
+--   announced)
+local ANSWER = { frozen = "done", terminated = "done", exited = "done",
+                 stale = "rebind", replaced = "rebind", refused = "snooze", failed = "snooze" }
+function M.answerFor(outcome) return ANSWER[outcome] or "stand" end
+
+-- Should the HUD raise now? Never while the episode's alert is already up
+-- (visible covers muted-but-armed). For a named offender (never an
+-- answered one: a process memwatch holds frozen, that is gone or ignored is
+-- no candidate at all):
+--   * one the operator closed (snoozed) returns when the snooze ends, or at
+--     once if its kind escalates (a quiet hog turning into a runaway);
+--   * any other process than the one this episode last raised for preempts
+--     the raise cooldown.
+-- The same process again, and no identified offender, wait the cooldown.
+-- a: { visible, offender, episode, snooze = { off, kind, untilAt }|nil,
+--      sinceRaiseSec, raiseSec, now }
+function M.hudRaiseDue(a)
+  if a.visible then return false end
+  local off = a.offender
+  if off then
+    local sn = a.snooze
+    if sn and M.sameOffender(sn.off, off) then
+      return M.kindRank(off.kind) > M.kindRank(sn.kind) or (a.now or 0) >= (sn.untilAt or 0)
+    end
+    if not M.sameOffender(a.episode, off) then return true end
+  end
+  return (a.sinceRaiseSec or math.huge) >= (a.raiseSec or 0)
 end
 
 -- What the menu-bar title should say. Quiet until trouble:

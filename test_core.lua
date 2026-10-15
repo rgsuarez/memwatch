@@ -1180,7 +1180,8 @@ do
   check("banner glue: notifyCrit located", #notify > 400, true)
   check("banner glue: steps through core.bannerStep", notify:find("core.bannerStep(", 1, true) ~= nil, true)
   check("banner glue: Force Quit passes the bound start time",
-    notify:find("M.killPid(off.pid, off.name, nil, { expectedLstart = lstart })", 1, true) ~= nil, true)
+    notify:find("{ expectedLstart = lstart })", 1, true) ~= nil
+      and notify:find("surfaceUpdate({ pid = off.pid, name = off.name, lstart = lstart })", 1, true) ~= nil, true)
   check("banner glue: the button exists only when identity is bound",
     notify:find("hasActionButton   = canAct,", 1, true) ~= nil, true)
   check("banner glue: no unbound kill remains (control: old shape is caught)",

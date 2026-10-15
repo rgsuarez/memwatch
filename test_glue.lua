@@ -785,6 +785,79 @@ scenario("a banner Force Quit stands unattended down", UNATTENDED_FREEZE, functi
   check("banner-answer: the operator's kill ran, and memwatch never froze it", W.signalsTo(4242), "TERM,KILL")
 end)
 
+-- ---- identity: a refusal on any surface rebinds every surface ----
+-- (round 3) The menu finds the HUD's binding stale while the HUD is up: the
+-- HUD rebinds to the process now holding the pid, so the next click acts
+-- instead of refusing forever.
+scenario("a menu refusal rebinds the visible HUD", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  W.reusePid(4242, "node", 9000)
+  W.grow(4242, 220)
+  local item = W.menuItem("Force Quit node")
+  if item then item.fn() end
+  W.run(1)
+  check("menu-rebind: the stale binding is refused", W.signalsTo(4242), "")
+  check("menu-rebind: the visible HUD rebinds to the newcomer",
+    runUntil(W, 15, function() return logHas(W, "hud-rebind:node(4242)") end), true)
+  check("menu-rebind: the HUD is still up", W.hudShowing(), true)
+  item = W.menuItem("Force Quit node")
+  if item then item.fn() end
+  W.run(10)
+  check("menu-rebind: the next click acts on the newcomer", W.signalsTo(4242), "TERM")
+end)
+
+scenario("a banner refusal withdraws the stale banner", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(6)
+  local b = W.liveBanners()[1]
+  check("banner-rebind: a bound banner is up", b ~= nil and b.attrs.hasActionButton == true, true)
+  W.reusePid(4242, "node", 9000)
+  W.grow(4242, 220)
+  if b then W.clickBanner(b) end
+  W.run(1)
+  check("banner-rebind: nothing signaled on the stale identity", W.signalsTo(4242), "")
+  check("banner-rebind: the stale banner is withdrawn", b ~= nil and b.withdrawn == true, true)
+  check("banner-rebind: the HUD rebinds", runUntil(W, 15, function() return logHas(W, "hud-rebind:node(4242)") end), true)
+end)
+
+-- (round 3) A menu process row binds when the menu opens: a pid reused
+-- between opening the menu and clicking is refused, and a row that cannot
+-- be verified offers no action.
+scenario("menu rows act only on the identity bound at open", nil, function(W)
+  W.addProc(4242, "node", 6000)
+  W.run(12)
+  local function row(items)
+    for _, it in ipairs(items) do
+      if type(it.title) == "string" and it.title:find("(pid 4242)", 1, true) and it.menu then return it end
+    end
+  end
+  local r = row(W.menuItems())
+  check("rows: the process row is listed", r ~= nil, true)
+  W.reusePid(4242, "node", 6000)
+  if r then r.menu[2].fn() end
+  W.run(10)
+  check("rows: Force Quit refuses a pid reused after the menu opened", W.signalsTo(4242), "")
+  if r then r.menu[1].fn() end
+  W.run(3)
+  check("rows: so does Freeze", W.signalsTo(4242), "")
+  W.probeFails = true
+  r = row(W.menuItems())
+  check("rows: an unverifiable row offers no Force Quit", r ~= nil and r.menu[2].disabled == true, true)
+  check("rows: and no Freeze", r ~= nil and r.menu[1].disabled == true, true)
+  W.probeFails = false
+  r = row(W.menuItems())
+  if r then r.menu[2].fn() end
+  W.run(10)
+  check("rows: a row bound to the live process acts", W.signalsTo(4242), "TERM")
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

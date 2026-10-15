@@ -89,6 +89,7 @@ local lfmTick
 local gcUnattendedState
 local offenderIsForeground
 local probePid
+local probeRows
 local resolveSignalTarget
 local frozenSweep
 local lfmRemoteActive
@@ -609,6 +610,24 @@ local function dismissHud(how, off)
   M.hideHud()
 end
 
+-- A signal path found that the pid no longer holds the process an alert
+-- bound (a same-name process reused it). Whichever surface found it, every
+-- surface forgets that binding: the HUD rebinds fresh on the next tick
+-- (the process now holding the pid is a new question, with its own grace),
+-- and a banner naming the old identity is withdrawn now.
+local function identityRefused(target)
+  if not target or not target.pid then return end
+  hudStalePid = target.pid
+  local k = procKey(target)
+  if k then exposure[k], interacted[k] = nil, nil end
+  if critNotif and critNotifOff and critNotifOff.pid == target.pid
+     and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then
+    pcall(function() critNotif:withdraw() end)
+    critNotif, critNotifOff = nil, nil
+  end
+  M.logSnapshot(string.format("identity-refused:%s(%d)", target.name or "?", target.pid))
+end
+
 -- After an action's narrative ends, the outcome the signal engine reported
 -- decides the alert's answer (core.answerFor): done (frozen, terminated,
 -- gone), snoozed (refused, or it survived: back after the cooldown), a
@@ -620,7 +639,7 @@ local function settleAction(target, outcome)
   M.logSnapshot(string.format("answered:%s:%s(%d):%s", answer, target.name or "?",
     target.pid or -1, outcome or "none"))
   if answer == "rebind" then
-    hudStalePid = target.pid
+    identityRefused(target)
     lastHudRaiseAt = 0
     M.hideHud()
   elseif answer == "done" then
@@ -632,6 +651,28 @@ local function settleAction(target, outcome)
     dismissHud("snooze", target)
   else
     hudHold = false
+  end
+end
+
+-- Progress for an action started from the menu or a banner (no HUD of its
+-- own): a brief on-screen alert per step, and the outcome routed to the
+-- episode as the HUD's is. A reused pid rebinds every surface; a process
+-- frozen or verified gone is answered, so a HUD still naming it comes down.
+-- (hs.alert directly: alertUpdate is declared further down the file.)
+local function surfaceUpdate(target)
+  return function(text, done, outcome)
+    hs.alert.show("memwatch: " .. text, 2.5)
+    if not done then return end
+    if outcome == "stale" then
+      identityRefused(target)
+    elseif core.answerFor(outcome) == "done" then
+      if outcome ~= "frozen" then
+        goneUntil[target.pid .. "|" .. (target.name or "")] = hs.timer.secondsSinceEpoch() + GONE_SEC
+      end
+      if hudOffender and hudOffender.pid == target.pid and not hudHold then
+        dismissHud("done", hudOffender)
+      end
+    end
   end
 end
 
@@ -803,15 +844,33 @@ local function buildMenu()
   if #lastRanked == 0 then
     items[#items + 1] = { title = "   sampling\u{2026}", disabled = true }
   end
+  -- Process rows act on the identity bound when the menu opens, in one
+  -- probe for every row: a pid reused between opening the menu and the
+  -- click is refused, and a row whose identity cannot be verified offers
+  -- no destructive action. (The rows come from the last sample, so the
+  -- binding covers open-to-click, not sample-to-open.)
+  local rowPids = {}
+  for _, p in ipairs(lastRanked) do rowPids[#rowPids + 1] = p.pid end
+  local rowProbe = (#rowPids > 0) and probeRows(rowPids) or nil
   for _, p in ipairs(lastRanked) do
     local pid, name, wMB = p.pid, p.name, p.weightMB
+    local _, live = core.probeResult(rowProbe, pid)
+    local lst = (live and core.sameName(procs.friendlyName(live.comm), name)) and live.lstart or nil
+    local target = { pid = pid, name = name, lstart = lst }
+    local note = lst and "" or " (can't verify)"
     items[#items + 1] = {
       title = string.format("%-22s %5.1f GB  (pid %d)", name:sub(1, 22), p.weightMB / 1024, pid),
       menu = {
-        { title = "Freeze " .. name,
-          fn = function() M.freezePid(pid, name, nil, { weightMB = wMB }) end },
-        { title = "Force Quit " .. name,
-          fn = function() M.killPid(pid, name) end },
+        { title = "Freeze " .. name .. note, disabled = (lst == nil) or nil,
+          fn = function()
+            markInteracted(target)
+            M.freezePid(pid, name, surfaceUpdate(target), { weightMB = wMB, expectedLstart = lst })
+          end },
+        { title = "Force Quit " .. name .. note, disabled = (lst == nil) or nil,
+          fn = function()
+            markInteracted(target)
+            M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
+          end },
         { title = "Ignore for 30 min",
           fn = function() M.ignore(pid, name) end },
         { title = "Show in Activity Monitor",
@@ -836,7 +895,9 @@ local function buildMenu()
           { title = "Resume " .. (e.name or "?"),
             fn = function() M.resumePid(pid) end },
           { title = "Force Quit " .. (e.name or "?"),
-            fn = function() M.killPid(pid, e.name) end },
+            fn = function()
+              M.killPid(pid, e.name, surfaceUpdate({ pid = pid, name = e.name, lstart = e.lstart }))
+            end },
         },
       }
     end
@@ -862,16 +923,18 @@ local function buildMenu()
           p, why = resolveSignalTarget(off.pid, off.name, nil)
           lst = p and p.lstart or nil
         end
+        local target = { pid = off.pid, name = off.name, lstart = lst }
         if not lst then
           -- (hs.alert directly: alertUpdate is declared further down the file)
           local msg = (why == "exited") and string.format("%s (pid %d) has exited; nothing signaled",
               off.name, off.pid)
             or string.format("can't verify %s (pid %d); nothing signaled", off.name, off.pid)
           hs.alert.show("memwatch: " .. msg, 2.5)
+          if why and why:find("^pid%-reused") then identityRefused(target) end
           return
         end
         markInteracted(off)
-        M.killPid(off.pid, off.name, nil, { expectedLstart = lst })
+        M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
       end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
       fn = function() M.ignore(off.pid, off.name) end }
@@ -974,7 +1037,8 @@ local function notifyCrit(m)
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
       markInteracted(off)
-      M.killPid(off.pid, off.name, nil, { expectedLstart = lstart })
+      M.killPid(off.pid, off.name,
+        surfaceUpdate({ pid = off.pid, name = off.name, lstart = lstart }), { expectedLstart = lstart })
     end
   end), {
     title             = "Memory pressure: CRITICAL",
@@ -1202,6 +1266,13 @@ local function alertSurfaces(state, now)
         raiseHud(offender)
       end
     elseif not hudHold then
+      -- A signal path (any surface) found the HUD's binding stale: whoever
+      -- holds the pid now is a new process, bound fresh, with its own grace.
+      if hudStalePid and hudOffender and hudOffender.pid == hudStalePid then
+        hudStalePid = nil
+        bindOffender(hudOffender, nil, now, true)
+        M.logSnapshot(string.format("hud-rebind:%s(%d)", hudOffender.name, hudOffender.pid))
+      end
       -- Keep identity bound across refreshes: each assessment builds a new
       -- offender table, and the same process inherits its bound start time.
       -- A different process heading the episode is a new question: bound
@@ -1387,7 +1458,7 @@ protectedPids[selfPid] = true
 -- positive control (core.parseProbeRows): nil means the probe is unknown,
 -- never that the processes are gone. Under memory pressure a fork can fail
 -- or hs.execute can raise, and both read as unknown.
-local function probeRows(pids)
+probeRows = function(pids)
   local list = {}
   for _, p in ipairs(pids) do list[#list + 1] = string.format("%d", p) end
   list[#list + 1] = string.format("%d", selfPid)

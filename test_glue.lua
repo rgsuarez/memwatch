@@ -47,6 +47,15 @@ end
 
 local function bodyNames(W, name) return W.hudBody():find(name, 1, true) ~= nil end
 
+-- Does memwatch.log (in the scenario's scratch home) contain this text?
+local function logHas(W, text)
+  local f = io.open(W.home .. "/projects/memwatch/memwatch.log", "r")
+  if not f then return false end
+  local all = f:read("a")
+  f:close()
+  return all:find(text, 1, true) ~= nil
+end
+
 -- A runaway the detector tags extreme within a few samples.
 local function leaker(W, pid, name, rate)
   W.addProc(pid, name or "leaker", 2000)
@@ -369,6 +378,7 @@ scenario("a muted episode arms", '{"unattended":"freeze","alerts":false}', funct
   check("muted: no banner is posted", #W.liveBanners(), 0)
   runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end)
   check("muted: the unattended freeze still lands", W.signalsTo(4242), "STOP")
+  W.run(2)                          -- the receipt follows the verified result
   check("muted: its receipt still notifies", #W.notices("memwatch unattended freeze"), 1)
 end)
 
@@ -529,6 +539,66 @@ scenario("a reload keeps a frozen process it cannot verify", nil, function(W)
   W.availPct = 45
   W.run(130)                        -- calm: the sweep re-checks it
   check("reload: the sweep keeps it once verified frozen", W.menuItem("   leaker") ~= nil, true)
+end)
+
+-- ---- outcomes: an unattended receipt says what happened, when it happened ----
+-- (round 3) A same-name process took the pid under an inherited binding:
+-- the attempt is refused, so no "freeze" receipt, and the newcomer is a new
+-- alert with its own grace.
+scenario("a refused unattended action posts no receipt", '{"unattended":"freeze","alerts":false}', function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(40)                         -- muted, armed, bound
+  W.reusePid(4242, "leaker", 9000)
+  W.grow(4242, 220)
+  local refused = runUntil(W, 40, function() return logHas(W, "answered:rebind:leaker(4242):stale") end)
+  check("receipt: the stale attempt is refused and rebinds", refused, true)
+  local refusedAt = W.now
+  check("receipt: nothing signaled to the newcomer on the old binding", W.signalsTo(4242), "")
+  check("receipt: and no receipt claims a freeze", #W.notices("memwatch unattended freeze"), 0)
+  runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end)
+  W.run(2)
+  check("receipt: the newcomer is frozen on its own identity", W.signalsTo(4242), "STOP")
+  check("receipt: (a full grace after the refusal)", W.sigs[#W.sigs].t - refusedAt >= 59, true)
+  check("receipt: exactly one receipt, for the freeze that happened", #W.notices("memwatch unattended freeze"), 1)
+end)
+
+-- (round 3) A freeze that did not stop the process is a snooze, not a
+-- handled answer, even when the settle window cannot probe; and memwatch
+-- does not keep retrying a signal that already failed on that process.
+scenario("a survivor is snoozed, not handled", nil, function(W)
+  W.addProc(4242, "wedged", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "wedged") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(1)
+  check("survivor: it did not stop", W.hudBody():find("did not stop", 1, true) ~= nil, true)
+  W.probeFails = true
+  W.run(8)
+  W.probeFails = false
+  check("survivor: the alert came down as a snooze", W.hudShowing(), false)
+  check("survivor: and comes back after the cooldown",
+    runUntil(W, 70, function() return W.hudShowing() and bodyNames(W, "wedged") end), true)
+end)
+
+scenario("unattended does not retry a failed freeze", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "wedged", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "wedged") end)
+  runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end)
+  W.run(2)
+  check("retry: the unattended freeze was tried", W.signalsTo(4242), "STOP")
+  check("retry: its receipt says it did not stop",
+    (W.notices("memwatch unattended freeze")[1] or { attrs = {} }).attrs.informativeText ~= nil
+    and W.notices("memwatch unattended freeze")[1].attrs.informativeText:find("did not stop", 1, true) ~= nil, true)
+  W.run(400)
+  check("retry: it is never tried again on the same process", W.signalsTo(4242), "STOP")
 end)
 
 if fails == 0 then

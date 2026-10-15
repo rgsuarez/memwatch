@@ -584,27 +584,26 @@ local function dismissHud(how, off)
   M.hideHud()
 end
 
--- After an action's narrative ends: the process is gone, or memwatch holds it
--- frozen -> handled; it survived the action -> snoozed, back after the
--- cooldown; the pid turned out to hold another process -> neither, so the
--- next tick surfaces whoever holds it now as a new alert. A probe that
--- cannot run proves nothing: the alert stands as it was, still retryable.
-local function settleAction(target, refused)
-  if refused then
+-- After an action's narrative ends, the outcome the signal engine reported
+-- decides the alert's answer (core.answerFor): done (frozen, terminated,
+-- gone), snoozed (refused, or it survived: back after the cooldown), a
+-- rebind (the pid holds another process: the next tick surfaces whoever
+-- holds it now as a new alert), or nothing at all (unverified: the alert
+-- stands as it was, still retryable).
+local function settleAction(target, outcome)
+  local answer = core.answerFor(outcome)
+  M.logSnapshot(string.format("answered:%s:%s(%d):%s", answer, target.name or "?",
+    target.pid or -1, outcome or "none"))
+  if answer == "rebind" then
     hudStalePid = target.pid
     lastHudRaiseAt = 0
     M.hideHud()
-    return
-  end
-  local still, why = resolveSignalTarget(target.pid, target.name, target.lstart)
-  if why == "unverified" then
-    hudHold = false
-    return
-  end
-  if (not still) or frozen[target.pid] then
+  elseif answer == "done" then
     dismissHud("handled", target)
-  else
+  elseif answer == "snooze" then
     dismissHud("snooze", target)
+  else
+    hudHold = false
   end
 end
 
@@ -685,20 +684,15 @@ local function buildHud()
         return
       end
       hudHold = true
-      local refused = false
-      local narrate = function(text, done)
+      local narrate = function(text, done, outcome)
         if hud then hud[3].text = text end
-        if done then afterHeld(4, guard("hud-close", function() settleAction(target, refused) end)) end
-      end
-      local onRefused = function(reason)
-        if type(reason) == "string" and reason:find("pid-reused", 1, true) then refused = true end
+        if done then afterHeld(4, guard("hud-close", function() settleAction(target, outcome) end)) end
       end
       if isFreeze then
         M.freezePid(target.pid, target.name, narrate,
-          { weightMB = target.weightMB, expectedLstart = target.lstart, onRefused = onRefused })
+          { weightMB = target.weightMB, expectedLstart = target.lstart })
       else
-        M.killPid(target.pid, target.name, narrate,
-          { expectedLstart = target.lstart, onRefused = onRefused })
+        M.killPid(target.pid, target.name, narrate, { expectedLstart = target.lstart })
       end
     elseif id == "ignore" or id == "ignore-label" then
       if hudOffender and not hudOffender.synthetic then
@@ -1036,6 +1030,106 @@ end
 -- breadcrumb. One reusable HUD, raise-cooldown gated, a new offender
 -- preempts the cooldown, and the body tracks live numbers unless a kill
 -- narrative owns it.
+-- The unattended receipt, posted when the action completes and saying what
+-- happened. A freeze or terminate that changed a process always notifies,
+-- even with desktop alerts muted (silence there turns a muted alert into a
+-- mystery hang); an action that signaled nothing is logged, not announced.
+local RECEIPT_OUTCOMES = { frozen = true, terminated = true, failed = true }
+local function unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
+  if not RECEIPT_OUTCOMES[outcome] then return end
+  local why = (adjudicator == "lfm")
+    and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
+    or "Extreme runaway, no response to the alert."
+  hs.notify.new({ title = "memwatch unattended " .. action,
+                  subTitle = string.format("%s (pid %d)", target.name, target.pid),
+                  informativeText = string.format("%s \u{00B7} %s", text or outcome, why),
+                  withdrawAfter = 0 }):send()
+end
+
+-- Unattended action: opt-in, extreme growers only, the alert episode
+-- unanswered for the grace window, once per offender. With desktop alerts
+-- muted the episode still arms and counts the same clock: muted-and-
+-- unanswered is unanswered. The LFM (when enabled and warm) refines the
+-- action within the mode ceiling via the async verdict cache; with no fresh
+-- verdict the deterministic policy acts exactly as the legacy autoKill did.
+-- Both paths execute through the same signal engines (identity probe +
+-- policy gate inside).
+-- Re-arm semantics (live-drill finding): a WAIT outcome must not consume
+-- the per-offender latch forever, or one low-confidence model wait disables
+-- unattended coverage while the crisis continues. Each adjudication stamps
+-- the time; another full grace window must pass before the same offender is
+-- adjudicated again. A freeze or terminate that failed on a process (it
+-- survived) is never retried on that same process.
+local function unattendedStep(offender, now)
+  local mode = core.resolveUnattended(core.cfg)
+  if mode == "off" or not offender or offender.kind ~= "extreme" then return end
+  if not alertActive or hudInteracted or hudHold then return end
+  if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
+  if frozen[offender.pid] or isHandled(offender, now) then return end
+  if (now - hudShownAt) < core.cfg.cool.autoKillGraceSec then return end
+  -- Act only on the identity the alert bound and surfaced, never on a name:
+  -- without a bound start time (the probe failed) skip this tick and stay
+  -- armed; the refresh retries the bind. The same start time keys the
+  -- fired/streak state, so a same-name pid reuse starts clean.
+  local lstart = hudOffender.lstart
+  if not lstart then
+    if (now - (unattendedSkipLogAt or 0)) > 60 then
+      unattendedSkipLogAt = now
+      M.logSnapshot(string.format("unattended-skip:identity-unverified:%s(%d)",
+        offender.name, offender.pid))
+    end
+    return
+  end
+  local fired = unattendedFiredFor[offender.pid]
+  if fired and fired.lstart and fired.lstart ~= lstart then
+    unattendedFiredFor[offender.pid] = nil
+    unattendedWaitStreak[offender.pid] = nil
+    fired = nil
+  end
+  if fired and fired.final then return end
+  if (now - ((fired and fired.at) or 0)) < core.cfg.cool.autoKillGraceSec then return end
+  unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
+  local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
+  M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
+    action, offender.name, offender.pid, adjudicator))
+  writeDecisionOutcome(offender, action, adjudicator, rationale, rails, extra)
+  if action == "wait" then
+    -- A wait is commentary: it respects the mute and cleans itself up.
+    if alertsEnabled then
+      hs.notify.new({ title = "memwatch unattended wait",
+                      subTitle = string.format("%s (pid %d)", offender.name, offender.pid),
+                      informativeText = (adjudicator == "lfm")
+                        and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
+                        or "Extreme runaway, no response to the alert.",
+                      withdrawAfter = 25 }):send()
+    end
+    return
+  end
+  hudHold = true
+  local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
+  local narrate = function(text, done, outcome)
+    if hud then hud[3].text = "AUTO: " .. text end
+    if not done then return end
+    if outcome == "failed" then
+      local f = unattendedFiredFor[target.pid]
+      if f and f.lstart == target.lstart then f.final = true end
+    end
+    unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
+    -- memwatch's own action answers the alert like an operator's would.
+    afterHeld(6, guard("hud-close", function() settleAction(target, outcome) end))
+  end
+  -- The bound start time also protects the autonomous signal (and its
+  -- TERM->KILL escalation seconds later) from acting on a pid reused since
+  -- this decision. Autonomous action is where a wrong target destroys work,
+  -- so identity is bound most strictly here.
+  if action == "terminate" then
+    M.killPid(offender.pid, offender.name, narrate, { expectedLstart = lstart })
+  else
+    M.freezePid(offender.pid, offender.name, narrate,
+      { weightMB = offender.weightMB, expectedLstart = lstart })
+  end
+end
+
 local function alertSurfaces(state, now)
   if state == "critical" then
     hudBelowCritSince = nil
@@ -1092,83 +1186,7 @@ local function alertSurfaces(state, now)
       end
     end
     notifyCrit(lastMetrics)
-    -- Unattended action: opt-in, extreme growers only, the alert episode
-    -- unanswered for the grace window, once per offender. With desktop
-    -- alerts muted the episode still arms and counts the same clock:
-    -- muted-and-unanswered is unanswered. The LFM (when enabled and warm)
-    -- refines the action within the mode ceiling via the async verdict
-    -- cache; with no fresh verdict the deterministic policy acts exactly as
-    -- the legacy autoKill did. Both paths execute through the same signal
-    -- engines (identity probe + policy gate inside).
-    -- Re-arm semantics (live-drill finding): a WAIT outcome must not consume
-    -- the per-offender latch forever, or one low-confidence model wait
-    -- disables unattended coverage while the crisis continues. Each
-    -- adjudication stamps the time; another full grace window must pass
-    -- before the same offender is adjudicated again.
-    local mode = core.resolveUnattended(core.cfg)
-    if mode ~= "off" and offender and offender.kind == "extreme"
-       and alertActive and not hudInteracted and not hudHold
-       and hudOffender and core.sameOffender(hudOffender, offender)
-       and not frozen[offender.pid] and not isHandled(offender, now)
-       and (now - hudShownAt) >= core.cfg.cool.autoKillGraceSec then
-      -- Act only on the identity the alert bound and surfaced, never on a
-      -- name: without a bound start time (the probe failed) skip this tick
-      -- and stay armed; the refresh retries the bind. The same start time
-      -- keys the fired/streak state, so a same-name pid reuse starts clean.
-      local lstart = hudOffender.lstart
-      if not lstart then
-        if (now - (unattendedSkipLogAt or 0)) > 60 then
-          unattendedSkipLogAt = now
-          M.logSnapshot(string.format("unattended-skip:identity-unverified:%s(%d)",
-            offender.name, offender.pid))
-        end
-      else
-      local fired = unattendedFiredFor[offender.pid]
-      if fired and fired.lstart and lstart and fired.lstart ~= lstart then
-        unattendedFiredFor[offender.pid] = nil
-        unattendedWaitStreak[offender.pid] = nil
-        fired = nil
-      end
-      if (now - ((fired and fired.at) or 0)) >= core.cfg.cool.autoKillGraceSec then
-      unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
-      local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
-      M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
-        action, offender.name, offender.pid, adjudicator))
-      writeDecisionOutcome(offender, action, adjudicator, rationale, rails, extra)
-      -- A freeze/terminate receipt always notifies, even with desktop alerts
-      -- muted: memwatch changed the operator's processes, and silence there
-      -- turns a muted alert into a mystery hang. A wait is commentary: it
-      -- respects the mute and cleans itself up.
-      if action ~= "wait" or alertsEnabled then
-        hs.notify.new({ title = "memwatch unattended " .. action,
-                        subTitle = string.format("%s (pid %d)", offender.name, offender.pid),
-                        informativeText = (adjudicator == "lfm")
-                          and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
-                          or "Extreme runaway, no response to the alert.",
-                        withdrawAfter = (action == "wait") and 25 or 0 }):send()
-      end
-      if action ~= "wait" then
-        hudHold = true
-        local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
-        local narrate = function(text, done)
-          if hud then hud[3].text = "AUTO: " .. text end
-          -- memwatch's own action answers the alert like an operator's would.
-          if done then afterHeld(6, guard("hud-close", function() settleAction(target) end)) end
-        end
-        -- The bound start time also protects the autonomous signal (and its
-        -- TERM->KILL escalation seconds later) from acting on a pid reused
-        -- since this decision. Autonomous action is where a wrong target
-        -- destroys work, so identity is bound most strictly here.
-        if action == "terminate" then
-          M.killPid(offender.pid, offender.name, narrate, { expectedLstart = lstart })
-        else
-          M.freezePid(offender.pid, offender.name, narrate,
-            { weightMB = offender.weightMB, expectedLstart = lstart })
-        end
-      end
-      end
-      end
-    end
+    unattendedStep(offender, now)
   else
     hudBelowCritSince = hudBelowCritSince or now
     local settled = (now - hudBelowCritSince) >= 10
@@ -1462,7 +1480,9 @@ end
 
 -- Freeze: same identity probe and policy gate as kill, then SIGSTOP with a
 -- verified stop state and a persisted ledger entry. Memory is NOT released
--- by a freeze; the win is stopping the growth reversibly.
+-- by a freeze; the win is stopping the growth reversibly. The final
+-- onUpdate carries the outcome: frozen, exited, stale, refused, failed or
+-- unverified.
 function M.freezePid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
   opts = opts or {}
@@ -1472,28 +1492,27 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   if not proc then
     if twhy == "exited" then
       M.logSnapshot(string.format("freeze-skip:%s(%d)-already-exited", expectedName or "?", pid))
-      onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+      onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true, "exited")
     elseif twhy == "unverified" then
       -- The probe could not run: nothing is signaled, and nothing is
       -- concluded about the process. The action can be retried.
       M.logSnapshot(string.format("freeze-skip:%s(%d)-unverified", expectedName or "?", pid))
       onUpdate(string.format("can't verify %s right now; nothing was signaled",
-        expectedName or tostring(pid)), true)
+        expectedName or tostring(pid)), true, "unverified")
     else
       M.logSnapshot(string.format("freeze-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
-      if opts.onRefused then pcall(opts.onRefused, twhy) end
-      onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true)
+      onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true, "stale")
     end
     return
   end
   local allowed, why = core.killAllowed(proc, ownUid, selfPid, nil, protectedPids)
   if not allowed then
     M.logSnapshot(string.format("freeze-refuse:%s(%d):%s", proc.liveName, pid, why))
-    onUpdate(string.format("refusing to freeze %s: %s", proc.liveName, why), true)
+    onUpdate(string.format("refusing to freeze %s: %s", proc.liveName, why), true, "refused")
     return
   end
   if frozen[pid] then
-    onUpdate(string.format("%s is already frozen", proc.liveName), true)
+    onUpdate(string.format("%s is already frozen", proc.liveName), true, "frozen")
     return
   end
   -- Record the ledger entry BEFORE the SIGSTOP, not after the verify: a
@@ -1520,27 +1539,27 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     local reprobe, rwhy = resolveSignalTarget(pid, proc.liveName, proc.lstart)
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
-      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true)
+      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unverified")
     elseif not reprobe then
       sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
       frozen[pid] = nil
       saveFrozen()
       if rwhy == "exited" then
         M.logSnapshot(string.format("freeze-abort:%s(%d)-exited", proc.liveName, pid))
-        onUpdate(string.format("%s exited during the freeze", proc.liveName), true)
+        onUpdate(string.format("%s exited during the freeze", proc.liveName), true, "exited")
       else
         M.logSnapshot(string.format("freeze-abort:%s(%d)-identity-changed", proc.liveName, pid))
-        onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true)
+        onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true, "stale")
       end
     elseif core.isStopped(reprobe) then
       M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
       onUpdate(string.format(
-        "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true)
+        "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true, "frozen")
     else
       frozen[pid] = nil
       saveFrozen()
       M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
-      onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true)
+      onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed")
     end
   end))
 end
@@ -2323,8 +2342,10 @@ end
 -- One-click kill: re-validate identity first (pid-reuse guard), check the
 -- pure policy, SIGTERM, escalate to SIGKILL after cfg.kill.escalateSec if the
 -- target is still alive (re-validated again), then verify death and report
--- how much memory actually came back. onUpdate(text, done) drives whichever
--- surface initiated the kill.
+-- how much memory actually came back. onUpdate(text, done, outcome) drives
+-- whichever surface initiated the kill; the final call (done) carries what
+-- happened: terminated, exited, stale, refused, failed or unverified
+-- (core.answerFor turns it into the alert's answer).
 function M.killPid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
   opts = opts or {}
@@ -2339,19 +2360,18 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   if not proc then
     if twhy == "exited" then
       M.logSnapshot(string.format("kill-skip:%s(%d)-already-exited", expectedName or "?", pid))
-      onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true)
+      onUpdate(string.format("%s already exited", expectedName or tostring(pid)), true, "exited")
     elseif twhy == "unverified" then
       -- The probe could not run: nothing is signaled and the frozen ledger
       -- is left as it was. The action can be retried.
       M.logSnapshot(string.format("kill-skip:%s(%d)-unverified", expectedName or "?", pid))
       onUpdate(string.format("can't verify %s right now; nothing was signaled",
-        expectedName or tostring(pid)), true)
+        expectedName or tostring(pid)), true, "unverified")
     else
       -- Identity mismatch: drop any stale ledger entry AND block the action.
       if frozenEntry then frozen[pid] = nil; saveFrozen() end
       M.logSnapshot(string.format("kill-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
-      if opts.onRefused then pcall(opts.onRefused, twhy) end
-      onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true)
+      onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true, "stale")
     end
     return
   end
@@ -2359,7 +2379,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   local allowed, why = core.killAllowed(proc, ownUid, selfPid, nil, protectedPids)
   if not allowed then
     M.logSnapshot(string.format("kill-refuse:%s(%d):%s", liveName, pid, why))
-    onUpdate(string.format("refusing to kill %s: %s", liveName, why), true)
+    onUpdate(string.format("refusing to kill %s: %s", liveName, why), true, "refused")
     return
   end
   local availBefore = lastMetrics.availPct or 0
@@ -2406,17 +2426,17 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
       if vwhy == "unverified" then
         M.logSnapshot(string.format("kill-unverified:%s(%d)", liveName, pid))
-        onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true)
+        onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true, "unverified")
       elseif not still then
         -- Gone, or the pid now holds another process: the original exited.
         if frozen[pid] then frozen[pid] = nil; saveFrozen() end
         local footTxt = footBeforeGB and string.format("-footprint=%.1fGB", footBeforeGB) or ""
         M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB%s", liveName, pid, reclaimedGB, footTxt))
         onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
-          footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or ""), true)
+          footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or ""), true, "terminated")
       else
         M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
-        onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true)
+        onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true, "failed")
       end
     end))
   end))

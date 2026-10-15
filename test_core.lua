@@ -843,6 +843,19 @@ do
   check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
 end
 
+-- ---- an action's outcome is the alert's answer ----
+do
+  check("answer: frozen is done",            core.answerFor("frozen"), "done")
+  check("answer: terminated is done",        core.answerFor("terminated"), "done")
+  check("answer: exited is done",            core.answerFor("exited"), "done")
+  check("answer: a reused pid rebinds",      core.answerFor("stale"), "rebind")
+  check("answer: a policy refusal snoozes",  core.answerFor("refused"), "snooze")
+  check("answer: a survivor snoozes",        core.answerFor("failed"), "snooze")
+  check("answer: unverified stands",         core.answerFor("unverified"), "stand")
+  check("answer: no outcome stands",         core.answerFor(nil), "stand")
+  check("answer: an unknown outcome stands", core.answerFor("bogus"), "stand")
+end
+
 -- ---- frozen-ledger prune (calm-state liveness sweep, 2026-07-09 field fix) ----
 -- Three-case floor: exited / identity-changed / healthy-kept, plus the
 -- resumed-externally drop, the unknown keep and the empty no-op.

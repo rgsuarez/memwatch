@@ -152,8 +152,9 @@ function F.new()
       local p = W.procs[kp]
       if p then
         -- ignoreTerm: a process that survives TERM; unkillable: one that
-        -- survives KILL too (a zombie, or stuck in the kernel).
-        if sig == "STOP" then p.state = "T"
+        -- survives KILL too (a zombie, or stuck in the kernel); unstoppable:
+        -- one a STOP does not stop (it never reaches state T).
+        if sig == "STOP" then if not p.unstoppable then p.state = "T" end
         elseif sig == "CONT" then p.state = "S"
         elseif sig == "TERM" and p.state ~= "T" and not p.ignoreTerm then W.procs[kp] = nil
         elseif sig == "KILL" and not p.unkillable then W.procs[kp] = nil end

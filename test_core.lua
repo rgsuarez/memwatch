@@ -600,13 +600,27 @@ check("rails: nil verdict waits", effNil, "wait")
 check("rails: nil verdict trace", tNil[1], "no-verdict")
 
 -- ---- LFM: system prompt (injection-wording regression) ----
-for _, variant in ipairs({ "baseline", "taxonomy", "fewshot" }) do
+for _, variant in ipairs({ "baseline", "taxonomy", "fewshot", "discriminate" }) do
   local prompt = lfm.buildSystemPrompt({ variant = variant })
-  local allPresent = true
-  for _, clause in ipairs(lfm.PINNED_CLAUSES) do
+  local allPresent, safe = true, true
+  for _, clause in ipairs(lfm.pinnedClauses(variant)) do
     if not prompt:find(clause, 1, true) then allPresent = false end
   end
+  for _, clause in ipairs(lfm.SAFETY_CLAUSES) do
+    if not prompt:find(clause, 1, true) then safe = false end
+  end
   check("prompt: pinned clauses in " .. variant, allPresent, true)
+  check("prompt: safety core in " .. variant, safe, true)
+end
+do
+  -- The discriminate variant swaps the "trust the tag, freeze it" command for
+  -- a dynamics-first clause, and keeps the plateau lesson.
+  local d = lfm.buildSystemPrompt({ variant = "discriminate" })
+  check("prompt: discriminate drops the trust-the-tag command", d:find("trust it over the instantaneous rate", 1, true), nil)
+  check("prompt: discriminate keeps the plateau lesson", d:find("PLATEAUED", 1, true) ~= nil, true)
+  check("prompt: discriminate names the self-limiting burst", d:find("self-limiting burst", 1, true) ~= nil, true)
+  check("prompt: the legacy variants keep the plateau command",
+    lfm.buildSystemPrompt({ variant = "baseline" }):find("trust it over the instantaneous rate", 1, true) ~= nil, true)
 end
 check("prompt: taxonomy adds classes", lfm.buildSystemPrompt({ variant = "taxonomy" }):find("Process classes", 1, true) ~= nil, true)
 check("prompt: fewshot adds examples", lfm.buildSystemPrompt({ variant = "fewshot" }):find("Examples", 1, true) ~= nil, true)
@@ -856,7 +870,7 @@ do
   local r = lfm.serializeSnapshot(snap, { redactNames = true })
   check("peak: survives redaction",       r:find('"peakSlopeMBmin":11332', 1, true) ~= nil, true)
   -- the plateau clause must be pinned into every prompt variant
-  for _, v in ipairs({ "baseline", "taxonomy", "fewshot" }) do
+  for _, v in ipairs({ "baseline", "taxonomy", "fewshot", "discriminate" }) do
     local p = lfm.buildSystemPrompt({ variant = v })
     check("peak: plateau clause pinned (" .. v .. ")",
       p:find("PLATEAUED", 1, true) ~= nil, true)

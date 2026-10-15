@@ -105,6 +105,8 @@ function M.row(a)
     },
     snapshot = a.snapshot, snapshotHash = a.snapshotHash,
     identityBasis = a.identityBasis,
+    -- The start was refused because a clock step back is replaying it.
+    identityReplayed = a.identityReplayed == true or nil,
   }
 end
 
@@ -234,14 +236,31 @@ end
 -- the previous reading (prevWall, prevMono), so the stretch runs from the
 -- stepped clock as it read then (prevWall + delta) to the old clock as it
 -- would read now (wall - delta). Without a monotonic reading the time since
--- the previous reading is unknown, and both ends widen by marginSec. Pure.
-function M.replaySpan(prevWall, prevMono, wall, mono, delta, marginSec)
+-- the previous reading cannot be bounded (a stalled run loop), so the
+-- stretch is unbounded: it fails closed. Pure.
+function M.replaySpan(prevWall, prevMono, wall, mono, delta)
   if type(prevWall) ~= "number" or type(wall) ~= "number" or type(delta) ~= "number" then return nil end
   if type(mono) == "number" and type(prevMono) == "number" then
     return { lo = prevWall + delta, hi = wall - delta }
   end
-  local m = tonumber(marginSec) or 0
-  return { lo = wall - m, hi = prevWall + m }
+  return { lo = -math.huge, hi = math.huge }
+end
+
+-- The stretches kept after a new one (`span`) is added. None is dropped:
+-- a process born in a stretch carries its start there for as long as it
+-- lives. Past `max`, the two oldest are merged into the stretch that spans
+-- both: wider, so it refuses more, never less. Returns a new list. Pure.
+function M.addReplay(spans, span, max)
+  local out = {}
+  for _, r in ipairs(spans or {}) do out[#out + 1] = r end
+  if type(span) == "table" then out[#out + 1] = span end
+  max = tonumber(max) or 16
+  while #out > max and #out >= 2 do
+    local a, b = out[1], out[2]
+    table.remove(out, 1)
+    out[1] = { lo = math.min(a.lo, b.lo), hi = math.max(a.hi, b.hi) }
+  end
+  return out
 end
 
 -- The stretches that still matter at raw instant `at`: those the clock has
@@ -250,7 +269,10 @@ end
 function M.replaysAt(spans, at, slackSec)
   local out = {}
   for _, r in ipairs(spans or {}) do
-    if type(at) ~= "number" or r.hi >= at - (tonumber(slackSec) or 0) then out[#out + 1] = r end
+    if type(r) == "table" and type(r.hi) == "number"
+       and (type(at) ~= "number" or r.hi >= at - (tonumber(slackSec) or 0)) then
+      out[#out + 1] = r
+    end
   end
   return out
 end
@@ -261,7 +283,8 @@ end
 function M.startReplayed(w, spans)
   if type(w) ~= "table" or type(w.lo) ~= "number" or type(w.hi) ~= "number" then return false end
   for _, r in ipairs(spans or {}) do
-    if w.hi >= r.lo and w.lo <= r.hi then return true end
+    if type(r) == "table" and type(r.lo) == "number" and type(r.hi) == "number"
+       and w.hi >= r.lo and w.lo <= r.hi then return true end
   end
   return false
 end

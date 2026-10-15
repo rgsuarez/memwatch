@@ -56,7 +56,7 @@ local sampler = { task = nil, startedAt = 0, at = 0,
 -- wall clock stepped back), and the step that counts as one.
 local clock = { wallAt = nil, monoAt = nil, stepSec = 2, stepTotal = 0,
                 depth = 0, pending = 0,
-                replays = {} }  -- { lo, hi } per step back: the wall time it replays (last 16)
+                replays = {} }  -- { lo, hi } per step back: the wall time it replays (see observe.addReplay)
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -2189,12 +2189,10 @@ function clock.now()
     -- (see obs.startReplayed). The step fell somewhere after the previous
     -- reading: the stretch runs from the stepped clock as it read then to
     -- the old clock as it would read now. Without a monotonic clock the time
-    -- since the previous reading is unknown, so both ends widen by two polls.
-    local span = observe.replaySpan(prevWall, prevMono, wall, mono, delta, 2 * core.cfg.pollSec)
-    if span then
-      clock.replays[#clock.replays + 1] = span
-      if #clock.replays > 16 then table.remove(clock.replays, 1) end
-    end
+    -- since the previous reading cannot be bounded, so the stretch is
+    -- unbounded (it fails closed).
+    local span = observe.replaySpan(prevWall, prevMono, wall, mono, delta)
+    if span then clock.replays = observe.addReplay(clock.replays, span, 16) end
     if clock.depth > 0 then
       clock.pending = clock.pending + delta
       -- The stamps wait for the frame's end, but what must take no evidence
@@ -3629,8 +3627,8 @@ obs.writeObservation = function(point, offender, now, extra)
   -- A start in wall time a step back replays identifies nothing: a process
   -- born since can carry the same start (obs.startReplayed). The stretches
   -- that matter now are kept with the record, for its samples.
-  local replays = obs.replaysAt(now + clock.pending)
-  if start0 and obs.startReplayed(start0, replays) then start0, identityBasis = nil, "none" end
+  local replayed = start0 and obs.startReplayed(start0, obs.replaysAt(now + clock.pending)) or false
+  if replayed then start0, identityBasis = nil, "none" end
   local row = observe.row({
     at = obsIso, session = obs.session, seq = seq, point = point, synthetic = extra.synthetic,
     state = smState.state, kern = lastKern,
@@ -3646,7 +3644,7 @@ obs.writeObservation = function(point, offender, now, extra)
                  peakSlopeMBmin = offender.peakSlopeMBmin, ageSec = offender.ageSec,
                  foreground = foreground },
     snapshot = user, snapshotHash = user and lfm.snapshotHash(user) or nil,
-    identityBasis = identityBasis,
+    identityBasis = identityBasis, identityReplayed = replayed or nil,
   })
   -- An oversize row drops its snapshot, never the row. A row that was not
   -- written gets no follow-ups and no sequence number back.
@@ -3665,7 +3663,13 @@ obs.writeObservation = function(point, offender, now, extra)
   local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
                                    start0 = start0, obsAt = now, weightMB = weight0,
                                    minSeq = sampler.nextSeq + 1, horizons = horizons })
-  ev.replays = replays   -- the stretches its samples' windows are checked against
+  -- Its samples' windows are checked against every stretch recorded so far,
+  -- whether or not the clock has run past it: with ps stalled, the pid may
+  -- already hold a process born in one, under the window of the one it
+  -- followed, and that process's start stays in the stretch while it lives.
+  local replays = {}
+  for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end
+  ev.replays = replays
   observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))
   -- Its life is a duration (on the monotonic clock): a step back, which
   -- closes the record, never lengthens it.

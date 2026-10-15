@@ -1978,14 +1978,15 @@ do
   -- Fates come only from the observation's own evidence: every sample folds
   -- in with its completeness and its start window, and the operator signal
   -- is the monotonic counter, not the resettable HUD flag.
-  local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt)")
+  local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt, seq)")
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
     sampleBody:find("complete = lastSample.complete, row = row,", 1, true) ~= nil, true)
   check("observe glue: and its start window, bounded by launch and delivery",
     sampleBody:find("start1 = row and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
-    sampleBody:find("if launchedAt and lastSample.launchedAt and launchedAt < lastSample.launchedAt then return end", 1, true) ~= nil, true)
+    sampleBody:find("if seq and seq < lastSample.seq then return end", 1, true) ~= nil
+      and sampleBody:find("launchedAt < lastSample.launchedAt", 1, true) == nil, true)
   check("observe glue: no point-estimate start compare remains",
     body:find("psStartedAt", 1, true), nil)
   check("observe glue: operator actions counted from the observation through the horizon",
@@ -2096,7 +2097,7 @@ do
     src:find("if (now - (lastErrorAt[label] or 0)) < 60 then return end", 1, true) ~= nil, true)
   -- The sampler tells its consumer how it ended and when it was launched.
   check("sampler glue: callback forwards exit code and launch time",
-    src:find("onDone(table.concat(acc), exitCode, launchedAt)", 1, true) ~= nil, true)
+    src:find("onDone(table.concat(acc), exitCode, launchedAt, seq)", 1, true) ~= nil, true)
   check("sampler glue: completeness comes from the exit code",
     src:find("lastSample.complete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time",

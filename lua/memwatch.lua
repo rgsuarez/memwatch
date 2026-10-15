@@ -44,9 +44,10 @@ local lastRuns     = {}   -- current runaway list, ignores applied
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
--- The sampler run behind lastPsList: when it was launched (nil: unknown,
--- start windows unbounded), and whether it exited 0 (its table is whole).
-local lastSample = { launchedAt = nil, complete = false }
+-- The sampler run behind lastPsList: its launch order (seq: an integer,
+-- immune to wall-clock steps), when it was launched (nil: unknown, start
+-- windows unbounded), and whether it exited 0 (its table is whole).
+local lastSample = { seq = 0, nextSeq = 0, launchedAt = nil, complete = false }
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -1308,6 +1309,8 @@ local function launchSampler(onDone)
   end
   sampleStartedAt = now
   local launchedAt = now   -- this task's own launch time, for its callback
+  lastSample.nextSeq = lastSample.nextSeq + 1
+  local seq = lastSample.nextSeq   -- and its place in launch order
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
   -- without a streaming drain hs.task never reads the pipe, ps blocks
   -- mid-write, and the task deadlocks until the watchdog TERMs it (observed
@@ -1325,7 +1328,7 @@ local function launchSampler(onDone)
       if exitCode ~= 0 then
         logError("sampler-exit", "code " .. tostring(exitCode))
       end
-      onDone(table.concat(acc), exitCode, launchedAt)
+      onDone(table.concat(acc), exitCode, launchedAt, seq)
     end),
     function(_, stdOut)
       acc[#acc + 1] = stdOut or ""
@@ -1340,11 +1343,14 @@ end
 -- state decision: under heavy pressure this fork can starve for tens of
 -- seconds (a live drill measured ~95s of stalled callbacks during a swap
 -- storm), and the verdict must never be hostage to it.
-local function onSample(blob, exitCode, launchedAt)
+local function onSample(blob, exitCode, launchedAt, seq)
   local now = hs.timer.secondsSinceEpoch()
   -- A callback from a sampler launched before the one already applied holds
-  -- an older table: it never replaces a newer one.
-  if launchedAt and lastSample.launchedAt and launchedAt < lastSample.launchedAt then return end
+  -- an older table: it never replaces a newer one. Launch order, not the
+  -- wall clock, decides: a clock stepped back (wake-time NTP, a VM resume)
+  -- must not discard every table until real time catches up.
+  if seq and seq < lastSample.seq then return end
+  lastSample.seq = seq or lastSample.seq
   lastSampleAt = now
   lastSample.launchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
   lastSample.complete = (exitCode == 0)

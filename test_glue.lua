@@ -1354,6 +1354,19 @@ scenario("a signal that cannot be sent ends its narrative", nil, function(W)
   check("send: and the next click acts", W.signalsTo(4242), "TERM")
 end)
 
+-- ---- sampler: launch order, not the wall clock, orders tables ----
+-- (round 3) The wall clock steps back 120 s (NTP at wake, a VM resume).
+-- Tables must keep landing: ordering by wall-clock launch time discarded
+-- every one until real time caught up.
+scenario("a clock stepped back does not stall the sampler", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(30)
+  check("clock: samples land before the step", mw.debug().sampleAgeSec <= 6, true)
+  W.wallOffset = -120
+  W.run(60)
+  check("clock: and keep landing after it", mw.debug().sampleAgeSec <= 6, true)
+end)
+
 -- ---- unattended state: what outlives an episode, and what proves an exit ----
 -- (round 3) A failed freeze or terminate is never retried on the same
 -- process, across episodes too: the episode's end keeps the final latch.

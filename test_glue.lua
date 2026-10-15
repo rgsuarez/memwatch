@@ -2347,8 +2347,10 @@ scenario("ledger: a successor born in replayed time never vouches for an older p
   local n0 = #ledgerRows(W)
   runUntil(W, 60, function() return #ledgerRows(W) > n0 end)
   W.run(38)                           -- a tick ahead of the next row, 45 s after that one
-  -- A step back 5 s shorter than the leaker's reported age: it started 5 s
-  -- before the stretch the step replays, so it keeps its identity.
+  -- A step back a little shorter than the leaker's reported age: it started
+  -- before the stretch the step replays (the stretch reaches back to the
+  -- reading before the step, so the margin is about 2 s), and it keeps its
+  -- identity.
   local D = math.floor(W.now - t0) + 115
   local tStep = W.now
   W.wallOffset = (W.wallOffset or 0) - D
@@ -2385,6 +2387,64 @@ scenario("ledger: a successor born in replayed time never vouches for an older p
   check("replay-successor: the +60 follow-up came (control)", fu[1] ~= nil, true)
   local f = fu[1] or {}
   check("replay-successor: it never reads the gone process alive (" .. tostring(f.fate) .. ", "
+    .. tostring(f.weightMB) .. " MB)", f.fate ~= "alive" and f.fate ~= "frozen", true)
+end)
+
+-- The same, with the successor already holding the pid when the observation
+-- is written. The observed process is younger than a step back, ps stalls,
+-- and a same-name successor takes the pid during the replay, with a start a
+-- couple of seconds from the observed one; the tracker still shows the
+-- observed process's window. An observation written after the clock has
+-- run past the stretch keeps that window as its identity. A slow table then
+-- places the successor's window over it: checked against every stretch
+-- recorded, not only those still being replayed, it proves nothing.
+scenario("ledger: a successor already at the pid when the stretch has passed never vouches for it", nil, function(W, mw)
+  local t0 = W.now
+  local row = toDecision(W, 4242)
+  if not row then check("passed-successor: decision row", false, true); return end
+  W.topEmits = true
+  W.run(6)
+  W.psStarved = true                  -- the tracker keeps the leaker's window (born 120 s before t0)
+  W.run(4)
+  local age = math.floor(W.now - t0) + 120
+  local D = age + 30                  -- younger than the step: its start is 30 s into the stretch
+  local tStep = W.now
+  W.wallOffset = (W.wallOffset or 0) - D
+  check("passed-successor: the step was taken out (control)",
+    runUntil(W, 6, function() return logHas(W, "clock-stepped-back:" .. D .. "s") end), true)
+  -- When the stepped clock is 2 s past the leaker's start, it exits and a
+  -- newborn takes its pid.
+  runUntil(W, 60, function() return W.now - tStep >= 32 end)
+  W.reusePid(4242, "leaker", 2000, { bornAgoSec = 0 })
+  -- The first row written after the clock has run past the stretch.
+  runUntil(W, D + 30, function() return W.now - tStep >= D + 5 end)
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local obsRow, tObs
+  runUntil(W, 60, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not before[r.seq] then obsRow = obsRow or r end
+    end
+    if obsRow and not tObs then tObs = W.now end
+    return obsRow ~= nil
+  end)
+  check("passed-successor: a row after the stretch has passed (control)", obsRow ~= nil, true)
+  if not obsRow then return end
+  check("passed-successor: it keeps the tracker's window as identity (control)", obsRow.identityBasis, "window")
+  -- One slow table (read at its delivery, 8 s after its launch) landing just
+  -- before the +60 follow-up; nothing else lands before that horizon.
+  W.psStarved, W.samplerStartFails = false, true
+  runUntil(W, 60, function() return W.now - tObs >= 46 end)
+  W.samplerStartFails, W.samplerReadsLate, W.samplerDelay = false, true, 8
+  local a0 = W.samplerStartAttempts or 0
+  runUntil(W, 8, function() return (W.samplerStartAttempts or 0) > a0 end)
+  W.samplerReadsLate, W.samplerDelay, W.samplerStartFails = nil, nil, true
+  runUntil(W, 30, function() return W.now - tObs >= 62 end)
+  W.samplerStartFails = false
+  local fu = followups(W, obsRow.seq)
+  check("passed-successor: the +60 follow-up came (control)", fu[1] ~= nil, true)
+  local f = fu[1] or {}
+  check("passed-successor: it never reads the gone process alive (" .. tostring(f.fate) .. ", "
     .. tostring(f.weightMB) .. " MB)", f.fate ~= "alive" and f.fate ~= "frozen", true)
 end)
 

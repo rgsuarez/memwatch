@@ -1938,23 +1938,33 @@ do
     observe.liveStamp(stamp, { comm = "/bin/x", startLo = 1500, startHi = 1502, etimeSec = 60 }), nil)
   local youngStamp = { at = 100, comm = "/bin/x", start = { lo = 999, hi = 1003, etimeSec = 1 } }
   check("liveStamp: an undecidable identity keeps it", observe.liveStamp(youngStamp, live), youngStamp)
+  do
   -- A step back replays a stretch of wall time (observe.replaySpan): from
   -- the stepped clock as it read at the previous reading to the old clock as
   -- it would read now. Read at 1000 (mono 500), next at 905 (mono 510): a
   -- 105 s step somewhere in those 10 s.
-  local span = observe.replaySpan(1000, 500, 905, 510, -105, 10)
+  local span = observe.replaySpan(1000, 500, 905, 510, -105)
   check("replaySpan: from the stepped clock at the previous reading", span.lo, 895)
   check("replaySpan: to the old clock now", span.hi, 1010)
   check("replaySpan: a start born 3 s after the previous reading lies in it",
     observe.startReplayed({ lo = 897, hi = 898 }, { span }), true)
   check("replaySpan: anchored at the detecting reading instead, it would escape (control)",
     observe.startReplayed({ lo = 897, hi = 898 }, { { lo = 905 - 2, hi = 1010 } }), false)
-  local blind = observe.replaySpan(1000, nil, 900, nil, -100, 10)
-  check("replaySpan: without a monotonic clock both ends widen", blind.lo == 890 and blind.hi == 1010, true)
-  check("replaySpan: nothing without a previous reading", observe.replaySpan(nil, nil, 900, 5, -100, 10), nil)
+  local blind = observe.replaySpan(1000, nil, 900, nil, -100)
+  check("replaySpan: without a monotonic clock it fails closed (unbounded)",
+    blind.lo == -math.huge and blind.hi == math.huge, true)
+  check("replaySpan: nothing without a previous reading", observe.replaySpan(nil, nil, 900, 5, -100), nil)
+  check("replaySpan: nothing without a previous wall reading, whatever the monotonic one",
+    observe.replaySpan(nil, 500, 900, 510, -100), nil)
   -- Each step keeps its own stretch; a start between two is untouched.
   local spans = { { lo = 100, hi = 200 }, { lo = 500, hi = 600 } }
   check("startReplayed: a start in a stretch", observe.startReplayed({ lo = 150, hi = 151 }, spans), true)
+  check("startReplayed: a start in the second stretch", observe.startReplayed({ lo = 550, hi = 551 }, spans), true)
+  check("startReplayed: a window ending at a stretch's start overlaps it",
+    observe.startReplayed({ lo = 98, hi = 100 }, spans), true)
+  check("startReplayed: one starting at a stretch's end overlaps it",
+    observe.startReplayed({ lo = 200, hi = 202 }, spans), true)
+  check("startReplayed: a malformed stretch is skipped", observe.startReplayed({ lo = 150, hi = 151 }, { {} }), false)
   check("startReplayed: a start between two stretches is untouched",
     observe.startReplayed({ lo = 300, hi = 301 }, spans), false)
   check("startReplayed: a start before every stretch is untouched",
@@ -1965,6 +1975,21 @@ do
   check("replaysAt: a stretch the clock has run past no longer matters", #live2 == 1 and live2[1].lo == 500, true)
   check("replaysAt: one it has not still does", #observe.replaysAt(spans, 150, 2), 2)
   check("replaysAt: whole-second slack at the end", #observe.replaysAt(spans, 201, 2), 2)
+  check("replaysAt: no instant keeps them all", #observe.replaysAt(spans, nil, 2), 2)
+  check("replaysAt: a malformed stretch is skipped", #observe.replaysAt({ {} }, 100, 2), 0)
+  -- Kept stretches: none is dropped (a process born in one starts there
+  -- while it lives); past the cap the two oldest merge, wider, never less.
+  -- A 500 s step at 1300 (replaying 800..1300), then sixteen more a second
+  -- apart.
+  local kept = observe.addReplay({}, { lo = 800, hi = 1300 }, 16)
+  for i = 1, 16 do kept = observe.addReplay(kept, { lo = 900 + i, hi = 1200 + i }, 16) end
+  check("addReplay: the cap holds", #kept, 16)
+  check("addReplay: seventeen steps on, a start only the first stretch covers is still refused",
+    observe.startReplayed({ lo = 850, hi = 851 }, kept), true)
+  local passed = observe.addReplay({ { lo = 100, hi = 200 } }, { lo = 500, hi = 600 }, 16)
+  check("addReplay: a stretch the clock has run past is kept", #passed, 2)
+  check("addReplay: an empty list takes the new stretch", #observe.addReplay(nil, { lo = 1, hi = 2 }, 16), 1)
+  end
   check("liveStamp: no tracker entry keeps it", observe.liveStamp(stamp, nil), stamp)
   check("liveStamp: no stamp is nil", observe.liveStamp(nil, live), nil)
 
@@ -2590,9 +2615,13 @@ do
   -- Each step back keeps its replayed stretch; observations refuse a start in
   -- one that still matters, and keep them for their samples' windows.
   check("replay glue: each step records its stretch",
-    src:find("observe.replaySpan(prevWall, prevMono, wall, mono, delta, 2 * core.cfg.pollSec)", 1, true) ~= nil, true)
-  check("replay glue: an observation checks the stretches that matter now",
-    src:find("local replays = obs.replaysAt(now + clock.pending)", 1, true) ~= nil
+    src:find("observe.replaySpan(prevWall, prevMono, wall, mono, delta)", 1, true) ~= nil, true)
+  check("replay glue: the kept stretches go through addReplay",
+    src:find("clock.replays = observe.addReplay(clock.replays, span, 16)", 1, true) ~= nil, true)
+  check("replay glue: an observation's own start is checked against the stretches that matter now",
+    src:find("obs.startReplayed(start0, obs.replaysAt(now + clock.pending))", 1, true) ~= nil, true)
+  check("replay glue: its samples against every stretch recorded so far",
+    src:find("for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end", 1, true) ~= nil
       and src:find("ev.replays = replays", 1, true) ~= nil, true)
   check("replay glue: a sample's window is checked against its record's stretches",
     src:find("if start1 and obs.startReplayed(start1, ev.replays) then start1 = nil end", 1, true) ~= nil, true)

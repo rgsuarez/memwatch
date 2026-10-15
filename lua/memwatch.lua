@@ -761,6 +761,16 @@ local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 2 + 2 
 local function markInteracted(off, pending)
   if not off or off.synthetic then return end
   obs.noteTouch(off)
+  -- The operator acting on a process supersedes memwatch's own action in
+  -- flight on that very process: its pending KILL escalation is withheld
+  -- and its late progress touches nothing (rule 4).
+  for owed in pairs(openReceipts) do
+    if core.sameIdentity(owed.target, off) then
+      owed.superseded = true
+      openReceipts[owed] = nil
+      M.logSnapshot(string.format("unattended-superseded-by-operator:%s(%d)", off.name or "?", off.pid))
+    end
+  end
   local r = recordFor(interacted, off, true)
   if not pending then
     r.confirmed, r.pendingUntil = true, nil
@@ -1212,9 +1222,10 @@ local function buildMenu()
     for _, row in ipairs(frozenRows) do
       local pid, e = row.pid, row.e
       local mins = (hs.timer.secondsSinceEpoch() - (e.frozenAt or 0)) / 60
+      local held = e.weightMB and string.format("%4.1f GB held", e.weightMB / 1024) or "size unknown"
       items[#items + 1] = {
-        title = string.format("   %-20s %4.1f GB held \u{00B7} %.0f min%s", (e.name or "?"):sub(1, 20),
-          (e.weightMB or 0) / 1024, mins, e.adopted and " \u{00B7} bound by name" or ""),
+        title = string.format("   %-20s %s \u{00B7} %.0f min%s", (e.name or "?"):sub(1, 20),
+          held, mins, e.adopted and " \u{00B7} bound by name" or ""),
         menu = {
           { title = "Resume " .. (e.name or "?"),
             fn = obs.byOperator(function()
@@ -1276,7 +1287,9 @@ local function buildMenu()
       end) }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
       fn = obs.byOperator(function()
-        obs.noteTouch({ pid = off.pid, name = off.name, lstart = bound })
+        -- An answer, as the HUD's Ignore is: it supersedes memwatch's own
+        -- action in flight on this process (markInteracted notes the touch).
+        markInteracted({ pid = off.pid, name = off.name, lstart = bound })
         M.ignore(off.pid, off.name, bound)
       end) }
     items[#items + 1] = { title = "-" }
@@ -1696,30 +1709,33 @@ local function unattendedStep(offender, now)
                  rationale = rationale, dueAt = now + HOLD_MAX_SEC }
   openReceipts[owed] = true
   local gen = runGen
-  local function receipt(outcome, text)
+  local function receipt(outcome, text, signaled)
     -- One live receipt per action: a "has not come back" receipt posted at
     -- the deadline gives way to the real outcome, whatever it is, and is
-    -- withdrawn only once that is up. (A notification handle is userdata in
-    -- Hammerspoon; true marks a deadline receipt that could not be posted.)
+    -- withdrawn only once that is up. An outcome the engine reports as
+    -- signaled (a signal went out) is always announced. (A notification
+    -- handle is userdata in Hammerspoon; true marks a deadline receipt that
+    -- could not be posted.)
     local late = owed.lateReceipt
-    local posted = unattendedReceipt(action, target, adjudicator, rationale, outcome, text, late ~= nil)
+    local posted = unattendedReceipt(action, target, adjudicator, rationale, outcome, text,
+      late ~= nil or signaled == true)
     if posted and late and late ~= true then pcall(function() late:withdraw() end) end
   end
-  local narrate = function(text, done, outcome)
+  local narrate = function(text, done, outcome, signaled)
     local t = hs.timer.secondsSinceEpoch()
     -- Released by the backstop: a newer action may own this process now.
     -- This one's late progress touches nothing of it (no HUD text, hold,
     -- retry state or answer); its final outcome only replaces its own
     -- receipt.
     if owed.superseded then
-      if done then receipt(outcome, text) end
+      if done then receipt(outcome, text, signaled) end
       return
     end
     if done then openReceipts[owed] = nil else owed.dueAt = t + HOLD_MAX_SEC end
     if gen ~= runGen then
       -- The run ended mid-action: still say what memwatch did, but leave
       -- the new run's alert alone.
-      if done then receipt(outcome, text) end
+      if done then receipt(outcome, text, signaled) end
       return
     end
     if hud then hud[3].text = "AUTO: " .. text end
@@ -1731,7 +1747,7 @@ local function unattendedStep(offender, now)
       local f = unattendedFiredFor[target.pid]
       if f and f.lstart == target.lstart then f.final = true end
     end
-    receipt(outcome, text)
+    receipt(outcome, text, signaled)
     -- memwatch's own action answers the alert like an operator's would.
     afterHeld(6, guard("hud-close", function()
       if gen == runGen then settleAction(target, outcome) end
@@ -1746,7 +1762,7 @@ local function unattendedStep(offender, now)
     M.killPid(offender.pid, offender.name, narrate, { expectedLstart = lstart, stillCurrent = stillCurrent })
   else
     M.freezePid(offender.pid, offender.name, narrate,
-      { weightMB = offender.weightMB, expectedLstart = lstart, stillCurrent = stillCurrent })
+      { weightMB = offender.weightMB, expectedLstart = lstart })
   end
 end
 
@@ -2210,6 +2226,16 @@ local function frozenReconcile()
   frozen = {}
   local survivors, unbound = {}, {}
   local now = hs.timer.secondsSinceEpoch()
+  -- Dating an old entry compares a start time read through os.time with a
+  -- freeze stamp from this clock: say so when the two disagree.
+  local skew = os.time() - now
+  if math.abs(skew) > 5 then
+    M.logSnapshot(string.format("frozen-reconcile-clock-skew:%.0fs", skew))
+  end
+  -- One bound by name says so wherever it is named.
+  local function survivorName(e)
+    return e.adopted and ((e.name or "?") .. " (bound by name; check before resuming)") or e.name
+  end
   for _, e in ipairs(list) do
     if type(e) == "table" and type(e.pid) == "number" then
       if e.lstart == nil then
@@ -2222,14 +2248,23 @@ local function frozenReconcile()
         -- that would prove it is what the old entry never had.
         local st, holder = probe(e.pid)
         local started = st == "present" and core.lstartEpoch(holder.lstart) or nil
-        if st == "present" and core.isStopped(holder)
-           and core.sameName(procs.friendlyName(holder.comm), e.name)
-           and started and type(e.frozenAt) == "number" and started <= e.frozenAt then
+        local candidate = st == "present" and core.isStopped(holder)
+          and core.sameName(procs.friendlyName(holder.comm), e.name)
+        local dated = candidate and started ~= nil and type(e.frozenAt) == "number"
+        -- Started in an earlier whole second than the freeze (ps prints
+        -- whole seconds), so a process started after it cannot be adopted.
+        if dated and started < math.floor(e.frozenAt) then
           e.lstart, e.adopted = holder.lstart, true
           M.logSnapshot(string.format("frozen-reconcile-bind:%s(%d)", e.name or "?", e.pid))
         else
           M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):no-start-time", e.name or "?", e.pid))
-          if st == "unknown" then unbound[#unbound + 1] = string.format("%s (pid %d)", e.name or "?", e.pid) end
+          -- Named in the notice whenever it could not be told: a probe that
+          -- could not answer, or that program stopped there with a start time
+          -- that cannot be read or dated, or that falls in the very second of
+          -- the freeze.
+          if st == "unknown" or (candidate and not dated) or (dated and started == math.floor(e.frozenAt)) then
+            unbound[#unbound + 1] = string.format("%s (pid %d)", e.name or "?", e.pid)
+          end
           e = nil
         end
       end
@@ -2248,18 +2283,18 @@ local function frozenReconcile()
         -- decides once the pending window ends.
         M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):pending", e.name or "?", e.pid))
         frozen[e.pid] = e
-        survivors[#survivors + 1] = e.name
+        survivors[#survivors + 1] = survivorName(e)
       elseif why == "unverified" then
         M.logSnapshot(string.format("frozen-reconcile-keep:%s(%d):unverified", e.name or "?", e.pid))
         frozen[e.pid] = e
-        survivors[#survivors + 1] = e.name
+        survivors[#survivors + 1] = survivorName(e)
       elseif not proc then
         M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):%s", e.name or "?", e.pid, why))
       elseif not core.isStopped(proc) then
         M.logSnapshot(string.format("frozen-reconcile-drop:%s(%d):resumed-externally", e.name or "?", e.pid))
       else
         frozen[e.pid] = e
-        survivors[#survivors + 1] = e.adopted and ((e.name or "?") .. " (bound by name; check before resuming)") or e.name
+        survivors[#survivors + 1] = survivorName(e)
       end
     end
   end
@@ -2300,10 +2335,10 @@ frozenSweep = function(now)
   local pids = {}
   for pid in pairs(frozen) do pids[#pids + 1] = pid end
   local rows = probeRows(pids)
-  local kept, dropped, settled = core.pruneFrozen(frozen, function(pid)
+  local kept, dropped = core.pruneFrozen(frozen, function(pid)
     return core.probeResult(rows, pid)
   end, now)
-  if #dropped == 0 and settled == 0 then return end
+  if #dropped == 0 then return end
   for _, d in ipairs(dropped) do
     M.logSnapshot(string.format("frozen-prune:%s(%d):%s",
       d.entry.name or "?", d.entry.pid or -1, d.why))
@@ -2379,7 +2414,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   -- process that never entered state T.
   local entry = {
     pid = pid, name = proc.liveName, lstart = proc.lstart,
-    weightMB = opts.weightMB or 0,
+    weightMB = opts.weightMB, -- nil: size unknown
     frozenAt = hs.timer.secondsSinceEpoch(),
     -- Until its verifier has run, the liveness sweep leaves the entry alone:
     -- the STOP may not have taken effect yet (a process in a syscall stops
@@ -2388,15 +2423,20 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   }
   frozen[pid] = entry
   saveFrozen()
-  -- A STOP that could not be sent still goes through the verifier, which
-  -- decides from the process's state: stopped keeps the entry, running
-  -- means nothing was done.
   local stopSent = send("STOP", pid)
   if stopSent then obs.noteSignal(pid, "freeze", proc) end
-  -- Whether the STOP went out is part of the entry: a reload before the
-  -- verifier runs keeps a pending entry only if it did.
+  -- Whether the STOP went out is part of the entry. One that could not be
+  -- sent leaves no entry, at once: whatever state the process is in, memwatch
+  -- did not put it there (a stop by anyone else is not memwatch's to resume).
+  -- The verifier still runs, to report what it finds.
   entry.stopSent = stopSent
-  if frozen[pid] == entry then saveFrozen() end
+  if frozen[pid] == entry then
+    if not stopSent then frozen[pid] = nil end
+    saveFrozen()
+  end
+  -- Every final outcome below says whether this freeze's STOP went out, so
+  -- an outcome after a signal is always announced (an exit or a takeover
+  -- found after the STOP included).
   afterHeld(0.5, guard("freeze-verify", function()
     -- Re-probe IDENTITY and state in one fork after the signal: if the
     -- pid was recycled between the pre-signal probe and the SIGSTOP, we
@@ -2406,25 +2446,28 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     -- cannot run keeps the entry: the STOP may have landed, and the
     -- reconcile and the sweep re-check it.
     local reprobe, rwhy, holder = resolveSignalTarget(pid, proc.liveName, proc.lstart)
-    -- The ledger slot is this freeze's to change only while it holds no
-    -- entry for another start time (a newer freeze of the pid's next
-    -- process, or one a restart adopted, is not this freeze's to touch).
-    local ours = ownsEntry(pid, proc.lstart)
+    -- The ledger slot is this freeze's to change only while it holds this
+    -- freeze's own entry (or nothing): an entry another action wrote since,
+    -- for this process or the pid's next one, is never this freeze's to
+    -- touch, so a freeze whose verifier runs late cannot undo a newer one.
+    local ours = frozen[pid] == entry or frozen[pid] == nil
+    local function dropOurs()
+      if frozen[pid] == entry then
+        frozen[pid] = nil
+        saveFrozen()
+      end
+    end
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
       if stopSent then
-        onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
+        onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed", stopSent)
       else
-        -- No STOP went out: there is nothing to protect, and a pending
-        -- entry would only hide a running process and swallow a retry.
-        dropOwnEntry(pid, proc.lstart)
-        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
+        -- No STOP went out (its entry went at the send): nothing to protect.
+        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified", stopSent)
       end
     elseif not reprobe then
       if ours then
-        local weightMB = frozen[pid] and frozen[pid].weightMB or 0
-        frozen[pid] = nil
-        saveFrozen()
+        dropOurs()
         -- The STOP reached the process this same probe found holding the pid
         -- (holder), or nothing. Undo it only on a process seen stopped. If
         -- that CONT cannot be sent, a fresh probe decides: the same process,
@@ -2438,42 +2481,53 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
             or (st2 == "present" and again.lstart == holder.lstart and core.isStopped(again))
           if still and frozen[pid] == nil then
             local holderName = procs.friendlyName(holder.comm)
-            frozen[pid] = { pid = pid, name = holderName, lstart = holder.lstart, weightMB = weightMB,
+            -- Its size is unknown (the probe row has none), never the size
+            -- of the process the freeze meant.
+            frozen[pid] = { pid = pid, name = holderName, lstart = holder.lstart, weightMB = nil,
                             frozenAt = hs.timer.secondsSinceEpoch(), stopSent = true }
             saveFrozen()
             M.logSnapshot(string.format("freeze-abort-cont-failed:%s(%d)", holderName, pid))
             onUpdate(string.format("%s changed identity mid-freeze, and pid %d (%s) may be left stopped; resume it from the menu",
-              proc.liveName, pid, holderName), true, "unconfirmed")
+              proc.liveName, pid, holderName), true, "unconfirmed", stopSent)
             return
           end
         end
       end
+      -- Said as it happened: a STOP that never went out signaled nothing.
       if rwhy == "exited" then
         M.logSnapshot(string.format("freeze-abort:%s(%d)-exited", proc.liveName, pid))
-        onUpdate(string.format("%s exited during the freeze", proc.liveName), true, "exited")
+        onUpdate(stopSent and string.format("%s exited during the freeze", proc.liveName)
+          or string.format("couldn't send STOP to %s; it has exited", proc.liveName), true, "exited", stopSent)
       else
         M.logSnapshot(string.format("freeze-abort:%s(%d)-identity-changed", proc.liveName, pid))
-        onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true, "stale")
+        onUpdate(stopSent and string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName)
+          or string.format("couldn't send STOP to %s; pid %d now holds another process, which was not signaled",
+            proc.liveName, pid), true, "stale", stopSent)
       end
+    elseif core.isStopped(reprobe) and not stopSent then
+      -- Stopped, but not by memwatch (its STOP never went out, and its entry
+      -- went at the send): no freeze of memwatch's, and no Resume to offer.
+      M.logSnapshot(string.format("freeze-skip:%s(%d)-stopped-by-another", proc.liveName, pid))
+      onUpdate(string.format("couldn't send STOP to %s; it is stopped, but not by memwatch", proc.liveName),
+        true, "unverified")
     elseif core.isStopped(reprobe) then
       -- A process memwatch stopped is always in the ledger: settle the entry
-      -- (or restore it, if anything removed it meanwhile).
-      entry.pendingUntil = nil
-      frozen[pid] = entry
-      saveFrozen()
-      M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
-      onUpdate(string.format(
-        "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true, "frozen")
-    else
+      -- (or restore it, if nothing else took the slot meanwhile).
       if ours then
-        frozen[pid] = nil
+        entry.pendingUntil = nil
+        frozen[pid] = entry
         saveFrozen()
       end
+      M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
+      onUpdate(string.format(
+        "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true, "frozen", stopSent)
+    else
+      dropOurs()
       if stopSent then
         M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
-        onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed")
+        onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed", stopSent)
       else
-        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified")
+        onUpdate(string.format("couldn't send STOP to %s; nothing was signaled", proc.liveName), true, "unverified", stopSent)
       end
     end
   end))
@@ -3660,21 +3714,22 @@ function M.killPid(pid, expectedName, onUpdate, opts)
     -- verified afresh (the TERM may have failed because it exited, and the
     -- pid may hold another process by now), its entry pending until its own
     -- verifier settles it. Its old entry goes when it proves to be gone.
+    -- Every outcome is reported in the re-freeze's own words (they say
+    -- whether its own STOP went out), and as a signaled action: the CONT
+    -- went out, so even an exit or a takeover is announced.
     M.freezePid(pid, liveName, function(text, done, outcome)
-      if done and (outcome == "exited" or outcome == "stale") then dropOwnEntry(pid, proc.lstart) end
+      if done and (outcome == "exited" or outcome == "stale") and frozenEntry and frozen[pid] == frozenEntry then
+        frozen[pid] = nil
+        saveFrozen()
+      end
       if done and outcome == "unverified" then
         -- Nothing was re-stopped, but the CONT went out: it may be running.
         onUpdate(string.format("couldn't send TERM to %s, and can't verify it now; it was continued and may be running",
-          liveName), true, "unconfirmed")
-      elseif done and outcome == "exited" then
-        onUpdate(string.format("couldn't send TERM to %s; it has exited", liveName), true, "exited")
-      elseif done and outcome == "stale" then
-        onUpdate(string.format("couldn't send TERM to %s; pid %d now holds another process, which was not signaled",
-          liveName, pid), true, "stale")
+          liveName), true, "unconfirmed", true)
       else
-        onUpdate(string.format("couldn't send TERM to %s; %s", liveName, text), done, outcome)
+        onUpdate(string.format("couldn't send TERM to %s; %s", liveName, text), done, outcome, true)
       end
-    end, { expectedLstart = proc.lstart, weightMB = frozenEntry and frozenEntry.weightMB or 0 })
+    end, { expectedLstart = proc.lstart, weightMB = frozenEntry and frozenEntry.weightMB })
     return
   end
   -- The TERM is the signal of record: a KILL escalation below carries out
@@ -3725,12 +3780,17 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- (KILL never goes to an unverified pid) and is retried twice, 2 s apart.
   local function escalate(attempt)
     afterHeld((attempt == 1) and k.escalateSec or 2, guard("kill-escalate", function()
-      local again, awhy = resolveSignalTarget(pid, liveName, proc.lstart)
-      if again and opts.stillCurrent and not opts.stillCurrent() then
-        -- A newer action owns this process now: this one's escalation never
-        -- overrides it.
+      -- A newer action (memwatch's, or the operator's) owns this process now:
+      -- this one's escalation never overrides it. It ends here, saying what
+      -- it did: no probe, no retry, no ledger change.
+      if opts.stillCurrent and not opts.stillCurrent() then
         M.logSnapshot(string.format("kill-escalate-superseded:%s(%d)", liveName, pid))
-      elseif again then
+        onUpdate(string.format("sent TERM to %s; KILL withheld, a newer action took it over", liveName),
+          true, "unconfirmed")
+        return
+      end
+      local again, awhy = resolveSignalTarget(pid, liveName, proc.lstart)
+      if again then
         M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
         onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
         killSent = send("KILL", pid)

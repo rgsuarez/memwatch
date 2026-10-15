@@ -435,58 +435,77 @@ function M.isStopped(proc)
   return proc ~= nil and type(proc.state) == "string" and proc.state:sub(1, 1) == "T"
 end
 
--- Frozen-ledger liveness decision (pure): given the persisted frozen map
--- ([pid] = entry carrying lstart) and probe(pid) -> "present", { lstart,
--- state } | "absent" | "unknown", partition into entries still
--- identity-valid AND stopped versus dead wood,
--- with a named reason per drop. The startup reconcile validates at load;
--- this is the same decision for the calm-state sweep, because a frozen
--- process that exits BETWEEN reloads must not haunt the ledger (2026-07-09
--- field finding: a dead VM pid held frozenCount=1 for two days).
+-- Frozen-ledger liveness decision (pure: it changes no entry): given the
+-- persisted frozen map ([pid] = entry carrying lstart) and probe(pid) ->
+-- "present", { lstart, state } | "absent" | "unknown", partition into entries
+-- still identity-valid AND stopped versus dead wood, with a named reason per
+-- drop. The startup reconcile validates at load; this is the same decision
+-- for the calm-state sweep, because a frozen process that exits BETWEEN
+-- reloads must not haunt the ledger (2026-07-09 field finding: a dead VM pid
+-- held frozenCount=1 for two days).
+-- An entry whose STOP never went out is no freeze of memwatch's, whatever
+-- the process's state: it goes without a probe (a stop by anyone else is
+-- not memwatch's to resume).
 -- Unknown keeps the entry: a probe that could not run proves nothing, and
 -- dropping a live entry would strand a stopped process with no way back.
 -- A freeze still being verified (pendingUntil in the future) is kept as it
 -- is: the STOP may not have taken effect yet, and its verifier decides.
+-- Once that window ends, the entry is simply no longer pending.
 function M.pruneFrozen(entries, probe, now)
-  local kept, dropped, settled = {}, {}, 0
+  local kept, dropped = {}, {}
   for pid, e in pairs(entries or {}) do
-    local st, p = "pending", nil
-    if not (e.pendingUntil and now and now < e.pendingUntil) then st, p = probe(pid) end
     local why = nil
-    if st == "absent" then
-      why = "exited"
-    elseif st == "present" then
-      if e.lstart and p.lstart and e.lstart ~= p.lstart then
-        why = "pid-recycled"
-      elseif not M.isStopped(p) then
-        why = "resumed-externally"
+    if e.stopSent == false then
+      why = "stop-never-sent"
+    elseif not (e.pendingUntil and now and now < e.pendingUntil) then
+      local st, p = probe(pid)
+      if st == "absent" then
+        why = "exited"
+      elseif st == "present" then
+        if e.lstart and p.lstart and e.lstart ~= p.lstart then
+          why = "pid-recycled"
+        elseif not M.isStopped(p) then
+          why = "resumed-externally"
+        end
       end
     end
     if why then
       dropped[#dropped + 1] = { entry = e, why = why }
     else
-      -- Verified stopped, the same process: a freeze whose own verifier
-      -- could not tell is settled now.
-      if st == "present" and e.pendingUntil then
-        e.pendingUntil = nil
-        settled = settled + 1
-      end
       kept[pid] = e
     end
   end
-  return kept, dropped, settled
+  return kept, dropped
 end
 
 -- A start time as ps prints it ("Mon Oct  5 10:00:01 2026", local time) as
--- an epoch; nil when it does not parse.
+-- an epoch; nil when it does not name exactly one instant: text that does
+-- not parse, a date that does not exist (Feb 30), a local time skipped by a
+-- clock change, or one that happens twice (the hour repeated when daylight
+-- saving time ends). A caller dating by it must fail closed on nil.
 local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
                  Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
 function M.lstartEpoch(s)
   if type(s) ~= "string" then return nil end
   local mon, d, h, mi, sec, y = s:match("^%a+%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)%s+(%d+)$")
   if not mon or not MONTHS[mon] then return nil end
-  return os.time({ year = tonumber(y), month = MONTHS[mon], day = tonumber(d),
-                   hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) })
+  local want = { year = tonumber(y), month = MONTHS[mon], day = tonumber(d),
+                 hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) }
+  -- Read it both ways (standard time and daylight time) and keep each
+  -- reading that names this very wall-clock time: none means it does not
+  -- exist here, two different ones mean it is ambiguous.
+  local found = nil
+  for _, dst in ipairs({ false, true }) do
+    local ok, t = pcall(os.time, { year = want.year, month = want.month, day = want.day,
+      hour = want.hour, min = want.min, sec = want.sec, isdst = dst })
+    local back = ok and t and os.date("*t", t)
+    if back and back.year == want.year and back.month == want.month and back.day == want.day
+       and back.hour == want.hour and back.min == want.min and back.sec == want.sec then
+      if found and found ~= t then return nil end
+      found = t
+    end
+  end
+  return found
 end
 
 -- Process names from the top stream are truncated at ~16 characters, so a

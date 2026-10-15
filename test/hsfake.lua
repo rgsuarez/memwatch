@@ -278,7 +278,14 @@ function F.new()
     W.notifs[#W.notifs + 1] = self
     local wa = self.attrs.withdrawAfter
     if wa and wa > 0 then addTimer("after", wa, nil, function() self.withdrawn = true end) end
-    local ud = io.tmpfile()
+    -- A real userdata, as Hammerspoon's handle is, from a file that needs
+    -- no write (a closed handle is still userdata): /dev/null, else a file
+    -- in the world's own scratch home, else a system temp file. With none,
+    -- the notification itself stands in (it has the same two methods).
+    local ud = io.open("/dev/null", "r")
+      or (W.home and io.open(W.home .. "/notif-handle", "a"))
+      or io.tmpfile()
+    if not ud then return self end
     ud:close()
     local n = self
     debug.setmetatable(ud, { __index = {

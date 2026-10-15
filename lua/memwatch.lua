@@ -2094,7 +2094,8 @@ function clock.shift(delta)
       for _, e in pairs(tracker.procs) do
         e.lastSeen, e.extremeUntil = sh(e.lastSeen), sh(e.extremeUntil)
         -- (Its start window is not shifted: it is anchored to the kernel's
-        -- start record, which a step does not move; see procs.startWindow.)
+        -- start record, which a step does not move; see procs.startWindow.
+        -- What a step does to its use as identity: obs.startReplayed.)
         for _, smp in ipairs(e.ring or {}) do smp.t = sh(smp.t) end
       end
     end },
@@ -2177,6 +2178,11 @@ function clock.now()
   end
   clock.wallAt, clock.monoAt = wall, mono
   if delta < -clock.stepSec then
+    -- The stretch of wall time this step makes the clock run through again,
+    -- from this reading to the one before the step (kept as one span over
+    -- every step: see obs.startReplayed).
+    clock.replayLo = math.min(clock.replayLo or wall, wall)
+    clock.replayHi = math.max(clock.replayHi or (wall - delta), wall - delta)
     if clock.depth > 0 then
       clock.pending = clock.pending + delta
       -- The stamps wait for the frame's end, but what must take no evidence
@@ -3567,6 +3573,18 @@ end
 -- grace expiry) or "synthetic" (memwatch.testObserve). Never forks: the
 -- snapshot is built from tick state, fates come from the latest ps sample
 -- and the frozen ledger, exit-cause evidence from a directory listing.
+-- Does a start window lie in wall time a step back made the clock run
+-- through again (clock.replayLo..replayHi)? A process started there carries a
+-- start a process born since the step can carry too: the stepped clock
+-- reaches the same instants a second time. Such a start cannot tell the
+-- observed process from its pid's next one, so it identifies nothing. Starts
+-- before the stretch (any process older than the step) are untouched.
+function obs.startReplayed(w)
+  if type(w) ~= "table" or type(w.lo) ~= "number" or type(w.hi) ~= "number" then return false end
+  if type(clock.replayLo) ~= "number" or type(clock.replayHi) ~= "number" then return false end
+  return w.hi >= clock.replayLo - clock.stepSec and w.lo <= clock.replayHi
+end
+
 obs.writeObservation = function(point, offender, now, extra)
   if not obs.enabled or type(offender) ~= "table" then return end
   extra = extra or {}
@@ -3601,6 +3619,9 @@ obs.writeObservation = function(point, offender, now, extra)
     start0 = observe.startFromLstart(extra.lstart, now + clock.pending)
     identityBasis = start0 and "lstart" or "none"
   end
+  -- A start in wall time a step back replayed identifies nothing: a process
+  -- born since can carry the same start (obs.startReplayed).
+  if start0 and obs.startReplayed(start0) then start0, identityBasis = nil, "none" end
   local row = observe.row({
     at = obsIso, session = obs.session, seq = seq, point = point, synthetic = extra.synthetic,
     state = smState.state, kern = lastKern,

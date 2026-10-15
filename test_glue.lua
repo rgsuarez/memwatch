@@ -2288,6 +2288,49 @@ scenario("ledger: a table without its launch record keeps identity across a step
     fu[1] ~= nil and fu[1].fate ~= "exited", true)
 end)
 
+-- A step back to before a process's start window, while ps stalls (the top
+-- stream keeps the offender current): a process born from then on can carry,
+-- on the stepped clock, a start inside that window. The window goes at the
+-- step, so the observation written after it cannot take a same-name
+-- successor for the process it observed.
+scenario("ledger: a step back outliving a start window never lets a successor vouch for it", nil, function(W)
+  local t0 = W.now
+  local row = toDecision(W, 4242)
+  if not row then check("outlived: decision row", false, true); return end
+  W.topEmits = true
+  W.run(6)
+  W.psStarved = true                  -- the tracker keeps the window the last pre-step table placed
+  W.run(20)
+  local S = 260                       -- longer than the leaker has lived
+  W.wallOffset = (W.wallOffset or 0) - S
+  check("outlived: the step was taken out (control)",
+    runUntil(W, 6, function() return logHas(W, "clock-stepped-back:" .. S .. "s") end), true)
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local nextRow, tRow
+  runUntil(W, 100, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not before[r.seq] then nextRow = nextRow or r end
+    end
+    if nextRow and not tRow then tRow = W.now end
+    return nextRow ~= nil
+  end)
+  check("outlived: a row is written after the step (control)", nextRow ~= nil, true)
+  if not nextRow then return end
+  check("outlived: it takes no identity from the outlived window (" .. tostring(nextRow.identityBasis) .. ")",
+    nextRow.identityBasis ~= "window", true)
+  check("outlived: the successor is born after the row (control)", (t0 + S) > tRow, true)
+  W.run(math.max(0, (t0 + S) - W.now))
+  W.reusePid(4242, "leaker", 2000)    -- a same-name successor takes the pid
+  W.psStarved = false
+  W.run(200)
+  local fu = followups(W, nextRow.seq)
+  check("outlived: three follow-ups came (control)", #fu, 3)
+  local last = fu[#fu]
+  check("outlived: the gone process is never read alive or frozen (" .. tostring(last and last.fate) .. ")",
+    last ~= nil and last.fate ~= "alive" and last.fate ~= "frozen", true)
+end)
+
 -- (round 9) The jetsam blind ceiling is a raw file time: a second step back
 -- never lowers it, so a report from before the first step is never counted
 -- by an observation written before the clock catches up with it.

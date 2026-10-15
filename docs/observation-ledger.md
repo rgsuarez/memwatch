@@ -125,6 +125,13 @@ runs after its record stopped collecting still reads its own horizon.
   start time the alert bound (on decision and advisory rows alike), unless
   it falls in a daylight-saving fold (`lstart`); otherwise `none`, and its
   follow-ups can only read `unknown` or `exited`.
+- A start in wall time a step back made the clock run through again is
+  `none` too. A process that started inside that stretch (one younger than
+  the step) carries a start time a process born since the step can carry
+  as well, since the stepped clock reaches the same instants a second time,
+  so it cannot tell the observed process from its pid's next one. The clock
+  keeps that stretch as one span over every step since load; a process
+  older than the step keeps its identity.
 - A sample: the same program in an overlapping window that rules out a
   successor is a sighting; another program or a disjoint window is a reuse
   (the observed process is gone); anything else is `identity-uncertain`.

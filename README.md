@@ -148,8 +148,9 @@ moment an adjudicator would have been consulted, and every 45 s while
 pressure is up. Each row holds the exact redacted, pid-free snapshot a model
 would have received and the deterministic action that would have fired.
 Follow-ups at 60, 120 and 180 s record what actually became of the process
-and the machine: alive, exited or frozen; weight; available memory; and kernel
-jetsam reports.
+and the machine: alive, exited or frozen, or unknown when a stale or partial
+process sample (or an undecidable identity) cannot say; weight; available
+memory; and kernel jetsam reports.
 
 It never forks, never acts and never leaves the machine. It exists so that
 adjudicators can be judged against real outcomes rather than synthetic

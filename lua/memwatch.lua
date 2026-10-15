@@ -44,6 +44,8 @@ local lastRuns     = {}   -- current runaway list, ignores applied
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
+local lastSampleLaunchedAt = nil -- when the sampler behind lastPsList was launched
+local lastSampleComplete = false -- that sampler exited 0 (its ps table is whole)
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local alertsEnabled = true  -- desktop alert surfaces (HUD + banners); menu toggle, persisted
@@ -788,6 +790,7 @@ local function launchSampler(onDone)
     sampleTask = nil
   end
   sampleStartedAt = now
+  local launchedAt = now   -- this task's own launch time, for its callback
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
   -- without a streaming drain hs.task never reads the pipe, ps blocks
   -- mid-write, and the task deadlocks until the watchdog TERMs it (observed
@@ -799,11 +802,13 @@ local function launchSampler(onDone)
       sampleTask = nil
       -- Keep partial output even on a nonzero exit: under memory pressure ps
       -- can fail mid-table, and a partial process list beats a blank one.
-      -- The parsers treat garbage as calm, never as alarm.
+      -- The parsers treat garbage as calm, never as alarm. The exit code
+      -- rides along so consumers that infer absence (a process is gone
+      -- because its row is missing) can refuse a partial table.
       if exitCode ~= 0 then
         logError("sampler-exit", "code " .. tostring(exitCode))
       end
-      onDone(table.concat(acc))
+      onDone(table.concat(acc), exitCode, launchedAt)
     end),
     function(_, stdOut)
       acc[#acc + 1] = stdOut or ""
@@ -818,9 +823,11 @@ end
 -- state decision: under heavy pressure this fork can starve for tens of
 -- seconds (a live drill measured ~95s of stalled callbacks during a swap
 -- storm), and the verdict must never be hostage to it.
-local function onSample(blob)
+local function onSample(blob, exitCode, launchedAt)
   local now = hs.timer.secondsSinceEpoch()
   lastSampleAt = now
+  lastSampleLaunchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
+  lastSampleComplete = (exitCode == 0)
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -830,7 +837,7 @@ local function onSample(blob)
   -- Per-process pipeline: fresh identities and RSS from ps, then the shared
   -- assessment. Attribution continuity under load is the top stream's job.
   lastPsList = procs.parsePsList(blob)
-  procs.update(tracker, lastPsList, now, topCache.map)
+  procs.update(tracker, lastPsList, now, topCache.map, launchedAt)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.
   for i = #lastRanked, 1, -1 do
@@ -1888,7 +1895,13 @@ writeObservation = function(point, offender, now, extra)
   observeStats.lastAt = now
   -- Follow-ups: what actually became of this process, and of the machine.
   local pid = offender.pid
-  local startedAt = type(offender.ageSec) == "number" and (now - offender.ageSec) or nil
+  -- Identity at observation time: the tracker's comm and the start window
+  -- of its latest ps sighting (bounded by that sampler's launch and
+  -- delivery, so callback latency cannot fake a mismatch later).
+  local e0 = tracker.procs[pid]
+  local comm0 = e0 and e0.comm or nil
+  local start0 = (e0 and e0.startLo)
+    and { lo = e0.startLo, hi = e0.startHi, etimeSec = e0.etimeSec } or nil
   local weight0 = offender.weightMB or 0
   local avail0 = lastMetrics.availPct or 0
   local hud0 = hudInteracted
@@ -1899,11 +1912,12 @@ writeObservation = function(point, offender, now, extra)
       for _, p in ipairs(lastPsList) do
         if p.pid == pid then psRow = p; break end
       end
-      local psStartedAt = (psRow and psRow.etimeSec) and (lastSampleAt - psRow.etimeSec) or nil
+      local start1 = psRow and procs.startWindow(psRow.etimeSec, lastSampleLaunchedAt, lastSampleAt) or nil
       local fate, detail = observe.fate({
-        frozen = frozen[pid] ~= nil,
         sampleAgeSec = lastSampleAt > 0 and (t - lastSampleAt) or nil,
-        psRow = psRow, startedAt = startedAt, psStartedAt = psStartedAt,
+        sampleComplete = lastSampleComplete,
+        psRow = psRow, comm0 = comm0, start0 = start0, start1 = start1,
+        frozen = frozen[pid] ~= nil,
       })
       local present = fate == "alive" or fate == "frozen"
       local e = present and tracker.procs[pid] or nil
@@ -1919,6 +1933,7 @@ writeObservation = function(point, offender, now, extra)
         windowPeakMB = peak and math.floor(peak) or nil,
         availPct = math.floor(availNow), availDelta = math.floor(availNow - avail0),
         state = smState.state,
+        frozenLedger = frozen[pid] ~= nil,
         hudInteractedSince = (hudInteracted and not hud0) or false,
         jetsamSince = jetsamSince(now),
       }))

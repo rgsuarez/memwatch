@@ -180,21 +180,35 @@ function M.newTracker(cfg)
   return { cfg = cfg or M.cfg, procs = {} }
 end
 
+-- The window a process's start time is known to, from one ps sample. ps
+-- read the table at some instant between the sampler's launch and its
+-- delivery, and etime truncates to whole seconds, so the true start lies in
+-- [launchedAt - etime - 1, deliveredAt - etime]. Callback latency widens
+-- the window; it never shifts it. Without a launch time the window has no
+-- lower bound. etimeSec rides along because identity comparisons need the
+-- process's age at that sample.
+function M.startWindow(etimeSec, launchedAt, deliveredAt)
+  if type(etimeSec) ~= "number" or type(deliveredAt) ~= "number" then return nil end
+  local from = (type(launchedAt) == "number") and math.min(launchedAt, deliveredAt) or -math.huge
+  return { lo = from - etimeSec - 1, hi = deliveredAt - etimeSec, etimeSec = etimeSec }
+end
+
 -- Feed one ps snapshot into the tracker. pid reuse is detected by a comm
 -- change, which resets that pid's history. etime (when the sampler carries
 -- it) fixes each pid's start time, so consumers get a real process age
--- (ageSec) instead of none. Start time is deliberately NOT used to detect
--- reuse here: it is estimated from the callback time, and under storm
--- latency jitter a young runaway could falsely read as a new process and
--- lose its growth history mid-incident. Signal paths re-validate identity
--- with lstart anyway.
+-- (ageSec) instead of none, plus the start window of the latest sample
+-- (startLo/startHi, see startWindow; launchedAt is when the sampler behind
+-- psList was launched). Start time is deliberately NOT used to detect reuse
+-- here: a young runaway falsely read as a new process would lose its growth
+-- history mid-incident. Signal paths re-validate identity with lstart, and
+-- the observation ledger compares windows, never point estimates.
 --
 -- Rings hold FOOTPRINT WEIGHT (rss + this pid's compressed size from the
 -- most recent top sample, sticky between top refreshes), not raw RSS. A
 -- machine under load compresses a fast allocator's pages in near-real-time,
 -- deflating its RSS while it grows; weight keeps climbing and stays visible.
 -- topMap may be nil or stale; the last known cmprs carries forward.
-function M.update(tr, psList, now, topMap)
+function M.update(tr, psList, now, topMap, launchedAt)
   local cfg = tr.cfg
   local n = 0
   for _ in pairs(tr.procs) do n = n + 1 end
@@ -218,7 +232,11 @@ function M.update(tr, psList, now, topMap)
       if t then e.cmprsMB = t.cmprsMB end
       local w = p.rssMB + (e.cmprsMB or 0)
       e.uid, e.lastSeen, e.rssMB, e.weightMB = p.uid, now, p.rssMB, w
-      if p.etimeSec then e.startedAt = now - p.etimeSec end
+      if p.etimeSec then
+        e.startedAt = now - p.etimeSec
+        local w = M.startWindow(p.etimeSec, launchedAt, now)
+        e.startLo, e.startHi, e.etimeSec = w.lo, w.hi, w.etimeSec
+      end
       local ring = e.ring
       ring[#ring + 1] = { t = now, v = w }
       if #ring > cfg.windowSamples then table.remove(ring, 1) end

@@ -22,7 +22,7 @@ M.cfg = {
   maxBytes       = 4e6,             -- rotate the ledger past this size
   keep           = 3,               -- rotated generations kept (.1 .. .3)
   sampleFreshSec = 15,              -- ps data older than this cannot decide a fate
-  reuseSlackSec  = 30,              -- start-time drift tolerated before a pid reads as reused
+  clockSlackSec  = 1,               -- timestamp granularity allowed when comparing start windows
 }
 
 local function floorOrNil(v)
@@ -63,24 +63,48 @@ function M.row(a)
   }
 end
 
+-- Identity of one pid across two samples, from their start windows (see
+-- memwatch_procs.startWindow). A process has one true start, so two windows
+-- of the same process always overlap: disjoint windows prove a different
+-- process. Overlap proves the SAME process only when the first sighting was
+-- older than the windows' combined width: a reused pid started after the
+-- original was last seen alive, so at least the original's etime after the
+-- original's start, and it can share a window only while that gap is
+-- smaller than the uncertainty. Wide windows (callback stalls) therefore
+-- yield unknown, never a false mismatch. Returns "same", "reused", "unknown".
+function M.identity(w0, w1)
+  if type(w0) ~= "table" or type(w1) ~= "table" then return "unknown" end
+  local slack = M.cfg.clockSlackSec
+  if w1.lo > w0.hi + slack or w0.lo > w1.hi + slack then return "reused" end
+  local width = (w0.hi - w0.lo) + (w1.hi - w1.lo) + 2 * slack
+  if type(w0.etimeSec) == "number" and w0.etimeSec >= width then return "same" end
+  return "unknown"
+end
+
 -- What became of an observed process at a follow-up horizon, decided only
--- from data the tick already holds. Returns fate, detail.
---   frozen  : memwatch's own frozen ledger holds it (memwatch paused it)
---   unknown : the ps sample is too old to say anything (never guessed)
---   exited  : absent from a fresh ps sample, or its pid now belongs to a
---             process that started well after the observed one
---   alive   : present, same process
--- a: { frozen, sampleAgeSec, psRow, startedAt, psStartedAt }
+-- from data the tick already holds, and only from a fresh COMPLETE sample:
+-- absence from a truncated table proves nothing. Returns fate, detail.
+--   unknown : no fresh complete sample, or identity cannot be decided
+--   exited  : absent from a fresh complete sample, or its pid now belongs to
+--             a different process (detail "pid-reused")
+--   frozen  : present, the same process, and memwatch's frozen ledger holds it
+--   alive   : present, the same process
+-- The frozen ledger never decides a fate by itself: an entry outlives a
+-- frozen process killed meanwhile until the calm-only sweep removes it.
+-- a: { sampleAgeSec, sampleComplete, psRow, comm0, start0, start1, frozen }
 function M.fate(a)
-  if a.frozen then return "frozen", nil end
   if type(a.sampleAgeSec) ~= "number" or a.sampleAgeSec > M.cfg.sampleFreshSec then
     return "unknown", "stale-sample"
   end
+  if a.sampleComplete ~= true then return "unknown", "incomplete-sample" end
   if not a.psRow then return "exited", nil end
-  if type(a.startedAt) == "number" and type(a.psStartedAt) == "number"
-     and (a.psStartedAt - a.startedAt) > M.cfg.reuseSlackSec then
+  if a.comm0 and a.psRow.comm and a.psRow.comm ~= a.comm0 then
     return "exited", "pid-reused"
   end
+  local id = M.identity(a.start0, a.start1)
+  if id == "reused" then return "exited", "pid-reused" end
+  if id == "unknown" then return "unknown", "identity-uncertain" end
+  if a.frozen then return "frozen", nil end
   return "alive", nil
 end
 

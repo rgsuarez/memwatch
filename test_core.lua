@@ -1089,17 +1089,76 @@ do
   check("observe: synthetic flag carried",
     observe.row({ synthetic = true, offender = {} }).synthetic, true)
 
-  -- Fate: decided only from tick data, never guessed.
-  check("fate: memwatch froze it", (observe.fate({ frozen = true, sampleAgeSec = 99 })), "frozen")
-  local f1, d1 = observe.fate({ sampleAgeSec = 40, psRow = { pid = 1 } })
+  -- Start windows: ps read the table between launch and delivery.
+  local sw = procs.startWindow(100, 5000, 5004)
+  check("window: lower bound is launch - etime - 1", sw.lo, 4899)
+  check("window: upper bound is delivery - etime", sw.hi, 4904)
+  check("window: carries the etime", sw.etimeSec, 100)
+  check("window: no etime, no window", procs.startWindow(nil, 5000, 5004), nil)
+  check("window: unknown launch leaves it unbounded below",
+    procs.startWindow(100, nil, 5004).lo, -math.huge)
+  check("window: a launch after delivery clamps to delivery",
+    procs.startWindow(100, 6000, 5004).lo, 4903)
+  local trWin = procs.newTracker()
+  procs.update(trWin, { { pid = 77, uid = 501, rssMB = 10, etimeSec = 300, comm = "/bin/x" } }, 2000, nil, 1990)
+  check("tracker: start window from the sampler's launch", trWin.procs[77].startLo, 1689)
+  check("tracker: start window to the sampler's delivery", trWin.procs[77].startHi, 1700)
+  check("tracker: start window carries the etime", trWin.procs[77].etimeSec, 300)
+
+  -- Identity: windows, never point estimates.
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  check("identity: same process, tight windows", observe.identity(old0, { lo = 999, hi = 1001 }), "same")
+  check("identity: disjoint windows prove a different process",
+    observe.identity(old0, { lo = 1500, hi = 1502 }), "reused")
+  -- The stall case: the follow-up sample was delivered 60 s late, so a
+  -- point estimate would sit 60 s after the original start and read as a
+  -- new process. The window widens instead and still overlaps.
+  check("identity: a 60 s delivery stall is not a reuse",
+    observe.identity(old0, { lo = 999, hi = 1060 }), "same")
+  check("identity: a young process under wide windows is undecidable",
+    observe.identity({ lo = 999, hi = 1003, etimeSec = 20 }, { lo = 999, hi = 1060 }), "unknown")
+  check("identity: missing windows are undecidable", observe.identity(nil, { lo = 1, hi = 2 }), "unknown")
+
+  -- Fate: decided only from fresh complete tick data, never guessed.
+  local same = { lo = 999, hi = 1001 }
+  local base = { sampleAgeSec = 3, sampleComplete = true, comm0 = "/bin/x",
+                 start0 = old0, start1 = same }
+  local function fateOf(over)
+    local a = {}
+    for k, v in pairs(base) do a[k] = v end
+    for k, v in pairs(over) do a[k] = v end
+    return observe.fate(a)
+  end
+  local f1, d1 = fateOf({ sampleAgeSec = 40, psRow = { pid = 1, comm = "/bin/x" } })
   check("fate: stale sample is unknown", f1, "unknown")
   check("fate: stale sample detail", d1, "stale-sample")
-  check("fate: absent from a fresh sample", (observe.fate({ sampleAgeSec = 3 })), "exited")
-  check("fate: present, same process",
-    (observe.fate({ sampleAgeSec = 3, psRow = { pid = 1 }, startedAt = 1000, psStartedAt = 1004 })), "alive")
-  local f2, d2 = observe.fate({ sampleAgeSec = 3, psRow = { pid = 1 }, startedAt = 1000, psStartedAt = 1100 })
+  local fi, di = fateOf({ sampleComplete = false })
+  check("fate: absence from a partial table proves nothing", fi, "unknown")
+  check("fate: partial table detail", di, "incomplete-sample")
+  check("fate: completeness must be asserted, never assumed",
+    (observe.fate({ sampleAgeSec = 3 })), "unknown")
+  check("fate: absent from a fresh complete sample", (fateOf({})), "exited")
+  check("fate: present, same process", (fateOf({ psRow = { pid = 1, comm = "/bin/x" } })), "alive")
+  local f2, d2 = fateOf({ psRow = { pid = 1, comm = "/bin/x" }, start1 = { lo = 1500, hi = 1502 } })
   check("fate: pid now belongs to a newer process", f2, "exited")
   check("fate: reuse detail", d2, "pid-reused")
+  local f3, d3 = fateOf({ psRow = { pid = 1, comm = "/usr/bin/other" } })
+  check("fate: a changed comm is a reuse", f3, "exited")
+  check("fate: changed comm detail", d3, "pid-reused")
+  check("fate: a delivery stall keeps a live process alive",
+    (fateOf({ psRow = { pid = 1, comm = "/bin/x" }, start1 = { lo = 999, hi = 1060 } })), "alive")
+  local fu, du = fateOf({ psRow = { pid = 1, comm = "/bin/x" },
+                          start0 = { lo = 999, hi = 1003, etimeSec = 20 }, start1 = { lo = 999, hi = 1060 } })
+  check("fate: undecidable identity is unknown", fu, "unknown")
+  check("fate: undecidable identity detail", du, "identity-uncertain")
+  -- The frozen ledger never decides alone: it outlives a frozen process
+  -- killed while pressure stayed up (the sweep runs only when calm).
+  check("fate: frozen and still present",
+    (fateOf({ frozen = true, psRow = { pid = 1, comm = "/bin/x" } })), "frozen")
+  check("fate: frozen but gone from a fresh complete sample", (fateOf({ frozen = true })), "exited")
+  check("fate: frozen but the sample is stale", (fateOf({ frozen = true, sampleAgeSec = 99 })), "unknown")
+  check("fate: frozen but the pid was reused",
+    (fateOf({ frozen = true, psRow = { pid = 1, comm = "/usr/bin/other" } })), "exited")
 
   -- Jetsam report names carry their local timestamp.
   local times = observe.jetsamTimes({ "JetsamEvent-2026-10-12-235154.ips",
@@ -1144,6 +1203,22 @@ do
     src:find('pcall(writeObservation, "advisory"', 1, true) ~= nil, true)
   check("observe glue: decision observation does not require an unattended mode",
     src:find('if observeEnabled and offender and offender.kind == "extreme"', 1, true) ~= nil, true)
+  -- Fates come only from a complete sample, through start windows.
+  check("observe glue: fate is told whether the sample was complete",
+    body:find("sampleComplete = lastSampleComplete", 1, true) ~= nil, true)
+  check("observe glue: follow-up identity uses a start window",
+    body:find("procs.startWindow(psRow.etimeSec, lastSampleLaunchedAt, lastSampleAt)", 1, true) ~= nil, true)
+  check("observe glue: no point-estimate start compare remains",
+    body:find("psStartedAt", 1, true), nil)
+  check("observe glue: the frozen ledger is recorded beside the fate",
+    body:find("frozenLedger = frozen[pid] ~= nil", 1, true) ~= nil, true)
+  -- The sampler tells its consumer how it ended and when it was launched.
+  check("sampler glue: callback forwards exit code and launch time",
+    src:find("onDone(table.concat(acc), exitCode, launchedAt)", 1, true) ~= nil, true)
+  check("sampler glue: completeness comes from the exit code",
+    src:find("lastSampleComplete = (exitCode == 0)", 1, true) ~= nil, true)
+  check("sampler glue: the tracker gets the launch time",
+    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt)", 1, true) ~= nil, true)
 end
 
 -- ---- glue pins: the live path must use the predicates above ----

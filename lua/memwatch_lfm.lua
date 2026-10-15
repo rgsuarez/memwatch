@@ -752,12 +752,15 @@ end
 -- A ledger audit (2026-10-14) found that every acting-path wait during the
 -- remote model's tenure was exactly this race. An entry with no recorded
 -- kind (written before this rule) is unusable. The caller re-validates the
--- process identity (pid plus start time) separately.
+-- process identity (pid plus start time) separately. A verdict stamped
+-- after now (the clock stepped back since: wake-time NTP, a VM resume) has
+-- no age it can be trusted for, so it is stale too: otherwise every tick
+-- until the clock caught up would consume it again.
 -- Returns usable (boolean), reason.
 function M.verdictUsable(entry, offender, now, freshSec)
   if type(entry) ~= "table" or type(entry.verdict) ~= "table" then return false, "no-verdict" end
   if type(offender) ~= "table" then return false, "no-offender" end
-  if type(entry.at) ~= "number" or type(now) ~= "number"
+  if type(entry.at) ~= "number" or type(now) ~= "number" or now < entry.at
      or (now - entry.at) > (freshSec or M.cfg.verdictFreshSec) then
     return false, "stale"
   end
@@ -772,9 +775,13 @@ end
 -- decision indefinitely while a true runaway grinds the machine down. The
 -- old bound counted waits; with verdicts cached for 90 s against a 60 s
 -- grace cadence, one cached wait could count twice and stretch the bound to
--- about 240 s. Elapsed time cannot double-count.
+-- about 240 s. Elapsed time cannot double-count. A first wait stamped
+-- after now (the clock stepped back since) ends the deferral: a negative
+-- elapsed time would otherwise hold the deterministic policy off until the
+-- wall clock caught up, which a step of minutes makes minutes.
 function M.deferralExhausted(firstWaitAt, now, maxDeferSec)
   if type(firstWaitAt) ~= "number" or type(now) ~= "number" then return false end
+  if now < firstWaitAt then return true end
   return (now - firstWaitAt) >= (maxDeferSec or M.cfg.maxDeferSec)
 end
 

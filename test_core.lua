@@ -1551,6 +1551,17 @@ do
   check("deferral: one window later not exhausted", lfm.deferralExhausted(now - 60, now, 120), false)
   check("deferral: exhausted at the bound", lfm.deferralExhausted(now - 120, now, 120), true)
   check("deferral: no first wait is not exhausted", lfm.deferralExhausted(nil, now, 120), false)
+  -- A clock stepped back after the stamp (wake-time NTP, a VM resume) makes
+  -- the age negative: the verdict is stale and the deferral is over, or a
+  -- step of minutes would hold the deterministic policy off for minutes.
+  check("verdict refused: stamped after now (clock stepped back)",
+    select(2, lfm.verdictUsable({ verdict = v, at = now + 600, kind = "extreme" }, { kind = "extreme" }, now, 90)),
+    "stale")
+  check("verdict usable: stamped this instant (age 0, control)",
+    (lfm.verdictUsable({ verdict = v, at = now, kind = "extreme" }, { kind = "extreme" }, now, 90)), true)
+  check("deferral: a first wait stamped after now is exhausted", lfm.deferralExhausted(now + 600, now, 120), true)
+  check("deferral step: a step back mid-deferral exhausts the next wait",
+    select(2, lfm.deferralStep({ firstAt = now + 600, count = 1 }, now, 120)), true)
   check("deferral bound spans at least two grace windows",
     lfm.cfg.maxDeferSec >= 2 * core.cfg.cool.autoKillGraceSec, true)
   -- The deferral step folds each wait into { firstAt, count } on the

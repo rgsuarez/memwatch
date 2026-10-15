@@ -4305,10 +4305,12 @@ do
     check("mid-tick: the shift ran without error", logHas(W, "error:clock-shift"), false)
   end)
 
-  -- Rule 8: a callback that throws while holding a step still ends its
-  -- frame: the step is applied once, and the next step is applied too (the
-  -- frame did not leak).
-  scenario("a callback that throws while holding a step still applies it", nil, function(W, mw)
+  -- Rule 8: a callback whose alert fails while it holds a step still ends
+  -- its frame: the failure is contained and logged, the step is applied
+  -- once, and the next step is applied too (the frame did not leak). Every
+  -- display, fork and signal inside a frame is contained, so no fake hook
+  -- can throw past one; guard's own error path is pinned by its text.
+  scenario("a callback whose alert fails while holding a step still applies it", nil, function(W, mw)
     leaker(W, 4242)
     W.run(12)
     W.kern = 4
@@ -4328,7 +4330,8 @@ do
     end
     if freeze then freeze.fn() end
     W.run(2)                          -- its verifier shows the outcome: the throw lands there
-    check("frame-error: the verifier's error was logged", logHas(W, "error:freeze-verify"), true)
+    check("frame-error: the alert's failure was contained and logged", logHas(W, "error:alert"), true)
+    check("frame-error: and the verifier ran on to its end", logHas(W, "error:freeze-verify"), false)
     check("frame-error: the held step was applied when the frame ended", logHas(W, "clock-stepped-back:120s"), true)
     W.wallOffset = -240                -- a second step: applied too, so no frame leaked
     W.run(6)
@@ -4466,6 +4469,91 @@ scenario("an entry kept at reload without a token is given one", nil, function(W
   local saved = g:read("a")
   g:close()
   check("reload-token: and written out with a token", saved:find('"id":"4242/', 1, true) ~= nil, true)
+end)
+
+-- (round 13) A progress alert that fails never stops the action reporting
+-- it: a frozen row's Force Quit still sends its TERM after the CONT.
+scenario("a failing progress alert never stops a kill", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.click("freeze")
+  W.run(3)
+  local quit = frozenRowAction(W, "node", "Force Quit")
+  check("alert-progress: the frozen row offers Force Quit (control)", quit ~= nil, true)
+  W.onAlert = function(text) if text:find("terminating", 1, true) then error("alert failed") end end
+  if quit then quit() end
+  W.run(10)
+  W.onAlert = nil
+  check("alert-progress: the failing alert was reached (control)", logHas(W, "alert failed"), true)
+  check("alert-progress: the TERM still went out after the CONT", W.signalsTo(4242), "STOP,CONT,TERM")
+  check("alert-progress: and the process is gone", W.procs[4242] == nil, true)
+end)
+
+-- (round 13) A row built before an in-process restart still resumes its
+-- own process: the rebuilt entry is the same process, not a stale row.
+scenario("a frozen row from before a restart still resumes its process", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.click("freeze")
+  W.run(3)
+  local resume = frozenRowAction(W, "leaker", "Resume")
+  check("restart-row: the frozen row offers Resume (control)", resume ~= nil, true)
+  mw.start()                        -- an in-process restart rebuilds the entry
+  W.run(3)
+  if resume then resume() end
+  W.run(3)
+  check("restart-row: the row's own process is resumed", W.signalsTo(4242), "STOP,CONT")
+  check("restart-row: and not refused as stale", logHas(W, "stale-row"), false)
+end)
+
+-- (round 13) A verifier that finds its slot empty puts its own entry back,
+-- reading a freeze stamp ahead of now as now: the entry missed the shift
+-- while it was out of the ledger.
+scenario("a verifier putting its entry back reads a future freeze stamp as now", nil, function(W, mw)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(1)
+  mw.freezePid(4242, "node", function() end, { expectedLstart = W.procs[4242].lstart })
+  -- A restart reconciles an empty ledger, so the slot is empty while the
+  -- earlier run's verifier is still pending.
+  local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+  f:write("[]\n")
+  f:close()
+  mw.start()
+  W.wallOffset = -120
+  mw.debug()                        -- a read outside any frame takes the step out at once
+  W.run(1)                          -- the verifier puts its own entry back
+  local g = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "r"))
+  local saved = g:read("a")
+  g:close()
+  local at = tonumber(saved:match('"frozenAt":([%d%.]+)'))
+  local wall = W.now + W.wallOffset
+  check("put-back: the entry is back", at ~= nil, true)
+  check("put-back: its freeze stamp is not ahead of now (" .. tostring(at and math.floor(at - wall)) .. " s)",
+    at ~= nil and at <= wall + 1, true)
+end)
+
+-- (round 13) A Force Quit refused over the name alone, with the entry's own
+-- process still there and stopped, keeps its ledger entry.
+scenario("a kill refused over the name alone keeps a stopped process's entry", nil, function(W, mw)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.click("freeze")
+  W.run(3)
+  check("name-refuse: frozen (control)", W.procs[4242] and W.procs[4242].state, "T")
+  mw.killPid(4242, "nodee")
+  W.run(3)
+  check("name-refuse: nothing was signaled after the freeze", W.signalsTo(4242), "STOP")
+  check("name-refuse: the process stays stopped", W.procs[4242] and W.procs[4242].state, "T")
+  check("name-refuse: and keeps its row to resume it from", W.menuItem("   node") ~= nil, true)
 end)
 
 

@@ -193,12 +193,15 @@ end
 -- instead of landing a step's width from the true start. Without a launch
 -- time the window has no lower bound. etimeSec rides along because
 -- identity comparisons need the process's age at that sample.
-function M.startWindow(etimeSec, launchedAt, deliveredAt)
+function M.startWindow(etimeSec, launchedAt, deliveredAt, steppedSec)
   if type(etimeSec) ~= "number" or type(deliveredAt) ~= "number" then return nil end
+  -- steppedSec: a step back taken between launch and delivery. ps read on
+  -- one side of it or the other, so either bound may be off by its size.
+  local widen = (type(steppedSec) == "number" and steppedSec > 0) and steppedSec or 0
   local hasLaunch = type(launchedAt) == "number"
   local from = hasLaunch and math.min(launchedAt, deliveredAt) or -math.huge
   local to = hasLaunch and math.max(launchedAt, deliveredAt) or deliveredAt
-  return { lo = from - etimeSec - 1, hi = to - etimeSec, etimeSec = etimeSec }
+  return { lo = from - widen - etimeSec - 1, hi = to + widen - etimeSec, etimeSec = etimeSec }
 end
 
 -- Feed one ps snapshot into the tracker. pid reuse is detected by a comm
@@ -222,7 +225,7 @@ end
 -- machine under load compresses a fast allocator's pages in near-real-time,
 -- deflating its RSS while it grows; weight keeps climbing and stays visible.
 -- topMap may be nil or stale; the last known cmprs carries forward.
-function M.update(tr, psList, now, topMap, launchedAt, wallAt)
+function M.update(tr, psList, now, topMap, launchedAt, wallAt, steppedSec)
   local cfg = tr.cfg
   local n = 0
   for _ in pairs(tr.procs) do n = n + 1 end
@@ -248,7 +251,7 @@ function M.update(tr, psList, now, topMap, launchedAt, wallAt)
       e.uid, e.lastSeen, e.rssMB, e.weightMB = p.uid, now, p.rssMB, w
       if p.etimeSec then
         local at = wallAt or now
-        local sw = M.startWindow(p.etimeSec, launchedAt, at)
+        local sw = M.startWindow(p.etimeSec, launchedAt, at, steppedSec)
         e.startLo, e.startHi, e.etimeSec = sw.lo, sw.hi, sw.etimeSec
         e.startedAt = (sw.lo > -math.huge) and (sw.lo + sw.hi) / 2 or (at - p.etimeSec)
       end
@@ -358,7 +361,7 @@ end
 --   { pid, name, comm, uid, rssMB, slopeMBmin, kind }
 -- kind: "extreme" (fires even at ok), "sustained" (watch at ok, alert once
 -- elevated), "absolute" (attribution only while the system is critical).
-function M.runaways(tr, now, systemState, totalMB)
+function M.runaways(tr, now, systemState, totalMB, wallNow)
   local cfg = tr.cfg
   local out = {}
   for pid, e in pairs(tr.procs) do
@@ -397,7 +400,8 @@ function M.runaways(tr, now, systemState, totalMB)
         out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,
                           rssMB = e.rssMB or 0, weightMB = e.weightMB or e.rssMB or 0,
                           slopeMBmin = slope, peakSlopeMBmin = e.peakSlopeMBmin or 0,
-                          ageSec = e.startedAt and math.max(0, math.floor(now - e.startedAt)) or nil,
+                          -- startedAt is on the raw wall clock (see update): so is the age.
+                          ageSec = e.startedAt and math.max(0, math.floor((wallNow or now) - e.startedAt)) or nil,
                           kind = kind }
       end
     end

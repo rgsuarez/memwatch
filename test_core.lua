@@ -261,6 +261,11 @@ do
   end
   local runsLate = procs.runaways(trLate, 1030, "elevated", 36 * 1024)
   check("runaway age is centered in a stalled sample's window", runsLate[1] and runsLate[1].ageSec, 100)
+  -- Inside a callback holding a 30 s step back, the raw clock is 30 s behind
+  -- memwatch's: the age reads on the raw clock its start window is on, as it
+  -- will once the step is taken out, never 30 s older for the frame's rest.
+  local runsHeld = procs.runaways(trLate, 1030, "elevated", 36 * 1024, 1000)
+  check("a runaway's age reads on the raw clock (30 s held back: 70, not 100)", runsHeld[1] and runsHeld[1].ageSec, 70)
   local ranked = procs.rankByWeight({ { pid = 7, uid = 502, rssMB = 9000,
                                         etimeSec = 86400, comm = "VirtualMachine" } }, nil, 5)
   local off = procs.pickOffender({}, ranked, "critical", nil)
@@ -273,6 +278,11 @@ do
   -- placed with the raw reading (wallAt), so it stays on the kernel's start.
   local trStep = procs.newTracker()
   procs.update(trStep, { { pid = 11, uid = 502, rssMB = 100, etimeSec = 100, comm = "x" } }, 2000, nil, 1968, 1970)
+  local wide = procs.startWindow(105, 1000, 906, 100)
+  check("a window widens by a step taken between launch and delivery (ps read at 1005, before it)",
+    wide.lo <= 900 and wide.hi >= 900, true)
+  local narrow = procs.startWindow(105, 1000, 906, 0)
+  check("without the widening that start falls outside (control)", narrow.hi < 900, true)
   check("a window is placed with the raw wall reading, not the callback's basis",
     trStep.procs[11].startLo == 1867 and trStep.procs[11].startHi == 1870, true)
   check("and the sighting keeps memwatch's basis", trStep.procs[11].lastSeen, 2000)
@@ -2382,8 +2392,8 @@ do
   check("observe glue: each sample folds in with its completeness",
     sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
   check("observe glue: and its start window, bounded by launch and the raw delivery reading (none from a clamped etime)",
-    sampleBody:find("start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, wallNow) or nil", 1, true) ~= nil
-      and sampleBody:find("local wallNow = clock.wallAt", 1, true) ~= nil
+    sampleBody:find("and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil", 1, true) ~= nil
+      and sampleBody:find("local rawDeliveredAt = clock.wallAt", 1, true) ~= nil
       and sampleBody:find("local placeable = row and type(row.etimeSec) == \"number\" and row.etimeSec > 0", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
     sampleBody:find("if seq and seq < sampler.seq then return end", 1, true) ~= nil
@@ -2539,11 +2549,18 @@ do
   check("sampler glue: completeness comes from the exit code",
     src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time, and the raw delivery reading for its windows",
-    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)", 1, true) ~= nil, true)
+    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, steppedSec or 0)", 1, true) ~= nil, true)
   -- The fake cannot build an unbound offender table beside a bound alert,
   -- so the recorded binding's fallback to the alert's is pinned by text.
   check("re-ask: a verdict records the alert's binding when its offender table is unbound",
     src:find("boundLstart = offender.lstart or bound", 1, true) ~= nil, true)
+  -- The fold's ordering and its own step check compare the launch with the
+  -- observation's time: they read the shifted launch record (memwatch's
+  -- basis), the raw reading being for windows only. Pinned by text: records
+  -- open across a step are closed when it is seen, so no scenario can tell
+  -- the two bases apart today.
+  check("observe glue: the fold orders on the shifted launch record, not the raw reading",
+    src:find("seq = seq, launchedAt = sampler.launchedAt or launchedAt, deliveredAt = now })", 1, true) ~= nil, true)
   check("sampler glue: the launch time for windows is the raw reading, not the callback's basis",
     src:find("local launchedAt = clock.wallAt", 1, true) ~= nil, true)
 end
@@ -2986,6 +3003,8 @@ do
     sentAt = "dispatch: copied into lfmInFlight.at (shifted) in the same call; latency: a monotonic reading",
     launchedAt = "launchSampler: the wall reading at launch, for start windows, which a step must not move "
       .. "(they are anchored to the kernel's start record); the GC reads the shifted launch record instead",
+    rawDeliveredAt = "onSample: the raw wall reading at delivery, for start windows (anchored, never shifted); dates nothing",
+    rawAt = "assessProcesses: the raw wall reading of the tick's instant, for ages against start windows; stored nowhere",
   }
   local function localStamps(text)
     local miss = {}

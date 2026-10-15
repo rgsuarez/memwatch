@@ -559,7 +559,10 @@ end
 -- is still alive under load keeps the picture current.
 local function assessProcesses(now)
   local totalMB = (lastMetrics.totalGB or 0) * 1024
-  local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
+  -- Ages are against start windows on the raw wall clock: the same instant
+  -- as now, on that clock (now itself stays on a held frame's basis).
+  local rawAt = now + clock.pending
+  local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil, rawAt)
   -- An answered process is no candidate, by its own state: ignored, held
   -- frozen by memwatch (stopped, so its extreme latch is history, not
   -- growth), or verified gone while its last samples age out. A frozen or
@@ -1532,7 +1535,9 @@ local function launchSampler(onDone)
   for old in pairs(sampler.launches) do
     if old <= sampler.seq or old <= seq - 16 then sampler.launches[old] = nil end
   end
-  sampler.launches[seq] = { at = now }
+  -- steps: the step-back total so far (taken out, or held in this frame),
+  -- so the delivery can tell how far the raw clock moved in between.
+  sampler.launches[seq] = { at = now, steps = clock.stepTotal + clock.pending }
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
   -- without a streaming drain hs.task never reads the pipe, ps blocks
   -- mid-write, and the task deadlocks until the watchdog TERMs it (observed
@@ -1579,8 +1584,12 @@ end
 local function onSample(blob, exitCode, launchedAt, seq)
   local now = clock.now()
   -- The same instant on the raw wall clock, for start windows (see below).
-  local wallNow = clock.wallAt
+  local rawDeliveredAt = clock.wallAt
   local launch = seq and sampler.launches[seq] or nil
+  -- A step back between the launch and this delivery moved the raw clock by
+  -- its size, and ps read on one side of it or the other: start windows
+  -- widen by it. Without the launch's record it is unknown.
+  local steppedSec = launch and math.max(0, (launch.steps or 0) - (clock.stepTotal + clock.pending)) or nil
   if seq then sampler.launches[seq] = nil end
   -- A callback from a sampler launched before the one already applied holds
   -- an older table: it never replaces a newer one. Launch order, not the
@@ -1613,9 +1622,9 @@ local function onSample(blob, exitCode, launchedAt, seq)
   sampler.complete = (exitCode == 0) and selfListed
   -- Start windows are anchored to the kernel's start record, and ps's etime
   -- runs on the raw wall clock: a window is placed with raw readings at
-  -- launch and delivery (launchedAt, wallNow), never this callback's basis,
+  -- launch and delivery (launchedAt, rawDeliveredAt), never this callback's basis,
   -- which a step held back to the frame's end leaves on the old one.
-  procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)
+  procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, steppedSec or 0)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.
   for i = #lastRanked, 1, -1 do
@@ -1639,9 +1648,15 @@ local function onSample(blob, exitCode, launchedAt, seq)
       local placeable = row and type(row.etimeSec) == "number" and row.etimeSec > 0
       observe.foldSample(ev, {
         complete = sampler.complete, row = row,
-        start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, wallNow) or nil,
+        -- No identity evidence from a table whose launch record is gone:
+        -- how far the clock moved since its launch is unknown.
+        start1 = placeable and steppedSec ~= nil
+          and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
-        seq = seq, launchedAt = launchedAt, deliveredAt = now })
+        -- Ordering and the fold's own step check compare the launch with
+        -- the observation's time, so they read the launch record the shift
+        -- moved (memwatch's basis), not the raw reading the windows use.
+        seq = seq, launchedAt = sampler.launchedAt or launchedAt, deliveredAt = now })
     end
   end
 end

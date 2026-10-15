@@ -157,6 +157,9 @@ printf 'emits %s here\n' "$(printf '%s:%s' league full)" > "$tmp/lua/memwatch_re
 git -C "$tmp" add lua/memwatch_report.lua
 expect 0 "the repository's own report module is exempt (control)"
 printf 'carries %s here\n' "$term" > "$tmp/outside/lua/memwatch_report.lua"
+printf 'emits %s here, and %s\n' "$(printf '%s:%s' league full)" "$term" > "$tmp/lua/memwatch_report.lua"
+expect 1 "the report module is exempt from its sentinel only: a local term in it fails"
+printf 'emits %s here\n' "$(printf '%s:%s' league full)" > "$tmp/lua/memwatch_report.lua"
 expect_named 1 "named: an exempt file name outside the repository is scanned" "$tmp/outside" "lua/memwatch_report.lua"
 expect_named 1 "named: and so by its absolute path" "/" "$tmp/outside/lua/memwatch_report.lua"
 git -C "$tmp" rm -q --cached lua/memwatch_report.lua
@@ -204,6 +207,13 @@ case "$said" in
   *) echo "FAIL  a local term is reported by number"; fails=$((fails + 1)) ;;
 esac
 clean
+
+# (round 5) A term list that is there but cannot be read is as blind as a
+# missing one: refused (2), not reported like a found reference (1).
+chmod 000 "$terms"
+expect 2 "an unreadable term list is refused"
+chmod 644 "$terms"
+expect 0 "a readable term list scans again (control)"
 
 # Not a git tree: a tree scan that finds no files is blind, not clean.
 notgit="$(mktemp -d)"

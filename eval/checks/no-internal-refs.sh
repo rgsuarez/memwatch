@@ -69,6 +69,12 @@ PATTERNS=(
 )
 STRUCTURAL=${#PATTERNS[@]}   # patterns past this index are local terms
 LOCAL_TERMS="$SCRIPT_DIR/internal-terms.txt"
+if [ -f "$LOCAL_TERMS" ] && [ ! -r "$LOCAL_TERMS" ]; then
+  # Present but unreadable: as blind as missing, so the same refusal (2), not
+  # a bare read error that would exit like a found reference.
+  echo "no-internal-refs: $LOCAL_TERMS cannot be read; refusing" >&2
+  exit 2
+fi
 if [ -f "$LOCAL_TERMS" ]; then
   effective=0
   # `|| [ -n "$pat" ]` keeps a final line that has no trailing newline.
@@ -124,11 +130,14 @@ repo_path() {
 }
 
 scan_file() {
-  local f="$1" rel
+  local f="$1" rel sentinelOk=0
   rel="$(repo_path "$f")"
   case "$rel" in
     eval/checks/no-internal-refs.sh) return 0 ;;  # the pattern list itself
-    lua/memwatch_report.lua|test_report.lua) return 0 ;; # emit/assert the league sentinel as a string literal; rendered ARTIFACTS carrying it are the leak class
+    # These two emit or assert the league sentinel as a string literal (the
+    # rendered ARTIFACTS carrying it are the leak class): exempt from that one
+    # pattern only, and scanned for every other.
+    lua/memwatch_report.lua|test_report.lua) sentinelOk=1 ;;
   esac
   case "$f" in
     *.gguf|*.png) return 0 ;;                      # binary artifacts
@@ -137,6 +146,7 @@ scan_file() {
   local idx=0
   for pat in "${PATTERNS[@]}"; do
     idx=$((idx + 1))
+    if [ "$sentinelOk" = 1 ] && [ "$pat" = "league:full" ]; then continue; fi
     # grep -q itself, never a pipe: under pipefail a pipe into head turns a
     # large match set into SIGPIPE, which would read as no match. 0 is a
     # match, 1 none, anything else a file that could not be scanned. -a reads

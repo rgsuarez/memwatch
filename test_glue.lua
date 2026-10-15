@@ -1354,6 +1354,24 @@ scenario("the menu offender acts on the banner's binding", nil, function(W)
   check("menu-banner: once rebound, the next click acts", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
 end)
 
+-- (round 5) A kill that refuses (the process exited between the identity
+-- check and the TERM) sent nothing, and nothing is claimed: no
+-- "terminated" for an exit memwatch did not cause.
+scenario("a TERM that kill refuses is not claimed", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+  W.run(5)
+  W.vanishAfterProbe = 4242         -- it exits right after the click's probe
+  W.click("kill")
+  W.run(1)
+  check("refused-send: the narrative says nothing was signaled",
+    W.hudBody():find("nothing was signaled", 1, true) ~= nil, true)
+  W.run(20)                         -- past any escalation and verify
+  check("refused-send: no termination is claimed", logHas(W, "kill-done:leaker(4242)"), false)
+end)
+
 -- ---- actions in flight ----
 -- (round 5) A run loop that stalls past the hold deadline: the deadline
 -- receipt goes out, but the action is still in flight, so no second action

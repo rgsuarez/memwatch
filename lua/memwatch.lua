@@ -338,13 +338,22 @@ local function sh(cmd)
   return out or ""
 end
 
--- Send one signal to a pid the caller has verified. A fork that fails
--- (hs.execute raises) sent nothing: the send returns false and is logged,
--- so the action reports that instead of dying before its outcome.
+-- Send one signal to a pid the caller has verified. It is sent only when
+-- kill(1) ran and exited 0: a fork that fails (hs.execute raises) sent
+-- nothing, and neither did a kill that refused (no such process any more,
+-- or not permitted). Either way the send returns false and is logged, so
+-- the action reports it instead of claiming, or recording, a signal.
 local function send(sig, pid)
-  local ok = pcall(sh, string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
-  if not ok then M.logSnapshot(string.format("signal-send-failed:%s:%d", sig, pid)) end
-  return ok
+  local ok, _, status = pcall(hs.execute, string.format("/bin/kill -%s %d 2>/dev/null", sig, pid))
+  if not ok then
+    M.logSnapshot(string.format("signal-send-failed:%s:%d", sig, pid))
+    return false
+  end
+  if status ~= true then
+    M.logSnapshot(string.format("signal-send-refused:%s:%d", sig, pid))
+    return false
+  end
+  return true
 end
 
 -- Sample memory metrics. Native hs.host.vmStat() first (no fork, and it

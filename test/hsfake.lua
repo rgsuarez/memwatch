@@ -145,6 +145,11 @@ function F.new()
           end
         end
       end
+      -- vanishAfterProbe: that process exits right after this probe saw it
+      -- (between an engine's identity check and its signal).
+      if W.vanishAfterProbe and W.procs[W.vanishAfterProbe] then
+        W.procs[W.vanishAfterProbe], W.vanishAfterProbe = nil, nil
+      end
       return table.concat(rows, "\n") .. "\n"
     end
     if cmd:find("^/bin/ps %-o ppid= %-p %d+") then return "1\n" end
@@ -174,8 +179,9 @@ function F.new()
         elseif sig == "CONT" then p.state = "S"
         elseif sig == "TERM" and p.state ~= "T" and not p.ignoreTerm then W.procs[kp] = nil
         elseif sig == "KILL" and not p.unkillable then W.procs[kp] = nil end
+        return ""
       end
-      return ""
+      return "", false   -- kill(1) on a pid nothing holds exits 1 (ESRCH)
     end
     W.unknown[#W.unknown + 1] = cmd
     return ""
@@ -255,10 +261,11 @@ function F.new()
          or (sig and W.sendFails and W.sendFails[sig]) then
         error("fork: Resource temporarily unavailable")
       end
-      local out = exec(cmd)
+      local out, exited0 = exec(cmd)
       if W.probeSignaled and cmd:find("^/bin/ps %-p") then
         return out:sub(1, math.max(0, math.floor(#out / 2))), nil, "signal", 9
       end
+      if exited0 == false then return out, nil, "exit", 1 end
       return out, true, "exit", 0
     end,
     processInfo = { processID = SELF_PID },

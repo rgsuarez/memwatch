@@ -284,11 +284,25 @@ end
 -- Load a fresh copy of memwatch.lua into world W, with HOME pointed at a
 -- private scratch tree (config, ledgers and logs land there). localConfig,
 -- when given, is written as memwatch-local.json before the load.
+-- The scratch root: HSFAKE_ROOT when set, else the system temp dir, else a
+-- directory under the working tree (for sandboxes that deny /tmp writes).
+local function scratchDir()
+  local tries = {}
+  local root = os.getenv("HSFAKE_ROOT")
+  if root and root ~= "" then tries[#tries + 1] = "mktemp -d '" .. root .. "/hsfake.XXXXXX'" end
+  tries[#tries + 1] = "mktemp -d 2>/dev/null"
+  tries[#tries + 1] = "mktemp -d \"$PWD/.hsfake.XXXXXX\" 2>/dev/null"
+  for _, cmd in ipairs(tries) do
+    local mp = io.popen(cmd)
+    local dir = mp and mp:read("l")
+    if mp then mp:close() end
+    if dir and dir:match("^/") then return dir end
+  end
+  error("no writable scratch directory (set HSFAKE_ROOT)")
+end
+
 function F.load(W, localConfig)
-  local mp = assert(io.popen("mktemp -d"))
-  local home = mp:read("l")
-  mp:close()
-  assert(home and home:match("^/"), "mktemp -d failed")
+  local home = scratchDir()
   os.execute("mkdir -p '" .. home .. "/projects/memwatch'")
   W.home = home
   if localConfig then

@@ -864,33 +864,117 @@ local function earlyRefs(path)
   return bad
 end
 
+-- ---- tri-state process probe: a failed probe is never an exit ----
+-- memwatch's own pid rides in every probe as the positive control, so a
+-- missing row means "gone" only when the control row came back.
+do
+  local SELF = 777
+  local out = table.concat({
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon",
+    " 4242   501 T    Mon Oct  5 10:00:01 2026 /usr/local/bin/node",
+    " 5151   501 R+   Tue Oct 13 11:22:33 2026 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)",
+  }, "\n") .. "\n"
+  local rows = core.parseProbeRows(out, SELF)
+  check("probe: the reply parses", rows ~= nil, true)
+  local st, p = core.probeResult(rows, 4242)
+  check("probe: a listed pid is present", st, "present")
+  check("probe: its start time is kept", p and p.lstart, "Mon Oct  5 10:00:01 2026")
+  check("probe: its state is kept", p and p.state, "T")
+  check("probe: a T state is stopped", core.isStopped(p), true)
+  local _, chrome = core.probeResult(rows, 5151)
+  check("probe: a comm with spaces is kept whole", chrome and chrome.comm,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)")
+  check("probe: R+ is not stopped", core.isStopped(chrome), false)
+  check("probe: a missing pid with the control row present is absent", (core.probeResult(rows, 9999)), "absent")
+  check("probe: an empty reply is unknown, not absent",
+    (core.probeResult(core.parseProbeRows("", SELF), 4242)), "unknown")
+  check("probe: a reply without the control row is unknown",
+    (core.probeResult(core.parseProbeRows(" 4242   501 S    Mon Oct  5 10:00:01 2026 /usr/local/bin/node\n", SELF), 4242)),
+    "unknown")
+  check("probe: a nil reply (the fork raised) is unknown", (core.probeResult(core.parseProbeRows(nil, SELF), 4242)), "unknown")
+  check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
+end
+
+-- ---- identity: continuity versus memory ----
+do
+  local full = "Google Chrome Helper (Renderer)"
+  check("name: a top-truncated name matches its full name",
+    core.sameName("Google Chrome He", full), true)
+  check("name: either way round", core.sameName(full, "Google Chrome He"), true)
+  check("name: short names must match exactly", core.sameName("node", "node2"), false)
+  check("name: a short prefix is not enough", core.sameName("Google", full), false)
+  check("continuity: a truncated name is the same offender",
+    core.sameOffender({ pid = 7, name = "Google Chrome He" }, { pid = 7, name = full, lstart = "L1" }), true)
+  local bound, other = { pid = 7, name = "node", lstart = "L1" }, { pid = 7, name = "node", lstart = "L2" }
+  local unbound = { pid = 7, name = "node" }
+  check("continuity: an unbound side matches while identity is being established",
+    core.sameOffender(unbound, bound), true)
+  check("memory: a bound record matches the same start time", core.sameRecord(bound, { pid = 7, name = "node", lstart = "L1" }), true)
+  check("memory: a different start time is a different process", core.sameRecord(bound, other), false)
+  check("memory: an unbound record never vouches for a bound process", core.sameRecord(unbound, bound), false)
+  check("memory: an unbound candidate compares by pid and name", core.sameRecord(bound, unbound), true)
+  check("memory: two unbound records compare by pid and name", core.sameRecord(unbound, { pid = 7, name = "node" }), true)
+  check("memory: another pid never matches", core.sameRecord(bound, { pid = 8, name = "node", lstart = "L1" }), false)
+end
+
+-- ---- held pollers: a give-up is never a success ----
+do
+  local st = {}
+  check("until: a poll that reports done is done", core.untilStep(st, true, true, 0, 120), "done")
+  check("until: a poll that runs but is not done polls again", core.untilStep(st, true, false, 1, 120), "poll")
+  check("until: an error polls again (escalations live in predicates)", core.untilStep(st, false, "boom", 10, 120), "poll")
+  check("until: still polling just under the budget", core.untilStep(st, false, "boom", 129, 120), "poll")
+  check("until: a continuous error run gives up at the budget", core.untilStep(st, false, "boom", 130, 120), "giveup")
+  local st2 = {}
+  core.untilStep(st2, false, "boom", 0, 120)
+  core.untilStep(st2, true, false, 100, 120)
+  check("until: a poll that runs ends the error run", core.untilStep(st2, false, "boom", 150, 120), "poll")
+end
+
+-- ---- an action's outcome is the alert's answer ----
+do
+  check("answer: frozen is done",            core.answerFor("frozen"), "done")
+  check("answer: terminated is done",        core.answerFor("terminated"), "done")
+  check("answer: exited is done",            core.answerFor("exited"), "done")
+  check("answer: a reused pid rebinds",      core.answerFor("stale"), "rebind")
+  check("answer: a policy refusal snoozes",  core.answerFor("refused"), "snooze")
+  check("answer: a survivor snoozes",        core.answerFor("failed"), "snooze")
+  check("answer: unverified stands",         core.answerFor("unverified"), "stand")
+  check("answer: no outcome stands",         core.answerFor(nil), "stand")
+  check("answer: an unknown outcome stands", core.answerFor("bogus"), "stand")
+end
+
 -- ---- frozen-ledger prune (calm-state liveness sweep, 2026-07-09 field fix) ----
 -- Three-case floor: exited / identity-changed / healthy-kept, plus the
--- resumed-externally drop and the empty no-op.
+-- resumed-externally drop, the unknown keep and the empty no-op.
 do
   local entries = {
     [100] = { pid = 100, name = "vm-host", lstart = "Tue Jul  7 07:24:43 2026" },
     [200] = { pid = 200, name = "leaky",   lstart = "Wed Jul  8 10:00:00 2026" },
     [300] = { pid = 300, name = "runner",  lstart = "Wed Jul  8 11:00:00 2026" },
     [400] = { pid = 400, name = "steady",  lstart = "Wed Jul  8 12:00:00 2026" },
+    [500] = { pid = 500, name = "held",    lstart = "Wed Jul  8 13:00:00 2026" },
   }
   local probes = {
-    -- [100] absent: exited
-    [200] = { lstart = "Thu Jul  9 09:00:00 2026", state = "T" }, -- pid recycled
-    [300] = { lstart = "Wed Jul  8 11:00:00 2026", state = "R" }, -- resumed externally
-    [400] = { lstart = "Wed Jul  8 12:00:00 2026", state = "T" }, -- still frozen
+    [100] = { "absent" },                                                        -- exited
+    [200] = { "present", { lstart = "Thu Jul  9 09:00:00 2026", state = "T" } },  -- pid recycled
+    [300] = { "present", { lstart = "Wed Jul  8 11:00:00 2026", state = "R" } },  -- resumed externally
+    [400] = { "present", { lstart = "Wed Jul  8 12:00:00 2026", state = "T" } },  -- still frozen
+    [500] = { "unknown" },                                                       -- probe could not run
   }
-  local kept, dropped = core.pruneFrozen(entries, function(pid) return probes[pid] end)
+  local kept, dropped = core.pruneFrozen(entries, function(pid) return table.unpack(probes[pid]) end)
   check("prune: exited dropped",       kept[100], nil)
   check("prune: recycled dropped",     kept[200], nil)
   check("prune: resumed dropped",      kept[300], nil)
   check("prune: live frozen kept",     kept[400] ~= nil, true)
+  check("prune: an unknown probe keeps the entry", kept[500] ~= nil, true)
   local whys = {}
   for _, d in ipairs(dropped) do whys[d.entry.pid] = d.why end
   check("prune: exited reason",        whys[100], "exited")
   check("prune: recycled reason",      whys[200], "pid-recycled")
   check("prune: resumed reason",       whys[300], "resumed-externally")
-  local k2, d2 = core.pruneFrozen({}, function() return nil end)
+  check("prune: nothing dropped for the unknown one", whys[500], nil)
+  local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
 end
 
@@ -1111,10 +1195,10 @@ do
     step(with({ hasBanner = false, offender = A, notified = true })), "---")
   check("banner: and a stale banner still goes when it returns",
     step(with({ hasBanner = true, banner = { pid = 11, name = "python3" }, offender = A, notified = true })), "W--")
-  -- Answered offenders get no banner, and lose the one they had.
-  check("banner: an answered offender gets none", step(with({ hasBanner = false, offender = A, handled = true })), "---")
-  check("banner: an answered offender's banner goes",
-    step(with({ hasBanner = true, banner = Ab, offender = A, handled = true })), "W--")
+  -- A banner naming a process since answered (frozen, gone, ignored) goes,
+  -- whoever heads the episode now (an answered process is no candidate).
+  check("banner: an answered process's banner goes when another heads the episode",
+    step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = B, sinceLastPostSec = 200 })), "WP-")
   check("banner: even once no offender is named",
     step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = nil, notified = true })), "W--")
   -- Degraded: the offender vanishes mid-episode; the banner stays (no churn).
@@ -1138,8 +1222,6 @@ do
   check("hud: an escalation preempts the snooze",
     raise({ visible = false, offender = { pid = 10, name = "node", kind = "extreme" }, episode = A,
             snooze = { off = A, kind = "hog", untilAt = 2000 }, now = 1010, sinceRaiseSec = 0, raiseSec = 60 }), true)
-  check("hud: an answered offender never returns",
-    raise({ visible = false, offender = A2, episode = A, handled = true, sinceRaiseSec = 1e9, raiseSec = 60 }), false)
   check("hud: a new offender preempts the cooldown",
     raise({ visible = false, offender = B, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), true)
   check("hud: the same offender again waits the cooldown",
@@ -1164,7 +1246,8 @@ do
   check("banner glue: notifyCrit located", #notify > 400, true)
   check("banner glue: steps through core.bannerStep", notify:find("core.bannerStep(", 1, true) ~= nil, true)
   check("banner glue: Force Quit passes the bound start time",
-    notify:find("M.killPid(off.pid, off.name, nil, { expectedLstart = lstart })", 1, true) ~= nil, true)
+    notify:find("{ expectedLstart = lstart })", 1, true) ~= nil
+      and notify:find("surfaceUpdate({ pid = off.pid, name = off.name, lstart = lstart })", 1, true) ~= nil, true)
   check("banner glue: the button exists only when identity is bound",
     notify:find("hasActionButton   = canAct,", 1, true) ~= nil, true)
   check("banner glue: no unbound kill remains (control: old shape is caught)",
@@ -1175,13 +1258,26 @@ do
   check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)
   check("hud glue: a refresh inherits the bound identity",
     surfaces:find("bindOffender(offender, hudOffender, now, false)", 1, true) ~= nil, true)
-  check("hud glue: a retarget binds anew and restarts the grace",
-    surfaces:find("bindOffender(offender, nil, now, true)\n          hudShownAt = now\n          hudInteracted = false", 1, true) ~= nil, true)
+  check("hud glue: a retarget binds anew",
+    surfaces:find("if not core.sameOffender(hudOffender, offender) then", 1, true) ~= nil
+      and surfaces:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
+  check("hud glue: the grace is per process (control: the single shared clock is gone)",
+    ("(now - hudShownAt) < core.cfg"):find("hudShownAt", 1, true) ~= nil
+      and src:find("hudShownAt", 1, true) == nil
+      and surfaces:find("exposure[exposureHead]", 1, true) ~= nil, true)
   check("hud glue: the refresh never drops the bound table (control included)",
     ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
       and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)
-  check("hud glue: the episode's end forgets its memory",
-    surfaces:find("hudEpisodeOff, hudSnooze, hudHandled, hudStalePid = nil, nil, {}, nil", 1, true) ~= nil, true)
+  local reset = body("local function resetEpisode()")
+  check("episode glue: resetEpisode located", #reset > 100, true)
+  check("episode glue: the episode's end forgets its HUD memory",
+    reset:find("hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil", 1, true) ~= nil
+      and reset:find("exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil", 1, true) ~= nil, true)
+  check("episode glue: the episode ends at settle",
+    surfaces:find("if settled and not hudHold then resetEpisode() end", 1, true) ~= nil, true)
+  check("episode glue: and with the run", body("function M.stop()"):find("resetEpisode()", 1, true) ~= nil, true)
+  check("episode glue: stop drops a pending model request",
+    body("function M.stop()"):find("lfmInFlight = nil", 1, true) ~= nil, true)
   local closeAt = src:find('elseif id == "close" then', 1, true)
   local closeBody = closeAt and src:sub(closeAt, closeAt + 260) or ""
   check("hud glue: a close is a snooze", closeBody:find('dismissHud("snooze")', 1, true) ~= nil, true)
@@ -1191,12 +1287,20 @@ do
     (select(2, ("M.hideHud()"):gsub("M%.hideHud%(%)", ""))) == 1 and bareHides == 0, true)
   check("hud glue: a click acts only on a bound identity",
     clicks:find("if not target.lstart then", 1, true) ~= nil, true)
-  local poll = body("local function untilHeld(pred, action, interval)")
+  local poll = body("local function untilHeld(pred, action, interval, onGiveUp)")
   check("poller glue: untilHeld located", #poll > 200, true)
+  check("poller glue: a give-up calls the owner's handler, never the success action",
+    poll:find('if step == "giveup" then', 1, true) ~= nil and poll:find("pcall(onGiveUp)", 1, true) ~= nil, true)
   check("poller glue: an error no longer ends the poller (control: old shape caught)",
     ("done = done == true or not ok"):find("or not ok", 1, true) ~= nil
       and poll:find("or not ok", 1, true) == nil, true)
   check("poller glue: a continuous error run gives up", poll:find("UNTIL_GIVEUP_SEC", 1, true) ~= nil, true)
+  local retire = body("local function retireLfmServer(reason)")
+  check("lfm glue: the retire KILL checks the tracked server's identity",
+    retire:find('if pid and (sig == "TERM" or trackedIsOurs()) then', 1, true) ~= nil
+      and retire:find('if pid then sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid)) end', 1, true) == nil, true)
+  check("lfm glue: the health poll's give-up retires the server",
+    src:find('retireLfmServer("health-giveup")', 1, true) ~= nil, true)
   check("poller glue: the retire probe cannot skip the KILL deadline",
     src:find("local okGone, gone = pcall(function()", 1, true) ~= nil, true)
   local police = src:find('"memwatch: adjudicator over budget"', 1, true)
@@ -1206,7 +1310,7 @@ do
     notify:find("canAct = canAct, notified = notified,", 1, true) ~= nil, true)
   check("banner glue: every post joins the episode history",
     notify:find("critNotified[#critNotified + 1] = critNotifOff or { none = true }", 1, true) ~= nil, true)
-  check("banner glue: the episode's end clears the history", surfaces:find("critNotified = {}", 1, true) ~= nil, true)
+  check("banner glue: the episode's end clears the history", reset:find("critNotified = {}", 1, true) ~= nil, true)
   local raiseBody = body("local function raiseHud(offender, titleText)")
   check("hud glue: a fresh raise binds identity anew",
     raiseBody:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
@@ -1214,7 +1318,7 @@ do
     ("bindOffender(offender, hudEpisodeOff)"):find("bindOffender(offender, hudEpisodeOff)", 1, true) ~= nil
       and raiseBody:find("bindOffender(offender, hudEpisodeOff)", 1, true) == nil, true)
   local test = body("function M.test(level, seconds)")
-  local clearAt = test:find("critNotif, critNotifOff = nil, nil", 1, true)
+  local clearAt = test:find("resetEpisode()", 1, true)
   local postAt = test:find("notifyCrit(lastMetrics)", 1, true)
   check("self-test glue: a fresh run clears the previous banner first",
     clearAt ~= nil and postAt ~= nil and clearAt < postAt, true)
@@ -1234,7 +1338,9 @@ do
   check("mute glue: unmuting lets the banner return with the HUD", mute:find("lastNotifyAt = 0", 1, true) ~= nil, true)
   check("mute glue: muting forgets the episode history so unmute restores the banner",
     mute:find("critNotified = {}", 1, true) ~= nil, true)
-  check("self-test glue: a fresh run clears the episode history", test:find("critNotified = {}", 1, true) ~= nil, true)
+  check("self-test glue: a fresh run clears the episode history", test:find("resetEpisode()", 1, true) ~= nil, true)
+  check("simulate glue: a simulation starts a fresh episode too",
+    body("function M.simulate(seconds)"):find("resetEpisode()", 1, true) ~= nil, true)
 end
 
 -- ---- episode banner: the cooldown ends with the episode ----
@@ -1244,14 +1350,21 @@ end
 do
   -- True when the settle branch resets the cooldown under the settle gate
   -- itself, not under a live-banner condition that skips it.
-  local function resetsOnSettle(body)
-    local gate = body:find("if settled then", 1, true) or body:find("if settled and not hudHold then", 1, true)
-    local reset = body:find("lastNotifyAt = 0", 1, true)
-    return gate ~= nil and reset ~= nil and gate < reset
-  end
   local f = assert(io.open("lua/memwatch.lua", "r"))
   local src = f:read("a")
   f:close()
+  local rs = src:find("local function resetEpisode()", 1, true)
+  local re = rs and src:find("\nend\n", rs, true)
+  local resetBody = (rs and re) and src:sub(rs, re) or ""
+  local function resetsOnSettle(body)
+    local gate = body:find("if settled then", 1, true) or body:find("if settled and not hudHold then", 1, true)
+    local reset = body:find("lastNotifyAt = 0", 1, true)
+    local viaEpisode = body:find("resetEpisode()", 1, true)
+    if gate and viaEpisode and gate < viaEpisode then
+      return resetBody:find("lastNotifyAt = 0", 1, true) ~= nil
+    end
+    return gate ~= nil and reset ~= nil and gate < reset
+  end
   local s = src:find("local settled = (now - hudBelowCritSince) >= 10", 1, true)
   local e = s and src:find("\nend\n", s, true)
   local body = (s and e) and src:sub(s, e) or ""
@@ -1575,10 +1688,10 @@ do
   -- The whole observation path is fork-free: the writer and its follow-ups,
   -- every glue helper it calls, and the decision trigger in alertSurfaces.
   local alertBody = fnBody("local function alertSurfaces(state, now)")
-  -- The decision trigger is everything between the banner and the mode
-  -- lookup: only comments and the observation block live there.
-  local _, da = alertBody:find("notifyCrit(lastMetrics)", 1, true)
-  local dz = alertBody:find("local mode = core.resolveUnattended(core.cfg)", 1, true)
+  -- The decision trigger is the observation block just before the
+  -- unattended step: only comments and the observation block live there.
+  local _, da = alertBody:find("and procKey(hudOffender) or nil", 1, true)
+  local dz = alertBody:find("unattendedStep(offender, now)", 1, true)
   local observePath = {
     { "writeObservation", body },
     { "jetsamSince", fnBody("local function jetsamSince(since)") },
@@ -1603,9 +1716,10 @@ do
   -- The decision trigger is the pure predicate, evaluated ahead of and
   -- independently of the unattended mode.
   local dd = alertBody:find("observe.decisionDue({", 1, true)
-  local ru = alertBody:find("core.resolveUnattended(core.cfg)", 1, true)
+  local ru = alertBody:find("unattendedStep(offender, now)", 1, true)
   check("observe glue: alertSurfaces decides through observe.decisionDue", dd ~= nil, true)
-  check("observe glue: the decision trigger precedes the mode lookup", dd ~= nil and ru ~= nil and dd < ru, true)
+  check("observe glue: the decision trigger precedes the unattended step (which looks up the mode)",
+    dd ~= nil and ru ~= nil and dd < ru, true)
   local function triggerTakesNoMode(text)
     local a = text:find("observe.decisionDue({", 1, true)
     local z = a and text:find("})", a, true)

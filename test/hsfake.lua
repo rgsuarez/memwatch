@@ -13,6 +13,7 @@
 local F = {}
 
 local MEM_BYTES = 36 * 1024 ^ 3
+local SELF_PID = 777   -- Hammerspoon's own pid in the fake
 local PAGE = 16384
 
 function F.new()
@@ -121,16 +122,28 @@ function F.new()
   local function exec(cmd)
     W.exec[#W.exec + 1] = cmd
     if cmd:find("^/usr/bin/id %-u") then return "501\n" end
-    local pid = cmd:match("^/bin/ps %-p (%d+) %-o uid=,lstart=,comm=")
-    if pid then
-      local p = W.procs[tonumber(pid)]
-      if not p or W.probeFails then return "" end
-      return string.format("  %d %s %s\n", p.uid, p.lstart, p.comm)
+    -- The identity probe: one row per live pid in the list, memwatch's own
+    -- pid included (the positive control). probeFails models a fork that
+    -- runs but answers nothing: no rows at all, control row included.
+    local list = cmd:match("^/bin/ps %-p ([%d,]+) %-o pid=,uid=,state=,lstart=,comm=")
+    if list then
+      if W.probeFails then return "" end
+      local rows, seen = {}, {}
+      for ps in list:gmatch("%d+") do
+        local pid = tonumber(ps)
+        if not seen[pid] then
+          seen[pid] = true
+          local p = W.procs[pid]
+          if pid == SELF_PID then
+            rows[#rows + 1] = string.format("%5d %5d Ss   Mon Oct 12 09:00:00 2026 %s", pid, 501,
+              "/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon")
+          elseif p then
+            rows[#rows + 1] = string.format("%5d %5d %-4s %s %s", pid, p.uid, p.state, p.lstart, p.comm)
+          end
+        end
+      end
+      return table.concat(rows, "\n") .. "\n"
     end
-    pid = cmd:match("^/bin/ps %-p (%d+) %-o pid=")
-    if pid then return W.procs[tonumber(pid)] and ("  " .. pid .. "\n") or "" end
-    pid = cmd:match("^/bin/ps %-p (%d+) %-o state=")
-    if pid then local p = W.procs[tonumber(pid)]; return p and (p.state .. "\n") or "" end
     if cmd:find("^/bin/ps %-o ppid= %-p %d+") then return "1\n" end
     local sig, kp = cmd:match("^/bin/kill %-(%u+) (%d+)")
     if sig then
@@ -138,10 +151,13 @@ function F.new()
       W.sigs[#W.sigs + 1] = { t = W.now, sig = sig, pid = kp }
       local p = W.procs[kp]
       if p then
-        if sig == "STOP" then p.state = "T"
+        -- ignoreTerm: a process that survives TERM; unkillable: one that
+        -- survives KILL too (a zombie, or stuck in the kernel); unstoppable:
+        -- one a STOP does not stop (it never reaches state T).
+        if sig == "STOP" then if not p.unstoppable then p.state = "T" end
         elseif sig == "CONT" then p.state = "S"
-        elseif sig == "TERM" and p.state ~= "T" then W.procs[kp] = nil
-        elseif sig == "KILL" then W.procs[kp] = nil end
+        elseif sig == "TERM" and p.state ~= "T" and not p.ignoreTerm then W.procs[kp] = nil
+        elseif sig == "KILL" and not p.unkillable then W.procs[kp] = nil end
       end
       return ""
     end
@@ -212,8 +228,15 @@ function F.new()
 
   -- ---- the hs table ---------------------------------------------------------
   local hs = {
-    execute = function(cmd) return exec(cmd), true end,
-    processInfo = { processID = 777 },
+    -- forkRaises models io.popen itself failing (hs.execute then raises);
+    -- killRaises fails only the signal sends, after the probes succeeded.
+    execute = function(cmd)
+      if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill")) then
+        error("fork: Resource temporarily unavailable")
+      end
+      return exec(cmd), true
+    end,
+    processInfo = { processID = SELF_PID },
     timer = {
       secondsSinceEpoch = function() return W.now end,
       doAfter = function(sec, fn) return addTimer("after", sec, nil, fn) end,
@@ -274,6 +297,14 @@ function F.new()
   }
   W.hs = hs
 
+  -- A Hammerspoon reload: every timer and canvas of the old Lua state dies
+  -- with it (persisted files and posted notifications survive).
+  function W.reloadState()
+    for _, t in ipairs(W.timers) do t.stopped = true end
+    if W.hud then W.hud._showing = false end
+    W.hud, W.menu = nil, nil
+  end
+
   -- Menu items as a person would see them (the builder runs on open).
   function W.menuItems() return W.menu and W.menu._fn and W.menu._fn() or {} end
   function W.menuItem(prefix)
@@ -287,11 +318,27 @@ end
 -- Load a fresh copy of memwatch.lua into world W, with HOME pointed at a
 -- private scratch tree (config, ledgers and logs land there). localConfig,
 -- when given, is written as memwatch-local.json before the load.
-function F.load(W, localConfig)
-  local mp = assert(io.popen("mktemp -d"))
-  local home = mp:read("l")
-  mp:close()
-  assert(home and home:match("^/"), "mktemp -d failed")
+-- The scratch root: HSFAKE_ROOT when set, else the system temp dir, else a
+-- directory under the working tree (for sandboxes that deny /tmp writes).
+local function scratchDir()
+  local tries = {}
+  local root = os.getenv("HSFAKE_ROOT")
+  if root and root ~= "" then tries[#tries + 1] = "mktemp -d '" .. root .. "/hsfake.XXXXXX'" end
+  tries[#tries + 1] = "mktemp -d 2>/dev/null"
+  tries[#tries + 1] = "mktemp -d \"$PWD/.hsfake.XXXXXX\" 2>/dev/null"
+  for _, cmd in ipairs(tries) do
+    local mp = io.popen(cmd)
+    local dir = mp and mp:read("l")
+    if mp then mp:close() end
+    if dir and dir:match("^/") then return dir end
+  end
+  error("no writable scratch directory (set HSFAKE_ROOT)")
+end
+
+-- opts.keepHome reloads into the world's existing home (a Hammerspoon
+-- reload: the config, the frozen ledger and the logs survive).
+function F.load(W, localConfig, opts)
+  local home = (opts and opts.keepHome and W.home) or scratchDir()
   os.execute("mkdir -p '" .. home .. "/projects/memwatch'")
   W.home = home
   if localConfig then

@@ -198,7 +198,11 @@ end
 -- it) fixes each pid's start time, so consumers get a real process age
 -- (ageSec) instead of none, plus the start window of the latest sample
 -- (startLo/startHi, see startWindow; launchedAt is when the sampler behind
--- psList was launched). Start time is deliberately NOT used to detect reuse
+-- psList was launched). startedAt is that window's midpoint when launchedAt
+-- bounds it: ps read the table somewhere between launch and delivery, so
+-- the callback time alone would under-report the age by the whole delivery
+-- latency (measured at 60-95 s in storms). Without launchedAt it is
+-- now - etime. Start time is deliberately NOT used to detect reuse
 -- here: a young runaway falsely read as a new process would lose its growth
 -- history mid-incident. Signal paths re-validate identity with lstart, and
 -- the observation ledger compares windows, never point estimates.
@@ -233,9 +237,9 @@ function M.update(tr, psList, now, topMap, launchedAt)
       local w = p.rssMB + (e.cmprsMB or 0)
       e.uid, e.lastSeen, e.rssMB, e.weightMB = p.uid, now, p.rssMB, w
       if p.etimeSec then
-        e.startedAt = now - p.etimeSec
-        local w = M.startWindow(p.etimeSec, launchedAt, now)
-        e.startLo, e.startHi, e.etimeSec = w.lo, w.hi, w.etimeSec
+        local sw = M.startWindow(p.etimeSec, launchedAt, now)
+        e.startLo, e.startHi, e.etimeSec = sw.lo, sw.hi, sw.etimeSec
+        e.startedAt = (sw.lo > -math.huge) and (sw.lo + sw.hi) / 2 or (now - p.etimeSec)
       end
       local ring = e.ring
       ring[#ring + 1] = { t = now, v = w }

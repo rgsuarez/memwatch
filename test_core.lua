@@ -243,6 +243,17 @@ do
   local runs = procs.runaways(tr, 1030, "elevated", 36 * 1024)
   check("runaway is extreme", runs[1] and runs[1].kind, "extreme")
   check("runaway carries live age", runs[1] and runs[1].ageSec, 70)
+  -- A 60 s delivery stall: the true start lies anywhere in the sampler's
+  -- window, so the age is centered in it rather than under-reported by the
+  -- whole stall (the callback-time estimate would still say 70 s).
+  local trLate = procs.newTracker()
+  for i = 0, 6 do
+    local at = 1000 + i * 5
+    procs.update(trLate, { { pid = 4243, uid = 502, rssMB = 1000 + i * 1000,
+                             etimeSec = 40 + i * 5, comm = "python3" } }, at, nil, at - 60)
+  end
+  local runsLate = procs.runaways(trLate, 1030, "elevated", 36 * 1024)
+  check("runaway age is centered in a stalled sample's window", runsLate[1] and runsLate[1].ageSec, 100)
   local ranked = procs.rankByWeight({ { pid = 7, uid = 502, rssMB = 9000,
                                         etimeSec = 86400, comm = "VirtualMachine" } }, nil, 5)
   local off = procs.pickOffender({}, ranked, "critical", nil)
@@ -1104,6 +1115,10 @@ do
   check("tracker: start window from the sampler's launch", trWin.procs[77].startLo, 1689)
   check("tracker: start window to the sampler's delivery", trWin.procs[77].startHi, 1700)
   check("tracker: start window carries the etime", trWin.procs[77].etimeSec, 300)
+  check("tracker: start estimate is the window midpoint", trWin.procs[77].startedAt, 1694.5)
+  local trNoLaunch = procs.newTracker()
+  procs.update(trNoLaunch, { { pid = 78, uid = 501, rssMB = 10, etimeSec = 300, comm = "/bin/x" } }, 2000, nil)
+  check("tracker: no launch time keeps the callback-time estimate", trNoLaunch.procs[78].startedAt, 1700)
 
   -- Identity: windows, never point estimates.
   local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }

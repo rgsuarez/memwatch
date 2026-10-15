@@ -127,6 +127,53 @@ scenario("a refusal keeps another process's banner", nil, function(W)
   check("refusal: nodeB's banner survives a refusal naming nodeA", nodeBBanner(), true)
 end)
 
+-- ---- names: a top-born truncated name and its full ps name are one process ----
+-- With the ps sampler starved, only the streaming top feeds the tracker, and
+-- top truncates names at 16 characters. When ps recovers it fills in the
+-- full name. An ignore made on the truncated name must hold, and the bound
+-- identity must carry over without another probe.
+local LONG = "Google Chrome Helper (Renderer)"
+local function topOnlyEpisode(W, mw)
+  -- Critical (the kernel level rides the ps sample) with the stream up,
+  -- then ps starves and the process is born: only top has seen it.
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, LONG, 2000)
+  W.grow(4242, 220)
+  return runUntil(W, 120, function() return bodyNames(W, LONG:sub(1, 16) .. " (pid") end)
+end
+local function probesOf(W, pid, from)
+  local n = 0
+  for i = from or 1, #W.exec do
+    local list = W.exec[i]:match("^/bin/ps %-p ([%d,]+) %-o pid=")
+    if list and ("," .. list .. ","):find("," .. pid .. ",", 1, true) then n = n + 1 end
+  end
+  return n
+end
+
+scenario("an ignore holds across the name ps fills in", nil, function(W, mw)
+  check("names: the HUD names the truncated top name", topOnlyEpisode(W, mw), true)
+  W.run(6)
+  W.click("ignore")
+  check("names: the ignore takes the HUD down", W.hudShowing(), false)
+  W.psStarved = false
+  runUntil(W, 120, function() return not W.hudShowing() and false end)
+  local reraised = runUntil(W, 400, function() return bodyNames(W, "Google Chrome") end)
+  check("names: the ignored process does not come back once ps names it in full", reraised, false)
+end)
+
+scenario("a refreshed full name keeps the bound identity", nil, function(W, mw)
+  check("names: the HUD names the truncated top name", topOnlyEpisode(W, mw), true)
+  W.run(20)
+  local from = #W.exec + 1
+  W.psStarved = false
+  check("names: ps fills in the full name", runUntil(W, 120, function() return bodyNames(W, LONG) end), true)
+  W.run(10)
+  check("names: no second probe for the same process", probesOf(W, 4242, from), 0)
+end)
+
 -- ---- identity: an unbound HUD refuses instead of signaling by name ----
 scenario("unbound HUD actions refuse", nil, function(W)
   leaker(W, 4242)

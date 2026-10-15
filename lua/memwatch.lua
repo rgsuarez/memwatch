@@ -56,10 +56,14 @@ local runGen        = 0     -- bumped by start/stop: a held resume from an older
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
-local ignoredUntil = {}   -- ["pid|name"] = epoch when the ignore expires
-local goneUntil    = {}   -- ["pid|name"] = verified gone: kept off the candidates
+local ignoredUntil = {}   -- [answerKey] = epoch when the ignore expires
+local goneUntil    = {}   -- [answerKey] = verified gone: kept off the candidates
                           -- while its last samples age out of the tracker
 local GONE_SEC     = 20   -- runawayFreshSec plus a sample period
+-- The ignore and gone lists' key: the pid and the name's first 15
+-- characters (core.sameName's rule), so a name top truncated and the full
+-- name ps fills in later key the same process.
+local function answerKey(pid, name) return pid .. "|" .. (name or ""):sub(1, 15) end
 local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
@@ -344,7 +348,7 @@ local function assessProcesses(now)
   -- growth), or verified gone while its last samples age out.
   local kept = {}
   for _, r in ipairs(runs) do
-    local key = r.pid .. "|" .. r.name
+    local key = answerKey(r.pid, r.name)
     if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
        and not protectedPids[r.pid] and not frozen[r.pid] then
       kept[#kept + 1] = r
@@ -365,7 +369,7 @@ local function assessProcesses(now)
   -- protected, memwatch-frozen or gone process is never named as the hog.
   local rankedKept = {}
   for _, h in ipairs(lastRanked) do
-    local key = h.pid .. "|" .. h.name
+    local key = answerKey(h.pid, h.name)
     if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
        and not protectedPids[h.pid] and not frozen[h.pid] then
       rankedKept[#rankedKept + 1] = h
@@ -511,7 +515,7 @@ local exposureTickAt = nil    -- the previous critical tick (nil: none yet)
 local exposureHead   = nil    -- the record whose process headed the alert since that tick
 local EXPOSURE_STEP_MAX = 15  -- a stalled tick counts at most this much grace
 local function procKey(off)
-  return off and off.pid and (off.pid .. "|" .. (off.name or ""):sub(1, 15)) or nil
+  return off and off.pid and answerKey(off.pid, off.name) or nil
 end
 -- The record in `map` for this process, or nil: a record made for a
 -- different bound process does not count (create replaces it).
@@ -566,7 +570,7 @@ local function bindOffender(offender, prev, now, fresh)
   if type(offender) ~= "table" or not offender.pid or offender.synthetic then return end
   if not fresh then
     if offender.lstart then return end
-    if prev and prev.pid == offender.pid and prev.name == offender.name and prev.lstart then
+    if prev and prev.pid == offender.pid and core.sameName(prev.name, offender.name) and prev.lstart then
       offender.lstart = prev.lstart
       return
     end
@@ -580,7 +584,7 @@ local function bindOffender(offender, prev, now, fresh)
   elseif why == "exited" or (why or ""):find("^pid%-reused") then
     -- Verified gone (or the pid holds a differently named process): the
     -- tracker's last samples of it are stale, so it is no candidate.
-    goneUntil[offender.pid .. "|" .. offender.name] = now + GONE_SEC
+    goneUntil[answerKey(offender.pid, offender.name)] = now + GONE_SEC
   end
 end
 
@@ -589,7 +593,7 @@ end
 -- or it is ignored. A pure read: it never probes.
 local function isAnswered(off, now)
   if not off or not off.pid then return false end
-  local key = off.pid .. "|" .. (off.name or "")
+  local key = answerKey(off.pid, off.name)
   local f = frozen[off.pid]
   if f and not (f.lstart and off.lstart and f.lstart ~= off.lstart) then return true end
   return (goneUntil[key] or 0) > now or (ignoredUntil[key] or 0) > now
@@ -671,7 +675,7 @@ local function settleAction(target, outcome)
     M.hideHud()
   elseif answer == "done" then
     if outcome ~= "frozen" then
-      goneUntil[target.pid .. "|" .. (target.name or "")] = hs.timer.secondsSinceEpoch() + GONE_SEC
+      goneUntil[answerKey(target.pid, target.name)] = hs.timer.secondsSinceEpoch() + GONE_SEC
     end
     dismissHud("done", target)
   elseif answer == "snooze" then
@@ -694,7 +698,7 @@ local function surfaceUpdate(target)
       identityRefused(target)
     elseif core.answerFor(outcome) == "done" then
       if outcome ~= "frozen" then
-        goneUntil[target.pid .. "|" .. (target.name or "")] = hs.timer.secondsSinceEpoch() + GONE_SEC
+        goneUntil[answerKey(target.pid, target.name)] = hs.timer.secondsSinceEpoch() + GONE_SEC
       end
       if hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
         dismissHud("done", hudOffender)
@@ -950,7 +954,7 @@ local function buildMenu()
     -- The alert's bound start time when it has one; otherwise the click binds
     -- it, so this item never signals by name alone.
     local bound = off.lstart or ((hudOffender and hudOffender.pid == off.pid
-      and hudOffender.name == off.name) and hudOffender.lstart or nil)
+      and core.sameName(hudOffender.name, off.name)) and hudOffender.lstart or nil)
     items[#items + 1] = { title = label, disabled = off.synthetic == true or nil,
       fn = function()
         local lst, why = bound, nil
@@ -1005,7 +1009,7 @@ local function notifyCrit(m)
   -- The bound identity lives on the HUD's table for the same process when
   -- an assessment has since replaced the offender table.
   local lstart = off and (off.lstart or ((hudOffender and hudOffender.pid == off.pid
-    and hudOffender.name == off.name) and hudOffender.lstart or nil)) or nil
+    and core.sameName(hudOffender.name, off.name)) and hudOffender.lstart or nil)) or nil
   local canAct = off ~= nil and lstart ~= nil and not off.synthetic
   -- The episode's notification history outlives the live banner: an
   -- offender that hands off and comes back has already been announced. It
@@ -1561,9 +1565,9 @@ end
 
 -- The single identity gate every signal path goes through (kill, freeze,
 -- resume, and the frozen-ledger reconcile), so probe discipline never
--- drifts between them. Names sourced from the top stream are truncated at
--- ~16 chars, so a long expected name may be a prefix of the live one; short
--- names must match exactly. Returns proc (with .liveName and .state) or nil
+-- drifts between them. Names compare with core.sameName: the top stream
+-- truncates names at ~16 chars, so a name of 15 or more characters may be
+-- a prefix of the other; shorter names must match exactly. Returns proc (with .liveName and .state) or nil
 -- plus why: "exited" (verified gone), "pid-reused:<why>" (the pid holds
 -- another process), or "unverified" (the probe could not run: never read
 -- as an exit, and never as a reason to signal).
@@ -1572,10 +1576,7 @@ resolveSignalTarget = function(pid, expectedName, expectedLstart)
   if st == "unknown" then return nil, "unverified" end
   if st == "absent" then return nil, "exited" end
   local liveName = procs.friendlyName(proc.comm)
-  local nameMatches = (liveName == expectedName)
-    or (expectedName ~= nil and #expectedName >= 15
-        and liveName:sub(1, #expectedName) == expectedName)
-  if expectedName and not nameMatches then
+  if expectedName and not core.sameName(liveName, expectedName) then
     return nil, string.format("pid-reused:%s", liveName)
   end
   if expectedLstart and proc.lstart and proc.lstart ~= expectedLstart then
@@ -2720,7 +2721,7 @@ end
 
 -- Silence alerts for one process for the standard window.
 function M.ignore(pid, name)
-  ignoredUntil[pid .. "|" .. name] = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec
+  ignoredUntil[answerKey(pid, name)] = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec
   M.logSnapshot(string.format("ignore:%s(%d)", name, pid))
   if lastOffender and lastOffender.pid == pid then
     lastOffender = nil

@@ -83,7 +83,11 @@ memwatch failed to stop, is alertable again.
   or at once if it escalates.
 - **Ignore 30m** puts the process on the ignore list for 30 minutes; it is no
   candidate for the HUD, the banner or the largest-process fallback while
-  the ignore lasts.
+  the ignore lasts. The ignore and gone lists key a process by its pid and
+  the first 15 characters of its name, so a name `top` truncated and the
+  full name `ps` reports later are one entry. The ignore carries no start
+  time: a same-name process that reuses the pid inside the window is
+  ignored too.
 - **Resume** returns a frozen process to the candidates.
 
 ## Grace and interaction

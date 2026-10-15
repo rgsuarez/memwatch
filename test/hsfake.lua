@@ -271,15 +271,35 @@ function F.new()
     task = { new = function(path, exitCb, streamCb)
       local t = { path = path }
       function t:start()
-        if path == "/bin/sh" then
+        -- psStarved: the sampler fork starts but never reports (the watchdog
+        -- relaunches it; a relaunch after psStarved clears reports again).
+        if path == "/bin/sh" and not W.psStarved then
           addTimer("after", W.samplerDelay or 0.05, nil, function()
             if streamCb then streamCb(t, samplerBlob()) end
             exitCb(0, "", "")
           end)
         end
+        -- The streaming top: with topEmits set, one block every 5 s naming
+        -- each process the way top does (truncated at 16 characters).
+        if path == "/usr/bin/top" then
+          t.timer = addTimer("every", 5, 5, function()
+            if not W.topEmits or not streamCb then return end
+            local rows = { "  PID COMMAND          MEM    CMPRS" }
+            local pids = {}
+            for pid in pairs(W.procs) do pids[#pids + 1] = pid end
+            table.sort(pids)
+            for _, pid in ipairs(pids) do
+              local p = W.procs[pid]
+              local name = (p.comm:match("([^/]+)$") or p.comm):sub(1, 16)
+              rows[#rows + 1] = string.format("%5d %-16s %dM %dM", pid, name,
+                math.floor(p.rssKB / 1024), 0)
+            end
+            streamCb(t, table.concat(rows, "\n") .. "\n")
+          end)
+        end
         return t
       end
-      function t:terminate() end
+      function t:terminate() if t.timer then t.timer:stop() end end
       function t:isRunning() return false end
       function t:pid() return 9999 end
       return t

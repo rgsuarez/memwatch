@@ -862,6 +862,10 @@ do
   check("name: either way round", core.sameName(full, "Google Chrome He"), true)
   check("name: short names must match exactly", core.sameName("node", "node2"), false)
   check("name: a short prefix is not enough", core.sameName("Google", full), false)
+  check("name: a 15-character prefix matches a 20-character name",
+    core.sameName("Chrome Helper (", "Chrome Helper (GPU)1"), true)
+  check("name: two long names that differ inside the prefix do not",
+    core.sameName("Chrome Helper (Renderer)", "Chrome Helpers (GPU)"), false)
   check("continuity: a truncated name is the same offender",
     core.sameOffender({ pid = 7, name = "Google Chrome He" }, { pid = 7, name = full, lstart = "L1" }), true)
   local bound, other = { pid = 7, name = "node", lstart = "L1" }, { pid = 7, name = "node", lstart = "L2" }

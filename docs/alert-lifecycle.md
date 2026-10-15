@@ -5,6 +5,37 @@ process actions and the unattended action) decide what to show, what to
 signal, and when to ask again. The rules below are what `lua/memwatch.lua`
 implements and what `test_glue.lua` drives against a fake Hammerspoon.
 
+## Rules every change is checked against
+
+1. **Verify, then signal, in one step.** Every STOP, CONT, TERM and KILL goes
+   to a process verified in the same step against the start time bound for
+   the action. A compensating signal is a new action and verifies again: the
+   STOP that re-freezes a process whose quit could not be sent is a freeze,
+   with a freeze's verifier, and the CONT that undoes a STOP that reached the
+   pid's next process goes only to a process seen stopped. Nothing is
+   signaled on a probe that could not answer.
+2. **The ledger says what was sent.** A freeze writes its entry before its
+   STOP and records whether the STOP went out. A reload keeps a pending
+   entry only if its STOP went out, or may have. Every entry carries a start
+   time; one without (written by an older version) is bound at reload by a
+   probe that finds that program stopped, or dropped.
+3. **Each writer owns only its process's entry.** An entry with no start
+   time is owned by no writer.
+4. **An action is in flight until its final outcome, with a backstop.**
+   Progress pushes its deadlines out. At the deadline the operator is told
+   the result has not come back; one more hold window with no progress
+   releases the in-flight hold, so the process can be acted on again. A late
+   outcome still replaces the receipt.
+5. **One live receipt per action.** Once a receipt has said the result has
+   not come back, the final outcome, whatever it is, replaces it; the old
+   receipt is withdrawn only when its replacement is up.
+6. **Surfaces retire by state.** A shown HUD whose process has been answered
+   (frozen, gone, ignored) goes at the next tick, whichever surface answered
+   it.
+7. **Marks are per process.** A frozen or gone mark never holds for a
+   process with another name, and a mark that growth has proved stale stays
+   released.
+
 ## The episode
 
 A critical episode starts on the first critical tick and ends when the state

@@ -18,6 +18,20 @@ local function check(name, got, want)
 end
 
 local UNATTENDED_FREEZE = '{"unattended":"freeze"}'
+
+-- The observation ledger's rows (memwatch-observe.jsonl), decoded.
+local function ledgerRowsFor(W)
+  local lfm = require("memwatch_lfm")
+  local rows = {}
+  local f = io.open(W.home .. "/projects/memwatch/memwatch-observe.jsonl", "r")
+  if not f then return rows end
+  for line in f:lines() do
+    local r = lfm.jsonDecode(line)
+    if r then rows[#rows + 1] = r end
+  end
+  f:close()
+  return rows
+end
 local UNATTENDED_KILL = '{"unattended":"kill"}'
 
 -- Run a scenario in a fresh world; fn(W, mw) does the driving.
@@ -1338,6 +1352,51 @@ scenario("a signal that cannot be sent ends its narrative", nil, function(W)
   W.click("kill")
   W.run(10)
   check("send: and the next click acts", W.signalsTo(4242), "TERM")
+end)
+
+-- ---- unattended state: what outlives an episode, and what proves an exit ----
+-- (round 3) A failed freeze or terminate is never retried on the same
+-- process, across episodes too: the episode's end keeps the final latch.
+scenario("a failed freeze stays final across episodes", UNATTENDED_FREEZE, function(W, mw)
+  W.addProc(4242, "wedged", 2000, { unstoppable = true })
+  local growth = W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.run(20)
+  check("final-episode: the STOP went out, and it did not stop", W.signalsTo(4242), "STOP")
+  growth:stop()                     -- it pauses, and pressure eases
+  W.kern = 1
+  check("final-episode: the state leaves critical",
+    runUntil(W, 300, function() return mw.debug().state ~= "critical" end), true)
+  W.run(20)                         -- settled: the episode ends
+  W.grow(4242, 220)                 -- the same process runs away again
+  W.kern = 4
+  check("final-episode: a new episode alerts on it",
+    runUntil(W, 120, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end), true)
+  W.run(200)
+  check("final-episode: and never signals it again", W.signalsTo(4242), "STOP")
+end)
+
+-- (round 3) While ps stalls, the last complete table predates a process
+-- the top stream has seen since. That table is no proof the process
+-- exited, so its unattended records (a failed freeze's final latch, the
+-- decision stamp) are kept: one STOP, not one per grace window.
+scenario("a stalled ps table does not prune a top-fed offender", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  runUntil(W, 200, function() return W.signalsTo(4242) ~= "" end)
+  W.run(400)
+  check("stale-gc: one STOP for a process that never stops", W.signalsTo(4242), "STOP")
+  local decisions = 0
+  for _, r in ipairs(ledgerRowsFor(W)) do
+    if r.point == "decision" and r.pid == 4242 then decisions = decisions + 1 end
+  end
+  check("stale-gc: one decision row, not one per grace window or tick", decisions, 1)
 end)
 
 -- ---- observation ledger: what was faced, and what became of it ----

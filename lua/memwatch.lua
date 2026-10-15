@@ -1358,9 +1358,16 @@ local function resetEpisode()
   hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil
   bindTriedAt = {}
   exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil
-  -- A new episode is a new decision sequence: deferral, latches and the
-  -- decision-row stamps start over.
-  unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, {}, {}
+  -- A new episode is a new decision sequence: deferral, re-adjudication
+  -- stamps and decision-row stamps start over. A failed action's final
+  -- latch does not: memwatch never retries a freeze or terminate that
+  -- already failed on the same process (the GC drops it once the process
+  -- is gone, and a new start time on the pid clears it).
+  local finals = {}
+  for pid, f in pairs(unattendedFiredFor) do
+    if f.final then finals[pid] = { final = true, lstart = f.lstart, at = f.at } end
+  end
+  unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, finals, {}
 end
 
 -- The unattended receipt, posted when the action completes and saying what
@@ -1411,14 +1418,18 @@ end
 -- adjudicated again. A freeze or terminate that failed on a process (it
 -- survived) is never retried on that same process.
 -- This tick's unattended gate (core.unattendedGate), read without side
--- effects: the unattended step and the decision row both ask it.
+-- effects: the unattended step and the decision row both ask it. A freeze
+-- or terminate that already failed on the bound identity closes it.
 local function gateFor(offender, now)
   local grace = hudOffender and recordFor(exposure, hudOffender, false) or nil
+  local fired = offender and unattendedFiredFor[offender.pid] or nil
   return core.unattendedGate({
     kind = offender and offender.kind, alertActive = alertActive, hudHold = hudHold,
     sameAsHud = offender ~= nil and hudOffender ~= nil and core.sameOffender(hudOffender, offender),
     answered = offender ~= nil and isAnswered(offender, now),
     interacted = hudOffender ~= nil and interactionStands(hudOffender, now),
+    final = fired ~= nil and fired.final == true and hudOffender ~= nil
+      and hudOffender.lstart ~= nil and fired.lstart == hudOffender.lstart,
     bound = hudOffender ~= nil and hudOffender.lstart ~= nil,
     exposureSec = grace and grace.sec or 0, graceSec = core.cfg.cool.autoKillGraceSec,
   })
@@ -3068,26 +3079,35 @@ end
 
 -- Drop per-offender unattended state (fired stamp, wait streak, decision
 -- stamp) when its process is gone: absent from the latest COMPLETE ps table
--- (a partial table proves nothing). Absence from the runaway list never
--- prunes: a sampler stall can age a live runaway off that list and restart
--- its deferral clock, and a process filtered off the candidates (frozen,
--- gone, ignored) keeps its records, a final failed-action latch above all.
--- A recycled pid cannot inherit a prior process's state either: the
--- unattended step resets it when the bound start time changes, and the
--- episode's end clears the rest (resetEpisode). Runs every tick regardless
--- of LFM.
+-- (a partial table proves nothing), taken after the pid was last seen
+-- alive. Absence from the runaway list never prunes: a sampler stall can
+-- age a live runaway off that list and restart its deferral clock, and a
+-- process filtered off the candidates (frozen, gone, ignored) keeps its
+-- records, a final failed-action latch above all. A recycled pid cannot
+-- inherit a prior process's state either: the unattended step resets it
+-- when the bound start time changes, and the episode's end clears all but
+-- the final latches (resetEpisode). Runs every tick regardless of LFM.
 gcUnattendedState = function(now)
-  if not lastSample.complete then return end
+  -- Proof of a pid's exit is its absence from a COMPLETE ps table taken
+  -- after the last evidence it was alive. A table from a stalled sampler
+  -- predates what the top stream has seen since, so a pid top saw after
+  -- that table was launched is not gone, however long ps stays stalled.
+  if not lastSample.complete or not lastSample.launchedAt then return end
   local alive = {}
   for _, p in ipairs(lastPsList) do alive[p.pid] = true end
+  local function gone(pid)
+    if alive[pid] then return false end
+    local e = tracker.procs[pid]
+    return not (e and e.lastSeen and e.lastSeen > lastSample.launchedAt)
+  end
   for pid in pairs(unattendedWaitStreak) do
-    if not alive[pid] then unattendedWaitStreak[pid] = nil end
+    if gone(pid) then unattendedWaitStreak[pid] = nil end
   end
   for pid in pairs(unattendedFiredFor) do
-    if not alive[pid] then unattendedFiredFor[pid] = nil end
+    if gone(pid) then unattendedFiredFor[pid] = nil end
   end
   for pid in pairs(obs.decisionAt) do
-    if not alive[pid] then obs.decisionAt[pid] = nil end
+    if gone(pid) then obs.decisionAt[pid] = nil end
   end
 end
 

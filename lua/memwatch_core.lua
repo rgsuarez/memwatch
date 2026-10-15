@@ -579,14 +579,16 @@ end
 -- exactly the ticks where the live gate stands open under any mode.
 -- a: { kind, alertActive, hudHold, sameAsHud (the offender is the process
 --      the alert surfaced), answered (frozen, gone or ignored), interacted
---      (the operator acted on it since the raise), bound (its start time is
---      bound), exposureSec (its grace so far), graceSec }
+--      (the operator acted on it since the raise), final (a freeze or
+--      terminate already failed on this same process: never retried),
+--      bound (its start time is bound), exposureSec (its grace so far),
+--      graceSec }
 -- -> "open" | "unbound" (open but for identity: the live step skips and
 --    logs) | "closed"
 function M.unattendedGate(a)
   if type(a) ~= "table" or a.kind ~= "extreme" then return "closed" end
   if a.alertActive ~= true or a.hudHold or not a.sameAsHud then return "closed" end
-  if a.answered or a.interacted then return "closed" end
+  if a.answered or a.interacted or a.final then return "closed" end
   if type(a.graceSec) ~= "number" or type(a.exposureSec) ~= "number"
      or a.exposureSec < a.graceSec then
     return "closed"

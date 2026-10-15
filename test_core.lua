@@ -1772,6 +1772,7 @@ do
   check("gate: before grace is closed", gateWith({ exposureSec = 59 }), "closed")
   check("gate: an operator action closes it", gateWith({ interacted = true }), "closed")
   check("gate: an answered process (frozen, gone, ignored) closes it", gateWith({ answered = true }), "closed")
+  check("gate: a failed action's final latch closes it", gateWith({ final = true }), "closed")
   check("gate: an offender the alert did not surface closes it", gateWith({ sameAsHud = false }), "closed")
   check("gate: a held narrative closes it", gateWith({ hudHold = true }), "closed")
   check("gate: a hog is never acted on", gateWith({ kind = "hog" }), "closed")
@@ -2101,25 +2102,29 @@ do
   check("glue: the decision passes the tick's clock", count(src, "resolveUnattendedAction(mode, offender, now)"), 1)
   check("glue: that decision is the only caller", count(src, "resolveUnattendedAction("), 1)
   check("glue: the decision never re-reads the clock", count(resolveBody, "secondsSinceEpoch"), 0)
-  -- Absent pids are pruned only after a fresh, complete sample; signal
-  -- records go only when the process is absent from a complete ps table.
-  local function prunesOnlyOnCompleteTables(text)
-    local guard = text:find("if not lastSample.complete then return end", 1, true)
-    local sweep = text:find("for _, p in ipairs(lastPsList) do alive[p.pid] = true end", 1, true)
-    return guard ~= nil and sweep ~= nil and guard < sweep
+  -- Absent pids are pruned only on a complete table taken after the pid
+  -- was last seen alive (the stale-table behavior itself is driven in
+  -- test_glue: "a stalled ps table does not prune a top-fed offender").
+  local GUARD = "if not lastSample.complete or not lastSample.launchedAt then return end"
+  local SWEEP = "for _, p in ipairs(lastPsList) do alive[p.pid] = true end"
+  local LATER = "return not (e and e.lastSeen and e.lastSeen > lastSample.launchedAt)"
+  local function prunesOnlyOnProof(text)
+    local guard, sweep = text:find(GUARD, 1, true), text:find(SWEEP, 1, true)
+    return guard ~= nil and sweep ~= nil and guard < sweep and text:find(LATER, 1, true) ~= nil
       and text:find("lastRuns", 1, true) == nil
   end
   check("glue: the prune scan refuses a guard after the sweep (positive control)",
-    prunesOnlyOnCompleteTables("for _, p in ipairs(lastPsList) do alive[p.pid] = true end\n"
-      .. "if not lastSample.complete then return end\n"), false)
+    prunesOnlyOnProof(SWEEP .. "\n" .. GUARD .. "\n" .. LATER .. "\n"), false)
   check("glue: the prune scan refuses pruning by the runaway list (positive control)",
-    prunesOnlyOnCompleteTables("if not lastSample.complete then return end\n"
-      .. "for _, p in ipairs(lastPsList) do alive[p.pid] = true end\nfor _, r in ipairs(lastRuns) do end\n"), false)
-  check("glue: a pid's records go only when a complete ps table lacks it",
-    prunesOnlyOnCompleteTables(fnBody("gcUnattendedState = function(now)")), true)
-  check("glue: the episode's end resets the unattended and decision records",
-    fnBody("local function resetEpisode()"):find(
-      "unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, {}, {}", 1, true) ~= nil, true)
+    prunesOnlyOnProof(GUARD .. "\n" .. SWEEP .. "\n" .. LATER .. "\nfor _, r in ipairs(lastRuns) do end\n"), false)
+  check("glue: the prune scan refuses absence alone, with no later evidence check (positive control)",
+    prunesOnlyOnProof(GUARD .. "\n" .. SWEEP .. "\n"), false)
+  check("glue: a pid's records go only on a complete table taken after it was last seen",
+    prunesOnlyOnProof(fnBody("gcUnattendedState = function(now)")), true)
+  local resetBody = fnBody("local function resetEpisode()")
+  check("glue: the episode's end resets streaks and decision stamps, and keeps final latches",
+    resetBody:find("if f.final then finals[pid] = { final = true, lstart = f.lstart, at = f.at } end", 1, true) ~= nil
+      and resetBody:find("unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, finals, {}", 1, true) ~= nil, true)
   check("glue: cache entries record the dispatch kind", count(src, "kind = offender.kind, snapshot = user,"), 1)
   check("glue: names redacted on every serialize call",
     count(src, "lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })"), 3)

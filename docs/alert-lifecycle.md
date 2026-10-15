@@ -11,8 +11,11 @@ A critical episode starts on the first critical tick and ends when the state
 has been below critical for 10 seconds with no action narrative holding the
 HUD, or when the run ends (`stop`, `start`, a self-test, a simulation). The
 end of an episode clears all of its memory (banner history, snooze, grace
-clocks, interaction marks, the bind throttle and the banner cooldown) and
-withdraws its banner, so the next episode starts clean.
+clocks, interaction marks, the bind throttle and the banner cooldown, and
+the unattended deferral and decision-row stamps) and withdraws its banner,
+so the next episode starts clean. One record outlives it: a freeze or
+terminate that failed on a process stays final for that process (its pid
+and start time) until the process is gone.
 
 ## Identity
 

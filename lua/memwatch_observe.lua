@@ -33,7 +33,6 @@ M.cfg = {
   clockSlackSec  = 1,               -- timestamp granularity allowed when comparing start windows
   maxLineBytes   = 60000,           -- a longer row drops its snapshot (the decoder rejects > 64 KB)
   maxActions     = 256,             -- operator action times kept per record (more are counted)
-  clockStepSec   = 2,               -- a wall clock that falls this far behind the monotonic one stepped back
 }
 
 local function floorOrNil(v)

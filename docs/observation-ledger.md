@@ -68,12 +68,15 @@ runs after its record stopped collecting still reads its own horizon.
 - A process's start window comes from `ps` etime, a duration on the wall
   clock: `[launch - etime - 1, delivery - etime]`, spanning both sides when
   the clock stepped back while the table was in flight.
-- A backward step is seen at the next tick, by comparing how far the wall
-  clock advanced with how far the monotonic clock did (any size beyond 2 s;
-  a sleep only makes the wall advance more), or in a table launched after
-  the observation that reads earlier, or delivered before its own launch.
-  Then every collecting record is closed, and the advisory cadence and
-  decision windows re-base to the step.
+- A backward step is seen at the first wall read after it (`clock.now`:
+  how far the wall clock advanced against how far the monotonic clock did
+  since the previous read; any size beyond 2 s, and a sleep only makes the
+  wall advance more), or in a table launched after the observation that
+  reads earlier, or delivered before its own launch. Then every collecting
+  record is closed, and the advisory cadence, the decision windows and the
+  tick log re-base to the step. The sampler in flight keeps its launch on
+  the monotonic clock, so a step between its launch and its delivery never
+  splits it.
 
 ## Identity model
 

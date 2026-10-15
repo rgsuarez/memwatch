@@ -385,6 +385,12 @@ function F.new()
     task = { new = function(path, exitCb, streamCb)
       local t = { path = path }
       function t:start()
+        -- samplerStartFails: the sampler fork cannot start (start() returns
+        -- nil, as hs.task does when the fork fails); every attempt is counted.
+        if path == "/bin/sh" then
+          W.samplerStartAttempts = (W.samplerStartAttempts or 0) + 1
+          if W.samplerStartFails then return nil end
+        end
         -- psStarved: the sampler fork starts but never reports (the watchdog
         -- relaunches it; a relaunch after psStarved clears reports again).
         if path == "/bin/sh" and not W.psStarved then

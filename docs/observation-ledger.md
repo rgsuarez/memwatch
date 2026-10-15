@@ -78,22 +78,24 @@ runs after its record stopped collecting still reads its own horizon.
   table delivered late, a follow-up) closes the records at once, though the
   callback's other stamps wait for its end to be shifted: nothing it reads
   after the step is folded.
-- A sampler's launch is read two ways. Its start windows use the wall
+- A sampler's launch is read two ways. Its start windows use the raw wall
   readings taken at launch and at delivery, which no step moves (they are
-  anchored to the kernel's start record). The delivery's is the raw wall
-  clock that ps's etime runs on, never a callback's held basis, so a table
-  read after a step that its own delivery is first to see still places each
-  process at its own start. The unattended-state GC uses the launch record
+  anchored to the kernel's start record). Both are the raw wall clock that
+  ps's etime runs on, never a callback's held basis, so a table launched or
+  delivered by the first callback to see a step still places each process
+  at its own start. The unattended-state GC uses the launch record
   the shift moves with the tracker's sightings, so a step between the launch
   and the delivery, back or forward, never puts the two on two bases. A
-  launch that never started leaves no record; the records are bounded to
+  launch that never started leaves no record and no handle, so the next
+  tick launches again; the records are bounded to
   the last 16 launches; and a delivery without its record leaves the launch
   unknown, so the GC prunes nothing.
 - Every follow-up reads the clock first, so a step back since the last tick
   closes its record before anything is read from it.
 - Report files (jetsam counts) carry the wall time they were written, which
   no shift moves. After a step back, an observation written before the new
-  clock catches up with the pre-step times reads the count as unknown.
+  clock catches up with the pre-step times reads the count as unknown. That
+  catch-up point is a raw file time too, so a later step never lowers it.
 - Durations run on the monotonic clock: a record's life after its last
   horizon, and the age of the last row written (`debug().observe`).
 

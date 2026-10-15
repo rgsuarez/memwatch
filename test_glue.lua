@@ -2170,6 +2170,101 @@ scenario("ledger: a step first seen by a follow-up closes its record before it r
   check("fu-step: with no readings", fu[1] and (fu[1].sampleAgeSec == nil and fu[1].jetsamSince == nil), true)
 end)
 
+-- (round 9) A step first seen by the tick that launches a slow table: the
+-- launch's reading for start windows is the raw wall clock ps's etime runs
+-- on, so the next observation keeps the process's identity.
+scenario("ledger: a step first seen by the tick launching a slow table keeps identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("launch-step: decision row", false, true); return end
+  local tD = W.now
+  W.run(49)                           -- just before a tick 10 s ahead of the next decision point
+  -- The step lands inside that tick (as it reads the memory counters), so
+  -- the tick is the first to see it and holds it while it launches a table
+  -- that takes 8 s: it lands before the next decision row is written, which
+  -- takes its start window from it.
+  W.onVmStat = function()
+    W.onVmStat = nil
+    W.wallOffset = (W.wallOffset or 0) - 100
+    W.samplerDelay = 8
+  end
+  W.run(1.5)
+  W.samplerDelay = nil
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("launch-step: the next decision row is written (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(190)
+  local fu = followups(W, nextRow.seq)
+  for i = 1, 3 do
+    check("launch-step: follow-up " .. i .. " sees the same process", fu[i] and fu[i].fate ~= "exited", true)
+  end
+end)
+
+-- (round 9) The jetsam blind ceiling is a raw file time: a second step back
+-- never lowers it, so a report from before the first step is never counted
+-- by an observation written before the clock catches up with it.
+scenario("ledger: a second step back does not lower the jetsam blind ceiling", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  local R = W.now + (W.wallOffset or 0)
+  W.jetsam = { ["JetsamEvent-before-steps.ips"] = R }  -- written now
+  W.wallOffset = -120
+  W.run(10)                           -- the first step is seen
+  W.wallOffset = -180
+  W.run(5)                            -- and the second
+  local function wall() return W.now + W.wallOffset end
+  runUntil(W, 200, function() return wall() > R - 58 end)
+  local seen = {}
+  for _, r in ipairs(ledgerRows(W)) do seen[r.seq or -1] = true end
+  local row, rowWall
+  runUntil(W, 70, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not seen[r.seq] then row = r end
+    end
+    if row and not rowWall then rowWall = wall() end
+    return row ~= nil
+  end)
+  check("jetsam-steps: a decision row after both steps", row ~= nil, true)
+  if not row then return end
+  check("jetsam-steps: written before the clock caught up with the report (control)", rowWall < R, true)
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("jetsam-steps: the report from before the steps is unknown, not counted", fu[1] and fu[1].jetsamSince, nil)
+end)
+
+-- (round 9) Launch records stay bounded to the last 16 launches, whatever
+-- happens to the tables.
+scenario("sampler: launch records stay bounded to the last 16", nil, function(W, mw)
+  W.run(6)
+  W.psStarved = true                  -- no table comes back; the watchdog relaunches
+  W.run(20 * 25)
+  local n = mw.debug().samplerLaunchRecords
+  check("bound: records kept (" .. tostring(n) .. ")", n, 16)
+end)
+
+-- (round 9) A table that cannot start leaves no record and no handle: the
+-- next tick launches again, rather than waiting out the watchdog.
+scenario("sampler: a table that cannot start is launched again at the next tick", nil, function(W, mw)
+  W.run(6)
+  local before = W.samplerStartAttempts or 0
+  W.samplerStartFails = true
+  W.run(30)
+  local attempts = (W.samplerStartAttempts or 0) - before
+  check("failed-start: launched again every tick (" .. attempts .. " in 30 s)", attempts >= 5, true)
+  check("failed-start: no record kept for a launch that never started", mw.debug().samplerLaunchRecords, 0)
+  check("failed-start: and no task handle held", mw.debug().samplerRunning, false)
+  W.samplerStartFails = false
+  W.run(6)
+  check("failed-start: tables flow again once it can start", mw.debug().sampleAgeSec <= 6, true)
+end)
+
 -- (round 3) A ledger that cannot be written is counted and logged, not
 -- reported as written.
 scenario("ledger: a write that fails is counted and logged", nil, function(W, mw)
@@ -2650,6 +2745,27 @@ scenario("a verdict asked about one binding is asked again once for another", RE
   check("rebind: the newcomer's binding is asked about at once", again, true)
   W.run(30)
   check("rebind: once, not every tick (" .. (#W.httpPosts - mark) .. ")", #W.httpPosts - mark, 1)
+end)
+
+-- (round 9) A verdict about a binding the alert has since replaced leaves
+-- the cache at once: with the newcomer's answer still on its way, nothing
+-- about the old binding is left to consume.
+scenario("a verdict about a replaced binding leaves the cache at once", REMOTE_LFM_QUIET, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  local cached = runUntil(W, 120, function() return (mw.debug().lfm.cached or 0) > 0 end)
+  W.run(5)
+  check("evict: a verdict is cached (control)", cached and (mw.debug().lfm.cached or 0) > 0, true)
+  W.httpDelay = 60                    -- the newcomer's answer takes a minute
+  W.reusePid(4242, "node", 9000)
+  W.run(2)
+  W.click("freeze")                   -- refused on the stale binding; the alert binds the newcomer
+  -- Once the newcomer is an extreme runaway too, the old verdict (still
+  -- fresh, same kind) would be usable: only its binding tells it apart.
+  W.run(20)
+  check("evict: the old binding's verdict is gone before the new one lands", mw.debug().lfm.cached, 0)
 end)
 
 -- ---- PR round 5: kept horizons, closed records, the launch-order line ----

@@ -1508,19 +1508,21 @@ local function launchSampler(onDone)
   end
   sampler.startedAt = now
   -- This task's own launch, read two ways for its callback. For start
-  -- windows, the wall reading as taken (ps reads its table, and etime, on
-  -- one side of a step or the other, so start windows span both; see
-  -- procs.startWindow). For the unattended-state GC, a record the clock
-  -- shift moves with the tracker's sightings, so the two never sit on two
-  -- bases whichever way the clock steps.
-  local launchedAt = now
+  -- windows, the raw wall reading clock.now just took (ps reads its table,
+  -- and etime, on that clock, on one side of a step or the other, so start
+  -- windows span both; see procs.startWindow), never this callback's basis,
+  -- which a step held to the frame's end leaves on the old one. For the
+  -- unattended-state GC, a record the clock shift moves with the tracker's
+  -- sightings, so the two never sit on two bases whichever way the clock
+  -- steps.
+  local launchedAt = clock.wallAt
   sampler.nextSeq = sampler.nextSeq + 1
   local seq = sampler.nextSeq   -- and its place in launch order
   -- Records of launches delivered or overtaken go, and so does any older
   -- than the last 16 launches (a table that never came back), so the set
   -- stays bounded whatever happens to the tables.
   for old in pairs(sampler.launches) do
-    if old <= sampler.seq or old < seq - 16 then sampler.launches[old] = nil end
+    if old <= sampler.seq or old <= seq - 16 then sampler.launches[old] = nil end
   end
   sampler.launches[seq] = { at = now }
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
@@ -1552,8 +1554,13 @@ local function launchSampler(onDone)
     end,
     { "-c", SAMPLER_CMD })
   sampler.task = task
-  -- A launch that never started gets no callback: its record goes now.
-  if not (task and task:start()) then sampler.launches[seq] = nil end
+  -- A launch that never started gets no callback: its record goes now, and
+  -- so does its handle, so the next tick launches again rather than waiting
+  -- out the watchdog for a task that was never running.
+  if not (task and task:start()) then
+    sampler.launches[seq] = nil
+    if sampler.task == task then sampler.task = nil end
+  end
 end
 
 -- Enrichment half: runs when the sampler fork returns. Refreshes the kernel
@@ -1563,6 +1570,8 @@ end
 -- storm), and the verdict must never be hostage to it.
 local function onSample(blob, exitCode, launchedAt, seq)
   local now = clock.now()
+  -- The same instant on the raw wall clock, for start windows (see below).
+  local wallNow = clock.wallAt
   local launch = seq and sampler.launches[seq] or nil
   if seq then sampler.launches[seq] = nil end
   -- A callback from a sampler launched before the one already applied holds
@@ -1595,10 +1604,9 @@ local function onSample(blob, exitCode, launchedAt, seq)
   end
   sampler.complete = (exitCode == 0) and selfListed
   -- Start windows are anchored to the kernel's start record, and ps's etime
-  -- runs on the raw wall clock: a window is placed with the raw reading
-  -- (wallNow), never this callback's basis, which a step held back to the
-  -- frame's end leaves on the old one.
-  local wallNow = now + clock.pending
+  -- runs on the raw wall clock: a window is placed with raw readings at
+  -- launch and delivery (launchedAt, wallNow), never this callback's basis,
+  -- which a step held back to the frame's end leaves on the old one.
   procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.
@@ -2080,7 +2088,8 @@ function clock.shift(delta)
       -- Report files written before the step keep their pre-step times, up
       -- to the step's size ahead of the new basis: an observation written
       -- before the new clock catches up with them cannot place them.
-      obs.jetsamBlindUntil = math.max(sh(obs.jetsamBlindUntil) or 0, (clock.wallAt or 0) - delta)
+      -- It is a ceiling in raw file time, so a later step never moves it.
+      obs.jetsamBlindUntil = math.max(obs.jetsamBlindUntil or 0, (clock.wallAt or 0) - delta)
       obs.lastAt = sh(obs.lastAt)
       for _, st in pairs(obs.decisionAt) do st.at = sh(st.at) end
       for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end
@@ -4244,6 +4253,8 @@ function M.debug()
     streamAlive    = topTask ~= nil,
     topCacheAgeSec = topCache.at > 0 and math.floor(now - topCache.at) or -1,
     sampleAgeSec   = sampler.at > 0 and math.floor(now - sampler.at) or -1,
+    samplerLaunchRecords = (function() local n = 0; for _ in pairs(sampler.launches) do n = n + 1 end; return n end)(),
+    samplerRunning = sampler.task ~= nil,
     tracked        = tracked,
     runs           = #lastRuns,
     ranked         = #lastRanked,

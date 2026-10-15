@@ -56,7 +56,7 @@ M.cfg = {
     ignoreSec        = 1800, -- per-offender "Ignore 30 min"
     hudRaiseSec      = 60,   -- min seconds between HUD raises (a new offender preempts)
     autoKillGraceSec = 60,   -- HUD unanswered this long before auto-kill (if enabled)
-    frozenSweepSec   = 60,   -- calm-state frozen-ledger liveness sweep cadence
+    frozenSweepSec   = 60,   -- frozen-ledger liveness sweep cadence (every state)
   },
   -- Unattended action at critical + grace expiry. The deterministic
   -- autonomous layer (successor to autoKill), model-free and shipping in

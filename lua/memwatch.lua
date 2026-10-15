@@ -57,9 +57,10 @@ local runGen        = 0     -- bumped by start/stop: a held resume from an older
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
 local ignoredUntil = {}   -- [answerKey] = epoch when the ignore expires
-local goneUntil    = {}   -- [answerKey] = verified gone: kept off the candidates
-                          -- while its last samples age out of the tracker
+local goneUntil    = {}   -- [answerKey] = { untilAt, at, lstart }: verified gone, kept
+                          -- off the candidates while its last samples age out
 local GONE_SEC     = 20   -- runawayFreshSec plus a sample period
+local REVEAL_RISES = 3    -- rises after a frozen or gone mark that only a running process makes
 -- The ignore and gone lists' key: the pid and the name's first 15
 -- characters (core.sameName's rule), so a name top truncated and the full
 -- name ps fills in later key the same process.
@@ -69,7 +70,23 @@ local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
 local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
-local lastFrozenSweepAt = 0 -- calm-state liveness sweep bookkeeping
+local lastFrozenSweepAt = 0 -- liveness sweep bookkeeping
+
+-- A verified exit keeps the process off the candidates while its last
+-- samples age out. The mark carries the start time when one was bound.
+local function markGone(off, now)
+  goneUntil[answerKey(off.pid, off.name)] = { untilAt = now + GONE_SEC, at = now, lstart = off.lstart }
+end
+-- Does a frozen or gone mark still describe the process at its pid? Not
+-- when that process has another bound start time, and not when it has
+-- grown since the mark: a stopped process cannot grow and an exited one
+-- makes no new samples, so growth means a newcomer holds the pid (or the
+-- process runs again). Fork-free: it reads only the tracker.
+local function markHolds(mark, at, pid, lstart)
+  if not mark then return false end
+  if mark.lstart and lstart and mark.lstart ~= lstart then return false end
+  return procs.risingSince(tracker, pid, at) < REVEAL_RISES
+end
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
 local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
 local unattendedSkipLogAt = 0  -- last "identity unverified" skip line (one a minute)
@@ -345,14 +362,20 @@ local function assessProcesses(now)
   lastRunsAll = runs
   -- An answered process is no candidate, by its own state: ignored, held
   -- frozen by memwatch (stopped, so its extreme latch is history, not
-  -- growth), or verified gone while its last samples age out.
+  -- growth), or verified gone while its last samples age out. A frozen or
+  -- gone mark yields as soon as the pid shows growth since the mark: that
+  -- is a newcomer (or a process running again), never the one marked.
+  local function heldBack(p)
+    local key = answerKey(p.pid, p.name)
+    if (ignoredUntil[key] or 0) >= now or protectedPids[p.pid] then return true end
+    local g = goneUntil[key]
+    if g and g.untilAt >= now and markHolds(g, g.at, p.pid, nil) then return true end
+    local f = frozen[p.pid]
+    return f ~= nil and markHolds(f, f.frozenAt or 0, p.pid, nil)
+  end
   local kept = {}
   for _, r in ipairs(runs) do
-    local key = answerKey(r.pid, r.name)
-    if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
-       and not protectedPids[r.pid] and not frozen[r.pid] then
-      kept[#kept + 1] = r
-    end
+    if not heldBack(r) then kept[#kept + 1] = r end
   end
   lastRuns = kept
   lastExtreme = false
@@ -369,11 +392,7 @@ local function assessProcesses(now)
   -- protected, memwatch-frozen or gone process is never named as the hog.
   local rankedKept = {}
   for _, h in ipairs(lastRanked) do
-    local key = answerKey(h.pid, h.name)
-    if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
-       and not protectedPids[h.pid] and not frozen[h.pid] then
-      rankedKept[#rankedKept + 1] = h
-    end
+    if not heldBack(h) then rankedKept[#rankedKept + 1] = h end
   end
   local offender, watch = procs.pickOffender(kept, rankedKept, smState.state,
     function(pid) return procs.peakSlopeFor(tracker, pid) end)
@@ -584,19 +603,22 @@ local function bindOffender(offender, prev, now, fresh)
   elseif why == "exited" or (why or ""):find("^pid%-reused") then
     -- Verified gone (or the pid holds a differently named process): the
     -- tracker's last samples of it are stale, so it is no candidate.
-    goneUntil[answerKey(offender.pid, offender.name)] = now + GONE_SEC
+    markGone(offender, now)
   end
 end
 
--- Is this process answered, by its own state? memwatch holds it frozen (the
--- ledger's start time agreeing when both are known), it is verified gone,
--- or it is ignored. A pure read: it never probes.
+-- Is this process answered, by its own state? memwatch holds it frozen, it
+-- is verified gone, or it is ignored. A frozen or gone mark counts only
+-- while it still describes this process (markHolds). A pure read: it
+-- never probes.
 local function isAnswered(off, now)
   if not off or not off.pid then return false end
   local key = answerKey(off.pid, off.name)
   local f = frozen[off.pid]
-  if f and not (f.lstart and off.lstart and f.lstart ~= off.lstart) then return true end
-  return (goneUntil[key] or 0) > now or (ignoredUntil[key] or 0) > now
+  if f and markHolds(f, f.frozenAt or 0, off.pid, off.lstart) then return true end
+  local g = goneUntil[key]
+  if g and g.untilAt > now and markHolds(g, g.at, off.pid, off.lstart) then return true end
+  return (ignoredUntil[key] or 0) > now
 end
 
 local HUD_W, HUD_H = 380, 176
@@ -674,9 +696,7 @@ local function settleAction(target, outcome)
     lastHudRaiseAt = 0
     M.hideHud()
   elseif answer == "done" then
-    if outcome ~= "frozen" then
-      goneUntil[answerKey(target.pid, target.name)] = hs.timer.secondsSinceEpoch() + GONE_SEC
-    end
+    if outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
     dismissHud("done", target)
   elseif answer == "snooze" then
     dismissHud("snooze", target)
@@ -697,9 +717,7 @@ local function surfaceUpdate(target)
     if outcome == "stale" then
       identityRefused(target)
     elseif core.answerFor(outcome) == "done" then
-      if outcome ~= "frozen" then
-        goneUntil[answerKey(target.pid, target.name)] = hs.timer.secondsSinceEpoch() + GONE_SEC
-      end
+      if outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
       if hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
         dismissHud("done", hudOffender)
       end
@@ -1726,9 +1744,30 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     onUpdate(string.format("refusing to freeze %s: %s", proc.liveName, why), true, "refused")
     return
   end
-  if frozen[pid] then
-    onUpdate(string.format("%s is already frozen", proc.liveName), true, "frozen")
-    return
+  -- A ledger entry answers "already frozen" only for this very process,
+  -- verified stopped now. An entry for another start time is a phantom
+  -- (its process is gone and a newcomer holds the pid): it goes, and the
+  -- newcomer is frozen. One still being verified stands. One whose process
+  -- runs again (resumed outside memwatch) goes, and the freeze proceeds.
+  local held = frozen[pid]
+  if held then
+    local now = hs.timer.secondsSinceEpoch()
+    if held.lstart and proc.lstart and held.lstart ~= proc.lstart then
+      M.logSnapshot(string.format("frozen-phantom-drop:%s(%d)", held.name or "?", pid))
+      frozen[pid] = nil
+      saveFrozen()
+    elseif core.isStopped(proc) then
+      onUpdate(string.format("%s is already frozen", proc.liveName), true, "frozen")
+      return
+    elseif held.pendingUntil and now < held.pendingUntil then
+      onUpdate(string.format("a freeze of %s is still being verified; nothing more was sent",
+        proc.liveName), true, "unverified")
+      return
+    else
+      M.logSnapshot(string.format("frozen-stale-drop:%s(%d):running", held.name or "?", pid))
+      frozen[pid] = nil
+      saveFrozen()
+    end
   end
   -- Record the ledger entry BEFORE the SIGSTOP, not after the verify: a
   -- reload in the verify window would otherwise leave a SIGSTOPped process
@@ -1757,13 +1796,20 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     -- cannot run keeps the entry: the STOP may have landed, and the
     -- reconcile and the sweep re-check it.
     local reprobe, rwhy = resolveSignalTarget(pid, proc.liveName, proc.lstart)
+    -- The ledger slot is this freeze's to change only while it holds no
+    -- entry for another start time (a newer freeze of the pid's next
+    -- process, or one a restart adopted, is not this freeze's to touch).
+    local cur = frozen[pid]
+    local ours = cur == nil or cur.lstart == nil or cur.lstart == proc.lstart
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
       onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
     elseif not reprobe then
-      sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
-      frozen[pid] = nil
-      saveFrozen()
+      if ours then
+        sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
+        frozen[pid] = nil
+        saveFrozen()
+      end
       if rwhy == "exited" then
         M.logSnapshot(string.format("freeze-abort:%s(%d)-exited", proc.liveName, pid))
         onUpdate(string.format("%s exited during the freeze", proc.liveName), true, "exited")
@@ -1781,8 +1827,10 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
       onUpdate(string.format(
         "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true, "frozen")
     else
-      frozen[pid] = nil
-      saveFrozen()
+      if ours then
+        frozen[pid] = nil
+        saveFrozen()
+      end
       M.logSnapshot(string.format("freeze-failed:%s(%d)-state=%s", proc.liveName, pid, reprobe.state or "?"))
       onUpdate(string.format("%s did not stop (state %s)", proc.liveName, reprobe.state or "?"), true, "failed")
     end
@@ -2624,8 +2672,12 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       onUpdate(string.format("can't verify %s right now; nothing was signaled",
         expectedName or tostring(pid)), true, "unverified")
     else
-      -- Identity mismatch: drop any stale ledger entry AND block the action.
-      if frozenEntry then frozen[pid] = nil; saveFrozen() end
+      -- Identity mismatch: block the action, and drop the ledger entry when
+      -- the refusal was about that entry's own process (it is gone).
+      if frozenEntry and (opts.expectedLstart == nil or opts.expectedLstart == frozenEntry.lstart) then
+        frozen[pid] = nil
+        saveFrozen()
+      end
       M.logSnapshot(string.format("kill-refuse:%s:%d(want %s)", twhy, pid, expectedName or "?"))
       onUpdate(string.format("pid %d identity changed (%s), refusing", pid, twhy), true, "stale")
     end

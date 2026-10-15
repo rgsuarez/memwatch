@@ -294,6 +294,27 @@ local runsBig = procs.runaways(trBig, 25, "critical", 36864)
 check("absolute fires at critical", #runsBig, 1)
 check("absolute kind", runsBig[1].kind, "absolute")
 
+-- risingSince: a run of rises after a mark (a freeze, a verified exit)
+-- means the pid holds a running process; a held or compressing one never
+-- makes a run. Three cases plus the empty one.
+do
+  local function series(values, comm)
+    local sr = {}
+    for i, v in ipairs(values) do sr[#sr + 1] = { t = (i - 1) * 5, list = { row(60, v, comm or "node") } } end
+    return feed(sr)
+  end
+  -- Frozen at t=12: big and flat before it, a newcomer growing after it.
+  local trNew = series({ 9000, 9000, 9000, 2000, 2300, 2600, 2900, 3200 })
+  check("risingSince: a grower after the mark is a run", procs.risingSince(trNew, 60, 12) >= 3, true)
+  check("risingSince: the mark bounds the count (rises before it do not count)",
+    procs.risingSince(series({ 1000, 1400, 1800, 2200, 2200, 2200 }), 60, 12), 0)
+  -- A held process whose pages compress: each drop is caught up by one rise.
+  local trHeld = series({ 9000, 9000, 8000, 8300, 7500, 7800, 7000, 7300 })
+  check("risingSince: a compressing held process never makes a run", procs.risingSince(trHeld, 60, 0) < 3, true)
+  check("risingSince: no samples after the mark", procs.risingSince(trNew, 60, 999), 0)
+  check("risingSince: an untracked pid", procs.risingSince(trNew, 61, 0), 0)
+end
+
 -- weight rings: cmprs from top joins rss and sticks between top refreshes,
 -- so a runaway whose pages are compressed away in real time stays visible.
 local trW = procs.newTracker(PC)

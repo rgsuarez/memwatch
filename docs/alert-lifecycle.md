@@ -79,6 +79,16 @@ in a list: memwatch holds it frozen, it is gone, or it is ignored. Nothing
 else is remembered as "handled", so a process that is resumed, or that
 memwatch failed to stop, is alertable again.
 
+A frozen or gone mark is about one process, not a pid. It stops counting
+as soon as the pid shows a run of growth after the mark (a stopped process
+cannot grow, and an exited one makes no samples), or the process there has
+a different bound start time. Either way a newcomer holds the pid, and it
+is alertable at once, without waiting for the frozen-ledger sweep, which
+cannot run while probes fail. A freeze click answers "already frozen" only
+for the same process verified stopped; a freeze still being verified
+stands; a ledger entry for another start time is dropped and the newcomer
+is frozen.
+
 - **Close** is "not now": the same process returns after the raise cooldown,
   or at once if it escalates.
 - **Ignore 30m** puts the process on the ignore list for 30 minutes; it is no

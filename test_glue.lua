@@ -174,6 +174,63 @@ scenario("a refreshed full name keeps the bound identity", nil, function(W, mw)
   check("names: no second probe for the same process", probesOf(W, 4242, from), 0)
 end)
 
+-- ---- answers: a frozen mark yields to a newcomer on its pid ----
+-- A frozen process dies and a same-name process takes its pid and runs
+-- away. Its ledger entry is a phantom until the sweep can prove it (60 s,
+-- or never while probes fail); growth since the freeze proves it sooner.
+local function frozenThenReused(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(6)
+  local frozenState = W.procs[4242] and W.procs[4242].state
+  W.reusePid(4242, "node", 2000)
+  W.grow(4242, 220)
+  return frozenState
+end
+
+scenario("a phantom frozen entry does not hide a newcomer", nil, function(W)
+  check("phantom: the runaway is frozen", frozenThenReused(W), "T")
+  W.probeFails = true   -- the sweep keeps an entry it cannot verify
+  check("phantom: the newcomer is surfaced while probes fail",
+    runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "node (pid 4242)") end), true)
+end)
+
+scenario("a freeze of the newcomer on a phantom's pid freezes it", nil, function(W)
+  check("phantom: the runaway is frozen", frozenThenReused(W), "T")
+  W.run(2)
+  local row = W.menuItem("node")
+  local freeze = row and row.menu and row.menu[1]
+  check("phantom: the menu offers the newcomer's Freeze", freeze ~= nil and freeze.fn ~= nil, true)
+  freeze.fn()
+  W.run(2)
+  check("phantom: the newcomer is stopped, not reported already frozen", W.procs[4242].state, "T")
+end)
+
+-- ---- answers: a freeze not yet verified does not answer the next click ----
+scenario("an unverified freeze does not answer the next click as frozen", nil, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].unstoppable = true
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  -- The STOP goes out (and does nothing); the verifier's probe then fails.
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  W.click("freeze")
+  W.run(1)
+  W.onSignal, W.probeFails = nil, false
+  W.run(5)
+  check("pending: the alert stands after an unverified freeze", W.hudShowing(), true)
+  W.click("freeze")
+  W.run(6)
+  check("pending: a second click does not answer it as frozen", W.hudShowing(), true)
+  check("pending: the process still runs", W.procs[4242].state, "S")
+end)
+
 -- ---- identity: an unbound HUD refuses instead of signaling by name ----
 scenario("unbound HUD actions refuse", nil, function(W)
   leaker(W, 4242)

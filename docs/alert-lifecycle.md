@@ -36,11 +36,11 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    reload without one is given one. A verifier settles its freeze's entry
    where the slot holds it (rebuilt and shifted since), never by putting
    back the copy it captured; if the slot is empty it puts its own entry
-   back, with a freeze stamp ahead of now read as now. A resume's verifier drops only the
-   entry it resumed, by the same token: a newer freeze of the same process
-   keeps its own. Writers that act on a process found gone own the entry for
-   the start time they acted on. An entry with no start time is owned by no
-   writer.
+   back, with a freeze stamp ahead of now read as now. A resume's verifier
+   drops only the entry it resumed, by the same token: a newer freeze of the
+   same process keeps its own. Writers that act on a process found gone own
+   the entry for the start time they acted on. An entry with no start time
+   is owned by no writer.
 4. **An action is in flight until its final outcome, with a backstop.**
    Progress pushes its deadlines out. At the deadline the operator is told
    the result has not come back; one more hold window with no progress
@@ -50,30 +50,32 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    action owns (HUD, hold, retry state, ledger entry); its late outcome only
    replaces its own receipt, which says why the KILL was withheld (released
    by the backstop, or answered by the operator). A freeze's verifier still
-   undoes a STOP of its own that reached the pid's next process, under
-   rule 1. An operator's answer on the process supersedes memwatch's own
-   action in flight on it the same way: Freeze, Force Quit, Ignore, Activity
+   undoes a STOP of its own that reached the pid's next process, under rule
+   1. An operator's answer on the process supersedes memwatch's own action
+   in flight on it the same way: Freeze, Force Quit, Ignore, Activity
    Monitor or closing the alert, from the HUD, the banner or the menu's
    process rows, and Resume or Force Quit from the frozen rows. The menu's
-   own Activity Monitor item names no process, so it answers none. A veto matches by pid and name
-   even when the answer could not bind a start time (a menu opened while
-   probes failed), because it only ever withholds; two bound start times
-   must still agree. A Resume vetoes but leaves the process a candidate,
-   since it is meant to run. A click handed to a signal engine (Freeze or
-   Force Quit) answers only once it did something, and each click holds its
-   own veto until then; its outcome settles it the moment it arrives (only
-   the HUD lingers), whatever run of memwatch it lands in, so a click that
-   did nothing has given its veto up before memwatch's escalation reads it.
-   A Resume clicked on a frozen row whose entry has gone since the menu
-   opened still answers for the process the row showed. A click that signals nothing gives
-   up its own hold,
-   and the veto is withdrawn (memwatch's action carries on) only when no
-   other answer holds it and the action is still in flight. One the backstop
-   has released stays superseded, so a late click that did nothing never
-   revives its escalation. A click that did something, and every answer
-   that needs no signal engine, holds its veto for good. A vetoed action
-   gives up its HUD hold at once, and still owes its receipt: one whose
-   result never comes back is announced at its deadline.
+   own Activity Monitor item names no process, so it answers none. A veto
+   matches by pid and name even when the answer could not bind a start time
+   (a menu opened while probes failed), because it only ever withholds; two
+   bound start times must still agree. A Resume vetoes but leaves the
+   process a candidate, since it is meant to run. A click handed to a signal
+   engine (Freeze or Force Quit) answers only once it did something, and
+   each click holds its own veto until then; its outcome settles it the
+   moment it arrives (only the HUD lingers), whatever run of memwatch it
+   lands in, so a click that did nothing has given its veto up before
+   memwatch's escalation reads it. A Resume clicked on a frozen row whose
+   entry has gone since the menu opened still answers for the process the
+   row showed, and when the pid now holds another frozen process, that one
+   stays frozen. A click that signals nothing because nothing could be
+   verified gives up its own hold, and the veto is withdrawn (memwatch's
+   action carries on) only when no other answer holds it and the action is
+   still in flight. One the backstop has released stays superseded, so a
+   late click that did nothing never revives its escalation. A click that
+   did something, and every answer that needs no signal engine, holds its
+   veto for good. A vetoed action gives up its HUD hold at once, and still
+   owes its receipt: one whose result never comes back is announced at its
+   deadline.
 5. **One live receipt per action.** Once a receipt has said the result has
    not come back, the final outcome, whatever it is, replaces it; the old
    receipt is withdrawn only when its replacement is up. An outcome after a
@@ -99,32 +101,35 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    deadlines, the grace before the next unattended attempt, the sampler's
    watchdog, cooldowns, the tracker's sample times and latches), at the
    first read after it and before that read's value is used. So a stamp a
-   callback writes between the step and the next tick is shifted once,
-   never twice, and each wait keeps the length it had left. A callback is
-   never shifted under: every entry point is a frame (each guarded callback,
-   the held timers and pollers, the top stream, the menu's build and every
-   item, the first tick), and a step seen anywhere inside one is taken out
-   when it ends, even when it ends by an error. Until then its reads stay
+   callback writes between the step and the next tick is shifted once, never
+   twice, and each wait keeps the length it had left. A callback is never
+   shifted under: every callback memwatch registers that reads the clock is
+   a frame (each guarded callback, the held timers and pollers, the top
+   stream, the menu's build and every item, the first tick; the output
+   drains of the sampler and the language-model server read no clock), and a
+   step seen anywhere inside one is taken out when it ends, even when it
+   ends by an error. Functions called from the console (`memwatch.freezePid`
+   and the like) run outside any frame: a step one of them sees is taken out
+   at that read, as at any read outside a frame. Until then its reads stay
    on the basis it began with, so the stamps it writes move with the rest.
    Each holder is shifted under its own guard: one that fails is logged by
-   name and costs only its own stamps. A source scan
-   holds the shift to every time-named stamp, matched by its whole path. A
-   wall reading kept in a function's local is out of the shift's reach (a
-   callback that captures it keeps the old basis), so the scan also lists
-   every time-named function local with how it is used. Pure durations (a
-   poller's error run, the language-model server's deadlines and its
-   fast-crash window, request latency, the error log's rate limit) run on
-   the monotonic clock and need no shift. The shifted frozen ledger is
-   written out at once. A grace stamp found after now (a step the shift
-   could not take out) restarts the grace from now: one grace, never the
-   step's length and never none. A pending window persisted ahead of now (a
-   step back across a reload) lasts at most one window more, and a freeze
-   stamp persisted ahead of now reads as now. Without a
-   monotonic clock, memwatch says so at start, and a step back shows only
-   when the wall clock runs backwards between two reads; durations then run
-   on the wall clock read through the detector, with every step it took out
-   added back, so a step back it saw never lengthens one (a step forward,
-   which it cannot see, shortens a wait).
+   name and costs only its own stamps. A source scan holds the shift to
+   every time-named stamp, matched by its whole path. A wall reading kept in
+   a function's local is out of the shift's reach (a callback that captures
+   it keeps the old basis), so the scan also lists every time-named function
+   local with how it is used. Pure durations (a poller's error run, the
+   language-model server's deadlines and its fast-crash window, request
+   latency, the error log's rate limit) run on the monotonic clock and need
+   no shift. The shifted frozen ledger is written out at once. A grace stamp
+   found after now (a step the shift could not take out) restarts the grace
+   from now: one grace, never the step's length and never none. A pending
+   window persisted ahead of now (a step back across a reload) lasts at most
+   one window more, and a freeze stamp persisted ahead of now reads as now.
+   Without a monotonic clock, memwatch says so at start, and a step back
+   shows only when the wall clock runs backwards between two reads;
+   durations then run on the wall clock read through the detector, with
+   every step it took out added back, so a step back it saw never lengthens
+   one (a step forward, which it cannot see, shortens a wait).
 
 ## The episode
 

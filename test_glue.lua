@@ -2842,6 +2842,39 @@ do
       logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
     check("restart-settle: memwatch's own KILL still went out", W.signalsTo(4242):find("KILL", 1, true) ~= nil, true)
   end)
+  -- (round 12) The same for a menu click, whose outcome comes back through
+  -- the surface's own update rather than the HUD's narrative.
+  scenario("a menu click that did nothing gives up its veto across a restart", UNATTENDED_KILL, function(W, mw)
+    termOut(W)
+    W.run(1)
+    local freeze = rowItem(W, "Freeze node")
+    check("menu-restart-settle: the process row offers Freeze (control)", freeze ~= nil and freeze.disabled ~= true, true)
+    W.sendFails = { STOP = true }
+    if freeze then freeze.fn() end    -- its STOP cannot be sent; it says so 0.5 s later
+    W.sendFails = nil
+    mw.start()                        -- an in-process restart before that outcome lands
+    W.run(30)
+    check("menu-restart-settle: the click gave up its veto after the restart",
+      logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
+    check("menu-restart-settle: memwatch's own KILL still went out", W.signalsTo(4242):find("KILL", 1, true) ~= nil, true)
+  end)
+  -- (round 12) A click's outcome settles before its on-screen alert: an
+  -- alert that fails never keeps a veto the click gave up.
+  scenario("a menu click settles even when its alert fails", UNATTENDED_KILL, function(W)
+    termOut(W)
+    W.run(1)
+    local freeze = rowItem(W, "Freeze node")
+    check("alert-fails: the process row offers Freeze (control)", freeze ~= nil and freeze.disabled ~= true, true)
+    W.sendFails = { STOP = true }
+    W.onAlert = function(text) if text:find("couldn't send STOP", 1, true) then error("alert failed") end end
+    if freeze then freeze.fn() end
+    W.sendFails = nil
+    W.run(30)
+    W.onAlert = nil
+    check("alert-fails: the failing alert was reached (control)", logHas(W, "alert failed"), true)
+    check("alert-fails: the click still gave up its veto", logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
+    check("alert-fails: and memwatch's own KILL went out", W.signalsTo(4242):find("KILL", 1, true) ~= nil, true)
+  end)
 
   -- The other order: a Force Quit that signals nothing, then a Freeze that
   -- works, both before the HUD comes down. The failed click's outcome never
@@ -2996,6 +3029,77 @@ do
   end)
   io.tmpfile = realTmpfile
 end
+
+-- (round 12) A frozen row's Resume answers for the process it showed: when
+-- the pid's next process has been frozen since the menu opened, that one
+-- stays frozen.
+scenario("a stale frozen row's Resume never resumes the pid's next frozen process", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.click("freeze")
+  W.run(3)
+  check("stale-row: A is frozen", W.procs[4242] and W.procs[4242].state, "T")
+  local resumeA = frozenRowAction(W, "leaker", "Resume")
+  check("stale-row: its row offers Resume", resumeA ~= nil, true)
+  W.reusePid(4242, "leaker", 2000)  -- A goes; B takes the pid
+  W.run(70)                         -- the sweep drops A's entry
+  local b = W.procs[4242]
+  mw.freezePid(4242, "leaker", function() end, { expectedLstart = b.lstart })
+  W.run(3)
+  check("stale-row: B is frozen in turn", b.state, "T")
+  if resumeA then resumeA() end
+  W.run(3)
+  check("stale-row: B stays frozen", b.state, "T")
+  check("stale-row: no CONT went out", W.signalsTo(4242):find("CONT", 1, true) == nil, true)
+  check("stale-row: the row was refused as stale", logHas(W, "resume-skip:leaker(4242):stale-row"), true)
+end)
+
+-- (round 12) A menu item is one clock frame: a step it sees is applied when
+-- the item ends, never in the middle of it.
+scenario("a step seen inside a menu item waits for the item's end", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.click("freeze")
+  W.run(3)
+  local resume = frozenRowAction(W, "leaker", "Resume")
+  check("menu-frame: the frozen row offers Resume", resume ~= nil, true)
+  mw.resumePid(4242)                -- resumed from the console: the row is now stale
+  W.run(2)
+  local mid
+  W.onAlert = function()
+    W.onAlert = nil
+    W.wallOffset = (W.wallOffset or 0) - 120
+    mw.ignore(99999, "probe", nil)  -- a clock read inside the item
+    mid = logHas(W, "clock-stepped-back")
+  end
+  if resume then resume() end
+  check("menu-frame: the item's alert ran (control)", mid ~= nil, true)
+  check("menu-frame: the step waited for the item's end", mid, false)
+  check("menu-frame: and was applied then", logHas(W, "clock-stepped-back:120s"), true)
+end)
+
+-- (round 12) Every entry kept at reload carries a token, written out with it.
+scenario("an entry kept at reload without a token is given one", nil, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].state = "T"
+  W.run(6)
+  local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+  f:write(string.format('[{"pid":4242,"name":"node","lstart":"%s","weightMB":0,"frozenAt":%d,"stopSent":true}]\n',
+    W.procs[4242].lstart, math.floor(W.now) - 30))
+  f:close()
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+  check("reload-token: the entry is kept", W.menuItem("   node") ~= nil, true)
+  local g = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "r"))
+  local saved = g:read("a")
+  g:close()
+  check("reload-token: and written out with a token", saved:find('"id":"4242/', 1, true) ~= nil, true)
+end)
 
 if fails == 0 then
   print("\nALL PASS")

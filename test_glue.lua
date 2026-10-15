@@ -2101,6 +2101,75 @@ scenario("ledger: a stale frozen row's Resume is still a touch", nil, function(W
     fu[3] and fu[3].operatorTouchesSince, 2)
 end)
 
+-- (round 9) A step back first seen by a late ps table (a fork that ran
+-- after the step). Its callback holds the step to its end. The observation
+-- stops collecting when the step is seen, and the table's start windows are
+-- placed on the raw wall clock its etime runs on, so a process still
+-- running is never read as gone.
+local function stepAtNextTable(W, sec)
+  W.samplerReadsLate = true
+  W.onSamplerDeliver = function()
+    W.wallOffset = (W.wallOffset or 0) - sec   -- shorter than the process's age
+    W.onSamplerDeliver = nil
+    W.samplerReadsLate = false
+  end
+end
+scenario("ledger: a step first seen by a late ps table never reads a running process as gone", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late-step: decision row", false, true); return end
+  W.run(8)                            -- before the next tick launches its table
+  stepAtNextTable(W, 30)
+  W.run(10)
+  check("late-step: the step was taken out", logHas(W, "clock-stepped-back:30s"), true)
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("late-step: the follow-up reads unknown", fu[1] and fu[1].fate, "unknown")
+  check("late-step: because the clock stepped", fu[1] and fu[1].fateDetail, "clock-step")
+  check("late-step: the process was running throughout", W.procs[4242] ~= nil, true)
+end)
+
+-- (round 9) The next observation after such a table takes its start window
+-- from the tracker: placed on the raw wall clock, it is the process's own,
+-- so the tables after it see the same process, not a successor.
+scenario("ledger: an observation after a late table's step keeps the process's identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late-step-next: decision row", false, true); return end
+  local tD = W.now
+  W.run(52)                           -- the table before the next decision point
+  stepAtNextTable(W, 30)
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("late-step-next: the next decision row is written (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("late-step-next: its follow-up sees the same process alive", fu[1] and fu[1].fate, "alive")
+end)
+
+-- (round 9) A follow-up reads the clock first: a step it is the first to see
+-- closes its record at once, though its callback holds the step to its end,
+-- so it reports nothing from after the step.
+scenario("ledger: a step first seen by a follow-up closes its record before it reads", nil, function(W)
+  W.timerLag = 0.5                    -- follow-ups fire between ticks
+  local row = toDecision(W, 4242)
+  if not row then check("fu-step: decision row", false, true); return end
+  local tD = W.now
+  W.run((tD + 60.25) - W.now)
+  W.wallOffset = (W.wallOffset or 0) - 30
+  W.run(1)
+  local fu = followups(W, row.seq)
+  check("fu-step: the follow-up came", fu[1] ~= nil, true)
+  check("fu-step: and was the first to see the step", logHas(W, "clock-stepped-back:30s"), true)
+  check("fu-step: it reads unknown", fu[1] and fu[1].fate, "unknown")
+  check("fu-step: because the clock stepped", fu[1] and fu[1].fateDetail, "clock-step")
+  check("fu-step: with no readings", fu[1] and (fu[1].sampleAgeSec == nil and fu[1].jetsamSince == nil), true)
+end)
+
 -- (round 3) A ledger that cannot be written is counted and logged, not
 -- reported as written.
 scenario("ledger: a write that fails is counted and logged", nil, function(W, mw)

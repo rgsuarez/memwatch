@@ -1591,7 +1591,12 @@ local function onSample(blob, exitCode, launchedAt, seq)
     if p.pid == hs.processInfo.processID then selfListed = true; break end
   end
   sampler.complete = (exitCode == 0) and selfListed
-  procs.update(tracker, lastPsList, now, topCache.map, launchedAt)
+  -- Start windows are anchored to the kernel's start record, and ps's etime
+  -- runs on the raw wall clock: a window is placed with the raw reading
+  -- (wallNow), never this callback's basis, which a step held back to the
+  -- frame's end leaves on the old one.
+  local wallNow = now + clock.pending
+  procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.
   for i = #lastRanked, 1, -1 do
@@ -1615,7 +1620,7 @@ local function onSample(blob, exitCode, launchedAt, seq)
       local placeable = row and type(row.etimeSec) == "number" and row.etimeSec > 0
       observe.foldSample(ev, {
         complete = sampler.complete, row = row,
-        start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, now) or nil,
+        start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, wallNow) or nil,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
         seq = seq, launchedAt = launchedAt, deliveredAt = now })
     end
@@ -2128,6 +2133,13 @@ function clock.now()
   if delta < -clock.stepSec then
     if clock.depth > 0 then
       clock.pending = clock.pending + delta
+      -- The stamps wait for the frame's end, but what must take no evidence
+      -- across a step is told now (clock.onHeld): nothing the rest of this
+      -- callback reads can be dated against what came before it.
+      if clock.onHeld then
+        local ok, err = pcall(clock.onHeld, delta)
+        if not ok then logError("clock-on-held", err) end
+      end
     else
       clock.apply(delta)
     end
@@ -2397,6 +2409,14 @@ end
 -- never reads pre-step stamps (rule 8).
 function clock.afterShift()
   if next(frozen) then saveFrozen() end
+end
+-- A step seen inside a callback closes every collecting observation at
+-- once, as one seen outside a callback does: the rest of the callback (a
+-- ps table whose etime is on the new basis, a follow-up that has just read
+-- the clock) cannot be dated against the observation. The shift's own
+-- observation step closes them again, harmlessly, when the frame ends.
+function clock.onHeld()
+  for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
 end
 
 -- A ledger writer changes only its own process's entry: the slot holds

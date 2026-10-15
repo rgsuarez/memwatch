@@ -74,10 +74,16 @@ runs after its record stopped collecting still reads its own horizon.
   wall advance more), or in a table launched after the observation that
   reads earlier, or delivered before its own launch. Then every collecting
   record is closed, and the advisory cadence, the decision windows and the
-  tick log re-base to the step.
+  tick log re-base to the step. A step first seen inside a callback (a ps
+  table delivered late, a follow-up) closes the records at once, though the
+  callback's other stamps wait for its end to be shifted: nothing it reads
+  after the step is folded.
 - A sampler's launch is read two ways. Its start windows use the wall
-  reading taken at launch, which no step moves (they are anchored to the
-  kernel's start record). The unattended-state GC uses the launch record
+  readings taken at launch and at delivery, which no step moves (they are
+  anchored to the kernel's start record). The delivery's is the raw wall
+  clock that ps's etime runs on, never a callback's held basis, so a table
+  read after a step that its own delivery is first to see still places each
+  process at its own start. The unattended-state GC uses the launch record
   the shift moves with the tracker's sightings, so a step between the launch
   and the delivery, back or forward, never puts the two on two bases. A
   launch that never started leaves no record; the records are bounded to

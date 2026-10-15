@@ -268,6 +268,14 @@ do
   local trNoAge = procs.newTracker()
   procs.update(trNoAge, { { pid = 9, uid = 502, rssMB = 100, comm = "x" } }, 1000, nil)
   check("no etime means no age", trNoAge.procs[9].startedAt, nil)
+  -- A delivery inside a callback still holding a step back reads memwatch's
+  -- clock 30 s ahead of the raw wall clock ps's etime runs on: the window is
+  -- placed with the raw reading (wallAt), so it stays on the kernel's start.
+  local trStep = procs.newTracker()
+  procs.update(trStep, { { pid = 11, uid = 502, rssMB = 100, etimeSec = 100, comm = "x" } }, 2000, nil, 1968, 1970)
+  check("a window is placed with the raw wall reading, not the callback's basis",
+    trStep.procs[11].startLo == 1867 and trStep.procs[11].startHi == 1870, true)
+  check("and the sighting keeps memwatch's basis", trStep.procs[11].lastSeen, 2000)
 end
 
 local topBlob = [[
@@ -2373,8 +2381,9 @@ do
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
     sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
-  check("observe glue: and its start window, bounded by launch and delivery (none from a clamped etime)",
-    sampleBody:find("start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil
+  check("observe glue: and its start window, bounded by launch and the raw delivery reading (none from a clamped etime)",
+    sampleBody:find("start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, wallNow) or nil", 1, true) ~= nil
+      and sampleBody:find("local wallNow = now + clock.pending", 1, true) ~= nil
       and sampleBody:find("local placeable = row and type(row.etimeSec) == \"number\" and row.etimeSec > 0", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
     sampleBody:find("if seq and seq < sampler.seq then return end", 1, true) ~= nil
@@ -2529,8 +2538,8 @@ do
     src:find("onDone(table.concat(acc), exitCode, launchedAt, seq)", 1, true) ~= nil, true)
   check("sampler glue: completeness comes from the exit code",
     src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
-  check("sampler glue: the tracker gets the launch time",
-    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt)", 1, true) ~= nil, true)
+  check("sampler glue: the tracker gets the launch time, and the raw delivery reading for its windows",
+    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)", 1, true) ~= nil, true)
 end
 
 -- ---- operator actions: every UI path that touches a process counts ----

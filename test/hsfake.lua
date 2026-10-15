@@ -392,7 +392,10 @@ function F.new()
           -- delivers that reading late (samplerDelay), as a real storm does.
           -- samplersLive / samplersMax count the sampler forks memwatch has
           -- neither seen finish nor terminated: overlap means two ps at once.
-          local blob = samplerBlob()
+          -- samplerReadsLate: ps reads its table when the delivery comes (a fork
+          -- that ran late in a storm), after onSamplerDeliver (something that
+          -- happens just before, such as a wall clock step).
+          local blob = (not W.samplerReadsLate) and samplerBlob() or nil
           t.sampler = true
           W.samplersLive = (W.samplersLive or 0) + 1
           W.samplersMax = math.max(W.samplersMax or 0, W.samplersLive)
@@ -400,6 +403,8 @@ function F.new()
             if t.done then return end
             t.done = true
             W.samplersLive = W.samplersLive - 1
+            if W.onSamplerDeliver then W.onSamplerDeliver() end
+            blob = blob or samplerBlob()
             if streamCb then streamCb(t, blob) end
             exitCb(W.samplerExit or 0, "", "")   -- nonzero: ps failed or was cut off mid-table
           end)

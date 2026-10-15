@@ -106,6 +106,10 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    item, the first tick), and a step seen anywhere inside one is taken out
    when it ends, even when it ends by an error. Until then its reads stay
    on the basis it began with, so the stamps it writes move with the rest.
+   What must take no evidence across a step is told when the step is seen,
+   not when the frame ends (`clock.onHeld`: the observation ledger closes
+   its records), and values on the raw wall clock (a process's start window
+   from `ps` etime) are read on that clock, never the frame's held basis.
    Each holder is shifted under its own guard: one that fails is logged by
    name and costs only its own stamps. A source scan
    holds the shift to every time-named stamp, matched by its whole path. A

@@ -1042,6 +1042,51 @@ scenario("a ps cut off by a signal is not an exit", nil, function(W)
   check("cut-off: the retry acts", W.signalsTo(4242), "STOP")
 end)
 
+-- (round 4) An escalation probe that cannot run once is retried; a
+-- survivor that never got its KILL is not reported as unkillable.
+scenario("an unverifiable escalation is retried", nil, function(W)
+  W.addProc(4242, "stubborn", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "stubborn") end)
+  W.run(5)
+  W.onSignal = function(sig)
+    if sig == "TERM" then
+      W.probeFails = true
+      W.addTimer("after", 8, nil, function() W.probeFails = false end)
+    end
+  end
+  W.click("kill")
+  W.run(25)
+  W.onSignal = nil
+  check("escalate-retry: KILL went out once the probe answered", W.signalsTo(4242), "TERM,KILL")
+  check("escalate-retry: and it is gone", W.procs[4242] == nil, true)
+end)
+
+-- (round 4) A kill's verify that finds a newer process at the pid must not
+-- drop that process's own frozen-ledger entry.
+scenario("a kill never drops a newer process's ledger entry", nil, function(W)
+  W.addProc(4242, "node", 2000, { ignoreTerm = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  W.click("kill")                   -- TERM to the first node (it ignores TERM)
+  W.run(2)
+  W.reusePid(4242, "node", 1000)    -- it exits; a newer node takes the pid
+  W.run(1)
+  local r
+  for _, it in ipairs(W.menuItems()) do
+    if type(it.title) == "string" and it.title:find("(pid 4242)", 1, true) and it.menu then r = it end
+  end
+  if r then r.menu[1].fn() end      -- the operator freezes the newer node
+  W.run(20)                         -- the first kill's escalate and verify run
+  check("newer-ledger: the newer node is frozen", W.procs[4242] and W.procs[4242].state, "T")
+  check("newer-ledger: and still listed under Frozen by memwatch", W.menuItem("   node") ~= nil, true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

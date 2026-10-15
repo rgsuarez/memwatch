@@ -689,7 +689,7 @@ local function surfaceUpdate(target)
       if outcome ~= "frozen" then
         goneUntil[target.pid .. "|" .. (target.name or "")] = hs.timer.secondsSinceEpoch() + GONE_SEC
       end
-      if hudOffender and hudOffender.pid == target.pid and not hudHold then
+      if hudOffender and core.sameOffender(hudOffender, target) and not hudHold then
         dismissHud("done", hudOffender)
       end
     end
@@ -2650,22 +2650,8 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))
-  afterHeld(k.escalateSec, guard("kill-escalate", function()
-    -- Re-validate FULL identity (name AND the start time bound above)
-    -- before SIGKILL: between TERM and this escalation the original may
-    -- have exited and the pid been reused by another same-name process;
-    -- name alone would not catch that, start time does. A probe that
-    -- cannot run sends nothing: KILL never goes to an unverified pid.
-    local again, awhy = resolveSignalTarget(pid, liveName, proc.lstart)
-    if again then
-      M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
-      onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
-      sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
-    elseif awhy == "unverified" then
-      M.logSnapshot(string.format("kill-escalate-skip:%s(%d)-unverified", liveName, pid))
-    elseif awhy ~= "exited" then
-      M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
-    end
+  local killSent = false
+  local function verify()
     afterHeld(k.verifySec + k.settleSec, guard("kill-verify", function()
       local still, vwhy = resolveSignalTarget(pid, liveName, proc.lstart)
       local m = readMetrics()
@@ -2675,17 +2661,52 @@ function M.killPid(pid, expectedName, onUpdate, opts)
         onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true, "unconfirmed")
       elseif not still then
         -- Gone, or the pid now holds another process: the original exited.
-        if frozen[pid] then frozen[pid] = nil; saveFrozen() end
+        -- Only its own frozen-ledger entry goes; one for a newer process
+        -- at this pid is not this kill's to touch.
+        local fe = frozen[pid]
+        if fe and (fe.lstart == nil or fe.lstart == proc.lstart) then frozen[pid] = nil; saveFrozen() end
         local footTxt = footBeforeGB and string.format("-footprint=%.1fGB", footBeforeGB) or ""
         M.logSnapshot(string.format("kill-done:%s(%d)-reclaimed=%.1fGB%s", liveName, pid, reclaimedGB, footTxt))
         onUpdate(string.format("%s terminated \u{00B7} reclaimed ~%.1f GB%s", liveName, reclaimedGB,
           footBeforeGB and string.format(" (footprint was ~%.1f GB)", footBeforeGB) or ""), true, "terminated")
-      else
+      elseif killSent then
         M.logSnapshot(string.format("kill-failed:%s(%d)-still-present", liveName, pid))
         onUpdate(string.format("%s is still present (zombie or unkillable); use Activity Monitor", liveName), true, "failed")
+      else
+        -- It survived TERM and memwatch never got to verify it for KILL:
+        -- nothing about it is final, and it can be tried again.
+        M.logSnapshot(string.format("kill-unconfirmed:%s(%d)-no-kill-sent", liveName, pid))
+        onUpdate(string.format("%s ignored TERM, and memwatch could not verify it to send KILL", liveName),
+          true, "unconfirmed")
       end
     end))
-  end))
+  end
+  -- Re-validate FULL identity (name AND the start time bound above) before
+  -- SIGKILL: between TERM and this escalation the original may have exited
+  -- and the pid been reused by another same-name process; name alone would
+  -- not catch that, start time does. A probe that cannot run sends nothing
+  -- (KILL never goes to an unverified pid) and is retried twice, 2 s apart.
+  local function escalate(attempt)
+    afterHeld((attempt == 1) and k.escalateSec or 2, guard("kill-escalate", function()
+      local again, awhy = resolveSignalTarget(pid, liveName, proc.lstart)
+      if again then
+        M.logSnapshot(string.format("kill-kill9:%s(%d)", liveName, pid))
+        onUpdate(string.format("%s ignored TERM, sending KILL", liveName), false)
+        sh(string.format("/bin/kill -KILL %d 2>/dev/null", pid))
+        killSent = true
+      elseif awhy == "unverified" and attempt < 3 then
+        M.logSnapshot(string.format("kill-escalate-retry:%s(%d)-unverified", liveName, pid))
+        escalate(attempt + 1)
+        return
+      elseif awhy == "unverified" then
+        M.logSnapshot(string.format("kill-escalate-skip:%s(%d)-unverified", liveName, pid))
+      elseif awhy ~= "exited" then
+        M.logSnapshot(string.format("kill-escalate-abort:%d-identity-changed", pid))
+      end
+      verify()
+    end))
+  end
+  escalate(1)
 end
 
 -- Silence alerts for one process for the standard window.

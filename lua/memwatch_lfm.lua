@@ -840,6 +840,22 @@ function M.floorActs(state, metrics, now, cfg)
   return nil
 end
 
+-- What a floor decision records, held or acting: the threshold and the hold
+-- cap in force, the headroom read (headroomKnown false, and no headroomPct,
+-- when it cannot be read), the waits so far, and how long the first wait has
+-- held the policy off. That is never negative: a first wait stamped after
+-- now has held nothing yet. Pure.
+function M.floorRecord(state, metrics, now, cfg)
+  cfg = cfg or M.cfg
+  local first = type(state) == "table" and state.firstAt or nil
+  local headroom = M.floorHeadroom(metrics)
+  return { floorAvailPct = cfg.floorAvailPct, maxHoldSec = cfg.maxHoldSec,
+           headroomPct = headroom, headroomKnown = headroom ~= nil,
+           deferrals = type(state) == "table" and state.count or nil,
+           deferredSec = (type(first) == "number" and type(now) == "number")
+             and math.max(0, math.floor(now - first)) or nil }
+end
+
 -- Does the floor act this tick, ahead of the grace window, on a wait the last
 -- decision held past its bound (state.exhausted)? Only while the adjudicator
 -- is enabled: with it off, the base system decides at its own cadence.

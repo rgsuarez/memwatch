@@ -80,12 +80,14 @@ The model is an advisor inside hard rails, never an autonomous authority.
 
   Otherwise the wait holds: a burst still holding more headroom than the
   floor would stall work for nothing if frozen.
-- **A held wait is re-checked every tick.** Past the bound, the floor is
-  checked every tick, so a runaway that eats the headroom is frozen the
-  tick it falls to the floor, not a grace window later. That check ends
-  the wait it was holding: after any decision, the next one waits out the
-  grace again unless the floor holds the wait again, so an action that
-  fails is never retried every tick. Each such act is a decision point
+- **A held wait is re-checked every tick the alert stands critical and
+  open.** Past the bound, the floor is checked on each such tick, so a
+  runaway that eats the headroom is frozen the tick it falls to the floor,
+  not a grace window later. That check ends the wait it was holding: after
+  any decision, the next one waits out the grace again unless the floor
+  holds the wait again, so an action that fails is never retried every
+  tick (a refused one is tried again at the grace cadence, as without the
+  floor). Each such act is a decision point
   the observation ledger records on its own tick. The step and the ledger
   ask one predicate for it (unattended on, the alert's gate open, the wait
   bound to the alert's start time, no final latch, no action in flight),
@@ -94,9 +96,13 @@ The model is an advisor inside hard rails, never an autonomous authority.
   `deferral-floor-held-by-headroom`. An act past the bound carries
   `deferral-floor-fired-by-headroom`, `-by-unknown-headroom` or
   `-by-hold-cap`. Both carry the threshold, the hold cap, the deferred
-  seconds and the headroom read (`headroomPct`). `floorAvailPct` 0 restores
-  the old floor: the policy acts at the bound regardless, with no floor
-  rail.
+  seconds and the headroom read: `headroomPct`, or `headroomKnown: false`
+  and no reading when it could not be read. An act the every-tick check
+  brings forward after the held wait's verdict has expired says so too,
+  with `no-fresh-verdict` beside the floor's rail. `floorAvailPct` 0
+  restores the old floor: the policy acts at the bound regardless, with no
+  floor rail. A `maxHoldSec` of 0 holds nothing past the bound: the policy
+  acts there, as it does for any cap at or under the bound.
 - **Disabled or unavailable means the base system.** If the feature is off,
   the model server is not running, a request times out, or the reply is
   malformed, memwatch behaves exactly as it does without the feature: the

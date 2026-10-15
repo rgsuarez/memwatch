@@ -584,7 +584,8 @@ end
 -- BIND_RETRY_SEC: a probe is a fork, and forks starve under pressure. A
 -- stale inherited value can only refuse (the signal path compares it with
 -- the live process), and that refusal triggers a fresh bind. Synthetic
--- offenders (self-test, simulate) are never bound.
+-- offenders (self-test, simulate) are never bound. Returns "gone" when the
+-- probe proved the process gone: no surface names it.
 local function bindOffender(offender, prev, now, fresh)
   if type(offender) ~= "table" or not offender.pid or offender.synthetic then return end
   if not fresh then
@@ -604,6 +605,7 @@ local function bindOffender(offender, prev, now, fresh)
     -- Verified gone (or the pid holds a differently named process): the
     -- tracker's last samples of it are stale, so it is no candidate.
     markGone(offender, now)
+    return "gone"
   end
 end
 
@@ -851,7 +853,9 @@ local function raiseHud(offender, titleText)
   -- The probe binds it, so a Freeze/Force Quit click seconds later cannot
   -- signal a pid reused meanwhile.
   local now = hs.timer.secondsSinceEpoch()
-  bindOffender(offender, nil, now, true)
+  -- A process this bind proves gone is not named: the alert rises without
+  -- a named offender.
+  if bindOffender(offender, nil, now, true) == "gone" then offender = nil end
   hudOffender = offender
   hudEpisodeOff = offender
   if hudSnooze and offender and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
@@ -1343,6 +1347,9 @@ local function alertSurfaces(state, now)
   if state == "critical" then
     hudBelowCritSince = nil
     local offender = lastOffender
+    -- Answered since the last assessment (a bind proved it gone, an action
+    -- froze it): until the next sample drops it, it is nobody's offender.
+    if offender and isAnswered(offender, now) then offender = nil end
     local visible = alertActive
     if not visible then
       -- core.hudRaiseDue: an answered offender never returns this episode, a
@@ -1350,7 +1357,7 @@ local function alertSurfaces(state, now)
       -- other process preempts the raise cooldown.
       if offender and offender.pid == hudStalePid then
         hudStalePid = nil
-        bindOffender(offender, nil, now, true)
+        if bindOffender(offender, nil, now, true) == "gone" then offender = nil end
       end
       if core.hudRaiseDue({ visible = false, offender = offender, episode = hudEpisodeOff,
                             snooze = hudSnooze,
@@ -1364,29 +1371,36 @@ local function alertSurfaces(state, now)
       -- holds the pid now is a new process, bound fresh, with its own grace.
       if hudStalePid and hudOffender and hudOffender.pid == hudStalePid then
         hudStalePid = nil
-        bindOffender(hudOffender, nil, now, true)
         M.logSnapshot(string.format("hud-rebind:%s(%d)", hudOffender.name, hudOffender.pid))
+        if bindOffender(hudOffender, nil, now, true) == "gone" then hudOffender = nil end
       end
       -- Keep identity bound across refreshes: each assessment builds a new
       -- offender table, and the same process inherits its bound start time.
       -- A different process heading the episode is a new question: bound
       -- fresh, with its own grace and its own answer, even while the canvas
       -- stays up or alerts are muted.
+      -- A process a bind proves gone is never named: no retarget to it, and
+      -- a HUD whose own process is proven gone goes on without a name.
       if offender and offender ~= hudOffender then
         if not core.sameOffender(hudOffender, offender) then
           -- A different process (or the first one named on a generic
           -- alert): bound fresh. Its grace is its own exposure, so it gets
           -- a full window from now unless it already headed this alert.
-          bindOffender(offender, nil, now, true)
-          if hudSnooze and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
-          M.logSnapshot(string.format("hud-retarget:%s(%d)", offender.name, offender.pid))
+          if bindOffender(offender, nil, now, true) ~= "gone" then
+            if hudSnooze and core.sameOffender(hudSnooze.off, offender) then hudSnooze = nil end
+            M.logSnapshot(string.format("hud-retarget:%s(%d)", offender.name, offender.pid))
+            hudOffender = offender
+            hudEpisodeOff = offender
+          end
+        elseif bindOffender(offender, hudOffender, now, false) == "gone" then
+          hudOffender = nil
         else
-          bindOffender(offender, hudOffender, now, false)
+          hudOffender = offender
+          hudEpisodeOff = offender
         end
-        hudOffender = offender
-        hudEpisodeOff = offender
       elseif hudOffender and not hudOffender.lstart then
-        bindOffender(hudOffender, nil, now, false)   -- bounded retry of a failed bind
+        -- bounded retry of a failed bind
+        if bindOffender(hudOffender, nil, now, false) == "gone" then hudOffender = nil end
       end
       if alertsEnabled then
         if hud and hud:isShowing() then

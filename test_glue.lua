@@ -769,6 +769,24 @@ scenario("a killed process does not haunt the HUD", nil, function(W)
   check("ghost: the next process is alerted instead", W.hudShowing() and bodyNames(W, "bigvm"), true)
 end)
 
+-- ---- answers: a raise never names a process its bind proved gone ----
+-- With the ps sampler starved, the last assessment's offender outlives the
+-- process. The raise's bind proves it gone; the alert rises unnamed.
+scenario("a raise never names a process its bind proved gone", nil, function(W)
+  leaker(W, 4242, "ghost")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "ghost (pid") end)
+  W.run(5)
+  W.click("close")                      -- snoozed: back after the raise cooldown
+  W.psStarved = true
+  W.run(6)
+  W.procs[4242] = nil                   -- it exits; no sample will say so
+  local named = runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "ghost (pid") end)
+  check("gone: the HUD never names the exited process", named, false)
+  check("gone: the alert still rises, unnamed", W.hudShowing() and bodyNames(W, "No single offender"), true)
+end)
+
 -- (round 3) A banner posted before its identity bound, upgraded in place,
 -- then a same-name process reuses the pid: the newcomer must get its own
 -- banner once the cooldown allows, not be taken for the one announced.

@@ -3413,8 +3413,11 @@ local function dispatchAdjudication(offender, why)
   lfmReqNonce = lfmReqNonce + 1
   local nonce = lfmReqNonce
   local hash = lfm.snapshotHash(user)
+  -- bound: whether the alert had bound the process when it was asked; an
+  -- unverified verdict is asked again only once that changes (or per
+  -- advisory interval), never every tick.
   local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart,
-                  verified = source == "same" }
+                  verified = source == "same", bound = offender.lstart ~= nil }
   local pid = offender.pid
   local sentAt = hs.timer.secondsSinceEpoch()
   lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
@@ -3580,10 +3583,15 @@ lfmTick = function(state, now, interesting)
     -- different detector kind is not fresh, so a hog-to-extreme promotion
     -- re-adjudicates at critical instead of waiting out the old verdict.
     local cached = verdictCache[lastOffender.pid]
-    local fresh = lfm.verdictUsable(cached, lastOffender, now, lfm.cfg.verdictFreshSec)
-      and cached.ident ~= nil and cached.ident.verified == true
+    local usable = lfm.verdictUsable(cached, lastOffender, now, lfm.cfg.verdictFreshSec)
+    local fresh = usable and cached.ident ~= nil and cached.ident.verified == true
     local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
-    if (lfm.cfg.advisory and due) or (state == "critical" and not fresh and not lfmInFlight) then
+    -- An unverified verdict never acts, and asking again verifies nothing
+    -- until something changed: it is asked again once the alert has bound
+    -- the process since it was asked, or once per advisory interval.
+    local reask = not fresh and (not usable or due
+      or (lastOffender.lstart ~= nil and not (cached.ident and cached.ident.bound)))
+    if (lfm.cfg.advisory and due) or (state == "critical" and reask and not lfmInFlight) then
       lfmLastAdvisoryAt = now
       dispatchAdjudication(lastOffender, state == "critical" and "critical" or "advisory")
     end

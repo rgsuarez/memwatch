@@ -2590,7 +2590,7 @@ do
   check("glue: the counter sees every occurrence (positive control)", count("ab x ab", "ab"), 2)
   check("glue: consumeVerdict uses verdictUsable", count(src, "if not lfm.verdictUsable(e, offender,"), 1)
   check("glue: dispatch freshness uses verdictUsable",
-    count(src, "local fresh = lfm.verdictUsable(cached, lastOffender,"), 1)
+    count(src, "local usable = lfm.verdictUsable(cached, lastOffender,"), 1)
   check("glue: verdictUsable has exactly those two call sites", count(src, "lfm.verdictUsable("), 2)
   check("glue: wait deferral is time-bound",
     count(src, "lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)"), 1)
@@ -2725,6 +2725,52 @@ do
   local utc = child("UTC")
   check("lstartEpoch: the same times parse where no clock changes (control)",
     utc:match("^ctl num fold num gap num") ~= nil, true)
+end
+
+-- ---- (round 6) the ledger's counts and reasons, as of each horizon ----
+do
+  local observe = require("memwatch_observe")
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  local function ev0()
+    return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000, weightMB = 100 })
+  end
+  -- Dropped operator actions are dated against the horizons: a drop after a
+  -- horizon never shows in that horizon's count.
+  local d = ev0()
+  for i = 1, observe.cfg.maxActions do observe.foldAction(d, 1000 + i * 0.01) end
+  observe.foldAction(d, 1061)        -- dropped after +60
+  observe.foldAction(d, 1121)        -- dropped after +120
+  check("dropped: none by +60 (the drops came after it)", observe.asOf(d, 1060).actionsDropped, nil)
+  check("dropped: one by +120", observe.asOf(d, 1120).actionsDropped, 1)
+  check("dropped: two by +180", observe.asOf(d, 1180).actionsDropped, 2)
+  check("dropped: the kept count is exact at +60", observe.asOf(d, 1060).actions, observe.cfg.maxActions)
+  local under = ev0()
+  observe.foldAction(under, 1001)
+  check("dropped: a record under the cap drops none (control)", observe.asOf(under, 1180).actionsDropped, nil)
+  -- A miss that a later sighting resolved is not the reason a later horizon
+  -- has no fresh sighting.
+  local same = { lo = 999, hi = 1001 }
+  local function sight(ev, launchedAt, deliveredAt)
+    observe.foldSample(ev, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = 100, launchedAt = launchedAt, deliveredAt = deliveredAt })
+  end
+  local function miss(ev, launchedAt, deliveredAt)
+    observe.foldSample(ev, { complete = false, row = nil, launchedAt = launchedAt, deliveredAt = deliveredAt })
+  end
+  local r1 = ev0()
+  miss(r1, 1005, 1006)
+  sight(r1, 1020, 1021)
+  check("reason: a miss, a sighting, then a stall reads stale",
+    select(2, observe.fateAt(r1, 1060)), "stale-sample")
+  local r2 = ev0()
+  sight(r2, 1020, 1021)
+  miss(r2, 1029, 1030)
+  check("reason: a miss after the last sighting keeps its reason",
+    select(2, observe.fateAt(r2, 1060)), "incomplete-sample")
+  local r3 = ev0()
+  miss(r3, 1005, 1006)
+  check("reason: a miss with no sighting keeps its reason (control)",
+    select(2, observe.fateAt(r3, 1060)), "incomplete-sample")
 end
 
 if fails == 0 then

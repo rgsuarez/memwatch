@@ -2325,6 +2325,26 @@ scenario("a verdict whose snapshot is not its process's own never acts", REMOTE_
     unattendedRow(W, "deterministic-fallback") ~= nil, true)
 end)
 
+-- (round 6) An unverified verdict is asked again once something can
+-- verify it (the alert binding the process since it was asked), or once
+-- per advisory interval: never every tick. Here the process's start time
+-- names no instant, so no answer about it can ever be tied to it.
+scenario("an unverified verdict is not asked again every tick", REMOTE_LFM, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242, "node")
+  W.procs[4242].lstart = "Mon Feb 30 10:00:00 2026"
+  W.run(12)
+  W.kern = 4
+  local asked = runUntil(W, 120, function() return #(W.httpPosts or {}) >= 1 end)
+  check("unverified-rate: the adjudicator was asked", asked, true)
+  W.run(5)
+  local before = #W.httpPosts
+  W.run(60)
+  local n = #W.httpPosts - before
+  check("unverified-rate: at most twice in a minute, not every tick (" .. n .. ")", n <= 2, true)
+  check("unverified-rate: but still asked again (control)", n >= 1, true)
+end)
+
 -- ---- PR round 5: kept horizons, closed records, the launch-order line ----
 -- A follow-up that runs after its record stopped collecting still reads
 -- the machine at its horizon (the record kept it).

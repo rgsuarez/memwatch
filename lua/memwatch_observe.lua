@@ -327,6 +327,10 @@ function M.foldSample(ev, s)
         ev.samples[#ev.samples + 1] = { at = s.deliveredAt, weightMB = s.weightMB }
       end
     end
+    -- A sighting after a miss is dated too, so a follow-up whose horizon
+    -- comes after it reads the reason from then on (stale, if no newer
+    -- sighting), never the miss the sighting resolved.
+    if ev.lastMiss ~= nil then ev.misses[#ev.misses + 1] = { at = s.deliveredAt, why = nil } end
     ev.lastMiss = nil
   elseif s.complete then
     ev.gone = { how = "exited", at = s.deliveredAt }
@@ -361,11 +365,18 @@ end
 -- Fold one operator action (any surface, any process) taken at `at`: a
 -- follow-up counts those through its own horizon. A record keeps at most
 -- M.cfg.maxActions times; beyond that it only counts how many it dropped,
--- and its follow-ups say their count is a lower bound.
+-- by each of its horizons (their times are not kept), and a follow-up whose
+-- horizon saw a drop says its count is a lower bound.
 function M.foldAction(ev, at)
   if ev.clockStep then return end
   if #ev.actions >= M.cfg.maxActions then
     ev.actionsDropped = (ev.actionsDropped or 0) + 1
+    ev.droppedBy = ev.droppedBy or {}
+    for _, h in ipairs(ev.horizons or {}) do
+      if type(at) == "number" and type(ev.obsAt) == "number" and at <= ev.obsAt + h then
+        ev.droppedBy[h] = (ev.droppedBy[h] or 0) + 1
+      end
+    end
     return
   end
   ev.actions[#ev.actions + 1] = at
@@ -428,7 +439,8 @@ function M.fateAt(ev, t)
     if held then return "frozen", nil end
     return "alive", nil
   end
-  -- The reason as of t: the last miss known by then.
+  -- The reason as of t: the last miss known by then, unless a sighting
+  -- came after it (its marker carries no reason).
   local why
   for _, m in ipairs(ev.misses or {}) do
     if type(m.at) == "number" and m.at <= t then why = m.why end
@@ -466,7 +478,15 @@ function M.asOf(ev, t)
   for _, a in ipairs(ev.actions or {}) do
     if by(a) then out.actions = out.actions + 1 end
   end
-  out.actionsDropped = (ev.actionsDropped or 0) > 0 and ev.actionsDropped or nil
+  -- Drops by t: the count by the last horizon at or before t (exact at
+  -- every horizon instant, which is where follow-ups read).
+  local dropped = 0
+  for _, h in ipairs(ev.horizons or {}) do
+    if type(ev.obsAt) == "number" and ev.obsAt + h <= t + 1e-6 then
+      dropped = math.max(dropped, (ev.droppedBy or {})[h] or 0)
+    end
+  end
+  out.actionsDropped = dropped > 0 and dropped or nil
   return out
 end
 

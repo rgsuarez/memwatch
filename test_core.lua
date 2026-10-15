@@ -1015,18 +1015,33 @@ do
   check("prune: once its verify window passes it is checked like any other", k4[600], nil)
   local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
-  -- A freeze its own verifier could not confirm is settled once a probe
-  -- past its window sees the same process stopped.
+  -- Pure: a freeze its own verifier could not confirm stays as it was once
+  -- its window passes (no longer pending only because the window ended),
+  -- and the reducer returns no third value.
   local unconf = { [700] = { pid = 700, name = "unconfirmed", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
-  local k5, d5, n5 = core.pruneFrozen(unconf, function()
+  local k5, d5, extra = core.pruneFrozen(unconf, function()
     return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
   check("prune: a stopped entry past its window is kept", k5[700] ~= nil and #d5 == 0, true)
-  check("prune: and settled (no longer pending)", k5[700] and k5[700].pendingUntil, nil)
-  check("prune: the settle is counted", n5, 1)
-  local k6, _, n6 = core.pruneFrozen({ [701] = { pid = 701, lstart = "Wed Jul  8 14:00:00 2026" } },
-    function() return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
-  check("prune: an already settled entry counts no settle (control)", n6, 0)
-  check("prune: and is kept", k6[701] ~= nil, true)
+  check("prune: and the entry is not changed (pure)", unconf[700].pendingUntil, 1030)
+  check("prune: no third return", extra, nil)
+  -- An entry whose STOP never went out is no freeze of memwatch's, whatever
+  -- the process's state: dropped without a probe, inside its window or not.
+  for _, case in ipairs({ { at = 1010, label = "inside its window" }, { at = 1040, label = "past its window" } }) do
+    local unsent = { [800] = { pid = 800, name = "unsent", lstart = "Wed Jul  8 14:00:00 2026",
+                               pendingUntil = 1030, stopSent = false } }
+    local asked = false
+    local k7, d7 = core.pruneFrozen(unsent, function()
+      asked = true
+      return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, case.at)
+    check("prune: an unsent STOP's entry is dropped " .. case.label, k7[800], nil)
+    check("prune: as stop-never-sent " .. case.label, d7[1] and d7[1].why, "stop-never-sent")
+    check("prune: with no probe " .. case.label, asked, false)
+  end
+  -- Control: the same stopped process with its STOP sent stays.
+  local sent = { [801] = { pid = 801, name = "sent", lstart = "Wed Jul  8 14:00:00 2026", stopSent = true } }
+  local k8 = core.pruneFrozen(sent, function()
+    return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
+  check("prune: a sent STOP's stopped process is kept (control)", k8[801] ~= nil, true)
 end
 
 -- ---- plateaued-runaway evidence: peak slope (2026-07-13 live-drill finding) ----
@@ -1489,6 +1504,59 @@ do
     "end" }, "\n")
   check("episode banner: scan rejects the pre-fix shape (positive control)",
     resetsOnSettle(preFix), false)
+end
+
+-- ---- start times as ps prints them (lstartEpoch) ----
+-- Dating an old frozen entry rests on this parse, so it is pinned against
+-- hand-written fields, and it must fail closed (nil) on anything that does
+-- not name exactly one instant.
+do
+  local names = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+  local allMonths = true
+  for m, mon in ipairs(names) do
+    -- Noon is never inside a daylight saving change, in any zone.
+    for _, day in ipairs({ 5, 15 }) do
+      local text = string.format("Mon %s %2d 12:00:00 2026", mon, day)
+      local want = os.time({ year = 2026, month = m, day = day, hour = 12, min = 0, sec = 0 })
+      if core.lstartEpoch(text) ~= want then
+        allMonths = false
+        print("  lstartEpoch mismatch: " .. text)
+      end
+    end
+  end
+  check("lstartEpoch: all twelve months, one- and two-digit days, match hand-written fields", allMonths, true)
+  check("lstartEpoch: one second apart reads one second apart",
+    (core.lstartEpoch("Mon Oct  5 10:00:02 2026") or 0) - (core.lstartEpoch("Mon Oct  5 10:00:01 2026") or 0), 1)
+  local bad = {
+    { "nil", nil }, { "a number", 1791212401 }, { "an unknown month", "Mon Foo  5 10:00:01 2026" },
+    { "missing seconds", "Mon Oct  5 10:00 2026" }, { "trailing junk", "Mon Oct  5 10:00:01 2026 x" },
+    { "a date that does not exist", "Mon Feb 30 10:00:00 2026" }, { "hour 25", "Mon Oct  5 25:00:00 2026" },
+    { "empty", "" },
+  }
+  for _, c in ipairs(bad) do
+    check("lstartEpoch: " .. c[1] .. " is nil", core.lstartEpoch(c[2]), nil)
+  end
+  -- The daylight saving fold and gap, in a child with a fixed zone (this
+  -- process cannot change its own). A child that does not answer fails the
+  -- checks: a silent child is never read as a pass.
+  local lua = arg and arg[-1] or "lua"
+  local code = 'package.path = "lua/?.lua;" .. package.path; local c = require("memwatch_core"); '
+    .. 'local function s(v) return v == nil and "nil" or "num" end; '
+    .. 'print("ctl " .. s(c.lstartEpoch("Sun Nov  1 03:00:00 2026")) .. " fold " .. s(c.lstartEpoch("Sun Nov  1 01:30:00 2026")) '
+    .. '.. " gap " .. s(c.lstartEpoch("Sun Mar  8 02:30:00 2026")))'
+  local function child(tz)
+    local h = io.popen(string.format("TZ=%s %s -e '%s' 2>&1", tz, lua, code))
+    local out = h and h:read("a") or ""
+    if h then h:close() end
+    return out
+  end
+  local chicago = child("America/Chicago")
+  check("lstartEpoch: the child answered (positive control)", chicago:match("^ctl num") ~= nil, true)
+  check("lstartEpoch: the hour repeated when daylight saving ends is nil", chicago:match(" fold (%a+)"), "nil")
+  check("lstartEpoch: the hour skipped when it starts is nil", chicago:match(" gap (%a+)"), "nil")
+  local utc = child("UTC")
+  check("lstartEpoch: the same times parse where no clock changes (control)",
+    utc:match("^ctl num fold num gap num") ~= nil, true)
 end
 
 if fails == 0 then

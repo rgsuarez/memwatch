@@ -13,29 +13,41 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    STOP that re-freezes a process whose quit could not be sent is a freeze,
    with a freeze's verifier, and the CONT that undoes a STOP that reached the
    pid's next process goes only to a process the verifier's own probe saw
-   stopped. Nothing is signaled on a probe that could not answer.
+   stopped. That undo goes to whatever process memwatch's STOP reached,
+   protected or not: memwatch never leaves its own STOP on a process it did
+   not mean, and it cannot tell its STOP apart from a stop by anyone else on
+   that same process. Nothing is signaled on a probe that could not answer.
 2. **The ledger says what was sent.** A freeze writes its entry before its
-   STOP and records whether the STOP went out. A reload keeps a pending
-   entry only if its STOP went out, or may have. Every entry carries a start
-   time; one without (written by an older version) is bound at reload by a
-   probe that finds that program stopped, or dropped.
-3. **Each writer owns only its process's entry.** An entry with no start
-   time is owned by no writer.
+   STOP and records whether the STOP went out; one whose STOP could not be
+   sent goes at once, because a process stopped by anyone else is not
+   memwatch's to resume. A reload keeps a pending entry only if its STOP
+   went out, or may have. Every entry carries a start time; one without
+   (written by an older version) is bound at reload by a probe that finds
+   that program stopped, or dropped.
+3. **Each writer owns only its own entry.** A freeze's verifier changes the
+   slot only while it holds that freeze's own entry (or nothing), so a late
+   verifier never undoes a newer action on the same process. Every other
+   writer owns the entry for the start time it acted on. An entry with no
+   start time is owned by no writer.
 4. **An action is in flight until its final outcome, with a backstop.**
    Progress pushes its deadlines out. At the deadline the operator is told
    the result has not come back; one more hold window with no progress
    releases the in-flight hold, so the process can be acted on again. The
-   released action is superseded: it sends no further signal (no KILL
-   escalation over the newer action) and touches nothing the newer action
-   owns (HUD, hold, retry state); its late outcome only replaces its own
-   receipt.
+   released action is superseded: it sends no further escalation (no KILL
+   over the newer action, and no retry of one) and touches nothing the newer
+   action owns (HUD, hold, retry state, ledger entry); its late outcome only
+   replaces its own receipt. A freeze's verifier still undoes a STOP of its
+   own that reached the pid's next process, under rule 1. An operator's
+   action on the process supersedes memwatch's own action in flight on it
+   the same way.
 5. **One live receipt per action.** Once a receipt has said the result has
    not come back, the final outcome, whatever it is, replaces it; the old
-   receipt is withdrawn only when its replacement is up.
+   receipt is withdrawn only when its replacement is up. An outcome after a
+   signal went out is always announced, whatever it is.
 6. **Surfaces retire by state.** A shown HUD whose process has been answered
    (frozen, gone, ignored) goes at the next tick, whichever surface answered
    it. A freeze of that process still inside its pending window is no answer
-   yet; the sweep settles a freeze once it sees the process stopped. Names
+   yet; a freeze stops counting as pending when its window ends. Names
    compare by the prefix rule, so a process whose truncated name is a
    prefix of another's can be read as answered by that one's freeze while
    unbound, a known limit of truncated names.
@@ -210,15 +222,20 @@ still replaces the receipt if it ever arrives.
 
 ## The frozen ledger
 
-Every writer changes only its own process's entry: a freeze verifier, a
-resume, a kill and the reconcile each drop or settle the entry for the
-start time they acted on, never an entry for the pid's next process. An
-entry with no start time is owned by no writer.
+Every writer changes only its own entry. A freeze's verifier holds the
+entry its freeze wrote and changes the slot only while the slot holds that
+very entry (or nothing): an entry another action wrote since, for this
+process or the pid's next one, is never its to touch. A resume, a kill and
+the reconcile each drop the entry for the start time they acted on, never
+an entry for the pid's next process, and a kill a newer action superseded
+drops none. An entry with no start time is owned by no writer.
 
 An entry is written before its STOP and records whether the STOP went out;
-if it could not be sent, the entry goes, and a reload at any later time
-drops an entry whose STOP never went out, whatever state the process is in
-by then. A freeze still being verified when memwatch reloads keeps its
+if it could not be sent, the entry goes at once, and both the sweep and a
+reload drop an entry whose STOP never went out, whatever state the process
+is in by then: a process stopped by anyone else is not memwatch's to
+resume. The verifier still runs and says what it found ("it is stopped,
+but not by memwatch"). A freeze still being verified when memwatch reloads keeps its
 entry (its STOP may land after the reload) until the sweep can decide. If
 the freeze's verifier finds the pid taken over, the STOP reached the
 newcomer its own probe found: it is continued if that probe saw it
@@ -229,15 +246,26 @@ it.
 A frozen process continued for a Force Quit whose TERM cannot be sent is
 frozen again as a new freeze: verified afresh, so a newcomer that took the
 pid is never stopped, and pending until its own verifier settles it, so a
-reload in between keeps it.
+reload in between keeps it. Its outcome is told in the new freeze's own
+words, which say whether its own STOP went out.
+
+A freeze stays pending only inside its window. Its verifier settles it; if
+the verifier never runs (a reload), the entry simply stops counting as
+pending when the window ends, and the sweep then decides it like any other.
+An entry whose size was never measured (a process found holding the pid
+mid-freeze) shows "size unknown" in the menu, never another process's size.
 
 An entry written by an older version without a start time is bound at
-reload to that program if a probe finds it stopped there and it started
-before the entry says it was frozen, or dropped; one whose probe could not
-answer is named in a notice in case it is still stopped. A bound one is
-labeled "bound by name" in the menu and the reload notice: the start time
-that would prove it is the process memwatch froze is what the old entry
-never had.
+reload to that program if a probe finds it stopped there and it started in
+an earlier whole second than the entry says it was frozen (`ps` prints whole
+seconds), or dropped. One that cannot be told is named in a notice in case
+it is still stopped: its probe could not answer, or that program is stopped
+there with a start time that does not name exactly one instant (text that
+does not parse, or a local time repeated or skipped by a daylight saving
+change), or one that started in the very second of the freeze, which may be
+just after it. A bound one is labeled "bound by name" in the menu and in every
+line of the reload notice: the start time that would prove it is the
+process memwatch froze is what the old entry never had.
 
 ## Banners
 

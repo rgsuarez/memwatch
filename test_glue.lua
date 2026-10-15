@@ -1075,6 +1075,66 @@ scenario("ledger: a pid taken over by another process", nil, function(W)
   check("ledger reuse: with the pid reuse named", fu[1] and fu[1].fateDetail, "pid-reused")
 end)
 
+-- ---- round 4: interactions the design pass introduced ----
+-- (round 4 P1) The sweep runs in every state now, in the same tick as an
+-- unattended freeze. A STOP that takes effect a moment later must not
+-- lose its ledger entry before its verifier runs.
+scenario("a freeze being verified survives the sweep", UNATTENDED_FREEZE, function(W)
+  W.stopDelay = 0.2
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end)
+  W.run(3)
+  check("pending: the process is stopped", W.procs[4242].state, "T")
+  check("pending: and the ledger still holds it (Resume is offered)", W.menuItem("   leaker") ~= nil, true)
+  W.kern = 1
+  W.run(130)                        -- calm sweeps re-check it
+  check("pending: still held after the sweeps", W.menuItem("   leaker") ~= nil, true)
+end)
+
+-- (round 4 P1) A same-name process reusing an earlier offender's pid gets
+-- its own grace when the alert comes back to that pid, not the old one's.
+scenario("a reused pid's newcomer gets its own grace", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "node", 2000)
+  local fastA = W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node (pid 4242)") end)
+  W.run(45)                         -- most of node's grace
+  W.addProc(5151, "bigger", 2000)   -- a faster runaway takes the alert
+  W.grow(5151, 900)
+  fastA:stop()
+  runUntil(W, 30, function() return bodyNames(W, "bigger") end)
+  W.procs[5151].state = "T"         -- held still by the operator elsewhere
+  W.reusePid(4242, "node", 3000)    -- node exits; a same-name process takes its pid
+  W.grow(4242, 1500)
+  local back = runUntil(W, 60, function() return bodyNames(W, "node (pid 4242)") end)
+  check("reuse-grace: the alert comes back to the pid", back, true)
+  local backAt = W.now
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  check("reuse-grace: the newcomer is frozen in the end", W.signalsTo(4242), "STOP")
+  check("reuse-grace: only after a grace of its own", W.sigs[#W.sigs].t - backAt >= 55, true)
+end)
+
+-- (round 4 P1) A STOP that went out but could not be verified changed a
+-- process: the muted operator is told, truthfully, and how to check.
+scenario("an unconfirmed unattended freeze is announced", '{"unattended":"freeze","alerts":false}', function(W)
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end)
+  W.run(3)
+  W.onSignal = nil
+  local n = W.notices("memwatch unattended freeze")[1]
+  check("unconfirmed: a receipt is posted though alerts are muted", n ~= nil, true)
+  check("unconfirmed: it says the result is unverified",
+    n ~= nil and (n.attrs.informativeText or ""):find("can't verify", 1, true) ~= nil, true)
+  W.probeFails = false
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

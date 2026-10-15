@@ -940,6 +940,7 @@ do
   check("answer: a policy refusal snoozes",  core.answerFor("refused"), "snooze")
   check("answer: a survivor snoozes",        core.answerFor("failed"), "snooze")
   check("answer: unverified stands",         core.answerFor("unverified"), "stand")
+  check("answer: unconfirmed stands",        core.answerFor("unconfirmed"), "stand")
   check("answer: no outcome stands",         core.answerFor(nil), "stand")
   check("answer: an unknown outcome stands", core.answerFor("bogus"), "stand")
 end
@@ -974,6 +975,13 @@ do
   check("prune: recycled reason",      whys[200], "pid-recycled")
   check("prune: resumed reason",       whys[300], "resumed-externally")
   check("prune: nothing dropped for the unknown one", whys[500], nil)
+  local pend = { [600] = { pid = 600, name = "settling", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
+  local probed = false
+  local k3 = core.pruneFrozen(pend, function() probed = true; return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1010)
+  check("prune: a freeze still being verified is kept", k3[600] ~= nil, true)
+  check("prune: and not even probed", probed, false)
+  local k4 = core.pruneFrozen(pend, function() return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1040)
+  check("prune: once its verify window passes it is checked like any other", k4[600], nil)
   local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
 end
@@ -1264,7 +1272,7 @@ do
   check("hud glue: the grace is per process (control: the single shared clock is gone)",
     ("(now - hudShownAt) < core.cfg"):find("hudShownAt", 1, true) ~= nil
       and src:find("hudShownAt", 1, true) == nil
-      and surfaces:find("exposure[exposureHead]", 1, true) ~= nil, true)
+      and surfaces:find("exposureHead.sec = (exposureHead.sec or 0)", 1, true) ~= nil, true)
   check("hud glue: the refresh never drops the bound table (control included)",
     ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
       and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)
@@ -1690,7 +1698,7 @@ do
   local alertBody = fnBody("local function alertSurfaces(state, now)")
   -- The decision trigger is the observation block just before the
   -- unattended step: only comments and the observation block live there.
-  local _, da = alertBody:find("and procKey(hudOffender) or nil", 1, true)
+  local _, da = alertBody:find("and recordFor(exposure, hudOffender, true) or nil", 1, true)
   local dz = alertBody:find("unattendedStep(offender, now)", 1, true)
   local observePath = {
     { "writeObservation", body },

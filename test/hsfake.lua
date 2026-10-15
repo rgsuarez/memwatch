@@ -149,12 +149,24 @@ function F.new()
     if sig then
       kp = tonumber(kp)
       W.sigs[#W.sigs + 1] = { t = W.now, sig = sig, pid = kp }
+      if W.onSignal then W.onSignal(sig, kp) end
       local p = W.procs[kp]
       if p then
         -- ignoreTerm: a process that survives TERM; unkillable: one that
         -- survives KILL too (a zombie, or stuck in the kernel); unstoppable:
-        -- one a STOP does not stop (it never reaches state T).
-        if sig == "STOP" then if not p.unstoppable then p.state = "T" end
+        -- one a STOP does not stop (it never reaches state T). stopDelay
+        -- models a STOP that takes effect a moment later (a process in a
+        -- syscall stops when it returns to user space).
+        if sig == "STOP" then
+          if not p.unstoppable then
+            if W.stopDelay then
+              addTimer("after", W.stopDelay, nil, function()
+                if W.procs[kp] == p then p.state = "T" end
+              end)
+            else
+              p.state = "T"
+            end
+          end
         elseif sig == "CONT" then p.state = "S"
         elseif sig == "TERM" and p.state ~= "T" and not p.ignoreTerm then W.procs[kp] = nil
         elseif sig == "KILL" and not p.unkillable then W.procs[kp] = nil end

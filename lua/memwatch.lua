@@ -41,6 +41,7 @@ local topCache     = { map = nil, at = 0 }  -- per-pid CMPRS from async top
 local lastPsList   = {}
 local lastRanked   = {}   -- top hogs by RSS+CMPRS weight (menu rows)
 local lastRuns     = {}   -- current runaway list, ignores applied
+local lastRunsAll  = {}   -- every runaway, before the answered filters (for GC)
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
@@ -356,6 +357,7 @@ end
 local function assessProcesses(now)
   local totalMB = (lastMetrics.totalGB or 0) * 1024
   local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
+  lastRunsAll = runs
   -- An answered process is no candidate, by its own state: ignored, held
   -- frozen by memwatch (stopped, so its extreme latch is history, not
   -- growth), or verified gone while its last samples age out.
@@ -515,21 +517,34 @@ end
 ------------------------------------------------------------------------------
 
 local hud            = nil
--- The grace clock and the answered mark are per process (keyed by pid and
--- the name's first 15 characters, which top's truncation preserves), so a
--- handoff, an alternation or a newly named offender never borrows another
--- process's clock. Both start over at every raise.
-local exposure       = {}     -- [key] = seconds it headed the active alert as extreme
-local interacted     = {}     -- [key] = the operator acted on it since the raise
+-- The grace clock and the answered mark are per process, so a handoff, an
+-- alternation or a newly named offender never borrows another process's
+-- clock. Records are filed under pid and the name's first 15 characters
+-- (which top's truncation preserves) and carry the start time they were
+-- made for: a record made for one bound process never serves another (a
+-- same-name process that reused the pid starts over), and one made while
+-- unbound is adopted when its process binds. Both start over at every raise.
+local exposure       = {}     -- [key] = { sec, lstart }: time it headed the active alert as extreme
+local interacted     = {}     -- [key] = { lstart }: the operator acted on it since the raise
 local exposureTickAt = nil    -- the previous critical tick (nil: none yet)
-local exposureHead   = nil    -- the key that headed the alert since that tick
+local exposureHead   = nil    -- the record whose process headed the alert since that tick
 local EXPOSURE_STEP_MAX = 15  -- a stalled tick counts at most this much grace
 local function procKey(off)
   return off and off.pid and (off.pid .. "|" .. (off.name or ""):sub(1, 15)) or nil
 end
-local function markInteracted(off)
+-- The record in `map` for this process, or nil: a record made for a
+-- different bound process does not count (create replaces it).
+local function recordFor(map, off, create)
   local k = procKey(off)
-  if k and not off.synthetic then interacted[k] = true end
+  if not k then return nil end
+  local r = map[k]
+  if r and r.lstart and off.lstart and r.lstart ~= off.lstart then r = nil end
+  if not r and create then r = {}; map[k] = r end
+  if r and r.lstart == nil and off.lstart then r.lstart = off.lstart end
+  return r
+end
+local function markInteracted(off)
+  if off and not off.synthetic then recordFor(interacted, off, true) end
 end
 -- Every operator touch on an alert or a process (HUD click, menu action,
 -- banner button) bumps one monotonic counter. An observation compares it
@@ -1214,15 +1229,17 @@ end
 -- happened. A freeze or terminate that changed a process always notifies,
 -- even with desktop alerts muted (silence there turns a muted alert into a
 -- mystery hang); an action that signaled nothing is logged, not announced.
-local RECEIPT_OUTCOMES = { frozen = true, terminated = true, failed = true }
+local RECEIPT_OUTCOMES = { frozen = true, terminated = true, failed = true, unconfirmed = true }
 local function unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
   if not RECEIPT_OUTCOMES[outcome] then return end
   local why = (adjudicator == "lfm")
     and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
     or "Extreme runaway, no response to the alert."
+  local tail = (outcome == "unconfirmed")
+    and "Check the memwatch menu (Frozen by memwatch) or Activity Monitor." or why
   hs.notify.new({ title = "memwatch unattended " .. action,
                   subTitle = string.format("%s (pid %d)", target.name, target.pid),
-                  informativeText = string.format("%s \u{00B7} %s", text or outcome, why),
+                  informativeText = string.format("%s \u{00B7} %s", text or outcome, tail),
                   withdrawAfter = 0 }):send()
 end
 
@@ -1245,8 +1262,9 @@ local function unattendedStep(offender, now)
   if mode == "off" or not offender or offender.kind ~= "extreme" then return end
   if not alertActive or hudHold then return end
   if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
-  if interacted[procKey(offender)] or isAnswered(offender, now) then return end
-  if (exposure[procKey(offender)] or 0) < core.cfg.cool.autoKillGraceSec then return end
+  if recordFor(interacted, hudOffender, false) or isAnswered(offender, now) then return end
+  local grace = recordFor(exposure, hudOffender, false)
+  if not grace or (grace.sec or 0) < core.cfg.cool.autoKillGraceSec then return end
   -- Act only on the identity the alert bound and surfaced, never on a name:
   -- without a bound start time (the probe failed) skip this tick and stay
   -- armed; the refresh retries the bind. The same start time keys the
@@ -1399,12 +1417,12 @@ local function alertSurfaces(state, now)
     -- interval, and to no one during a narrative. A stalled tick counts at
     -- most EXPOSURE_STEP_MAX.
     if exposureHead and exposureTickAt then
-      exposure[exposureHead] = (exposure[exposureHead] or 0)
+      exposureHead.sec = (exposureHead.sec or 0)
         + math.min(math.max(now - exposureTickAt, 0), EXPOSURE_STEP_MAX)
     end
     exposureTickAt = now
     exposureHead = (alertActive and not hudHold and hudOffender and hudOffender.kind == "extreme")
-      and procKey(hudOffender) or nil
+      and recordFor(exposure, hudOffender, true) or nil
     -- Passive observation at every WOULD-BE decision point, whatever the
     -- unattended mode (including off): the record of exactly what an
     -- adjudicator would have faced, once per offender process per grace
@@ -1412,14 +1430,15 @@ local function alertSurfaces(state, now)
     -- start window, so a pid reused within the window cannot suppress the
     -- new process's row. Fork-free. Error boundary: the observation layer
     -- may never break alerting.
-    local decKey = procKey(offender)
+    local decGrace = hudOffender and recordFor(exposure, hudOffender, false) or nil
     local decEntry = offender and tracker.procs[offender.pid] or nil
     local decStamp = offender and observe.liveStamp(observeDecisionAt[offender.pid], decEntry) or nil
     if observe.decisionDue({
          enabled = observeEnabled, kind = offender and offender.kind,
-         alertActive = alertActive, hudInteracted = decKey ~= nil and interacted[decKey] == true,
+         alertActive = alertActive,
+         hudInteracted = hudOffender ~= nil and recordFor(interacted, hudOffender, false) ~= nil,
          hudHold = hudHold,
-         sinceShownSec = decKey and (exposure[decKey] or 0) or 0,
+         sinceShownSec = decGrace and decGrace.sec or 0,
          sinceLastSec = decStamp and (now - decStamp.at) or nil,
          graceSec = core.cfg.cool.autoKillGraceSec,
        }) then
@@ -1427,7 +1446,7 @@ local function alertSurfaces(state, now)
       observeDecisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,
                                           start = observe.startOf(decEntry) }
       local okObs, errObs = pcall(writeObservation, "decision", offender, now,
-        { graceElapsedSec = exposure[decKey] or 0 })
+        { graceElapsedSec = decGrace and decGrace.sec or 0 })
       if not okObs then logError("observe-decision", errObs) end
     end
     unattendedStep(offender, now)
@@ -1643,6 +1662,7 @@ end
 ------------------------------------------------------------------------------
 
 local FROZEN_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-frozen.json"
+local FREEZE_PENDING_SEC = 30   -- a freeze's entry is its verifier's until then
 
 local function saveFrozen()
   local list = lfm.jsonArray({})
@@ -1722,7 +1742,7 @@ frozenSweep = function(now)
   local rows = probeRows(pids)
   local kept, dropped = core.pruneFrozen(frozen, function(pid)
     return core.probeResult(rows, pid)
-  end)
+  end, now)
   if #dropped == 0 then return end
   for _, d in ipairs(dropped) do
     M.logSnapshot(string.format("frozen-prune:%s(%d):%s",
@@ -1735,8 +1755,9 @@ end
 -- Freeze: same identity probe and policy gate as kill, then SIGSTOP with a
 -- verified stop state and a persisted ledger entry. Memory is NOT released
 -- by a freeze; the win is stopping the growth reversibly. The final
--- onUpdate carries the outcome: frozen, exited, stale, refused, failed or
--- unverified.
+-- onUpdate carries the outcome: frozen, exited, stale, refused, failed,
+-- unverified (nothing was signaled) or unconfirmed (STOP went out; its
+-- result could not be verified).
 function M.freezePid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
   opts = opts or {}
@@ -1775,11 +1796,16 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   -- means a reload finds it and frozenReconcile re-validates (still stopped
   -- -> kept; failed to stop -> dropped). The verify below downgrades a
   -- process that never entered state T.
-  frozen[pid] = {
+  local entry = {
     pid = pid, name = proc.liveName, lstart = proc.lstart,
     weightMB = opts.weightMB or 0,
     frozenAt = hs.timer.secondsSinceEpoch(),
+    -- Until its verifier has run, the liveness sweep leaves the entry alone:
+    -- the STOP may not have taken effect yet (a process in a syscall stops
+    -- when it returns to user space).
+    pendingUntil = hs.timer.secondsSinceEpoch() + FREEZE_PENDING_SEC,
   }
+  frozen[pid] = entry
   saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
   memwatchSignals[pid] = { at = hs.timer.secondsSinceEpoch(), action = "freeze" }
@@ -1794,7 +1820,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     local reprobe, rwhy = resolveSignalTarget(pid, proc.liveName, proc.lstart)
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
-      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unverified")
+      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
     elseif not reprobe then
       sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
       frozen[pid] = nil
@@ -1807,6 +1833,11 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
         onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true, "stale")
       end
     elseif core.isStopped(reprobe) then
+      -- A process memwatch stopped is always in the ledger: settle the entry
+      -- (or restore it, if anything removed it meanwhile).
+      entry.pendingUntil = nil
+      frozen[pid] = entry
+      saveFrozen()
       M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
       onUpdate(string.format(
         "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true, "frozen")
@@ -2809,13 +2840,16 @@ gcUnattendedState = function(now)
   for pid, s in pairs(memwatchSignals) do
     if (now - (s.at or 0)) > MEMWATCH_SIGNAL_KEEP_SEC then memwatchSignals[pid] = nil end
   end
-  -- Absence from lastRuns proves a pid is no longer a runaway only when the
-  -- latest ps sample is fresh and complete: during a sampler stall a live
-  -- runaway can drop off the list, and pruning it then would silently
-  -- restart its deferral clock.
+  -- Absence from the runaway set proves a pid is no longer a runaway only
+  -- when the latest ps sample is fresh and complete: during a sampler stall
+  -- a live runaway can drop off the list, and pruning it then would
+  -- silently restart its deferral clock. Every runaway counts, answered or
+  -- not: a process filtered off the alert candidates (frozen, gone,
+  -- ignored) is not thereby dead, and its records (a final failed-action
+  -- latch above all) must outlive the filter.
   if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end
   local liveRun = {}
-  for _, r in ipairs(lastRuns) do liveRun[r.pid] = true end
+  for _, r in ipairs(lastRunsAll) do liveRun[r.pid] = true end
   for pid in pairs(unattendedWaitStreak) do
     if not liveRun[pid] then unattendedWaitStreak[pid] = nil end
   end
@@ -2832,8 +2866,9 @@ end
 -- target is still alive (re-validated again), then verify death and report
 -- how much memory actually came back. onUpdate(text, done, outcome) drives
 -- whichever surface initiated the kill; the final call (done) carries what
--- happened: terminated, exited, stale, refused, failed or unverified
--- (core.answerFor turns it into the alert's answer).
+-- happened: terminated, exited, stale, refused, failed, unverified (nothing
+-- was signaled) or unconfirmed (TERM went out; its result could not be
+-- verified). core.answerFor turns it into the alert's answer.
 function M.killPid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
   opts = opts or {}
@@ -2917,7 +2952,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
       if vwhy == "unverified" then
         M.logSnapshot(string.format("kill-unverified:%s(%d)", liveName, pid))
-        onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true, "unverified")
+        onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true, "unconfirmed")
       elseif not still then
         -- Gone, or the pid now holds another process: the original exited.
         if frozen[pid] then frozen[pid] = nil; saveFrozen() end

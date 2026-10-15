@@ -1,8 +1,10 @@
 # label	hf_repo	filename	sha256	license_sha256
 # The download registry: get-model.sh and the bake-off fetch exclusively
 # through these rows. resolve URL = https://huggingface.co/<hf_repo>/resolve/main/<filename>
-# sha256 pinned at first verified download (PENDING until then); license
-# hash pins licenses/LFM-Open-License-v1.0.txt.
+# sha256 pinned at first verified download (PENDING until then) or from the
+# repo's published LFS hash; license_sha256 pins the repo's own LICENSE bytes
+# (the tracked licenses/LFM-Open-License-v1.0.txt for the LFM2.5 repos; the
+# d1 repos ship the same license text with different bytes).
 230M-Q4_K_M	LiquidAI/LFM2.5-230M-GGUF	LFM2.5-230M-Q4_K_M.gguf	7bbd90384d3deffe4c646ec9643b212802d32d4ce417c90a1ec9282100650062	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
 230M-Q8_0	LiquidAI/LFM2.5-230M-GGUF	LFM2.5-230M-Q8_0.gguf	855be85429300602eda72958547614703541b7d6dd965a8f8f6052b85a7aa935	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
 350M-Q4_K_M	LiquidAI/LFM2.5-350M-GGUF	LFM2.5-350M-Q4_K_M.gguf	7e6f72643caafc9a68256686638c4d7916f2cec76d1df478d4c3ddcd95a6aed4	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
@@ -11,3 +13,5 @@
 1.2B-Q8_0	LiquidAI/LFM2.5-1.2B-Instruct-GGUF	LFM2.5-1.2B-Instruct-Q8_0.gguf	f6b981dcb86917fa463f78a362320bd5e2dc45445df147287eedb85e5a30d26a	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
 1.2B-Thinking-Q4_K_M	LiquidAI/LFM2.5-1.2B-Thinking-GGUF	LFM2.5-1.2B-Thinking-Q4_K_M.gguf	7223a2202405b02e8e1e6c5baa543c43dc98c1d9741a5c2a0ee1583212e1231b	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
 8B-A1B-Q4_K_M	LiquidAI/LFM2.5-8B-A1B-GGUF	LFM2.5-8B-A1B-Q4_K_M.gguf	4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0	30adf9d6478191fb87f2424f63ba0728598335aaf99cd2848ef17e8e545fe94b
+d1-omni-600M-Q8_0	LiquidAI/d1-omni-600M-GGUF	d1-omni-600M-Q8_0.gguf	cd94463f4cac9c700ec6750df8df005bb6846de410e159d1f5e985e1171693d3	9953509cbd8c1c6ce7b06ddf74fcc204a892692316201dd8f7400a84790d4120
+d1-3B-Q4_K_M	LiquidAI/d1-3B-GGUF	d1-3B-Q4_K_M.gguf	16aff27ea2eefdc32b9897f43854a5d3170c1dc8dccb9c756905af30a4e22402	4d28ca14dedc0b3d0fcc2b3339f0e79931faa33874f3d24f522183a8fc70068c

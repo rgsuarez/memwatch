@@ -29,14 +29,34 @@ URL="https://huggingface.co/$REPO/resolve/main/$FILE"
 mkdir -p "$DEST" "$ROOT/licenses"
 
 # License first: the operator sees what governs the weights before the fetch.
-LIC="$ROOT/licenses/LFM-Open-License-v1.0.txt"
-if [ ! -f "$LIC" ]; then
-  curl -fsSL -o "$LIC" "https://huggingface.co/$REPO/resolve/main/LICENSE"
+# Each row pins its own license hash. The repo's LICENSE is re-fetched and
+# re-verified on every run, so an upstream license change is caught even when
+# a local copy exists; offline, a previously verified local copy stands. Rows
+# whose pin matches the tracked LFM Open License copy verify against it;
+# other repos (same license text, different bytes) keep a fetched copy under
+# licenses/<owner>_<repo>.LICENSE (gitignored).
+CANON="$ROOT/licenses/LFM-Open-License-v1.0.txt"
+CANONSHA=""
+if [ -f "$CANON" ]; then CANONSHA="$(shasum -a 256 "$CANON" | awk '{print $1}')"; fi
+if [ "$LICSHA" = "$CANONSHA" ]; then
+  LIC="$CANON"
+else
+  LIC="$ROOT/licenses/$(printf '%s' "$REPO" | tr '/' '_').LICENSE"
 fi
-GOTLICSHA="$(shasum -a 256 "$LIC" | awk '{print $1}')"
-if [ "$GOTLICSHA" != "$LICSHA" ]; then
-  echo "get-model: license text hash mismatch (expected $LICSHA, got $GOTLICSHA)" >&2
-  echo "get-model: refusing to proceed; the model repo's license changed - re-review it" >&2
+LICTMP="$(mktemp)"
+trap 'rm -f "$LICTMP"' EXIT
+if curl -fsSL -o "$LICTMP" "https://huggingface.co/$REPO/resolve/main/LICENSE"; then
+  GOTLICSHA="$(shasum -a 256 "$LICTMP" | awk '{print $1}')"
+  if [ "$GOTLICSHA" != "$LICSHA" ]; then
+    echo "get-model: $REPO license text hash mismatch (expected $LICSHA, got $GOTLICSHA)" >&2
+    echo "get-model: refusing to proceed; the model repo's license changed - re-review it" >&2
+    exit 1
+  fi
+  if [ "$LIC" != "$CANON" ]; then cp "$LICTMP" "$LIC"; fi
+elif [ -f "$LIC" ] && [ "$(shasum -a 256 "$LIC" | awk '{print $1}')" = "$LICSHA" ]; then
+  echo "get-model: could not re-fetch the $REPO license; using the verified local copy" >&2
+else
+  echo "get-model: cannot fetch or verify the $REPO license; refusing" >&2
   exit 1
 fi
 

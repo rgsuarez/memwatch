@@ -16,3 +16,7 @@ eval/results/
 eval/tmp/
 eval/panel/
 eval/checks/internal-terms.txt
+
+# Per-repo license copies fetched by scripts/get-model.sh (the tracked
+# LFM Open License text stays canonical).
+licenses/*.LICENSE

@@ -1779,6 +1779,10 @@ do
   check("clock frames: the menu's build and every item are frames",
     src:find("    clock.enter()\n    local ok, items = pcall(buildMenu)\n    clock.leave()", 1, true) ~= nil
       and src:find('it.fn = guard("menu-item", it.fn)', 1, true) ~= nil, true)
+  -- The fake cannot empty a slot inside the half-second verify window, so
+  -- the verifier's put-back clamp is pinned by text.
+  check("frozen ledger: a verifier putting its own entry back reads a freeze stamp ahead of now as now",
+    src:find("if type(entry.frozenAt) == \"number\" and entry.frozenAt > t then entry.frozenAt = t end", 1, true) ~= nil, true)
   check("resume: a stale row's Resume still answers for the process it showed",
     src:find("if shown then markInteracted(shown, nil, true) end", 1, true) ~= nil, true)
   check("clock.shift: the wait streak is a count, never indexed as a stamp", body:find("unattendedWaitStreak", 1, true), nil)

@@ -2301,6 +2301,12 @@ do
         local it = W.menuItem("Ignore node")
         if it then it.fn() end
       end, want = "TERM", state = "S" },
+    { how = "the process row's Ignore", act = function(W)
+        local row = W.menuItem("node ")
+        for _, it in ipairs(row and row.menu or {}) do
+          if it.title == "Ignore for 30 min" and it.fn then it.fn() end
+        end
+      end, want = "TERM", state = "S" },
   }) do
     scenario(case.how .. " supersedes memwatch's own kill in flight", UNATTENDED_KILL, function(W)
       W.frontmost = { name = "Terminal", pid = 760 }

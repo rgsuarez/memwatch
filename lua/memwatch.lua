@@ -925,7 +925,7 @@ local function buildHud()
         M.killPid(target.pid, target.name, narrate, { expectedLstart = target.lstart })
       end
     elseif id == "ignore" or id == "ignore-label" then
-      markInteracted(hudOffender)
+      -- The ignore marks the operator's answer itself, as every surface's does.
       if hudOffender and not hudOffender.synthetic then
         M.ignore(hudOffender.pid, hudOffender.name, hudOffender.lstart)
       end
@@ -1109,12 +1109,7 @@ local function buildMenu()
         M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
       end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
-      fn = function()
-        -- An answer, as the HUD's Ignore is: it supersedes memwatch's own
-        -- action in flight on this process.
-        markInteracted({ pid = off.pid, name = off.name, lstart = bound })
-        M.ignore(off.pid, off.name, bound)
-      end }
+      fn = function() M.ignore(off.pid, off.name, bound) end }
     items[#items + 1] = { title = "-" }
   end
   items[#items + 1] = { title = "Open Activity Monitor",
@@ -3249,6 +3244,9 @@ end
 
 -- Silence alerts for one process for the standard window.
 function M.ignore(pid, name, lstart)
+  -- An ignore is the operator's answer, from whichever surface: it supersedes
+  -- memwatch's own action in flight on this process (rule 4).
+  markInteracted({ pid = pid, name = name, lstart = lstart })
   ignoredUntil[pid] = { pid = pid, name = name, lstart = lstart,
                         untilAt = hs.timer.secondsSinceEpoch() + core.cfg.cool.ignoreSec }
   M.logSnapshot(string.format("ignore:%s(%d)", name, pid))

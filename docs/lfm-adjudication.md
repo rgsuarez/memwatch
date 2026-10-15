@@ -71,7 +71,10 @@ The model is an advisor inside hard rails, never an autonomous authority.
   policy acts once available memory is at or below `floorAvailPct` (12% by
   default), and at once when headroom is unknown. Past the bound, headroom
   is checked every tick, so a runaway that eats it is frozen the tick it
-  falls to the floor, not a grace window later. A burst still holding
+  falls to the floor, not a grace window later. That check ends the wait
+  it was holding: after any decision, the next one waits out the grace
+  again unless headroom holds the wait again, so an action that fails is
+  never retried every tick. A burst still holding
   more headroom than that keeps its wait: freezing it would stall work
   without protecting the machine. `floorAvailPct` 0 restores the old floor
   (acting at the bound regardless). The decision record names a wait held

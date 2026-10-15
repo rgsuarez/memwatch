@@ -1774,6 +1774,9 @@ local function unattendedStep(offender, now)
   local floorDue = type(w) == "table" and w.exhausted == true
     and lfm.floorFires(lastMetrics and lastMetrics.availPct, lfm.cfg.floorAvailPct)
   if sinceFired < core.cfg.cool.autoKillGraceSec and not floorDue then return end
+  -- That check ends one held wait. Whatever this decision is, the next one
+  -- waits out the grace again, unless headroom holds the wait again.
+  if type(w) == "table" then w.exhausted = nil end
   unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
   local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now)
   M.logSnapshot(string.format("unattended-%s:%s(%d):%s",

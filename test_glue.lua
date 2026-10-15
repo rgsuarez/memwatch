@@ -2481,10 +2481,6 @@ scenario("a verdict on the offender's own snapshot defers the freeze", REMOTE_LF
   check("verdict: so nothing was stopped yet", W.signalsTo(4242), "")
 end)
 
--- (round 6) A wall clock stepped back while a model's wait defers the
--- freeze: the deferral's first wait moves with the step, so the freeze
--- comes when the deferral ends (120 s of real time from the first wait),
--- not a grace early, and the shift runs cleanly with a deferral in place.
 -- The deferral floor acts only at or below floorAvailPct (12%) once the
 -- bound has run. Above it a model's wait keeps standing; past the bound,
 -- headroom is checked every tick, so the floor acts the tick it falls.
@@ -2515,6 +2511,48 @@ scenario("a wait past its bound holds while headroom stays above the floor", REM
   check("floor-held: and only after the bound", dropAt - firstWait >= 120, true)
 end)
 
+-- The every-tick check ends one held wait. A decision that does not hold
+-- the wait again (here the verdict has aged out and the deterministic
+-- freeze cannot be sent) is retried a grace window later, not every tick.
+scenario("the floor's every-tick check ends with the wait it held", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("floor-once: the model's wait deferred the freeze", waited, true)
+  local held = runUntil(W, 200, function()
+    for _, r in ipairs(decisionRows(W)) do
+      for _, rail in ipairs(r.rails or {}) do
+        if rail == "deferral-floor-held-by-headroom" then return true end
+      end
+    end
+    return false
+  end)
+  check("floor-once: past the bound, headroom holds the wait", held, true)
+  W.httpReply = function() return 503, "" end   -- the model stops answering
+  W.sendFails = { STOP = true }                 -- and no freeze can be sent
+  local function attempts()
+    local n = 0
+    for _, r in ipairs(decisionRows(W)) do
+      if r.adjudicator == "deterministic-fallback" then n = n + 1 end
+    end
+    return n
+  end
+  local tried = runUntil(W, 200, function() return attempts() >= 1 end)
+  check("floor-once: once the verdict ages out, the deterministic freeze is tried", tried, true)
+  local before, at = attempts(), W.now
+  W.availPct = 10                                -- headroom falls under the floor
+  W.run(40)                                      -- inside one grace window of that try
+  check("floor-once: and is not tried again every tick (" .. (attempts() - before) .. " more in "
+    .. math.floor(W.now - at) .. " s)", attempts() - before, 0)
+end)
+
+-- (round 6) A wall clock stepped back while a model's wait defers the
+-- freeze: the deferral's first wait moves with the step, so the freeze
+-- comes when the deferral ends (120 s of real time from the first wait),
+-- not a grace early, and the shift runs cleanly with a deferral in place.
 scenario("a step back while a wait defers the freeze keeps the deferral whole", REMOTE_LFM_FREEZE, function(W, mw)
   W.httpReply = cannedVerdict("wait")
   leaker(W, 4242)

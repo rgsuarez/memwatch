@@ -790,12 +790,6 @@ function M.deferralExhausted(firstWaitAt, now, maxDeferSec)
   return (now - firstWaitAt) >= (maxDeferSec or M.cfg.maxDeferSec)
 end
 
--- One model wait at grace expiry, folded into the per-offender deferral
--- state { firstAt, count }; a nil (or malformed) state starts at now. The
--- caller passes the decision tick's own clock to every step: a first stamp
--- read later than the checks that follow it (behind a slow probe fork)
--- would keep the wait that should exhaust the bound from exhausting it.
--- Returns newState, exhausted.
 -- Does the deferral floor act now? Once the bound has run, it acts at or
 -- below floorAvailPct of available memory, and when the headroom is not
 -- known (it fails closed). A floor of 0 or less acts at once, as before.
@@ -807,6 +801,12 @@ function M.floorFires(availPct, floorAvailPct)
   return availPct <= floor
 end
 
+-- One model wait at grace expiry, folded into the per-offender deferral
+-- state { firstAt, count }; a nil (or malformed) state starts at now. The
+-- caller passes the decision tick's own clock to every step: a first stamp
+-- read later than the checks that follow it (behind a slow probe fork)
+-- would keep the wait that should exhaust the bound from exhausting it.
+-- Returns newState, exhausted.
 function M.deferralStep(state, now, maxDeferSec)
   local s
   if type(state) == "table" and type(state.firstAt) == "number" then

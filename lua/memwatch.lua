@@ -1419,9 +1419,13 @@ local function launchSampler(onDone)
   -- live as intermittent sampler death that tracked the process count).
   -- The streaming callback exists purely to drain; assembly happens at exit.
   local acc = {}
-  sampler.task = hs.task.new("/bin/sh",
+  local task
+  task = hs.task.new("/bin/sh",
     guard("sampler", function(exitCode)
-      sampler.task = nil
+      -- Only this task's own handle: when the watchdog has terminated this
+      -- task and launched another, clearing the newer handle would let the
+      -- next tick launch a third ps beside it.
+      if sampler.task == task then sampler.task = nil end
       -- Keep partial output even on a nonzero exit: under memory pressure ps
       -- can fail mid-table, and a partial process list beats a blank one.
       -- The parsers treat garbage as calm, never as alarm. The exit code
@@ -1437,7 +1441,8 @@ local function launchSampler(onDone)
       return true
     end,
     { "-c", SAMPLER_CMD })
-  if sampler.task then sampler.task:start() end
+  sampler.task = task
+  if task then task:start() end
 end
 
 -- Enrichment half: runs when the sampler fork returns. Refreshes the kernel
@@ -1455,7 +1460,6 @@ local function onSample(blob, exitCode, launchedAt, seq)
   sampler.seq = seq or sampler.seq
   sampler.at = now
   sampler.launchedAt = launchedAt   -- nil: launch unknown, start windows unbounded
-  sampler.complete = (exitCode == 0)
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -1465,6 +1469,14 @@ local function onSample(blob, exitCode, launchedAt, seq)
   -- Per-process pipeline: fresh identities and RSS from ps, then the shared
   -- assessment. Attribution continuity under load is the top stream's job.
   lastPsList = procs.parsePsList(blob)
+  -- A table is whole (its absences prove exits) only when ps exited 0 AND
+  -- it lists memwatch's own process, the positive control: a table cut
+  -- short that still exited 0 is missing that row as surely as others.
+  local selfListed = false
+  for _, p in ipairs(lastPsList) do
+    if p.pid == hs.processInfo.processID then selfListed = true; break end
+  end
+  sampler.complete = (exitCode == 0) and selfListed
   procs.update(tracker, lastPsList, now, topCache.map, launchedAt)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.

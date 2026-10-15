@@ -89,6 +89,10 @@ function F.new()
     W.procs[pid] = p
     return p
   end
+  -- Hammerspoon's own row in the sampler's table (not a fake process the
+  -- scenarios drive: it never grows, and memwatch never signals it).
+  W.selfProc = { pid = SELF_PID, uid = 501, comm = "/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon",
+                 rssKB = 300 * 1024, state = "S", bornAt = W.now - 86400, bornWall = W.now - 86400 }
   -- A same-name process taking over a pid that just exited.
   function W.reusePid(pid, name, rssMB)
     W.procs[pid] = nil
@@ -114,9 +118,12 @@ function F.new()
       W.etimeColumn and "  PID   UID    RSS ELAPSED COMM" or "  PID   UID    RSS COMM" }
     local pids = {}
     for pid in pairs(W.procs) do pids[#pids + 1] = pid end
+    -- Hammerspoon itself is in every real table (memwatch's positive
+    -- control for a whole table).
+    if not W.procs[SELF_PID] then pids[#pids + 1] = SELF_PID end
     table.sort(pids)
     for _, pid in ipairs(pids) do
-      local p = W.procs[pid]
+      local p = W.procs[pid] or (pid == SELF_PID and W.selfProc)
       -- samplerOmit: rows a cut-off (partial) table is missing.
       if W.samplerOmit and W.samplerOmit[pid] then goto continue end
       if W.etimeColumn then
@@ -305,8 +312,16 @@ function F.new()
         if path == "/bin/sh" and not W.psStarved then
           -- ps reads the table when it runs, at launch; a starved callback
           -- delivers that reading late (samplerDelay), as a real storm does.
+          -- samplersLive / samplersMax count the sampler forks memwatch has
+          -- neither seen finish nor terminated: overlap means two ps at once.
           local blob = samplerBlob()
-          addTimer("after", W.samplerDelay or 0.05, nil, function()
+          t.sampler = true
+          W.samplersLive = (W.samplersLive or 0) + 1
+          W.samplersMax = math.max(W.samplersMax or 0, W.samplersLive)
+          t.delivery = addTimer("after", W.samplerDelay or 0.05, nil, function()
+            if t.done then return end
+            t.done = true
+            W.samplersLive = W.samplersLive - 1
             if streamCb then streamCb(t, blob) end
             exitCb(W.samplerExit or 0, "", "")   -- nonzero: ps failed or was cut off mid-table
           end)
@@ -331,7 +346,20 @@ function F.new()
         end
         return t
       end
-      function t:terminate() if t.timer then t.timer:stop() end end
+      function t:terminate()
+        if t.timer then t.timer:stop() end
+        -- A terminated sampler stops counting as running. With
+        -- terminateCallsBack it also reports at once, as SIGTERM ends it:
+        -- exit 15, its table lost.
+        if t.sampler and not t.done then
+          t.done = true
+          W.samplersLive = W.samplersLive - 1
+          if W.terminateCallsBack then
+            if t.delivery then t.delivery:stop() end
+            addTimer("after", 0.05, nil, function() exitCb(15, "", "") end)
+          end
+        end
+      end
       function t:isRunning() return false end
       function t:pid() return 9999 end
       return t

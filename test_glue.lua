@@ -2166,6 +2166,39 @@ scenario("ledger: an unreadable generation is moved on, not overwritten", nil, f
   observe.cfg.maxBytes = 4e6
 end)
 
+-- The watchdog terminates a sampler that has not reported and launches
+-- another; the terminated one's exit callback must not clear the newer
+-- handle, or the next tick launches a third ps beside the second.
+scenario("a terminated sampler's callback keeps the newer sampler's handle", nil, function(W, mw)
+  W.run(12)
+  W.terminateCallsBack = true
+  W.samplerDelay = 30               -- every ps outlives the 20 s watchdog
+  W.samplersMax = W.samplersLive or 0
+  W.run(120)
+  check("sampler handle: the watchdog replaced stalled samplers", W.samplersMax >= 1, true)
+  check("sampler handle: never two ps running at once", W.samplersMax, 1)
+  W.samplerDelay = 0.05
+  W.terminateCallsBack = false
+  W.run(30)
+  check("sampler handle: samples land again once ps answers (control)", mw.debug().sampleAgeSec <= 6, true)
+end)
+
+-- A ps table that exited 0 but is missing memwatch's own row was cut
+-- short: its absences prove nothing. With the row there, they do.
+scenario("ledger: a table without memwatch's own row proves no exit", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("self row: decision row", false, true); return end
+  W.samplerOmit = { [4242] = true, [777] = true }   -- cut short, yet exit 0
+  W.run(65)
+  local fu = followups(W, row.seq)
+  check("self row: the cut table is not read as an exit", fu[1] and fu[1].fate, "unknown")
+  check("self row: and says the table was incomplete", fu[1] and fu[1].fateDetail, "incomplete-sample")
+  W.samplerOmit = { [4242] = true }                 -- whole: memwatch's own row is there
+  W.run(125)
+  fu = followups(W, row.seq)
+  check("self row: a whole table's absence is an exit (control)", fu[3] and fu[3].fate, "exited")
+end)
+
 -- ---- round 4: interactions the design pass introduced ----
 -- (round 4 P1) The sweep runs in every state now, in the same tick as an
 -- unattended freeze. A STOP that takes effect a moment later must not

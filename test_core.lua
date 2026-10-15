@@ -268,6 +268,14 @@ do
   local trNoAge = procs.newTracker()
   procs.update(trNoAge, { { pid = 9, uid = 502, rssMB = 100, comm = "x" } }, 1000, nil)
   check("no etime means no age", trNoAge.procs[9].startedAt, nil)
+  -- A delivery inside a callback still holding a step back reads memwatch's
+  -- clock 30 s ahead of the raw wall clock ps's etime runs on: the window is
+  -- placed with the raw reading (wallAt), so it stays on the kernel's start.
+  local trStep = procs.newTracker()
+  procs.update(trStep, { { pid = 11, uid = 502, rssMB = 100, etimeSec = 100, comm = "x" } }, 2000, nil, 1968, 1970)
+  check("a window is placed with the raw wall reading, not the callback's basis",
+    trStep.procs[11].startLo == 1867 and trStep.procs[11].startHi == 1870, true)
+  check("and the sighting keeps memwatch's basis", trStep.procs[11].lastSeen, 2000)
 end
 
 local topBlob = [[
@@ -2373,8 +2381,9 @@ do
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
     sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
-  check("observe glue: and its start window, bounded by launch and delivery (none from a clamped etime)",
-    sampleBody:find("start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, now) or nil", 1, true) ~= nil
+  check("observe glue: and its start window, bounded by launch and the raw delivery reading (none from a clamped etime)",
+    sampleBody:find("start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, wallNow) or nil", 1, true) ~= nil
+      and sampleBody:find("local wallNow = clock.wallAt", 1, true) ~= nil
       and sampleBody:find("local placeable = row and type(row.etimeSec) == \"number\" and row.etimeSec > 0", 1, true) ~= nil, true)
   check("observe glue: an older sampler's late table never replaces a newer one",
     sampleBody:find("if seq and seq < sampler.seq then return end", 1, true) ~= nil
@@ -2529,8 +2538,10 @@ do
     src:find("onDone(table.concat(acc), exitCode, launchedAt, seq)", 1, true) ~= nil, true)
   check("sampler glue: completeness comes from the exit code",
     src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
-  check("sampler glue: the tracker gets the launch time",
-    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt)", 1, true) ~= nil, true)
+  check("sampler glue: the tracker gets the launch time, and the raw delivery reading for its windows",
+    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)", 1, true) ~= nil, true)
+  check("sampler glue: the launch time for windows is the raw reading, not the callback's basis",
+    src:find("local launchedAt = clock.wallAt", 1, true) ~= nil, true)
 end
 
 -- ---- operator actions: every UI path that touches a process counts ----
@@ -2880,10 +2891,14 @@ do
     if sa and sz then text = text:sub(1, sa - 1) .. text:sub(sz) end
     local miss, ctor, depth = {}, nil, 0
     -- A local bound to os.date holds that ISO string: a field set from it
-    -- is the same written-out value.
+    -- is the same written-out value. The credit follows the name's latest
+    -- binding as the scan reads down the file, so the same name bound to a
+    -- wall reading elsewhere is not excused.
     local isoLocals = {}
-    for name in text:gmatch("local%s+([%a_][%w_]*)%s*=%s*os%.date%(") do isoLocals[name] = true end
     for line in text:gmatch("[^\n]+") do
+      local bindName, bindValue = line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*(.*)$")
+      if not bindName then bindName, bindValue = line:match("^%s*([%a_][%w_]*)%s*=%s*([^=].*)$") end
+      if bindName then isoLocals[bindName] = bindValue:find("^os%.date%(") ~= nil or nil end
       -- The table a constructor builds: the name right before "= {", or
       -- before its index ("finals[pid] = {"). A field line counts toward it
       -- only while that constructor is still open.
@@ -2926,6 +2941,9 @@ do
     #lowerStamps("  local iso = os.date(\"!%Y\")\n  write({\n    at = iso, seq = 1,\n  })\n"), 0)
   check("clock.shift: a local holding a wall reading is still a stamp (positive control)",
     #lowerStamps("  local iso = clock.now()\n  write({\n    at = iso, seq = 1,\n  })\n"), 1)
+  check("clock.shift: the os.date credit follows the name's latest binding (positive control)",
+    #lowerStamps("  local iso = os.date(\"!%Y\")\n  write({\n    at = iso,\n  })\n"
+      .. "  local iso = clock.now()\n  write({\n    at = iso, seq = 1,\n  })\n"), 1)
   check("clock.shift: a constructor is named by the table it builds, not the statement around it",
     table.concat(lowerStamps("  if ok then fresh[pid] = { at = now } end\n"), ","), "fresh")
   -- A name is matched whole: one that appears in the shift only inside a
@@ -3027,10 +3045,16 @@ do
       and src:find("      end)\n      clock.leave()\n      if not ok then logError(\"topstream\", err) end", 1, true) ~= nil, true)
   local _, rawTicks = src:gsub("\n%s+tick%(%)", "")
   check("clock frames: no tick runs outside one", rawTicks, 0)
-  local _, everies = src:gsub("hs%.timer%.doEvery%(", "")
-  local _, framedEveries = src:gsub("hs%.timer%.doEvery%([^\n]-guard%(", "")
+  local function everyCounts(text)
+    local _, all = text:gsub("hs%.timer%.doEvery%(", "")
+    local _, framed = text:gsub("hs%.timer%.doEvery%([^\n]-guard%(", "")
+    return all, framed
+  end
+  local everies, framedEveries = everyCounts(src)
   check("clock frames: every repeating timer's callback is guarded (" .. framedEveries .. "/" .. everies .. ")",
     everies > 0 and framedEveries == everies, true)
+  local ctlAll, ctlFramed = everyCounts("  t = hs.timer.doEvery(5, function() tick() end)\n")
+  check("clock frames: an unguarded repeating timer is caught (control)", ctlAll == 1 and ctlFramed == 0, true)
   check("clock frames: the held one-shot and the held poller each run one frame",
     src:find("    clock.enter()\n    local ok, err = pcall(fn)\n    clock.leave()", 1, true) ~= nil
       and src:find("    clock.enter()\n    local ok, finished = pcall(poll)\n    clock.leave()", 1, true) ~= nil, true)

@@ -210,7 +210,9 @@ end
 -- bounds it: ps read the table somewhere between launch and delivery, so
 -- the callback time alone would under-report the age by the whole delivery
 -- latency (measured at 60-95 s in storms). Without launchedAt it is
--- now - etime. Start time is deliberately NOT used to detect reuse
+-- now - etime. wallAt, when given, is the raw wall reading at delivery for
+-- the windows (etime's own clock); now (memwatch's basis) dates the
+-- sightings. Start time is deliberately NOT used to detect reuse
 -- here: a young runaway falsely read as a new process would lose its growth
 -- history mid-incident. Signal paths re-validate identity with lstart, and
 -- the observation ledger compares windows, never point estimates.
@@ -220,7 +222,7 @@ end
 -- machine under load compresses a fast allocator's pages in near-real-time,
 -- deflating its RSS while it grows; weight keeps climbing and stays visible.
 -- topMap may be nil or stale; the last known cmprs carries forward.
-function M.update(tr, psList, now, topMap, launchedAt)
+function M.update(tr, psList, now, topMap, launchedAt, wallAt)
   local cfg = tr.cfg
   local n = 0
   for _ in pairs(tr.procs) do n = n + 1 end
@@ -245,9 +247,10 @@ function M.update(tr, psList, now, topMap, launchedAt)
       local w = p.rssMB + (e.cmprsMB or 0)
       e.uid, e.lastSeen, e.rssMB, e.weightMB = p.uid, now, p.rssMB, w
       if p.etimeSec then
-        local sw = M.startWindow(p.etimeSec, launchedAt, now)
+        local at = wallAt or now
+        local sw = M.startWindow(p.etimeSec, launchedAt, at)
         e.startLo, e.startHi, e.etimeSec = sw.lo, sw.hi, sw.etimeSec
-        e.startedAt = (sw.lo > -math.huge) and (sw.lo + sw.hi) / 2 or (now - p.etimeSec)
+        e.startedAt = (sw.lo > -math.huge) and (sw.lo + sw.hi) / 2 or (at - p.etimeSec)
       end
       local ring = e.ring
       ring[#ring + 1] = { t = now, v = w }

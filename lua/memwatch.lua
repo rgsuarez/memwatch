@@ -1020,25 +1020,28 @@ end
 local function surfaceUpdate(target, click)
   local gen = runGen
   return function(text, done, outcome)
-    hs.alert.show("memwatch: " .. text, 2.5)
     if not done then
       if gen == runGen then extendInteraction(target) end
-      return
+    else
+      local answer = core.answerFor(outcome)
+      if answer == "done" and outcome ~= "frozen" then markGone(target, clock.now()) end
+      -- The click settles whatever run it ends in: its veto may stand against
+      -- an action of the run before a restart.
+      settleInteraction(target, outcome, click)
+      if gen == runGen then
+        if answer == "rebind" then
+          identityRefused(target)
+        elseif (answer == "done" or answer == "snooze")
+           and core.sameIdentity(hudOffender, target) and not hudHold then
+          -- Only a HUD bound to this very process: an outcome never answers a
+          -- HUD that might name another process (unbound, or rebound).
+          dismissHud(answer, hudOffender)
+        end
+      end
     end
-    local answer = core.answerFor(outcome)
-    if answer == "done" and outcome ~= "frozen" then markGone(target, clock.now()) end
-    -- The click settles whatever run it ends in: its veto may stand against
-    -- an action of the run before a restart.
-    settleInteraction(target, outcome, click)
-    if gen ~= runGen then return end
-    if answer == "rebind" then
-      identityRefused(target)
-    elseif (answer == "done" or answer == "snooze")
-       and core.sameIdentity(hudOffender, target) and not hudHold then
-      -- Only a HUD bound to this very process: an outcome never answers a
-      -- HUD that might name another process (unbound, or rebound).
-      dismissHud(answer, hudOffender)
-    end
+    -- Shown last: what the outcome settles never waits on, or is lost to,
+    -- the on-screen alert.
+    hs.alert.show("memwatch: " .. text, 2.5)
   end
 end
 
@@ -1505,19 +1508,21 @@ local function launchSampler(onDone)
   end
   sampler.startedAt = now
   -- This task's own launch, read two ways for its callback. For start
-  -- windows, the wall reading as taken (ps reads its table, and etime, on
-  -- one side of a step or the other, so start windows span both; see
-  -- procs.startWindow). For the unattended-state GC, a record the clock
-  -- shift moves with the tracker's sightings, so the two never sit on two
-  -- bases whichever way the clock steps.
-  local launchedAt = now
+  -- windows, the raw wall reading clock.now just took (ps reads its table,
+  -- and etime, on that clock, on one side of a step or the other, so start
+  -- windows span both; see procs.startWindow), never this callback's basis,
+  -- which a step held to the frame's end leaves on the old one. For the
+  -- unattended-state GC, a record the clock shift moves with the tracker's
+  -- sightings, so the two never sit on two bases whichever way the clock
+  -- steps.
+  local launchedAt = clock.wallAt
   sampler.nextSeq = sampler.nextSeq + 1
   local seq = sampler.nextSeq   -- and its place in launch order
   -- Records of launches delivered or overtaken go, and so does any older
   -- than the last 16 launches (a table that never came back), so the set
   -- stays bounded whatever happens to the tables.
   for old in pairs(sampler.launches) do
-    if old <= sampler.seq or old < seq - 16 then sampler.launches[old] = nil end
+    if old <= sampler.seq or old <= seq - 16 then sampler.launches[old] = nil end
   end
   sampler.launches[seq] = { at = now }
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
@@ -1549,8 +1554,13 @@ local function launchSampler(onDone)
     end,
     { "-c", SAMPLER_CMD })
   sampler.task = task
-  -- A launch that never started gets no callback: its record goes now.
-  if not (task and task:start()) then sampler.launches[seq] = nil end
+  -- A launch that never started gets no callback: its record goes now, and
+  -- so does its handle, so the next tick launches again rather than waiting
+  -- out the watchdog for a task that was never running.
+  if not (task and task:start()) then
+    sampler.launches[seq] = nil
+    if sampler.task == task then sampler.task = nil end
+  end
 end
 
 -- Enrichment half: runs when the sampler fork returns. Refreshes the kernel
@@ -1560,6 +1570,8 @@ end
 -- storm), and the verdict must never be hostage to it.
 local function onSample(blob, exitCode, launchedAt, seq)
   local now = clock.now()
+  -- The same instant on the raw wall clock, for start windows (see below).
+  local wallNow = clock.wallAt
   local launch = seq and sampler.launches[seq] or nil
   if seq then sampler.launches[seq] = nil end
   -- A callback from a sampler launched before the one already applied holds
@@ -1591,7 +1603,11 @@ local function onSample(blob, exitCode, launchedAt, seq)
     if p.pid == hs.processInfo.processID then selfListed = true; break end
   end
   sampler.complete = (exitCode == 0) and selfListed
-  procs.update(tracker, lastPsList, now, topCache.map, launchedAt)
+  -- Start windows are anchored to the kernel's start record, and ps's etime
+  -- runs on the raw wall clock: a window is placed with raw readings at
+  -- launch and delivery (launchedAt, wallNow), never this callback's basis,
+  -- which a step held back to the frame's end leaves on the old one.
+  procs.update(tracker, lastPsList, now, topCache.map, launchedAt, wallNow)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.
   for i = #lastRanked, 1, -1 do
@@ -1615,7 +1631,7 @@ local function onSample(blob, exitCode, launchedAt, seq)
       local placeable = row and type(row.etimeSec) == "number" and row.etimeSec > 0
       observe.foldSample(ev, {
         complete = sampler.complete, row = row,
-        start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, now) or nil,
+        start1 = placeable and procs.startWindow(row.etimeSec, launchedAt, wallNow) or nil,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
         seq = seq, launchedAt = launchedAt, deliveredAt = now })
     end
@@ -2087,7 +2103,8 @@ function clock.shift(delta)
       -- Report files written before the step keep their pre-step times, up
       -- to the step's size ahead of the new basis: an observation written
       -- before the new clock catches up with them cannot place them.
-      obs.jetsamBlindUntil = math.max(sh(obs.jetsamBlindUntil) or 0, (clock.wallAt or 0) - delta)
+      -- It is a ceiling in raw file time, so a later step never moves it.
+      obs.jetsamBlindUntil = math.max(obs.jetsamBlindUntil or 0, (clock.wallAt or 0) - delta)
       obs.lastAt = sh(obs.lastAt)
       for _, st in pairs(obs.decisionAt) do st.at = sh(st.at) end
       for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end
@@ -2143,6 +2160,13 @@ function clock.now()
   if delta < -clock.stepSec then
     if clock.depth > 0 then
       clock.pending = clock.pending + delta
+      -- The stamps wait for the frame's end, but what must take no evidence
+      -- across a step is told now (clock.onHeld): nothing the rest of this
+      -- callback reads can be dated against what came before it.
+      if clock.onHeld then
+        local ok, err = pcall(clock.onHeld, delta)
+        if not ok then logError("clock-on-held", err) end
+      end
     else
       clock.apply(delta)
     end
@@ -2412,6 +2436,14 @@ end
 -- never reads pre-step stamps (rule 8).
 function clock.afterShift()
   if next(frozen) then saveFrozen() end
+end
+-- A step seen inside a callback closes every collecting observation at
+-- once, as one seen outside a callback does: the rest of the callback (a
+-- ps table whose etime is on the new basis, a follow-up that has just read
+-- the clock) cannot be dated against the observation. The shift's own
+-- observation step closes them again, harmlessly, when the frame ends.
+function clock.onHeld()
+  for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
 end
 
 -- A ledger writer changes only its own process's entry: the slot holds
@@ -2793,6 +2825,17 @@ function M.resumePid(pid, onUpdate, shown)
   if not e then
     if shown then markInteracted(shown, nil, true) end
     onUpdate(string.format("pid %d is not in the frozen ledger", pid), true)
+    return
+  end
+  -- A row built for another process than the one the slot holds now (the
+  -- pid was frozen again, for a newcomer, since the menu opened) is stale:
+  -- the operator answered for the process it showed, and the one frozen now
+  -- stays frozen.
+  if shown and not core.sameIdentity(shown, e) then
+    markInteracted(shown, nil, true)
+    M.logSnapshot(string.format("resume-skip:%s(%d):stale-row", shown.name or "?", pid))
+    onUpdate(string.format("that row was for %s, no longer frozen; pid %d now holds %s, which stays frozen",
+      shown.name or "?", pid, e.name or "?"), true)
     return
   end
   -- A resume is the operator's answer, from whichever surface: it vetoes
@@ -4248,6 +4291,8 @@ function M.debug()
     streamAlive    = topTask ~= nil,
     topCacheAgeSec = topCache.at > 0 and math.floor(now - topCache.at) or -1,
     sampleAgeSec   = sampler.at > 0 and math.floor(now - sampler.at) or -1,
+    samplerLaunchRecords = (function() local n = 0; for _ in pairs(sampler.launches) do n = n + 1 end; return n end)(),
+    samplerRunning = sampler.task ~= nil,
     tracked        = tracked,
     runs           = #lastRuns,
     ranked         = #lastRanked,

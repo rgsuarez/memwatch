@@ -2101,6 +2101,170 @@ scenario("ledger: a stale frozen row's Resume is still a touch", nil, function(W
     fu[3] and fu[3].operatorTouchesSince, 2)
 end)
 
+-- (round 9) A step back first seen by a late ps table (a fork that ran
+-- after the step). Its callback holds the step to its end. The observation
+-- stops collecting when the step is seen, and the table's start windows are
+-- placed on the raw wall clock its etime runs on, so a process still
+-- running is never read as gone.
+local function stepAtNextTable(W, sec)
+  W.samplerReadsLate = true
+  W.onSamplerDeliver = function()
+    W.wallOffset = (W.wallOffset or 0) - sec   -- shorter than the process's age
+    W.onSamplerDeliver = nil
+    W.samplerReadsLate = false
+  end
+end
+scenario("ledger: a step first seen by a late ps table never reads a running process as gone", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late-step: decision row", false, true); return end
+  W.run(8)                            -- before the next tick launches its table
+  stepAtNextTable(W, 30)
+  W.run(10)
+  check("late-step: the step was taken out", logHas(W, "clock-stepped-back:30s"), true)
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("late-step: the follow-up reads unknown", fu[1] and fu[1].fate, "unknown")
+  check("late-step: because the clock stepped", fu[1] and fu[1].fateDetail, "clock-step")
+  check("late-step: the process was running throughout", W.procs[4242] ~= nil, true)
+end)
+
+-- (round 9) The next observation after such a table takes its start window
+-- from the tracker: placed on the raw wall clock, it is the process's own,
+-- so the tables after it see the same process, not a successor.
+scenario("ledger: an observation after a late table's step keeps the process's identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late-step-next: decision row", false, true); return end
+  local tD = W.now
+  W.run(52)                           -- the table before the next decision point
+  stepAtNextTable(W, 30)
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("late-step-next: the next decision row is written (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("late-step-next: its follow-up sees the same process alive", fu[1] and fu[1].fate, "alive")
+end)
+
+-- (round 9) A follow-up reads the clock first: a step it is the first to see
+-- closes its record at once, though its callback holds the step to its end,
+-- so it reports nothing from after the step.
+scenario("ledger: a step first seen by a follow-up closes its record before it reads", nil, function(W)
+  W.timerLag = 0.5                    -- follow-ups fire between ticks
+  local row = toDecision(W, 4242)
+  if not row then check("fu-step: decision row", false, true); return end
+  local tD = W.now
+  W.run((tD + 60.25) - W.now)
+  W.wallOffset = (W.wallOffset or 0) - 30
+  W.run(1)
+  local fu = followups(W, row.seq)
+  check("fu-step: the follow-up came", fu[1] ~= nil, true)
+  check("fu-step: and was the first to see the step", logHas(W, "clock-stepped-back:30s"), true)
+  check("fu-step: it reads unknown", fu[1] and fu[1].fate, "unknown")
+  check("fu-step: because the clock stepped", fu[1] and fu[1].fateDetail, "clock-step")
+  check("fu-step: with no readings", fu[1] and (fu[1].sampleAgeSec == nil and fu[1].jetsamSince == nil), true)
+end)
+
+-- (round 9) A step first seen by the tick that launches a slow table: the
+-- launch's reading for start windows is the raw wall clock ps's etime runs
+-- on, so the next observation keeps the process's identity.
+scenario("ledger: a step first seen by the tick launching a slow table keeps identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("launch-step: decision row", false, true); return end
+  local tD = W.now
+  W.run(49)                           -- just before a tick 10 s ahead of the next decision point
+  -- The step lands inside that tick (as it reads the memory counters), so
+  -- the tick is the first to see it and holds it while it launches a table
+  -- that takes 8 s: it lands before the next decision row is written, which
+  -- takes its start window from it.
+  W.onVmStat = function()
+    W.onVmStat = nil
+    W.wallOffset = (W.wallOffset or 0) - 100
+    W.samplerDelay = 8
+  end
+  W.run(1.5)
+  W.samplerDelay = nil
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("launch-step: the next decision row is written (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(190)
+  local fu = followups(W, nextRow.seq)
+  for i = 1, 3 do
+    check("launch-step: follow-up " .. i .. " sees the same process", fu[i] and fu[i].fate ~= "exited", true)
+  end
+end)
+
+-- (round 9) The jetsam blind ceiling is a raw file time: a second step back
+-- never lowers it, so a report from before the first step is never counted
+-- by an observation written before the clock catches up with it.
+scenario("ledger: a second step back does not lower the jetsam blind ceiling", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  local R = W.now + (W.wallOffset or 0)
+  W.jetsam = { ["JetsamEvent-before-steps.ips"] = R }  -- written now
+  W.wallOffset = -120
+  W.run(10)                           -- the first step is seen
+  W.wallOffset = -180
+  W.run(5)                            -- and the second
+  local function wall() return W.now + W.wallOffset end
+  runUntil(W, 200, function() return wall() > R - 58 end)
+  local seen = {}
+  for _, r in ipairs(ledgerRows(W)) do seen[r.seq or -1] = true end
+  local row, rowWall
+  runUntil(W, 70, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not seen[r.seq] then row = r end
+    end
+    if row and not rowWall then rowWall = wall() end
+    return row ~= nil
+  end)
+  check("jetsam-steps: a decision row after both steps", row ~= nil, true)
+  if not row then return end
+  check("jetsam-steps: written before the clock caught up with the report (control)", rowWall < R, true)
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("jetsam-steps: the report from before the steps is unknown, not counted", fu[1] and fu[1].jetsamSince, nil)
+end)
+
+-- (round 9) Launch records stay bounded to the last 16 launches, whatever
+-- happens to the tables.
+scenario("sampler: launch records stay bounded to the last 16", nil, function(W, mw)
+  W.run(6)
+  W.psStarved = true                  -- no table comes back; the watchdog relaunches
+  W.run(20 * 25)
+  local n = mw.debug().samplerLaunchRecords
+  check("bound: records kept (" .. tostring(n) .. ")", n, 16)
+end)
+
+-- (round 9) A table that cannot start leaves no record and no handle: the
+-- next tick launches again, rather than waiting out the watchdog.
+scenario("sampler: a table that cannot start is launched again at the next tick", nil, function(W, mw)
+  W.run(6)
+  local before = W.samplerStartAttempts or 0
+  W.samplerStartFails = true
+  W.run(30)
+  local attempts = (W.samplerStartAttempts or 0) - before
+  check("failed-start: launched again every tick (" .. attempts .. " in 30 s)", attempts >= 5, true)
+  check("failed-start: no record kept for a launch that never started", mw.debug().samplerLaunchRecords, 0)
+  check("failed-start: and no task handle held", mw.debug().samplerRunning, false)
+  W.samplerStartFails = false
+  W.run(6)
+  check("failed-start: tables flow again once it can start", mw.debug().sampleAgeSec <= 6, true)
+end)
+
 -- (round 3) A ledger that cannot be written is counted and logged, not
 -- reported as written.
 scenario("ledger: a write that fails is counted and logged", nil, function(W, mw)
@@ -2816,6 +2980,27 @@ scenario("a verdict asked about one binding is asked again once for another", RE
   check("rebind: the newcomer's binding is asked about at once", again, true)
   W.run(30)
   check("rebind: once, not every tick (" .. (#W.httpPosts - mark) .. ")", #W.httpPosts - mark, 1)
+end)
+
+-- (round 9) A verdict about a binding the alert has since replaced leaves
+-- the cache at once: with the newcomer's answer still on its way, nothing
+-- about the old binding is left to consume.
+scenario("a verdict about a replaced binding leaves the cache at once", REMOTE_LFM_QUIET, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  local cached = runUntil(W, 120, function() return (mw.debug().lfm.cached or 0) > 0 end)
+  W.run(5)
+  check("evict: a verdict is cached (control)", cached and (mw.debug().lfm.cached or 0) > 0, true)
+  W.httpDelay = 60                    -- the newcomer's answer takes a minute
+  W.reusePid(4242, "node", 9000)
+  W.run(2)
+  W.click("freeze")                   -- refused on the stale binding; the alert binds the newcomer
+  -- Once the newcomer is an extreme runaway too, the old verdict (still
+  -- fresh, same kind) would be usable: only its binding tells it apart.
+  W.run(20)
+  check("evict: the old binding's verdict is gone before the new one lands", mw.debug().lfm.cached, 0)
 end)
 
 -- ---- PR round 5: kept horizons, closed records, the launch-order line ----
@@ -4259,6 +4444,39 @@ do
       logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
     check("restart-settle: memwatch's own KILL still went out", W.signalsTo(4242):find("KILL", 1, true) ~= nil, true)
   end)
+  -- (round 12) The same for a menu click, whose outcome comes back through
+  -- the surface's own update rather than the HUD's narrative.
+  scenario("a menu click that did nothing gives up its veto across a restart", UNATTENDED_KILL, function(W, mw)
+    termOut(W)
+    W.run(1)
+    local freeze = rowItem(W, "Freeze node")
+    check("menu-restart-settle: the process row offers Freeze (control)", freeze ~= nil and freeze.disabled ~= true, true)
+    W.sendFails = { STOP = true }
+    if freeze then freeze.fn() end    -- its STOP cannot be sent; it says so 0.5 s later
+    W.sendFails = nil
+    mw.start()                        -- an in-process restart before that outcome lands
+    W.run(30)
+    check("menu-restart-settle: the click gave up its veto after the restart",
+      logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
+    check("menu-restart-settle: memwatch's own KILL still went out", W.signalsTo(4242):find("KILL", 1, true) ~= nil, true)
+  end)
+  -- (round 12) A click's outcome settles before its on-screen alert: an
+  -- alert that fails never keeps a veto the click gave up.
+  scenario("a menu click settles even when its alert fails", UNATTENDED_KILL, function(W)
+    termOut(W)
+    W.run(1)
+    local freeze = rowItem(W, "Freeze node")
+    check("alert-fails: the process row offers Freeze (control)", freeze ~= nil and freeze.disabled ~= true, true)
+    W.sendFails = { STOP = true }
+    W.onAlert = function(text) if text:find("couldn't send STOP", 1, true) then error("alert failed") end end
+    if freeze then freeze.fn() end
+    W.sendFails = nil
+    W.run(30)
+    W.onAlert = nil
+    check("alert-fails: the failing alert was reached (control)", logHas(W, "alert failed"), true)
+    check("alert-fails: the click still gave up its veto", logHas(W, "unattended-veto-withdrawn:node(4242)"), true)
+    check("alert-fails: and memwatch's own KILL went out", W.signalsTo(4242):find("KILL", 1, true) ~= nil, true)
+  end)
 
   -- The other order: a Force Quit that signals nothing, then a Freeze that
   -- works, both before the HUD comes down. The failed click's outcome never
@@ -4413,6 +4631,78 @@ do
   end)
   io.tmpfile = realTmpfile
 end
+
+-- (round 12) A frozen row's Resume answers for the process it showed: when
+-- the pid's next process has been frozen since the menu opened, that one
+-- stays frozen.
+scenario("a stale frozen row's Resume never resumes the pid's next frozen process", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.click("freeze")
+  W.run(3)
+  check("stale-row: A is frozen", W.procs[4242] and W.procs[4242].state, "T")
+  local resumeA = frozenRowAction(W, "leaker", "Resume")
+  check("stale-row: its row offers Resume", resumeA ~= nil, true)
+  W.reusePid(4242, "leaker", 2000)  -- A goes; B takes the pid
+  W.run(70)                         -- the sweep drops A's entry
+  local b = W.procs[4242]
+  mw.freezePid(4242, "leaker", function() end, { expectedLstart = b.lstart })
+  W.run(3)
+  check("stale-row: B is frozen in turn", b.state, "T")
+  if resumeA then resumeA() end
+  W.run(3)
+  check("stale-row: B stays frozen", b.state, "T")
+  check("stale-row: no CONT went out", W.signalsTo(4242):find("CONT", 1, true) == nil, true)
+  check("stale-row: the row was refused as stale", logHas(W, "resume-skip:leaker(4242):stale-row"), true)
+end)
+
+-- (round 12) A menu item is one clock frame: a step it sees is applied when
+-- the item ends, never in the middle of it.
+scenario("a step seen inside a menu item waits for the item's end", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.click("freeze")
+  W.run(3)
+  local resume = frozenRowAction(W, "leaker", "Resume")
+  check("menu-frame: the frozen row offers Resume", resume ~= nil, true)
+  mw.resumePid(4242)                -- resumed from the console: the row is now stale
+  W.run(2)
+  local mid
+  W.onAlert = function()
+    W.onAlert = nil
+    W.wallOffset = (W.wallOffset or 0) - 120
+    mw.ignore(99999, "probe", nil)  -- a clock read inside the item
+    mid = logHas(W, "clock-stepped-back")
+  end
+  if resume then resume() end
+  check("menu-frame: the item's alert ran (control)", mid ~= nil, true)
+  check("menu-frame: the step waited for the item's end", mid, false)
+  check("menu-frame: and was applied then", logHas(W, "clock-stepped-back:120s"), true)
+end)
+
+-- (round 12) Every entry kept at reload carries a token, written out with it.
+scenario("an entry kept at reload without a token is given one", nil, function(W)
+  leaker(W, 4242, "node")
+  W.procs[4242].state = "T"
+  W.run(6)
+  local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
+  f:write(string.format('[{"pid":4242,"name":"node","lstart":"%s","weightMB":0,"frozenAt":%d,"stopSent":true}]\n',
+    W.procs[4242].lstart, math.floor(W.now) - 30))
+  f:close()
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  W.run(3)
+  check("reload-token: the entry is kept", W.menuItem("   node") ~= nil, true)
+  local g = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "r"))
+  local saved = g:read("a")
+  g:close()
+  check("reload-token: and written out with a token", saved:find('"id":"4242/', 1, true) ~= nil, true)
+end)
+
 
 os.remove(LFM_KEYFILE)
 os.remove(LFM_KEYDIR)

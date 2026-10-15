@@ -171,6 +171,8 @@ metric operationally defined:
   lua/memwatch.lua        Hammerspoon glue: timers, async sampling, HUD, menu, kill/freeze, LFM lifecycle, log
   test_core.lua           unit tests for the pure modules (lua test_core.lua)
   test_report.lua         unit tests for the report renderer (lua test_report.lua)
+  test_glue.lua           behavioral tests of the alert glue in a fake Hammerspoon (lua test_glue.lua)
+  test/hsfake.lua         that fake: virtual clock, timers, process table, HUD, banners, menu
   eval/                   the model bake-off: corpus, runner, gates, methodology
   install.sh              idempotent wiring into ~/.hammerspoon/init.lua (with backup); --with-lfm adds adjudication
   memwatch.log            state transitions, runaways, kills, errors; rotates at 1 MB
@@ -203,10 +205,13 @@ Appends a `BEGIN memwatch / END memwatch` block to `~/.hammerspoon/init.lua`
 
 ## Test
 
-Pure-logic unit tests (state machine, detector, kill policy, parsers):
+Pure-logic unit tests (state machine, detector, kill policy, parsers), and
+behavioral tests that run the real Hammerspoon glue against a fake
+Hammerspoon with a virtual clock (alert episodes, identity binding, snooze
+and answers, banners, diagnostics):
 
 ```sh
-cd ~/projects/memwatch && lua test_core.lua
+cd ~/projects/memwatch && lua test_core.lua && lua test_glue.lua
 ```
 
 Visual self-test and full-surface simulation (no real process involved; the

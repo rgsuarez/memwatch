@@ -143,14 +143,31 @@ metric operationally defined:
 ### Observation ledger (passive, default ON)
 
 Independently of adjudication, memwatch keeps a passive observation ledger,
-`memwatch-observe.jsonl` (local and gitignored). It writes a row at every
-moment an adjudicator would have been consulted, and every 45 s while
-pressure is up. Each row holds the exact redacted, pid-free snapshot a model
-would have received and the deterministic action that would have fired.
+`memwatch-observe.jsonl` (local and gitignored). It writes a row at each
+grace-expiry decision point (an extreme runaway whose alert has gone
+unanswered for the grace window, under any unattended mode) and every 45 s
+while pressure is up. Each row holds the exact redacted, pid-free snapshot a
+model would have received (a row that would exceed 60 KB drops it and
+carries `snapshotDropped`); `wouldAct`, the action the deterministic policy
+fires under the live mode (`none` while unattended is off, and on every
+45 s row); and at decision points `wouldActAtFreeze`, the freeze-ceiling
+counterfactual a model would own at grace expiry. `offender.name` is a
+sanitized local basename kept only to re-derive categories: like the row's
+`pid`, it is never model input and is stripped from any dataset built from
+the ledger.
+
 Follow-ups at 60, 120 and 180 s record what actually became of the process
-and the machine: alive, exited or frozen, or unknown when a stale or partial
-process sample (or an undecidable identity) cannot say; weight; available
-memory; kernel jetsam reports; and any operator action in the window.
+and the machine. The fate is `alive`, `exited` (detail `pid-reused` when the
+pid now belongs to another process), `frozen`, or `unknown` (details
+`stale-sample`, `incomplete-sample`, `identity-uncertain`), decided only from
+a fresh, complete process sample and never guessed. Each follow-up also
+carries the weight (taken only from the provably same process),
+`peakSinceMB` (the peak weight since the observation), available memory,
+kernel jetsam reports, `frozenLedger` (whether memwatch's frozen ledger
+lists the pid), `operatorActionsSince` (operator actions since the
+observation) and `memwatchSignalSince` (a terminate or freeze memwatch
+itself sent since the observation, so its own actions never read as
+natural exits).
 
 It never forks, never acts and never leaves the machine. It exists so that
 adjudicators can be judged against real outcomes rather than synthetic

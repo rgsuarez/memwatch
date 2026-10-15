@@ -98,6 +98,13 @@ license from the hash-pinned registry, and writes the enable config. You
 can also toggle the feature from the menu bar at any time. The default
 model is chosen empirically; see [bakeoff-methodology.md](bakeoff-methodology.md).
 
+**Evaluation caveat.** Live snapshots now carry each process's real age
+(`ageSec`), while the 74-scenario bake-off corpus (`eval/gen-scenarios.lua`)
+still hardcodes ages by kind (40 s for an extreme grower, one day
+otherwise), so no bake-off score yet covers the ages a live model sees. The
+corpus is being replaced by an episode generator, and the adjudicator stays
+disabled until then.
+
 The model weights are **not** part of this repository and are licensed
 separately from memwatch's MIT code under the LFM Open License v1.0; see
 `NOTICE-LFM` and `licenses/`.
@@ -123,6 +130,7 @@ self-contained dashboard. Nothing in the ledger or report leaves the
 machine.
 
 With the feature on or off, the passive observation ledger
-(`memwatch-observe.jsonl`; see the README) records every moment an
-adjudicator would have been consulted and what happened afterward. That is
-the outcome record new models are evaluated against.
+(`memwatch-observe.jsonl`; see the README) records, at each grace-expiry
+decision point and every 45 s while pressure is up, what an adjudicator
+would have faced and what happened afterward. That is the outcome record
+new models are evaluated against.

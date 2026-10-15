@@ -1791,6 +1791,13 @@ do
   check("horizon: a later horizon reports the later signal", observe.asOf(hz, 1100).signal.action, "terminate")
   check("horizon: and counts both", observe.asOf(hz, 1100).signalCount, 2)
   check("horizon: no sightings, no weight, the observation's own peak", observe.asOf(ev0(), 1060).peakMB, 100)
+  -- The freshness boundary: a sighting read exactly 15 s before the
+  -- horizon still counts; one a moment earlier does not.
+  local edge = ev0()
+  observe.foldSample(edge, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = 1, launchedAt = 1045, deliveredAt = 1046 })
+  check("freshness: read exactly 15 s before the horizon is alive", (observe.fateAt(edge, 1060)), "alive")
+  check("freshness: a moment more is unknown", (observe.fateAt(edge, 1060.5)), "unknown")
   check("frozen: no entry is false", observe.frozenMatches(nil, old0), false)
   check("frozen: an entry without a start time cannot tell", observe.frozenMatches({ name = "x" }, old0), nil)
 

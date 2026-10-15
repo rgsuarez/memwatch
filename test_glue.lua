@@ -708,7 +708,7 @@ scenario("an unattended action refused as stale posts no receipt", '{"unattended
   W.run(40)                         -- muted, armed, bound
   W.reusePid(4242, "leaker", 9000)
   W.grow(4242, 220)
-  local refused = runUntil(W, 90, function() return logHas(W, "answered:rebind:leaker(4242):stale") end)
+  local refused = runUntil(W, 60, function() return logHas(W, "answered:rebind:leaker(4242):stale") end)
   check("receipt: the stale attempt is refused and rebinds", refused, true)
   local refusedAt = W.now
   check("receipt: nothing signaled to the newcomer on the old binding", W.signalsTo(4242), "")
@@ -1674,6 +1674,34 @@ scenario("ledger: freeze then terminate, and menu touches", nil, function(W)
   check("signals: and counts both", fu[3] and fu[3].memwatchSignalCount, 2)
   check("signals: the HUD click and the menu Force Quit are both touches",
     fu[3] and fu[3].operatorTouchesSince, 2)
+end)
+
+-- (round 3) A menu action on the observed process is a touch on it.
+scenario("ledger: a menu Ignore is a touch on the process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("menu touch: decision row", false, true); return end
+  local procRow = W.menuItem("leaker")
+  local ignore = procRow and procRow.menu and procRow.menu[3]
+  check("menu touch: the row offers Ignore", ignore ~= nil and ignore.title, "Ignore for 30 min")
+  ignore.fn()
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("menu touch: counted as an action", fu[1] and fu[1].operatorActionsSince, 1)
+  check("menu touch: and as a touch on this process", fu[1] and fu[1].operatorTouchesSince, 1)
+end)
+
+-- (round 3) A ledger that cannot be written is counted and logged, not
+-- reported as written.
+scenario("ledger: a write that fails is counted and logged", nil, function(W, mw)
+  os.execute("mkdir -p '" .. W.home .. "/projects/memwatch/memwatch-observe.jsonl'")  -- a directory: open fails
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(120)                        -- advisory rows, and a decision point, all attempted
+  local d = mw.debug().observe
+  check("write-fail: no row is reported written", d.rows, 0)
+  check("write-fail: the failures are counted", d.errors >= 1, true)
+  check("write-fail: and logged", logHas(W, "observe-open"), true)
 end)
 
 scenario("ledger: a pid taken over by another process", nil, function(W)

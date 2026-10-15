@@ -1717,10 +1717,10 @@ local function tick()
   local state, changed, reason = core.smStep(smState, sig, now)
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
   if changed then M.logSnapshot("state:" .. reason) end
-  -- GC the recycled-pid unattended state BEFORE alertSurfaces consumes it:
-  -- if a pid left the runaway set (old process gone) its streak/fired stamp
-  -- must be cleared before this tick's unattended decision can read it, or a
-  -- recycled pid could inherit stale state for one tick.
+  -- GC the unattended state of processes proven gone BEFORE alertSurfaces
+  -- consumes it (see gcUnattendedState: absence from a complete ps table
+  -- taken after the pid was last seen), so a recycled pid cannot inherit a
+  -- prior process's state for one tick.
   gcUnattendedState(now)
   settleOpenReceipts(now)
   alertSurfaces(state, now)

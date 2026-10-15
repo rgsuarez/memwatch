@@ -1723,7 +1723,9 @@ do
                           weightMB = 140, launchedAt = 1050, deliveredAt = 1052 })
   check("evidence: seen as the same process near the horizon is alive", (observe.fateAt(e, 1060)), "alive")
   check("evidence: freshness counts from acquisition, not delivery", (observe.fateAt(e, 1066)), "unknown")
-  check("evidence: the frozen ledger's process is frozen", (observe.fateAt(e, 1060, true)), "frozen")
+  observe.foldFrozen(e, 1055, true)
+  check("evidence: the frozen ledger's process is frozen", (observe.fateAt(e, 1060)), "frozen")
+  check("evidence: but not before the ledger held it", (observe.fateAt(e, 1054)), "alive")
   check("evidence: weight is the latest sighting", e.lastWeightMB, 140)
   check("evidence: peak is folded as samples arrive", e.peakMB, 140)
   -- A late delivery: the table was read at launch, long before it landed.
@@ -1979,6 +1981,148 @@ do
     observe.row({ mode = "freeze", wouldAct = "freeze", offender = { pid = 1 } }).wouldActBasis, nil)
 end
 
+-- ---- (round 4) evidence as of the horizon, whenever the timer runs ----
+-- Each follow-up reads what held at its horizon instant: a weight read
+-- after it, a freeze or resume after it, an operator action after it, or a
+-- clock stepped back after the observation must not leak into it.
+do
+  local observe = require("memwatch_observe")
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  local same = { lo = 999, hi = 1001 }
+  local function ev0(minSeq)
+    return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000,
+                                 weightMB = 100, minSeq = minSeq })
+  end
+  local function sight(ev, w, launched, delivered, seq)
+    observe.foldSample(ev, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = w, launchedAt = launched, deliveredAt = delivered, seq = seq })
+  end
+
+  -- A weight counts from its delivery: a table launched before the
+  -- horizon but read and delivered after it is not the weight at it.
+  local cross = ev0()
+  sight(cross, 100, 1050, 1051)
+  sight(cross, 900, 1055, 1066)
+  check("as-of weight: a reading delivered after the horizon is excluded", observe.asOf(cross, 1060).weightMB, 100)
+  check("as-of weight: and is not the peak at it", observe.asOf(cross, 1060).peakMB, 100)
+  check("as-of weight: presence still counts from the launch", (observe.fateAt(cross, 1060)), "alive")
+  check("as-of weight: a later horizon has it", observe.asOf(cross, 1070).weightMB, 900)
+
+  -- The frozen ledger as of the horizon: frozen after it, or resumed after
+  -- it, does not change what held at it.
+  local fz = ev0()
+  observe.foldFrozen(fz, 1000, false)
+  sight(fz, 100, 1050, 1051)
+  sight(fz, 100, 1095, 1096)
+  observe.foldFrozen(fz, 1070, true)
+  observe.foldFrozen(fz, 1090, false)
+  check("frozen as of: running at +60 though frozen at +70", (observe.fateAt(fz, 1060)), "alive")
+  check("frozen as of: the ledger held it at +80", observe.frozenAt(fz, 1080), true)
+  check("frozen as of: and not once resumed", observe.frozenAt(fz, 1095), false)
+  check("frozen as of: an unchanged state is not logged twice",
+    (function() local n = #fz.frozenLog; observe.foldFrozen(fz, 1100, false); return #fz.frozenLog - n end)(), 0)
+  local fzu = ev0()
+  sight(fzu, 100, 1050, 1051)
+  observe.foldFrozen(fzu, 1040, nil)
+  local fu1, fu2 = observe.fateAt(fzu, 1060)
+  check("frozen as of: an entry that cannot be told apart is not alive", fu1, "unknown")
+  check("frozen as of: and says why", fu2, "frozen-uncertain")
+  check("frozen as of: nothing logged is not frozen", observe.frozenAt(ev0(), 1060), false)
+
+  -- Operator actions per observation, through the horizon only.
+  local ac = ev0()
+  observe.foldAction(ac, 1050)
+  observe.foldAction(ac, 1070)
+  check("actions as of: one by +60", observe.asOf(ac, 1060).actions, 1)
+  check("actions as of: both by +100", observe.asOf(ac, 1100).actions, 2)
+  check("actions as of: none for a fresh record", observe.asOf(ev0(), 1060).actions, 0)
+
+  -- An event with no time is never placed before a horizon.
+  local nt = ev0()
+  observe.foldSignal(nt, { action = "freeze", comm = "/bin/x", startEpoch = nil })
+  observe.foldTouch(nt, { comm = "/bin/x" })
+  check("undated: a signal with no time is not counted", observe.asOf(nt, 1e9).signalCount, 0)
+  check("undated: nor a touch", observe.asOf(nt, 1e9).touchesUncertain, 0)
+  local ng = ev0()
+  ng.gone = { how = "exited", at = nil }
+  check("undated: a proof of exit with no time is not an exit", (observe.fateAt(ng, 1e9)), "unknown")
+
+  -- Launch order, not the wall clock, decides what came after the
+  -- observation; a later launch whose wall time reads before it proves
+  -- the clock stepped back, and then nothing can be placed.
+  local sq = ev0(5)
+  sight(sq, 100, 2000, 2001, 4)
+  check("launch order: an earlier sampler is ignored whatever its wall time", sq.seenAcq, nil)
+  check("launch order: and says so", select(2, observe.fateAt(sq, 1060)), "pre-observation-sample")
+  sight(sq, 100, 1001, 1002, 5)
+  check("launch order: the first sampler after the observation counts", sq.seenAcq, 1001)
+  local st = ev0(5)
+  sight(st, 100, 880, 881, 6)
+  check("clock step: a later launch that reads before the observation flags it", st.clockStep, true)
+  local f1, d1 = observe.fateAt(st, 1060)
+  check("clock step: the fate is unknown", f1, "unknown")
+  check("clock step: and says why", d1, "clock-step")
+  check("clock step: nothing is reported as of a horizon", observe.asOf(st, 1060), nil)
+  check("clock step: a one-second jitter is not a step (control)",
+    (function() local j = ev0(5); sight(j, 100, 999.5, 1000.5, 5); return j.clockStep end)(), nil)
+  local wall = ev0()
+  sight(wall, 100, 999, 1001)
+  check("launch order: without sequences the launch time decides (fallback)", wall.seenAcq, nil)
+
+  -- A pre-observation sample never hides a later, better reason.
+  local lm = ev0(5)
+  observe.foldSample(lm, { complete = false, row = nil, launchedAt = 1050, deliveredAt = 1051, seq = 5 })
+  sight(lm, 100, 1060, 1061, 4)
+  check("lastMiss: a pre-observation sample does not overwrite a real miss",
+    select(2, observe.fateAt(lm, 1060)), "incomplete-sample")
+  local lm2 = ev0(5)
+  sight(lm2, 100, 1001, 1002, 5)
+  sight(lm2, 100, 1060, 1061, 4)
+  check("lastMiss: nor mark a record that has a sighting", lm2.lastMiss, nil)
+
+  -- The machine's reading as of the horizon, from the tick log.
+  local log = { { at = 1000, availPct = 5, state = "critical" }, { at = 1055, availPct = 6, state = "critical" },
+                { at = 1090, availPct = 44, state = "ok" } }
+  check("metricAt: the last reading at or before the horizon", observe.metricAt(log, 1060).availPct, 6)
+  check("metricAt: not the recovery after it", observe.metricAt(log, 1060).state, "critical")
+  check("metricAt: a reading older than the freshness window is no reading", observe.metricAt(log, 1080), nil)
+  check("metricAt: nothing before the horizon", observe.metricAt(log, 999), nil)
+  check("metricAt: an empty log", observe.metricAt({}, 1060), nil)
+
+  -- A bound start time seeds a start window when no ps sighting gave one,
+  -- unless it falls in the hour a daylight-saving fold repeats.
+  local stamp = os.date("%a %b %e %H:%M:%S %Y", 1760000000)
+  check("lstart strict: an ordinary time reads as lstartEpoch does",
+    observe.lstartEpochUnambiguous(stamp), observe.lstartEpoch(stamp))
+  check("lstart strict: garbage is nil", observe.lstartEpochUnambiguous("not a time"), nil)
+  local w = observe.startFromLstart(stamp, 1760000600)
+  check("startFromLstart: the whole second the start time names", w and (w.lo .. "-" .. w.hi), "1760000000-1760000001")
+  check("startFromLstart: with the process's age", w and w.etimeSec, 600)
+  check("startFromLstart: a start after now is refused", observe.startFromLstart(stamp, 1759999999), nil)
+  check("startFromLstart: a bound process seen by ps later is the same process",
+    observe.identity(w, { lo = 1760000000, hi = 1760000003 }), "same")
+  -- The fold, found from this zone's own transitions (hourly scan of 2026):
+  -- the half hour after daylight time ends occurs twice.
+  local fallBack
+  local t0 = os.time({ year = 2026, month = 1, day = 1, hour = 12 })
+  for i = 0, 365 * 24 do
+    local a, b = os.date("*t", t0 + i * 3600), os.date("*t", t0 + (i + 1) * 3600)
+    if a.isdst and not b.isdst then fallBack = t0 + (i + 1) * 3600; break end
+  end
+  if fallBack then
+    local twice = os.date("%a %b %e %H:%M:%S %Y", fallBack - (fallBack % 3600) + 1800)
+    check("lstart strict: a time the fold repeats is refused", observe.lstartEpochUnambiguous(twice), nil)
+    check("lstart strict: so no window is seeded from it", observe.startFromLstart(twice, fallBack + 7200), nil)
+    check("lstart strict: two hours later is ordinary again (control)",
+      observe.lstartEpochUnambiguous(os.date("%a %b %e %H:%M:%S %Y", fallBack + 7200)) ~= nil, true)
+  else
+    print("note  lstart strict: this zone keeps no daylight time; the fold case is not exercised")
+  end
+
+  local rowB = observe.row({ offender = { pid = 1 }, identityBasis = "lstart" })
+  check("row: the identity basis is recorded", rowB.identityBasis, "lstart")
+end
+
 -- ---- observation glue: fork-free, error-bounded, mode-independent ----
 do
   local f = assert(io.open("lua/memwatch.lua", "r"))
@@ -2076,17 +2220,31 @@ do
   check("observe glue: no point-estimate start compare remains",
     body:find("psStartedAt", 1, true), nil)
   check("observe glue: operator actions counted from the observation through the horizon",
-    body:find("operatorActionsSince = observe.countSince(obs.actionTimes, now, tH),", 1, true) ~= nil, true)
+    body:find("operatorActionsSince = at.actions,", 1, true) ~= nil
+      and src:find("obs.actionTimes", 1, true) == nil, true)
   check("observe glue: a follow-up reads its horizon instant, not its timer's",
     body:find("local tH = now + h", 1, true) ~= nil
-      and body:find("observe.fateAt(ev, tH, frozenSame == true)", 1, true) ~= nil
-      and body:find("local at = observe.asOf(ev, tH)", 1, true) ~= nil
+      and body:find("local fate, detail = observe.fateAt(ev, tH)", 1, true) ~= nil
+      and body:find("local at = observe.asOf(ev, tH) or {}", 1, true) ~= nil
+      and body:find("observe.metricAt(obs.ticks, tH)", 1, true) ~= nil
       and body:find("observe.fateAt(ev, t,", 1, true) == nil, true)
+  -- The follow-up callback itself (the row above it reads live state at
+  -- the observation, as it should).
+  local fuAt = body:find('afterHeld(h, guard("observe-followup"', 1, true)
+  local fuBody = fuAt and body:sub(fuAt) or ""
+  check("observe glue: machine metrics come from the tick log, never live",
+    fuBody:find("availPct = mt and math.floor(mt.availPct) or nil", 1, true) ~= nil
+      and fuBody:find("state = mt and mt.state or nil", 1, true) ~= nil
+      and fuBody:find("lastMetrics", 1, true) == nil
+      and fuBody:find("smState", 1, true) == nil
+      and fuBody:find("frozen[", 1, true) == nil, true)
   check("observe glue: the resettable HUD flag is not the operator signal",
     body:find("hudInteracted", 1, true), nil)
-  check("observe glue: the frozen ledger counts only for the observed process",
-    body:find("local frozenSame = observe.frozenMatches(frozen[pid], ev.start0)", 1, true) ~= nil
-      and body:find("frozenLedger = frozenSame,", 1, true) ~= nil, true)
+  check("observe glue: the frozen ledger counts only for the observed process, as of the horizon",
+    body:find("observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))", 1, true) ~= nil
+      and body:find("frozenNow = observe.frozenAt(ev, tH)", 1, true) ~= nil
+      and body:find("frozenLedger = frozenNow,", 1, true) ~= nil
+      and body:find("frozen[pid], ev.start0", 1, true) == nil, true)
   -- Weight and peak come only from the folded evidence: the follow-up never
   -- reads the tracker (an entry can expire, or belong to a newer process).
   local _, trackerReads = body:gsub("tracker%.procs%[pid%]", "")
@@ -2138,7 +2296,7 @@ do
   check("observe glue: follow-ups report the last signal to the observed process by the horizon",
     body:find("local sig = at.signal", 1, true) ~= nil
       and body:find("memwatchSignalSince = sig and sig.action or nil", 1, true) ~= nil
-      and body:find("memwatchSignalCount = at.signalCount > 1 and at.signalCount or nil", 1, true) ~= nil, true)
+      and body:find("memwatchSignalCount = (at.signalCount or 0) > 1 and at.signalCount or nil", 1, true) ~= nil, true)
   local gcBody = fnBody("gcUnattendedState = function(")
   check("signals glue: gcUnattendedState located", #gcBody > 200, true)
   check("signals glue: the tick hands the GC its clock", src:find("gcUnattendedState(now)", 1, true) ~= nil, true)

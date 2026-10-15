@@ -1928,6 +1928,188 @@ scenario("ledger: a pid taken over by another process", nil, function(W)
   check("ledger reuse: with the pid reuse named", fu[1] and fu[1].fateDetail, "pid-reused")
 end)
 
+-- ---- PR round 4: follow-ups read their horizon, whenever their timers run ----
+-- An advisory row whose follow-up timers run lagSec (default 90) late (a
+-- blocked run loop); returns the row.
+local function laggedAdvisory(W, after, lagSec)
+  W.timerLag = lagSec or 90
+  local adv
+  runUntil(W, 60, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point == "advisory" and r.seq > after then adv = r end
+    end
+    return adv ~= nil
+  end)
+  W.timerLag = 0
+  return adv, W.now
+end
+
+-- A freeze after the +60 horizon, and the machine's recovery after it,
+-- stay out of the +60 follow-up that runs at +150.
+scenario("ledger: a late follow-up reads the freeze and the machine as of its horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late state: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq)
+  check("late state: an advisory row was written under the lag", adv ~= nil, true)
+  if not adv then return end
+  local avail0 = adv.availPct
+  check("late state: the row reads the machine under pressure", avail0 ~= nil and avail0 < 50, true)
+  W.run(70)
+  W.click("freeze")                 -- +70: frozen after the +60 horizon
+  W.run(30)
+  W.kern, W.availPct = 1, 80        -- +100: the machine recovers
+  W.run(200)
+  local fu = followups(W, adv.seq)
+  check("late state: three follow-ups", #fu, 3)
+  check("late state: +60 says running, not the freeze after it", fu[1] and fu[1].fate, "alive")
+  check("late state: +60's frozen ledger had no entry yet", fu[1] and fu[1].frozenLedger, false)
+  check("late state: +60 reads the pressure at +60", fu[1] and fu[1].availPct, avail0)
+  check("late state: +60's change since the row is none", fu[1] and fu[1].availDelta, 0)
+  check("late state: +60's state is the state at +60", fu[1] and fu[1].state, "critical")
+  check("late state: +120 says frozen (control)", fu[2] and fu[2].fate, "frozen")
+  check("late state: +120's ledger held it (control)", fu[2] and fu[2].frozenLedger, true)
+  check("late state: +120 reads the recovery (control)",
+    fu[2] ~= nil and fu[2].availPct ~= nil and fu[2].availPct > avail0 + 25, true)
+end)
+
+-- A resume between the horizon and its late timer: frozen at +60, though
+-- running when the timer ran.
+scenario("ledger: a late follow-up keeps a freeze its process left after the horizon", nil, function(W, mw)
+  local row = toDecision(W, 4242)
+  if not row then check("late resume: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq)
+  if not adv then check("late resume: advisory row", false, true); return end
+  W.run(30)
+  W.click("freeze")                 -- +30: frozen before the +60 horizon
+  W.run(60)
+  mw.resumePid(4242)                -- +90: resumed after it
+  W.run(200)
+  local fu = followups(W, adv.seq)
+  check("late resume: +60 says frozen, though running when the timer ran", fu[1] and fu[1].fate, "frozen")
+  check("late resume: +60's ledger held it", fu[1] and fu[1].frozenLedger, true)
+  check("late resume: +120 says running again (control)", fu[2] and fu[2].fate, "alive")
+  check("late resume: the resume is memwatch's own signal", fu[2] and fu[2].memwatchSignalSince, "resume")
+end)
+
+-- An operator action inside the horizon counts however late the timer
+-- runs (here more than ten minutes, with a later action meanwhile), and
+-- one after the horizon does not.
+scenario("ledger: a late follow-up counts the operator actions by its horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late actions: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq, 700)
+  if not adv then check("late actions: advisory row", false, true); return end
+  local function menuAction(prefix)
+    local procRow = W.menuItem("leaker")
+    for _, it in ipairs(procRow and procRow.menu or {}) do
+      if type(it.title) == "string" and it.title:sub(1, #prefix) == prefix and it.fn then
+        it.fn(); return true
+      end
+    end
+    return false
+  end
+  W.run(20)
+  W.click("snooze")                 -- +20: inside every horizon
+  W.run(60)
+  check("late actions: the menu offers Ignore", menuAction("Ignore"), true)   -- +80
+  W.run(620)
+  check("late actions: and Activity Monitor", menuAction("Show in Activity Monitor"), true)  -- +700
+  W.run(400)
+  local fu = followups(W, adv.seq)
+  check("late actions: the follow-ups ran more than ten minutes late", fu[1] ~= nil, true)
+  check("late actions: +60 counts the one by +60", fu[1] and fu[1].operatorActionsSince, 1)
+  check("late actions: +120 counts both by +120", fu[2] and fu[2].operatorActionsSince, 2)
+end)
+
+-- A clock stepped back after the observation: nothing in its record can be
+-- placed before or after a horizon, so the follow-ups say so instead of
+-- calling a living process exited or mixing readings from both sides.
+scenario("ledger: a clock stepped back leaves its follow-ups unknown", nil, function(W, mw)
+  local row = toDecision(W, 4242)
+  if not row then check("step: decision row", false, true); return end
+  W.run(10)
+  local before = 0
+  for _, r in ipairs(ledgerRows(W)) do if r.seq and r.seq > before then before = r.seq end end
+  W.wallOffset = -120
+  local after
+  runUntil(W, 60, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point and r.seq > before then after = r; return true end
+    end
+    return false
+  end)
+  -- The cadence stamps from before the step re-based to it: rows go on
+  -- within the advisory interval, not once the wall clock has caught up.
+  check("step: a row is written within a minute of the step", after ~= nil, true)
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("step: three follow-ups", #fu, 3)
+  local unknown, stepped, exited, metrics = 0, 0, 0, 0
+  for _, r in ipairs(fu) do
+    if r.fate == "unknown" then unknown = unknown + 1 end
+    if r.fateDetail == "clock-step" then stepped = stepped + 1 end
+    if r.fate == "exited" then exited = exited + 1 end
+    if r.availPct ~= nil or r.peakSinceMB ~= nil or r.operatorActionsSince ~= nil then metrics = metrics + 1 end
+  end
+  check("step: every follow-up is unknown", unknown, 3)
+  check("step: and says the clock stepped", stepped, 3)
+  check("step: none calls the living process exited", exited, 0)
+  check("step: none reports a reading it cannot place", metrics, 0)
+  check("step: the process is alive throughout", W.procs[4242] ~= nil, true)
+  -- A row written after the step has ordinary follow-ups (control).
+  local fa = after and followups(W, after.seq) or {}
+  check("step: a row written after the step reads alive at +60", fa[1] and fa[1].fate, "alive")
+  check("step: and reads the machine", fa[1] ~= nil and fa[1].availPct ~= nil, true)
+end)
+
+-- A process only the top stream named (ps stalled) is bound by its start
+-- time at the alert; that seeds the identity its follow-ups compare, so
+-- once ps recovers they can see it alive.
+scenario("ledger: a top-born offender is told apart by its bound start time", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  local row
+  runUntil(W, 200, function() row = decisionRow(W, 4242); return row ~= nil end)
+  check("top-born: a decision row while ps is stalled", row ~= nil, true)
+  if not row then return end
+  check("top-born: its identity comes from the bound start time", row.identityBasis, "lstart")
+  W.psStarved = false               -- ps recovers
+  W.run(200)
+  local fu = followups(W, row.seq)
+  local alive = 0
+  for _, r in ipairs(fu) do if r.fate == "alive" or r.fate == "frozen" then alive = alive + 1 end end
+  check("top-born: the follow-ups after ps recovers see it", alive >= 2, true)
+  check("top-born: none calls it exited", (function()
+    for _, r in ipairs(fu) do if r.fate == "exited" then return true end end
+    return false end)(), false)
+end)
+
+-- Follow-up timers that never run (a stalled run loop): the records stop
+-- collecting once far past their last horizon, and the tick log with them.
+scenario("ledger: records whose follow-ups never run stop growing", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.timersStall = true
+  W.run(2000)
+  local mid = mw.debug().observe
+  check("stall: rows were written", (mid.rows or 0) >= 30, true)
+  -- A row every 45 s and a decision row every grace window: about 30 are
+  -- younger than the 780 s a record collects for. Without the bound, all.
+  check("stall: only records near their horizons still collect", mid.pending <= 40, true)
+  W.procs[4242] = nil               -- the runaway ends and the machine calms:
+  W.kern, W.availPct = 1, 80        -- no new rows
+  W.run(900)
+  local d = mw.debug().observe
+  check("stall: once calm, no record is still collecting", d.pending, 0)
+  check("stall: the tick log is cut back to the newest reading", d.ticks <= 2, true)
+  W.timersStall = false
+end)
+
 -- ---- round 4: interactions the design pass introduced ----
 -- (round 4 P1) The sweep runs in every state now, in the same tick as an
 -- unattended freeze. A STOP that takes effect a moment later must not

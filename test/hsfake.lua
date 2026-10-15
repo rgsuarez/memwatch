@@ -74,13 +74,17 @@ function F.new()
   -- ---- processes ---------------------------------------------------------
   -- A process's start time as ps prints it (local time), consistent with
   -- the etime the sampler reports for it (every fake process is reported
-  -- 120 s older than its bornAt, so identity windows can decide).
-  local function startStamp(bornAt)
-    return os.date("%a %b %e %H:%M:%S %Y", math.floor(bornAt) - 120)
+  -- 120 s older than its birth, so identity windows can decide). Both are
+  -- on the wall clock, as the kernel keeps them: the start is the wall time
+  -- at birth, and etime is the wall clock now minus it, so a wall-clock
+  -- step moves etime and launch times together and the start stays put.
+  local function wallNow() return W.now + (W.wallOffset or 0) end
+  local function startStamp(bornWall)
+    return os.date("%a %b %e %H:%M:%S %Y", math.floor(bornWall) - 120)
   end
   function W.addProc(pid, name, rssMB, extra)
     local p = { pid = pid, uid = 501, comm = "/usr/local/bin/" .. name, rssKB = math.floor(rssMB * 1024),
-                lstart = startStamp(W.now), state = "S", bornAt = W.now }
+                lstart = startStamp(wallNow()), state = "S", bornAt = W.now, bornWall = wallNow() }
     for k, v in pairs(extra or {}) do p[k] = v end
     W.procs[pid] = p
     return p
@@ -101,7 +105,7 @@ function F.new()
   end
 
   local function etime(p)
-    local s = math.max(0, math.floor(W.now - p.bornAt)) + 120
+    local s = math.max(0, math.floor(wallNow() - p.bornWall) + 120)
     return string.format("%02d:%02d", s // 60, s % 60)
   end
   local function samplerBlob()

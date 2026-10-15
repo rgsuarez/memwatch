@@ -186,13 +186,19 @@ end
 -- read the table at some instant between the sampler's launch and its
 -- delivery, and etime truncates to whole seconds, so the true start lies in
 -- [launchedAt - etime - 1, deliveredAt - etime]. Callback latency widens
--- the window; it never shifts it. Without a launch time the window has no
--- lower bound. etimeSec rides along because identity comparisons need the
--- process's age at that sample.
+-- the window; it never shifts it. A wall clock stepped back while the
+-- sample was in flight delivers it "before" its launch, and ps read the
+-- clock on one side of the step or the other: the window spans both, from
+-- the earlier of the two times to the later, so it widens across the step
+-- instead of landing a step's width from the true start. Without a launch
+-- time the window has no lower bound. etimeSec rides along because
+-- identity comparisons need the process's age at that sample.
 function M.startWindow(etimeSec, launchedAt, deliveredAt)
   if type(etimeSec) ~= "number" or type(deliveredAt) ~= "number" then return nil end
-  local from = (type(launchedAt) == "number") and math.min(launchedAt, deliveredAt) or -math.huge
-  return { lo = from - etimeSec - 1, hi = deliveredAt - etimeSec, etimeSec = etimeSec }
+  local hasLaunch = type(launchedAt) == "number"
+  local from = hasLaunch and math.min(launchedAt, deliveredAt) or -math.huge
+  local to = hasLaunch and math.max(launchedAt, deliveredAt) or deliveredAt
+  return { lo = from - etimeSec - 1, hi = to - etimeSec, etimeSec = etimeSec }
 end
 
 -- Feed one ps snapshot into the tracker. pid reuse is detected by a comm

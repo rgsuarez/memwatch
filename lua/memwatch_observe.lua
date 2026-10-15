@@ -70,7 +70,11 @@ end
 --      runawayCount, mode, lfmEnabled, wouldAct, wouldActAtFreeze,
 --      graceElapsedSec, category, offender = {pid, name, kind, weightMB,
 --      slopeMBmin, peakSlopeMBmin, ageSec, foreground}, snapshot,
---      snapshotHash }
+--      snapshotHash, identityBasis }
+-- identityBasis says how the follow-ups tell the observed process from a
+-- successor under its pid: "window" (the start window of its latest ps
+-- sighting), "lstart" (the start time the alert bound), or absent (neither:
+-- its follow-ups can only read unknown or exited).
 function M.row(a)
   local off = type(a.offender) == "table" and a.offender or {}
   return {
@@ -97,6 +101,7 @@ function M.row(a)
       foreground = off.foreground == true or nil, foregroundBasis = "name",
     },
     snapshot = a.snapshot, snapshotHash = a.snapshotHash,
+    identityBasis = a.identityBasis,
   }
 end
 
@@ -184,12 +189,51 @@ end
 -- left unrecorded, never attributed to another process).
 local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
                  Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
-function M.lstartEpoch(s)
+local function lstartFields(s)
   if type(s) ~= "string" then return nil end
   local mon, d, h, mi, sec, y = s:match("^%a+%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)%s+(%d+)$")
   if not mon or not MONTHS[mon] then return nil end
-  return os.time({ year = tonumber(y), month = MONTHS[mon], day = tonumber(d),
-                   hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) })
+  return { year = tonumber(y), month = MONTHS[mon], day = tonumber(d),
+           hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) }
+end
+function M.lstartEpoch(s)
+  local f = lstartFields(s)
+  return f and os.time(f) or nil
+end
+
+-- The same, but nil in the hour a daylight-saving fold repeats, where the
+-- local time names two epochs an hour apart: read as standard time and as
+-- daylight time, both convert back to the same clock reading. Outside the
+-- fold only one reading converts back.
+function M.lstartEpochUnambiguous(s)
+  local f = lstartFields(s)
+  if not f then return nil end
+  local function readAs(isdst)
+    local t = { year = f.year, month = f.month, day = f.day, hour = f.hour,
+                min = f.min, sec = f.sec, isdst = isdst }
+    local ok, e = pcall(os.time, t)
+    if not ok or type(e) ~= "number" then return nil end
+    local back = os.date("*t", e)
+    if back.year == f.year and back.month == f.month and back.day == f.day
+       and back.hour == f.hour and back.min == f.min and back.sec == f.sec then
+      return e
+    end
+    return nil
+  end
+  local std, dst = readAs(false), readAs(true)
+  if std and dst and std ~= dst then return nil end
+  return std or dst
+end
+
+-- A start window from a bound start time (ps prints whole seconds, so the
+-- start lies in [epoch, epoch + 1]), for an observation whose tracker entry
+-- has no window: a process the top stream named while ps was stalled. Its
+-- age at `now` lets identity() decide. nil when the start time does not
+-- parse, is ambiguous (see lstartEpochUnambiguous), or lies after now.
+function M.startFromLstart(s, now)
+  local epoch = M.lstartEpochUnambiguous(s)
+  if not epoch or type(now) ~= "number" or epoch > now then return nil end
+  return { lo = epoch, hi = epoch + 1, etimeSec = now - epoch }
 end
 
 -- Is a process with this start epoch (and comm) the observed one?
@@ -214,32 +258,55 @@ end
 -- events arrive instead of read back from whatever the globals hold at the
 -- follow-up: every ps sample (presence by acquisition time, weight and
 -- peak, or proof it is gone), every memwatch signal and every operator
--- touch aimed at that same process. A follow-up reads only this record, so
--- a delivery stall, an expired tracker entry, a reused pid or an event from
--- before the observation cannot change what it reports.
--- a: { pid, comm0, start0, obsAt, weightMB }
+-- touch aimed at that same process, every operator action, and each
+-- change in whether memwatch's frozen ledger holds it. A follow-up reads
+-- only this record, as of its horizon, so a delivery stall, a late timer,
+-- an expired tracker entry, a reused pid or an event from before the
+-- observation cannot change what it reports.
+-- a: { pid, comm0, start0, obsAt, weightMB, minSeq }. minSeq is the first
+-- sampler sequence launched after the observation (nil: decide by launch
+-- time); see foldSample.
 function M.newEvidence(a)
-  return { pid = a.pid, comm0 = a.comm0, start0 = a.start0, obsAt = a.obsAt,
+  return { pid = a.pid, comm0 = a.comm0, start0 = a.start0, obsAt = a.obsAt, minSeq = a.minSeq,
            weight0 = a.weightMB, peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil,
            gone = nil, lastMiss = nil, samples = {}, signals = {},
-           touches = 0, touchesUncertain = 0, touchLog = {} }
+           touches = 0, touchesUncertain = 0, touchLog = {}, actions = {}, frozenLog = {},
+           clockStep = nil }
 end
 
 -- Fold one ps sample. s: { complete, row (the pid's row or nil), start1
--- (the row's start window), weightMB (the row's weight), launchedAt,
--- deliveredAt }. Presence counts from the sample's ACQUISITION bound (its
--- launch: ps read the table between launch and delivery), so a sample
--- delivered late is exactly as fresh as its launch says. A sample launched
--- before the observation says nothing about what followed it (a stalled
--- table can land after the observation and lack a process born since), so
--- it is ignored. A different process under the pid (another comm, or
--- disjoint start windows) proves the observed one gone, as does absence
--- from a complete table; absence from a partial table proves nothing. The
--- proof is dated by its delivery: the table was read by then.
+-- (the row's start window), weightMB (the row's weight), seq (the
+-- sampler's launch order), launchedAt, deliveredAt }. Presence counts from
+-- the sample's ACQUISITION bound (its launch: ps read the table between
+-- launch and delivery), so a sample delivered late is exactly as fresh as
+-- its launch says. A weight counts from its DELIVERY: the reading was taken
+-- by then, and not provably before. A sample launched before the
+-- observation says nothing about what followed it (a stalled table can land
+-- after the observation and lack a process born since), so it is ignored;
+-- launch ORDER decides that, not the wall clock. A sample launched after
+-- the observation whose wall-clock launch reads before it, or one
+-- delivered "before" its own launch, proves the clock stepped back, and
+-- the record can no longer date anything (clockStep). A
+-- different process under the pid (another comm, or disjoint start
+-- windows) proves the observed one gone, as does absence from a complete
+-- table; absence from a partial table proves nothing. The proof is dated by
+-- its delivery: the table was read by then.
 function M.foldSample(ev, s)
   if ev.gone then return end
-  if type(s.launchedAt) ~= "number" or s.launchedAt < ev.obsAt then
-    ev.lastMiss = "pre-observation-sample"
+  local pre
+  if type(ev.minSeq) == "number" and type(s.seq) == "number" then
+    pre = s.seq < ev.minSeq
+  else
+    pre = type(s.launchedAt) ~= "number" or s.launchedAt < ev.obsAt
+  end
+  if pre or type(s.launchedAt) ~= "number" then
+    -- Only while nothing better is known: it never hides a later reason.
+    if ev.seenAcq == nil and ev.lastMiss == nil then ev.lastMiss = "pre-observation-sample" end
+    return
+  end
+  if s.launchedAt < ev.obsAt - M.cfg.clockSlackSec
+     or (type(s.deliveredAt) == "number" and s.deliveredAt < s.launchedAt - M.cfg.clockSlackSec) then
+    ev.clockStep = true
     return
   end
   if s.row then
@@ -257,7 +324,9 @@ function M.foldSample(ev, s)
     if type(s.weightMB) == "number" then
       ev.lastWeightMB = s.weightMB
       if ev.peakMB == nil or s.weightMB > ev.peakMB then ev.peakMB = s.weightMB end
-      ev.samples[#ev.samples + 1] = { at = s.launchedAt, weightMB = s.weightMB }
+      if type(s.deliveredAt) == "number" then
+        ev.samples[#ev.samples + 1] = { at = s.deliveredAt, weightMB = s.weightMB }
+      end
     end
     ev.lastMiss = nil
   elseif s.complete then
@@ -288,6 +357,32 @@ function M.foldTouch(ev, t)
   ev.touchLog[#ev.touchLog + 1] = { at = t and t.at, uncertain = uncertain or nil }
 end
 
+-- Fold one operator action (any surface, any process) taken at `at`: a
+-- follow-up counts those through its own horizon.
+function M.foldAction(ev, at)
+  ev.actions[#ev.actions + 1] = at
+end
+
+-- Fold whether memwatch's frozen ledger holds the observed process from
+-- `at` on: held is frozenMatches' answer (true, false, or nil when the
+-- entry's process cannot be told apart). Only changes are kept.
+function M.foldFrozen(ev, at, held)
+  local log = ev.frozenLog
+  local last = log[#log]
+  if last and last.held == held then return end
+  log[#log + 1] = { at = at, held = held }
+end
+
+-- Whether the frozen ledger held the observed process at instant t: the
+-- last change at or before t (false before any); nil when it could not tell.
+function M.frozenAt(ev, t)
+  local held = false
+  for _, f in ipairs(ev.frozenLog or {}) do
+    if type(f.at) == "number" and f.at <= t then held = f.held end
+  end
+  return held
+end
+
 -- What became of the observed process by horizon instant t (the
 -- observation time plus the horizon, never the moment a late timer ran),
 -- from its evidence alone. Returns fate, detail.
@@ -296,43 +391,72 @@ end
 --   alive   : seen, as the same process, in a sample ACQUIRED within
 --             sampleFreshSec of t, or after it (a process alive later was
 --             alive at t)
---   frozen  : alive, and memwatch's frozen ledger holds this same process
+--   frozen  : alive, and memwatch's frozen ledger held this same process at t
 --   unknown : no such evidence (detail: stale-sample, incomplete-sample,
---             identity-uncertain, or pre-observation-sample)
-function M.fateAt(ev, t, frozenSame)
-  if ev.gone and (ev.gone.at == nil or ev.gone.at <= t) then
+--             identity-uncertain, pre-observation-sample; frozen-uncertain
+--             when it was alive but the ledger's entry for its pid cannot
+--             be told apart from another process; clock-step when the wall
+--             clock stepped back after the observation, so nothing in the
+--             record can be placed before or after t)
+-- An event with no time is never placed before t.
+function M.fateAt(ev, t)
+  if ev.clockStep then return "unknown", "clock-step" end
+  if ev.gone and type(ev.gone.at) == "number" and ev.gone.at <= t then
     return "exited", (ev.gone.how == "pid-reused") and "pid-reused" or nil
   end
   if ev.seenAcq and ev.seenAcq >= t - M.cfg.sampleFreshSec then
-    if frozenSame then return "frozen", nil end
+    local held = M.frozenAt(ev, t)
+    if held == nil then return "unknown", "frozen-uncertain" end
+    if held then return "frozen", nil end
     return "alive", nil
   end
   return "unknown", ev.lastMiss or "stale-sample"
 end
 
 -- The evidence as of horizon instant t: the weight of the last sighting
--- acquired by t, the peak since the observation through t, the last
--- memwatch signal sent by t (and how many), and the operator touches by t
--- (certain, and uncertain). A follow-up whose timer ran late reports the
--- horizon it names, not what happened after it.
+-- delivered by t, the peak since the observation through t, the last
+-- memwatch signal sent by t (and how many), the operator touches by t
+-- (certain, and uncertain), and the operator actions by t. A follow-up
+-- whose timer ran late reports the horizon it names, not what happened
+-- after it. nil after a clock step (see fateAt): nothing can be placed.
 function M.asOf(ev, t)
+  if ev.clockStep then return nil end
+  local function by(at) return type(at) == "number" and at <= t end
   local out = { weightMB = nil, peakMB = ev.weight0, signal = nil, signalCount = 0,
-                touches = 0, touchesUncertain = 0 }
+                touches = 0, touchesUncertain = 0, actions = 0 }
   for _, s in ipairs(ev.samples or {}) do
-    if s.at <= t then
+    if by(s.at) then
       out.weightMB = s.weightMB
       if out.peakMB == nil or s.weightMB > out.peakMB then out.peakMB = s.weightMB end
     end
   end
   for _, sig in ipairs(ev.signals or {}) do
-    if sig.at == nil or sig.at <= t then out.signal, out.signalCount = sig, out.signalCount + 1 end
+    if by(sig.at) then out.signal, out.signalCount = sig, out.signalCount + 1 end
   end
   for _, tc in ipairs(ev.touchLog or {}) do
-    if tc.at == nil or tc.at <= t then
+    if by(tc.at) then
       if tc.uncertain then out.touchesUncertain = out.touchesUncertain + 1 else out.touches = out.touches + 1 end
     end
   end
+  for _, a in ipairs(ev.actions or {}) do
+    if by(a) then out.actions = out.actions + 1 end
+  end
   return out
+end
+
+-- The machine's reading as of instant t from the glue's tick log (entries
+-- { at, availPct, state } in tick order): the last entry at or before t,
+-- when it is no older than freshSec (ticks stall with the run loop, and a
+-- reading from long before the horizon is not a reading at it); else nil.
+function M.metricAt(log, t, freshSec)
+  for i = #(log or {}), 1, -1 do
+    local m = log[i]
+    if type(m.at) == "number" and m.at <= t then
+      if m.at >= t - (freshSec or M.cfg.sampleFreshSec) then return m end
+      return nil
+    end
+  end
+  return nil
 end
 
 -- Does a frozen-ledger entry hold the observed process? From the entry's

@@ -2110,6 +2110,62 @@ scenario("ledger: records whose follow-ups never run stop growing", nil, functio
   W.timersStall = false
 end)
 
+-- A rotation that keeps failing stops the live file at twice its cap, and
+-- counts each failure; a generation that exists but cannot be read is
+-- still moved on, never overwritten.
+scenario("ledger: a rotation that keeps failing caps the live file", nil, function(W, mw)
+  local observe = require("memwatch_observe")
+  observe.cfg.maxBytes = 3000
+  local dir = W.home .. "/projects/memwatch/"
+  local path = dir .. "memwatch-observe.jsonl"
+  -- .2 is a file and .3 a non-empty directory: the first step (.2 -> .3)
+  -- fails every time, so no rotation finishes.
+  local g2 = assert(io.open(path .. ".2", "w")); g2:write("old\n"); g2:close()
+  os.execute("mkdir -p '" .. path .. ".3/keep'")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(900)
+  local f = io.open(path, "r")
+  local size = f and f:seek("end") or 0
+  if f then f:close() end
+  check("rotate-fail: the live file stops near twice its cap", size > 3000 and size < 2 * 3000 + 5000, true)
+  check("rotate-fail: each failed rotation is counted", mw.debug().observe.errors >= 2, true)
+  check("rotate-fail: and logged", logHas(W, "observe-rotate"), true)
+  check("rotate-fail: the generation that could not move is intact", (function()
+    local h = io.open(path .. ".2", "r"); local t = h and h:read("a"); if h then h:close() end
+    return t end)(), "old\n")
+  observe.cfg.maxBytes = 4e6
+end)
+
+scenario("ledger: an unreadable generation is moved on, not overwritten", nil, function(W, mw)
+  local observe = require("memwatch_observe")
+  observe.cfg.maxBytes = 3000
+  local path = W.home .. "/projects/memwatch/memwatch-observe.jsonl"
+  local g1 = assert(io.open(path .. ".1", "w")); g1:write("generation one\n"); g1:close()
+  os.execute("chmod 000 '" .. path .. ".1'")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  -- Until the first rotation: the unreadable .1 must have moved to .2.
+  local found = runUntil(W, 600, function()
+    if not os.rename(path .. ".2", path .. ".2") then return false end
+    os.execute("chmod 644 '" .. path .. ".2'")
+    local h = io.open(path .. ".2", "r")
+    local t = h and h:read("a")
+    if h then h:close() end
+    return t ~= nil
+  end)
+  local h = io.open(path .. ".2", "r")
+  local t = h and h:read("a")
+  if h then h:close() end
+  check("unreadable: a rotation ran", found, true)
+  check("unreadable: the unreadable generation moved on, intact", t, "generation one\n")
+  check("unreadable: no rotation failed", mw.debug().observe.errors, 0)
+  os.execute("chmod 644 '" .. path .. ".1' 2>/dev/null")
+  observe.cfg.maxBytes = 4e6
+end)
+
 -- ---- round 4: interactions the design pass introduced ----
 -- (round 4 P1) The sweep runs in every state now, in the same tick as an
 -- unattended freeze. A STOP that takes effect a moment later must not

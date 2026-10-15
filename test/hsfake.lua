@@ -371,8 +371,14 @@ function F.new()
       end,
       attributes = function(path, key)
         local m = (W.jetsam or {})[path:match("[^/]+$")]
-        if key == "modification" then return m end
-        return m and { modification = m } or nil
+        if m then
+          if key == "modification" then return m end
+          return { modification = m }
+        end
+        -- Any other path is a real file in the scratch home: it exists when
+        -- renaming it onto itself succeeds (a stat, needing no read access).
+        if key == nil and os.rename(path, path) then return { mode = "file" } end
+        return nil
       end,
     },
   }

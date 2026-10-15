@@ -2307,15 +2307,17 @@ do
   check("observe glue: a nil line counts as an error",
     appendBody:find("if not line then obs.stats.errors = obs.stats.errors + 1; return false end", 1, true) ~= nil, true)
   local _, falseReturns = appendBody:gsub("return false", "")
-  check("observe glue: nil line, both opens and the write each report failure", falseReturns, 4)
+  check("observe glue: nil line, both opens, a refused row past the cap and the write each report failure",
+    falseReturns, 5)
   check("observe glue: write and close are both checked",
     appendBody:find("if not (wrote and closed) then", 1, true) ~= nil, true)
   local _, trueReturns = appendBody:gsub("return true", "")
   check("observe glue: only a written line reports success",
     trueReturns == 1 and appendBody:find("return true\n$") ~= nil, true)
-  check("observe glue: rotation runs through observe.rotate, and a failure is logged",
+  check("observe glue: rotation runs through observe.rotate, and a failure is counted and logged",
     appendBody:find("local rotated, rerr = observe.rotate(observe.rotationPlan(obs.path, observe.cfg.keep),", 1, true) ~= nil
-      and appendBody:find('if not rotated then logError("observe-rotate", rerr) end', 1, true) ~= nil, true)
+      and appendBody:find('logError("observe-rotate", rerr)', 1, true) ~= nil
+      and appendBody:find("function(path) return hs.fs.attributes(path) ~= nil end", 1, true) ~= nil, true)
   check("observe glue: a write that fails at close logs the close's error",
     appendBody:find('logError("observe-write", werr or cerr)', 1, true) ~= nil, true)
   local function guardedIncrements(text, counter)

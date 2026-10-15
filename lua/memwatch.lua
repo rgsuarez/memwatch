@@ -2930,17 +2930,22 @@ function obs.appendObserve(line)
     logError("observe-open", err)
     return false
   end
-  if f:seek("end") > observe.cfg.maxBytes then
+  local size = f:seek("end")
+  if size > observe.cfg.maxBytes then
     f:close()
     -- A rotation that cannot finish stops, and the row goes on the live
-    -- file (over its cap) rather than a generation being overwritten.
+    -- file (over its cap) rather than a generation being overwritten; past
+    -- twice the cap, rows are refused instead, so a rename that keeps
+    -- failing cannot grow the file without bound. A generation exists if
+    -- the path does (stat), readable or not: one skipped as absent would be
+    -- overwritten by the step after it.
     local rotated, rerr = observe.rotate(observe.rotationPlan(obs.path, observe.cfg.keep),
-      function(path)
-        local h = io.open(path, "r")
-        if h then h:close() end
-        return h ~= nil
-      end, os.rename)
-    if not rotated then logError("observe-rotate", rerr) end
+      function(path) return hs.fs.attributes(path) ~= nil end, os.rename)
+    if not rotated then
+      obs.stats.errors = obs.stats.errors + 1
+      logError("observe-rotate", rerr)
+      if size > 2 * observe.cfg.maxBytes then return false end
+    end
     f, err = io.open(obs.path, "a")
     if not f then
       obs.stats.errors = obs.stats.errors + 1

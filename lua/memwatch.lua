@@ -40,6 +40,7 @@ local topCache     = { map = nil, at = 0 }  -- per-pid CMPRS from async top
 local lastPsList   = {}
 local lastRanked   = {}   -- top hogs by RSS+CMPRS weight (menu rows)
 local lastRuns     = {}   -- current runaway list, ignores applied
+local lastRunsAll  = {}   -- every runaway, before the answered filters (for GC)
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
@@ -337,6 +338,7 @@ end
 local function assessProcesses(now)
   local totalMB = (lastMetrics.totalGB or 0) * 1024
   local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
+  lastRunsAll = runs
   -- An answered process is no candidate, by its own state: ignored, held
   -- frozen by memwatch (stopped, so its extreme latch is history, not
   -- growth), or verified gone while its last samples age out.
@@ -2536,8 +2538,11 @@ end
 -- The signal path also re-validates identity, but this keeps the DECISION
 -- from ever consuming stale streak state. Runs every tick regardless of LFM.
 gcUnattendedState = function()
+  -- Every runaway counts, answered or not: a process filtered off the alert
+  -- candidates (frozen, gone, ignored) is not thereby dead, and its records
+  -- (a final failed-action latch above all) must outlive the filter.
   local liveRun = {}
-  for _, r in ipairs(lastRuns) do liveRun[r.pid] = true end
+  for _, r in ipairs(lastRunsAll) do liveRun[r.pid] = true end
   for pid in pairs(unattendedWaitStreak) do
     if not liveRun[pid] then unattendedWaitStreak[pid] = nil end
   end

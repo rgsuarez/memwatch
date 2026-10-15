@@ -150,6 +150,61 @@ case "$said" in
 esac
 printf '%s\n' "$term" > "$terms"
 
+# (round 4) An exemption is an exact path in this repository: the same
+# file name anywhere else is scanned like any other file.
+mkdir -p "$tmp/lua" "$tmp/outside/lua"
+printf 'emits %s here\n' "$(printf '%s:%s' league full)" > "$tmp/lua/memwatch_report.lua"
+git -C "$tmp" add lua/memwatch_report.lua
+expect 0 "the repository's own report module is exempt (control)"
+printf 'carries %s here\n' "$term" > "$tmp/outside/lua/memwatch_report.lua"
+expect_named 1 "named: an exempt file name outside the repository is scanned" "$tmp/outside" "lua/memwatch_report.lua"
+expect_named 1 "named: and so by its absolute path" "/" "$tmp/outside/lua/memwatch_report.lua"
+git -C "$tmp" rm -q --cached lua/memwatch_report.lua
+rm -rf "$tmp/lua" "$tmp/outside/lua"
+
+# (round 4) A symlinked working directory cannot hide a file's place in the
+# repository: the path classes still refuse it.
+mkdir -p "$tmp/reports" "$tmp/eval/results"
+printf 'plain page\n' > "$tmp/reports/value.html"
+printf 'plain run\n' > "$tmp/eval/results/run1.txt"
+link="$(mktemp -u)"
+ln -s "$tmp" "$link"
+expect_named 1 "named: a report page is refused from the repository (control)" "$tmp" "reports/value.html"
+expect_named 1 "named: and from a symlinked path to it" "$link" "reports/value.html"
+expect_named 1 "named: an eval result from a symlinked path" "$link" "eval/results/run1.txt"
+rm -f "$link"
+rm -rf "$tmp/reports" "$tmp/eval/results"
+
+# (round 4) A named symlink is refused: its name says nothing of its target.
+ln -s "$tmp/outside/draft.md" "$tmp/outside/innocent.txt"
+expect_named 2 "named: a symlink is refused" "$tmp/outside" "innocent.txt"
+rm -f "$tmp/outside/innocent.txt"
+
+# (round 4) A hit in a file with no newline reports where, not what: the
+# report stays small however large the line, and never prints the term.
+awk -v k="$key" 'BEGIN { for (i = 0; i < 200000; i++) printf "aaaaaaaaaaaaaaa"; printf " %s", k }' > "$tmp/blob.txt"
+git -C "$tmp" add -f blob.txt
+said="$( (cd "$tmp" && env -u MEMWATCH_PUBLIC_CLONE bash "$fw") 2>&1 >/dev/null || true)"
+got=0
+(cd "$tmp" && env -u MEMWATCH_PUBLIC_CLONE bash "$fw") >/dev/null 2>&1 || got=$?
+if [ "$got" -eq 1 ]; then echo "ok    a newline-free blob with a hit fails"; else echo "FAIL  a newline-free blob with a hit fails got=$got want=1"; fails=$((fails + 1)); fi
+if [ "${#said}" -lt 1000 ]; then echo "ok    and its report is bounded (${#said} bytes)"; else echo "FAIL  and its report is bounded (${#said} bytes)"; fails=$((fails + 1)); fi
+case "$said" in
+  *"$key"*) echo "FAIL  the report does not print the hit"; fails=$((fails + 1)) ;;
+  *"blob.txt, line 1"*) echo "ok    the report names the file and line, not the hit" ;;
+  *) echo "FAIL  the report names the file and line"; fails=$((fails + 1)) ;;
+esac
+git -C "$tmp" rm -q --cached blob.txt
+rm -f "$tmp/blob.txt"
+printf 'carries %s here\n' "$term" > "$tmp/probe.txt"
+said="$( (cd "$tmp" && env -u MEMWATCH_PUBLIC_CLONE bash "$fw") 2>&1 >/dev/null || true)"
+case "$said" in
+  *"$term"*) echo "FAIL  a local term is reported by number, not text"; fails=$((fails + 1)) ;;
+  *"local term 1"*) echo "ok    a local term is reported by number, not text" ;;
+  *) echo "FAIL  a local term is reported by number"; fails=$((fails + 1)) ;;
+esac
+clean
+
 # Not a git tree: a tree scan that finds no files is blind, not clean.
 notgit="$(mktemp -d)"
 mkdir -p "$notgit/eval/checks"

@@ -11,10 +11,15 @@
 #   1  an internal reference, or a tracked internal-only artifact, was found
 #   2  refused to scan blind: the local term list is missing, or holds no
 #      effective pattern (only blank and # lines); a pattern does not
-#      compile; a named file cannot be read; a file cannot be scanned; or
-#      the tree scan found no files at all (not a git tree). A public clone
-#      has no local list by design and sets MEMWATCH_PUBLIC_CLONE=1 to scan
-#      with the structural patterns alone.
+#      compile; a named file cannot be read, or is a symlink (name its
+#      target); a file cannot be scanned; or the tree scan found no files at
+#      all (not a git tree). A public clone has no local list by design and
+#      sets MEMWATCH_PUBLIC_CLONE=1 to scan with the structural patterns
+#      alone.
+#
+# A hit is reported as its file and line and the pattern's number, never
+# the matching text or a local term: the report itself stays bounded and
+# carries nothing internal.
 # test-no-internal-refs.sh pins this contract.
 #
 # Usage:
@@ -28,18 +33,25 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Named files are resolved BEFORE moving to the repository root, so a path
 # relative to the caller's directory scans the file the caller meant; a
-# named file that cannot be read is a refusal, never a clean pass.
+# named file that cannot be read is a refusal, never a clean pass. Paths
+# are physical (pwd -P), like the root below, so a symlinked directory
+# cannot hide a file's place in the repository; a named symlink is refused
+# (its name says nothing about what it points to).
 NAMED=()
 for f in "$@"; do
+  if [ -L "$f" ]; then
+    echo "no-internal-refs: $f is a symlink; name its target; refusing" >&2
+    exit 2
+  fi
   if [ ! -f "$f" ] || [ ! -r "$f" ]; then
     echo "no-internal-refs: cannot read $f; refusing" >&2
     exit 2
   fi
-  NAMED+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")")
+  NAMED+=("$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")")
 done
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo "$SCRIPT_DIR")/" 2>/dev/null || true
-ROOT="$(pwd)"
+ROOT="$(pwd -P)"
 
 # Internal-reference patterns. STRUCTURAL only, so this tracked script
 # carries no specific internal identifier: any Notion-style workspace UUID
@@ -55,6 +67,7 @@ PATTERNS=(
   'notion\.so|app\.notion\.com'
   'league:full'
 )
+STRUCTURAL=${#PATTERNS[@]}   # patterns past this index are local terms
 LOCAL_TERMS="$SCRIPT_DIR/internal-terms.txt"
 if [ -f "$LOCAL_TERMS" ]; then
   effective=0
@@ -99,15 +112,31 @@ done
 fail=0
 scanned=0
 
+# A path's place in this repository: repository-relative for a tracked
+# path (the tree scan lists them so) or a named file under the root; empty
+# for a named file anywhere else, which no exemption by name ever covers.
+repo_path() {
+  case "$1" in
+    "$ROOT"/*) printf '%s' "${1#"$ROOT"/}" ;;
+    /*) printf '' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 scan_file() {
-  local f="$1"
+  local f="$1" rel
+  rel="$(repo_path "$f")"
+  case "$rel" in
+    eval/checks/no-internal-refs.sh) return 0 ;;  # the pattern list itself
+    lua/memwatch_report.lua|test_report.lua) return 0 ;; # emit/assert the league sentinel as a string literal; rendered ARTIFACTS carrying it are the leak class
+  esac
   case "$f" in
-    eval/checks/no-internal-refs.sh|*/eval/checks/no-internal-refs.sh) return 0 ;;  # the pattern list itself
-    lua/memwatch_report.lua|test_report.lua|*/lua/memwatch_report.lua|*/test_report.lua) return 0 ;; # emit/assert the league sentinel as a string literal; rendered ARTIFACTS carrying it are the leak class
     *.gguf|*.png) return 0 ;;                      # binary artifacts
   esac
   scanned=$((scanned + 1))
+  local idx=0
   for pat in "${PATTERNS[@]}"; do
+    idx=$((idx + 1))
     # grep -q itself, never a pipe: under pipefail a pipe into head turns a
     # large match set into SIGPIPE, which would read as no match. 0 is a
     # match, 1 none, anything else a file that could not be scanned. -a reads
@@ -116,8 +145,12 @@ scan_file() {
     local rc=0
     grep -aqE -e "$pat" -- "$f" 2>/dev/null || rc=$?
     if [ "$rc" -eq 0 ]; then
-      echo "INTERNAL-REF: pattern '$pat' in $f:" >&2
-      { grep -anE -e "$pat" -- "$f" 2>/dev/null || true; } | head -3 >&2 || true
+      # Where, never what: the first matching line's number (cut keeps only
+      # it, however long the line), and the pattern by number.
+      local line what
+      line="$({ grep -anE -m 1 -e "$pat" -- "$f" 2>/dev/null || true; } | cut -d: -f1)"
+      if [ "$idx" -le "$STRUCTURAL" ]; then what="structural pattern $idx"; else what="local term $((idx - STRUCTURAL))"; fi
+      echo "INTERNAL-REF: $what in $f, line ${line:-?}" >&2
       fail=1
     elif [ "$rc" -ge 2 ]; then
       echo "no-internal-refs: could not scan $f; refusing" >&2
@@ -130,8 +163,8 @@ scan_file() {
 # they hold: the same classes the tracked-tree check below refuses, by name
 # anywhere, and by repository path inside this tree.
 internal_artifact() {
-  local f="$1" rel="$1"
-  case "$f" in "$ROOT"/*) rel="${f#"$ROOT"/}" ;; esac
+  local f="$1" rel
+  rel="$(repo_path "$f")"
   case "$(basename "$f")" in
     memwatch-lfm.jsonl*|memwatch-observe.jsonl*|memwatch-frozen.json*|memwatch-local.json*|memwatch.log*) return 0 ;;
   esac

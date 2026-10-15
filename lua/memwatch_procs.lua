@@ -187,12 +187,13 @@ end
 -- delivery, and etime truncates to whole seconds, so the true start lies in
 -- [launchedAt - etime - 1, deliveredAt - etime]. Callback latency widens
 -- the window; it never shifts it. A wall clock stepped back while the
--- sample was in flight delivers it "before" its launch, and ps read the
--- clock on one side of the step or the other: the window spans both, from
--- the earlier of the two times to the later, so it widens across the step
--- instead of landing a step's width from the true start. Without a launch
--- time the window has no lower bound. etimeSec rides along because
--- identity comparisons need the process's age at that sample.
+-- sample was in flight delivers it "before" its launch, so the window spans
+-- the earlier of the two times to the later. That alone is not enough: ps
+-- read the clock on one side of the step or the other, so either bound may
+-- be off by the step's size, and steppedSec (the step back taken between
+-- launch and delivery, or a bound on it) widens both. Without a launch time
+-- the window has no lower bound. etimeSec rides along because identity
+-- comparisons need the process's age at that sample.
 function M.startWindow(etimeSec, launchedAt, deliveredAt, steppedSec)
   if type(etimeSec) ~= "number" or type(deliveredAt) ~= "number" then return nil end
   -- steppedSec: a step back taken between launch and delivery. ps read on

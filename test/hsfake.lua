@@ -266,7 +266,11 @@ function F.new()
       secondsSinceEpoch = function() return W.now end,
       -- timersStall: a one-shot callback that never gets to run (a run loop
       -- stalled past it), so a narrative waiting on it never finishes.
-      doAfter = function(sec, fn) return addTimer("after", W.timersStall and math.huge or sec, nil, fn) end,
+      -- timerLag: one-shots run that much late (a run loop blocked in a
+      -- probe during a storm), so an outcome can arrive after a deadline.
+      doAfter = function(sec, fn)
+        return addTimer("after", W.timersStall and math.huge or (sec + (W.timerLag or 0)), nil, fn)
+      end,
       doEvery = function(iv, fn) return addTimer("every", iv, iv, fn) end,
       doUntil = function(pred, action, iv) return addTimer("until", iv or 1, iv or 1, action, pred) end,
     },

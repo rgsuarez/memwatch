@@ -590,6 +590,14 @@ local function settleInteraction(target, outcome)
     r.confirmed, r.pendingUntil = true, nil
   end
 end
+-- A progress step of the action the mark waits on: its outcome is on the
+-- way, so the mark's deadline moves out with it.
+local function extendInteraction(target)
+  local r = recordFor(interacted, target, false)
+  if r and not r.confirmed and r.pendingUntil then
+    r.pendingUntil = hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
+  end
+end
 -- Does the operator's answer stand this process's unattended action down?
 local function interactionStands(off, now)
   local r = recordFor(interacted, off, false)
@@ -762,7 +770,10 @@ local function surfaceUpdate(target)
   local gen = runGen
   return function(text, done, outcome)
     hs.alert.show("memwatch: " .. text, 2.5)
-    if not done then return end
+    if not done then
+      if gen == runGen then extendInteraction(target) end
+      return
+    end
     local answer = core.answerFor(outcome)
     if answer == "done" and outcome ~= "frozen" then markGone(target, hs.timer.secondsSinceEpoch()) end
     if gen ~= runGen then return end
@@ -866,6 +877,12 @@ local function buildHud()
       local narrate = function(text, done, outcome)
         if gen ~= runGen then return end
         if hud then hud[3].text = text end
+        if not done then
+          -- Progress: the action is alive, so its hold and pending mark
+          -- move out with it (only a narrative that stopped moving lapses).
+          hudHoldUntil = hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
+          extendInteraction(target)
+        end
         if done then
           afterHeld(4, guard("hud-close", function()
             if gen == runGen then settleAction(target, outcome) end
@@ -1295,7 +1312,7 @@ local function unattendedReceipt(action, target, adjudicator, rationale, outcome
     or "Extreme runaway, no response to the alert."
   local tail = (outcome == "unconfirmed")
     and "Check the memwatch menu (Frozen by memwatch) or Activity Monitor." or why
-  hs.notify.new({ title = "memwatch unattended " .. action,
+  return hs.notify.new({ title = "memwatch unattended " .. action,
                   subTitle = string.format("%s (pid %d)", target.name, target.pid),
                   informativeText = string.format("%s \u{00B7} %s", text or outcome, tail),
                   withdrawAfter = 0 }):send()
@@ -1304,16 +1321,26 @@ end
 -- An unattended action whose outcome never arrived by the hold deadline
 -- (a step of its narrative never ran) still owes its receipt: a signal may
 -- have gone out, so the operator is told, never left with silence.
+-- The record stays (the action is still in flight: no second action
+-- starts on that process); if the outcome arrives after all, it replaces
+-- this receipt, so one action never leaves two.
 local function settleOpenReceipts(now)
   for owed in pairs(openReceipts) do
-    if now > owed.dueAt then
-      openReceipts[owed] = nil
+    if now > owed.dueAt and not owed.lateReceipt then
       M.logSnapshot(string.format("unattended-no-result:%s:%s(%d)", owed.action,
         owed.target.name or "?", owed.target.pid or -1))
-      unattendedReceipt(owed.action, owed.target, owed.adjudicator, owed.rationale, "unconfirmed",
-        string.format("%s started, but its result never came back", owed.action))
+      owed.lateReceipt = unattendedReceipt(owed.action, owed.target, owed.adjudicator, owed.rationale,
+        "unconfirmed", string.format("%s started, but its result has not come back", owed.action)) or true
     end
   end
+end
+-- Is an unattended action still in flight on this very process? Its
+-- record goes only when its final outcome arrives.
+local function actionInFlight(off)
+  for owed in pairs(openReceipts) do
+    if core.sameIdentity(owed.target, off) then return true end
+  end
+  return false
 end
 
 -- Unattended action: opt-in, extreme growers only, the alert episode
@@ -1358,6 +1385,9 @@ local function unattendedStep(offender, now)
     fired = nil
   end
   if fired and fired.final then return end
+  -- An action still in flight on this process (its outcome has not come
+  -- back, say through a stalled run loop) is never followed by another.
+  if actionInFlight(hudOffender) then return end
   if (now - ((fired and fired.at) or 0)) < core.cfg.cool.autoKillGraceSec then return end
   unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
   local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
@@ -1378,27 +1408,39 @@ local function unattendedStep(offender, now)
   end
   hudHold, hudHoldUntil = true, now + HOLD_MAX_SEC
   local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
-  -- The receipt is owed from here (settleOpenReceipts covers an outcome
-  -- that never arrives).
+  -- The action is in flight, and its receipt owed, from here until its
+  -- final outcome (settleOpenReceipts covers an outcome that is late). Each
+  -- progress step pushes the deadlines out: a slow narrative is not a lost
+  -- one.
   local owed = { action = action, target = target, adjudicator = adjudicator,
                  rationale = rationale, dueAt = now + HOLD_MAX_SEC }
   openReceipts[owed] = true
   local gen = runGen
+  local function receipt(outcome, text)
+    -- One live receipt per action: a "has not come back" receipt posted at
+    -- the deadline gives way to the real outcome.
+    if type(owed.lateReceipt) == "table" then pcall(function() owed.lateReceipt:withdraw() end) end
+    unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
+  end
   local narrate = function(text, done, outcome)
-    if done then openReceipts[owed] = nil end
+    local t = hs.timer.secondsSinceEpoch()
+    if done then openReceipts[owed] = nil else owed.dueAt = t + HOLD_MAX_SEC end
     if gen ~= runGen then
       -- The run ended mid-action: still say what memwatch did, but leave
       -- the new run's alert alone.
-      if done then unattendedReceipt(action, target, adjudicator, rationale, outcome, text) end
+      if done then receipt(outcome, text) end
       return
     end
     if hud then hud[3].text = "AUTO: " .. text end
-    if not done then return end
+    if not done then
+      if hudHold then hudHoldUntil = t + HOLD_MAX_SEC end
+      return
+    end
     if outcome == "failed" then
       local f = unattendedFiredFor[target.pid]
       if f and f.lstart == target.lstart then f.final = true end
     end
-    unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
+    receipt(outcome, text)
     -- memwatch's own action answers the alert like an operator's would.
     afterHeld(6, guard("hud-close", function()
       if gen == runGen then settleAction(target, outcome) end

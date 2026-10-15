@@ -793,8 +793,8 @@ scenario("an unattended action with no result still posts a receipt", '{"unatten
   W.run(50)
   local n = W.notices("memwatch unattended freeze")
   check("no-result: one receipt at the deadline, though alerts are muted", #n, 1)
-  check("no-result: it says the result never came back",
-    n[1] ~= nil and (n[1].attrs.informativeText or ""):find("never came back", 1, true) ~= nil, true)
+  check("no-result: it says the result has not come back",
+    n[1] ~= nil and (n[1].attrs.informativeText or ""):find("has not come back", 1, true) ~= nil, true)
 end)
 
 -- (round 3) A freeze that did not stop the process is a snooze, not a
@@ -1352,6 +1352,35 @@ scenario("the menu offender acts on the banner's binding", nil, function(W)
   item.fn()
   W.run(10)
   check("menu-banner: once rebound, the next click acts", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
+end)
+
+-- ---- actions in flight ----
+-- (round 5) A run loop that stalls past the hold deadline: the deadline
+-- receipt goes out, but the action is still in flight, so no second action
+-- starts on the process, and when the outcome arrives it replaces that
+-- receipt: one live receipt for one action.
+scenario("a late outcome replaces its deadline receipt", '{"unattended":"freeze","alerts":false}', function(W)
+  W.onSignal = function(sig) if sig == "STOP" then W.timerLag = 70 end end
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end)
+  W.onSignal, W.timerLag = nil, 0
+  W.run(50)
+  local function live()
+    local out = {}
+    for _, n in ipairs(W.notices("memwatch unattended")) do
+      if not n.withdrawn then out[#out + 1] = n end
+    end
+    return out
+  end
+  check("late: the deadline receipt is up while the outcome is late", #live(), 1)
+  W.run(40)                         -- the verifier finally runs
+  local l = live()
+  check("late: one live receipt in the end", #l, 1)
+  check("late: and it is the real outcome",
+    l[1] ~= nil and (l[1].attrs.informativeText or ""):find("frozen", 1, true) ~= nil, true)
+  check("late: no second action while the first was in flight", W.signalsTo(4242), "STOP")
 end)
 
 -- ---- the frozen ledger: each writer owns only its own entry ----

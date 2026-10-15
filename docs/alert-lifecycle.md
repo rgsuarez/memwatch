@@ -142,10 +142,16 @@ on the same process.
 Receipts for unattended actions say what happened and are posted when the
 action completes, even with desktop alerts muted: `frozen`, `terminated`,
 `failed` (it survived), or `unconfirmed` (a signal went out but its result
-could not be verified). An action whose result has not arrived by the hold
-deadline gets an `unconfirmed` receipt then. An action that signaled
-nothing (`unverified`, `refused`, `stale`, `exited`) is logged, not
-announced.
+could not be verified). An action that signaled nothing (`unverified`,
+`refused`, `stale`, `exited`) is logged, not announced.
+
+An action stays in flight until its final outcome arrives. Each progress
+step pushes its deadlines (the HUD's hold, a pending interaction mark, the
+owed receipt) out by 45 seconds, so a slow narrative is not a lost one.
+If an unattended action's outcome has still not arrived by its deadline
+(a stalled run loop), a receipt says so, and no second action starts on
+that process while the first is in flight. If the outcome then arrives, it
+replaces that receipt: one action, one live receipt.
 
 ## The frozen ledger
 

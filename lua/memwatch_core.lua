@@ -431,10 +431,13 @@ end
 -- field finding: a dead VM pid held frozenCount=1 for two days).
 -- Unknown keeps the entry: a probe that could not run proves nothing, and
 -- dropping a live entry would strand a stopped process with no way back.
-function M.pruneFrozen(entries, probe)
+-- A freeze still being verified (pendingUntil in the future) is kept as it
+-- is: the STOP may not have taken effect yet, and its verifier decides.
+function M.pruneFrozen(entries, probe, now)
   local kept, dropped = {}, {}
   for pid, e in pairs(entries or {}) do
-    local st, p = probe(pid)
+    local st, p = "pending", nil
+    if not (e.pendingUntil and now and now < e.pendingUntil) then st, p = probe(pid) end
     local why = nil
     if st == "absent" then
       why = "exited"

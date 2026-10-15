@@ -922,6 +922,13 @@ do
   check("prune: recycled reason",      whys[200], "pid-recycled")
   check("prune: resumed reason",       whys[300], "resumed-externally")
   check("prune: nothing dropped for the unknown one", whys[500], nil)
+  local pend = { [600] = { pid = 600, name = "settling", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
+  local probed = false
+  local k3 = core.pruneFrozen(pend, function() probed = true; return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1010)
+  check("prune: a freeze still being verified is kept", k3[600] ~= nil, true)
+  check("prune: and not even probed", probed, false)
+  local k4 = core.pruneFrozen(pend, function() return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1040)
+  check("prune: once its verify window passes it is checked like any other", k4[600], nil)
   local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
 end

@@ -1571,6 +1571,7 @@ end
 ------------------------------------------------------------------------------
 
 local FROZEN_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-frozen.json"
+local FREEZE_PENDING_SEC = 30   -- a freeze's entry is its verifier's until then
 
 local function saveFrozen()
   local list = lfm.jsonArray({})
@@ -1650,7 +1651,7 @@ frozenSweep = function(now)
   local rows = probeRows(pids)
   local kept, dropped = core.pruneFrozen(frozen, function(pid)
     return core.probeResult(rows, pid)
-  end)
+  end, now)
   if #dropped == 0 then return end
   for _, d in ipairs(dropped) do
     M.logSnapshot(string.format("frozen-prune:%s(%d):%s",
@@ -1703,11 +1704,16 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   -- means a reload finds it and frozenReconcile re-validates (still stopped
   -- -> kept; failed to stop -> dropped). The verify below downgrades a
   -- process that never entered state T.
-  frozen[pid] = {
+  local entry = {
     pid = pid, name = proc.liveName, lstart = proc.lstart,
     weightMB = opts.weightMB or 0,
     frozenAt = hs.timer.secondsSinceEpoch(),
+    -- Until its verifier has run, the liveness sweep leaves the entry alone:
+    -- the STOP may not have taken effect yet (a process in a syscall stops
+    -- when it returns to user space).
+    pendingUntil = hs.timer.secondsSinceEpoch() + FREEZE_PENDING_SEC,
   }
+  frozen[pid] = entry
   saveFrozen()
   sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))
   afterHeld(0.5, guard("freeze-verify", function()
@@ -1734,6 +1740,11 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
         onUpdate(string.format("%s changed identity mid-freeze; released, no freeze", proc.liveName), true, "stale")
       end
     elseif core.isStopped(reprobe) then
+      -- A process memwatch stopped is always in the ledger: settle the entry
+      -- (or restore it, if anything removed it meanwhile).
+      entry.pendingUntil = nil
+      frozen[pid] = entry
+      saveFrozen()
       M.logSnapshot(string.format("freeze-done:%s(%d)", proc.liveName, pid))
       onUpdate(string.format(
         "%s frozen \u{00B7} memory is NOT released until it is resumed or quit", proc.liveName), true, "frozen")

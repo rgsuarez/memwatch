@@ -962,6 +962,25 @@ scenario("a stuck narrative hold is released", nil, function(W)
   check("hold: and acts again", W.signalsTo(4242):find("TERM", 1, true) ~= nil, true)
 end)
 
+-- ---- round 4: interactions the design pass introduced ----
+-- (round 4 P1) The sweep runs in every state now, in the same tick as an
+-- unattended freeze. A STOP that takes effect a moment later must not
+-- lose its ledger entry before its verifier runs.
+scenario("a freeze being verified survives the sweep", UNATTENDED_FREEZE, function(W)
+  W.stopDelay = 0.2
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end)
+  W.run(3)
+  check("pending: the process is stopped", W.procs[4242].state, "T")
+  check("pending: and the ledger still holds it (Resume is offered)", W.menuItem("   leaker") ~= nil, true)
+  W.kern = 1
+  W.run(130)                        -- calm sweeps re-check it
+  check("pending: still held after the sweeps", W.menuItem("   leaker") ~= nil, true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

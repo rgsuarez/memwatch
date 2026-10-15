@@ -498,21 +498,34 @@ end
 ------------------------------------------------------------------------------
 
 local hud            = nil
--- The grace clock and the answered mark are per process (keyed by pid and
--- the name's first 15 characters, which top's truncation preserves), so a
--- handoff, an alternation or a newly named offender never borrows another
--- process's clock. Both start over at every raise.
-local exposure       = {}     -- [key] = seconds it headed the active alert as extreme
-local interacted     = {}     -- [key] = the operator acted on it since the raise
+-- The grace clock and the answered mark are per process, so a handoff, an
+-- alternation or a newly named offender never borrows another process's
+-- clock. Records are filed under pid and the name's first 15 characters
+-- (which top's truncation preserves) and carry the start time they were
+-- made for: a record made for one bound process never serves another (a
+-- same-name process that reused the pid starts over), and one made while
+-- unbound is adopted when its process binds. Both start over at every raise.
+local exposure       = {}     -- [key] = { sec, lstart }: time it headed the active alert as extreme
+local interacted     = {}     -- [key] = { lstart }: the operator acted on it since the raise
 local exposureTickAt = nil    -- the previous critical tick (nil: none yet)
-local exposureHead   = nil    -- the key that headed the alert since that tick
+local exposureHead   = nil    -- the record whose process headed the alert since that tick
 local EXPOSURE_STEP_MAX = 15  -- a stalled tick counts at most this much grace
 local function procKey(off)
   return off and off.pid and (off.pid .. "|" .. (off.name or ""):sub(1, 15)) or nil
 end
-local function markInteracted(off)
+-- The record in `map` for this process, or nil: a record made for a
+-- different bound process does not count (create replaces it).
+local function recordFor(map, off, create)
   local k = procKey(off)
-  if k and not off.synthetic then interacted[k] = true end
+  if not k then return nil end
+  local r = map[k]
+  if r and r.lstart and off.lstart and r.lstart ~= off.lstart then r = nil end
+  if not r and create then r = {}; map[k] = r end
+  if r and r.lstart == nil and off.lstart then r.lstart = off.lstart end
+  return r
+end
+local function markInteracted(off)
+  if off and not off.synthetic then recordFor(interacted, off, true) end
 end
 local hudHold        = false  -- a kill narrative owns the body text
 local hudHoldUntil   = 0      -- a hold no narrative released by now is released
@@ -1207,8 +1220,9 @@ local function unattendedStep(offender, now)
   if mode == "off" or not offender or offender.kind ~= "extreme" then return end
   if not alertActive or hudHold then return end
   if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
-  if interacted[procKey(offender)] or isAnswered(offender, now) then return end
-  if (exposure[procKey(offender)] or 0) < core.cfg.cool.autoKillGraceSec then return end
+  if recordFor(interacted, hudOffender, false) or isAnswered(offender, now) then return end
+  local grace = recordFor(exposure, hudOffender, false)
+  if not grace or (grace.sec or 0) < core.cfg.cool.autoKillGraceSec then return end
   -- Act only on the identity the alert bound and surfaced, never on a name:
   -- without a bound start time (the probe failed) skip this tick and stay
   -- armed; the refresh retries the bind. The same start time keys the
@@ -1361,12 +1375,12 @@ local function alertSurfaces(state, now)
     -- interval, and to no one during a narrative. A stalled tick counts at
     -- most EXPOSURE_STEP_MAX.
     if exposureHead and exposureTickAt then
-      exposure[exposureHead] = (exposure[exposureHead] or 0)
+      exposureHead.sec = (exposureHead.sec or 0)
         + math.min(math.max(now - exposureTickAt, 0), EXPOSURE_STEP_MAX)
     end
     exposureTickAt = now
     exposureHead = (alertActive and not hudHold and hudOffender and hudOffender.kind == "extreme")
-      and procKey(hudOffender) or nil
+      and recordFor(exposure, hudOffender, true) or nil
     unattendedStep(offender, now)
   else
     exposureTickAt, exposureHead = nil, nil

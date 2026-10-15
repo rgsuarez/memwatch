@@ -1219,7 +1219,7 @@ do
   check("hud glue: the grace is per process (control: the single shared clock is gone)",
     ("(now - hudShownAt) < core.cfg"):find("hudShownAt", 1, true) ~= nil
       and src:find("hudShownAt", 1, true) == nil
-      and surfaces:find("exposure[exposureHead]", 1, true) ~= nil, true)
+      and surfaces:find("exposureHead.sec = (exposureHead.sec or 0)", 1, true) ~= nil, true)
   check("hud glue: the refresh never drops the bound table (control included)",
     ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
       and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)

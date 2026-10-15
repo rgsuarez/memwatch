@@ -1203,13 +1203,18 @@ do
     src:find('pcall(writeObservation, "advisory"', 1, true) ~= nil, true)
   check("observe glue: decision observation does not require an unattended mode",
     src:find('if observeEnabled and offender and offender.kind == "extreme"', 1, true) ~= nil, true)
-  -- Fates come only from a complete sample, through start windows.
+  -- Fates come only from a complete sample, through start windows, and the
+  -- operator signal is the monotonic counter, not the resettable HUD flag.
   check("observe glue: fate is told whether the sample was complete",
     body:find("sampleComplete = lastSampleComplete", 1, true) ~= nil, true)
   check("observe glue: follow-up identity uses a start window",
     body:find("procs.startWindow(psRow.etimeSec, lastSampleLaunchedAt, lastSampleAt)", 1, true) ~= nil, true)
   check("observe glue: no point-estimate start compare remains",
     body:find("psStartedAt", 1, true), nil)
+  check("observe glue: operator actions counted across the window",
+    body:find("operatorActionsSince = operatorActions - ops0", 1, true) ~= nil, true)
+  check("observe glue: the resettable HUD flag is not the operator signal",
+    body:find("hudInteracted", 1, true), nil)
   check("observe glue: the frozen ledger is recorded beside the fate",
     body:find("frozenLedger = frozen[pid] ~= nil", 1, true) ~= nil, true)
   -- The sampler tells its consumer how it ended and when it was launched.
@@ -1219,6 +1224,38 @@ do
     src:find("lastSampleComplete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time",
     src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt)", 1, true) ~= nil, true)
+end
+
+-- ---- operator actions: every UI path that touches a process counts ----
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  -- An unwrapped menu action: fn = function() calling a process action or
+  -- opening Activity Monitor directly, without byOperator around it.
+  local unwrapped = "fn = function%(%)%s*([%w_.:]+)%("
+  local acts = { killPid = true, freezePid = true, ignore = true, resumePid = true,
+                 resumeAll = true, launchOrFocus = true }
+  local function countUnwrapped(text)
+    local n = 0
+    for callee in text:gmatch(unwrapped) do
+      if acts[callee:match("([%w_]+)$")] then n = n + 1 end
+    end
+    return n
+  end
+  check("operator actions: scan sees an unwrapped menu kill (positive control)",
+    countUnwrapped('{ title = "x", fn = function() M.killPid(pid, name) end }'), 1)
+  check("operator actions: scan ignores a wrapped one (negative control)",
+    countUnwrapped('{ title = "x", fn = byOperator(function() M.killPid(pid, name) end) }'), 0)
+  check("operator actions: every menu process action is wrapped", countUnwrapped(src), 0)
+  local _, wrapped = src:gsub("fn = byOperator%(function%(%)", "")
+  check("operator actions: the ten menu actions are wrapped", wrapped, 10)
+  local hs0 = src:find('if evt ~= "mouseUp" then return end', 1, true)
+  check("operator actions: HUD clicks count",
+    hs0 ~= nil and src:sub(hs0, hs0 + 160):find("operatorActions = operatorActions + 1", 1, true) ~= nil, true)
+  local nb = src:find("actionButtonClicked then", 1, true)
+  check("operator actions: the banner's Force Quit counts",
+    nb ~= nil and src:sub(nb, nb + 120):find("operatorActions = operatorActions + 1", 1, true) ~= nil, true)
 end
 
 -- ---- glue pins: the live path must use the predicates above ----

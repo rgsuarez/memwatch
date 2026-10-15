@@ -150,7 +150,7 @@ would have received and the deterministic action that would have fired.
 Follow-ups at 60, 120 and 180 s record what actually became of the process
 and the machine: alive, exited or frozen, or unknown when a stale or partial
 process sample (or an undecidable identity) cannot say; weight; available
-memory; and kernel jetsam reports.
+memory; kernel jetsam reports; and any operator action in the window.
 
 It never forks, never acts and never leaves the machine. It exists so that
 adjudicators can be judged against real outcomes rather than synthetic

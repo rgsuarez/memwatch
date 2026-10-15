@@ -465,6 +465,17 @@ end
 local hud            = nil
 local hudShownAt     = 0
 local hudInteracted  = false
+-- Every operator touch on an alert or a process (HUD click, menu action,
+-- banner button) bumps one monotonic counter. An observation compares it
+-- across its follow-up window, so a human intervention is never hidden by a
+-- later HUD resetting hudInteracted for its own episode.
+local operatorActions = 0
+local function byOperator(fn)
+  return function(...)
+    operatorActions = operatorActions + 1
+    return fn(...)
+  end
+end
 local hudHold        = false  -- a kill narrative owns the body text
 local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
@@ -542,6 +553,7 @@ local function buildHud()
   hud:mouseCallback(guard("hud-click", function(_, evt, id)
     if evt ~= "mouseUp" then return end
     hudInteracted = true
+    operatorActions = operatorActions + 1
     if id == "freeze" or id == "freeze-label" then
       if hudOffender then
         local target = hudOffender
@@ -636,13 +648,13 @@ local function buildMenu()
       title = string.format("%-22s %5.1f GB  (pid %d)", name:sub(1, 22), p.weightMB / 1024, pid),
       menu = {
         { title = "Freeze " .. name,
-          fn = function() M.freezePid(pid, name, nil, { weightMB = wMB }) end },
+          fn = byOperator(function() M.freezePid(pid, name, nil, { weightMB = wMB }) end) },
         { title = "Force Quit " .. name,
-          fn = function() M.killPid(pid, name) end },
+          fn = byOperator(function() M.killPid(pid, name) end) },
         { title = "Ignore for 30 min",
-          fn = function() M.ignore(pid, name) end },
+          fn = byOperator(function() M.ignore(pid, name) end) },
         { title = "Show in Activity Monitor",
-          fn = function() hs.application.launchOrFocus("Activity Monitor") end },
+          fn = byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) },
       },
     }
   end
@@ -661,14 +673,14 @@ local function buildMenu()
           (e.weightMB or 0) / 1024, mins),
         menu = {
           { title = "Resume " .. (e.name or "?"),
-            fn = function() M.resumePid(pid) end },
+            fn = byOperator(function() M.resumePid(pid) end) },
           { title = "Force Quit " .. (e.name or "?"),
-            fn = function() M.killPid(pid, e.name) end },
+            fn = byOperator(function() M.killPid(pid, e.name) end) },
         },
       }
     end
     if #frozenRows > 1 then
-      items[#items + 1] = { title = "Resume all", fn = function() M.resumeAll() end }
+      items[#items + 1] = { title = "Resume all", fn = byOperator(function() M.resumeAll() end) }
     end
   end
   items[#items + 1] = { title = "-" }
@@ -678,13 +690,13 @@ local function buildMenu()
       and string.format("Force Quit largest process (%s, pid %d)", off.name, off.pid)
       or  string.format("Force Quit %s (pid %d)", off.name, off.pid)
     items[#items + 1] = { title = label,
-      fn = function() M.killPid(off.pid, off.name) end }
+      fn = byOperator(function() M.killPid(off.pid, off.name) end) }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
-      fn = function() M.ignore(off.pid, off.name) end }
+      fn = byOperator(function() M.ignore(off.pid, off.name) end) }
     items[#items + 1] = { title = "-" }
   end
   items[#items + 1] = { title = "Open Activity Monitor",
-    fn = function() hs.application.launchOrFocus("Activity Monitor") end }
+    fn = byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) }
   items[#items + 1] = { title = "Log snapshot now",
     fn = function() M.logSnapshot("manual") end }
   items[#items + 1] = { title = string.format("Desktop alerts: %s", alertsEnabled and "on" or "off"),
@@ -736,6 +748,7 @@ local function notifyCrit(m)
   critNotifPid = pid
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if off and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
+      operatorActions = operatorActions + 1
       M.killPid(off.pid, off.name)
     end
   end), {
@@ -1904,7 +1917,7 @@ writeObservation = function(point, offender, now, extra)
     and { lo = e0.startLo, hi = e0.startHi, etimeSec = e0.etimeSec } or nil
   local weight0 = offender.weightMB or 0
   local avail0 = lastMetrics.availPct or 0
-  local hud0 = hudInteracted
+  local ops0 = operatorActions
   for _, h in ipairs(extra.horizons or observe.cfg.horizons) do
     afterHeld(h, guard("observe-followup", function()
       local t = hs.timer.secondsSinceEpoch()
@@ -1934,7 +1947,7 @@ writeObservation = function(point, offender, now, extra)
         availPct = math.floor(availNow), availDelta = math.floor(availNow - avail0),
         state = smState.state,
         frozenLedger = frozen[pid] ~= nil,
-        hudInteractedSince = (hudInteracted and not hud0) or false,
+        operatorActionsSince = operatorActions - ops0,
         jetsamSince = jetsamSince(now),
       }))
       observeStats.followups = observeStats.followups + 1

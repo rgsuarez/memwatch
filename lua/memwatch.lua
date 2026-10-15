@@ -41,7 +41,6 @@ local topCache     = { map = nil, at = 0 }  -- per-pid CMPRS from async top
 local lastPsList   = {}
 local lastRanked   = {}   -- top hogs by RSS+CMPRS weight (menu rows)
 local lastRuns     = {}   -- current runaway list, ignores applied
-local lastRunsAll  = {}   -- every runaway, before the answered filters (for GC)
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
@@ -383,7 +382,6 @@ end
 local function assessProcesses(now)
   local totalMB = (lastMetrics.totalGB or 0) * 1024
   local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
-  lastRunsAll = runs
   -- An answered process is no candidate, by its own state: ignored, held
   -- frozen by memwatch (stopped, so its extreme latch is history, not
   -- growth), or verified gone while its last samples age out.
@@ -1271,6 +1269,9 @@ local function resetEpisode()
   hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil
   bindTriedAt = {}
   exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil
+  -- A new episode is a new decision sequence: deferral, latches and the
+  -- decision-row stamps start over.
+  unattendedWaitStreak, unattendedFiredFor, observeDecisionAt = {}, {}, {}
 end
 
 -- The unattended receipt, posted when the action completes and saying what
@@ -2874,30 +2875,28 @@ lfmTick = function(state, now, interesting)
   end
 end
 
--- Drop per-offender unattended state (fired stamp, wait streak) for any pid
--- that is not a currently-tracked runaway, so a recycled pid cannot inherit
--- a prior process's streak or fired stamp and trigger a premature action.
--- The signal path also re-validates identity, but this keeps the DECISION
--- from ever consuming stale streak state. Runs every tick regardless of LFM.
+-- Drop per-offender unattended state (fired stamp, wait streak, decision
+-- stamp) when its process is gone: absent from the latest COMPLETE ps table
+-- (a partial table proves nothing). Absence from the runaway list never
+-- prunes: a sampler stall can age a live runaway off that list and restart
+-- its deferral clock, and a process filtered off the candidates (frozen,
+-- gone, ignored) keeps its records, a final failed-action latch above all.
+-- A recycled pid cannot inherit a prior process's state either: the
+-- unattended step resets it when the bound start time changes, and the
+-- episode's end clears the rest (resetEpisode). Runs every tick regardless
+-- of LFM.
 gcUnattendedState = function(now)
-  -- Absence from the runaway set proves a pid is no longer a runaway only
-  -- when the latest ps sample is fresh and complete: during a sampler stall
-  -- a live runaway can drop off the list, and pruning it then would
-  -- silently restart its deferral clock. Every runaway counts, answered or
-  -- not: a process filtered off the alert candidates (frozen, gone,
-  -- ignored) is not thereby dead, and its records (a final failed-action
-  -- latch above all) must outlive the filter.
-  if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end
-  local liveRun = {}
-  for _, r in ipairs(lastRunsAll) do liveRun[r.pid] = true end
+  if not lastSampleComplete then return end
+  local alive = {}
+  for _, p in ipairs(lastPsList) do alive[p.pid] = true end
   for pid in pairs(unattendedWaitStreak) do
-    if not liveRun[pid] then unattendedWaitStreak[pid] = nil end
+    if not alive[pid] then unattendedWaitStreak[pid] = nil end
   end
   for pid in pairs(unattendedFiredFor) do
-    if not liveRun[pid] then unattendedFiredFor[pid] = nil end
+    if not alive[pid] then unattendedFiredFor[pid] = nil end
   end
   for pid in pairs(observeDecisionAt) do
-    if not liveRun[pid] then observeDecisionAt[pid] = nil end
+    if not alive[pid] then observeDecisionAt[pid] = nil end
   end
 end
 

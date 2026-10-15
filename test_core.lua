@@ -2001,17 +2001,24 @@ do
   check("glue: that decision is the only caller", count(src, "resolveUnattendedAction("), 1)
   check("glue: the decision never re-reads the clock", count(resolveBody, "secondsSinceEpoch"), 0)
   -- Absent pids are pruned only after a fresh, complete sample; signal
-  -- records age out first, whatever the sampler is doing.
-  local function prunesOnlyWhenFresh(text)
-    local fresh = text:find("if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end", 1, true)
-    local sweep = text:find("local liveRun = {}", 1, true)
-    return fresh ~= nil and sweep ~= nil and fresh < sweep
+  -- records go only when the process is absent from a complete ps table.
+  local function prunesOnlyOnCompleteTables(text)
+    local guard = text:find("if not lastSampleComplete then return end", 1, true)
+    local sweep = text:find("for _, p in ipairs(lastPsList) do alive[p.pid] = true end", 1, true)
+    return guard ~= nil and sweep ~= nil and guard < sweep
+      and text:find("lastRuns", 1, true) == nil
   end
-  check("glue: the prune-order scan refuses a guard after the sweep (positive control)",
-    prunesOnlyWhenFresh("local liveRun = {}\n"
-      .. "if not (lastSampleComplete and (now - lastSampleAt) <= SAMPLE_STALE_SEC) then return end\n"), false)
-  check("glue: absent pids are pruned only after a fresh, complete sample",
-    prunesOnlyWhenFresh(fnBody("gcUnattendedState = function(now)")), true)
+  check("glue: the prune scan refuses a guard after the sweep (positive control)",
+    prunesOnlyOnCompleteTables("for _, p in ipairs(lastPsList) do alive[p.pid] = true end\n"
+      .. "if not lastSampleComplete then return end\n"), false)
+  check("glue: the prune scan refuses pruning by the runaway list (positive control)",
+    prunesOnlyOnCompleteTables("if not lastSampleComplete then return end\n"
+      .. "for _, p in ipairs(lastPsList) do alive[p.pid] = true end\nfor _, r in ipairs(lastRuns) do end\n"), false)
+  check("glue: a pid's records go only when a complete ps table lacks it",
+    prunesOnlyOnCompleteTables(fnBody("gcUnattendedState = function(now)")), true)
+  check("glue: the episode's end resets the unattended and decision records",
+    fnBody("local function resetEpisode()"):find(
+      "unattendedWaitStreak, unattendedFiredFor, observeDecisionAt = {}, {}, {}", 1, true) ~= nil, true)
   check("glue: cache entries record the dispatch kind", count(src, "kind = offender.kind, snapshot = user,"), 1)
   check("glue: names redacted on every serialize call",
     count(src, "lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })"), 3)

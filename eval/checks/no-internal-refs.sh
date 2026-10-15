@@ -32,6 +32,13 @@ if [ -f "$LOCAL_TERMS" ]; then
   while IFS= read -r pat; do
     [ -n "$pat" ] && [ "${pat#\#}" = "$pat" ] && PATTERNS+=("$pat")
   done < "$LOCAL_TERMS"
+elif [ "${MEMWATCH_PUBLIC_CLONE:-0}" != "1" ]; then
+  # Fail closed: a maintainer worktree without the local term list would scan
+  # with only the structural patterns and pass blind. A plain public clone
+  # (no local terms by design) opts in explicitly with MEMWATCH_PUBLIC_CLONE=1.
+  echo "no-internal-refs: $LOCAL_TERMS is missing (symlink it into this worktree," >&2
+  echo "no-internal-refs: or set MEMWATCH_PUBLIC_CLONE=1 in a public clone); refusing" >&2
+  exit 2
 fi
 
 fail=0
@@ -58,7 +65,7 @@ else
   # Tracked-tree scan, plus tracked-path class assertions: runtime and
   # internal-only artifacts must never be tracked.
   while IFS= read -r f; do scan_file "$f"; done < <(git ls-files)
-  BAD_TRACKED="$(git ls-files -- 'models/*.gguf' 'eval/results/*' 'eval/tmp/*' 'eval/panel/*' 'reports/*' 'memwatch-lfm.jsonl*' 'memwatch-frozen.json*' 'memwatch-local.json*' 'memwatch.log*' 2>/dev/null || true)"
+  BAD_TRACKED="$(git ls-files -- 'models/*.gguf' 'eval/results/*' 'eval/tmp/*' 'eval/panel/*' 'reports/*' 'memwatch-lfm.jsonl*' 'memwatch-observe.jsonl*' 'memwatch-frozen.json*' 'memwatch-local.json*' 'memwatch.log*' 2>/dev/null || true)"
   if [ -n "$BAD_TRACKED" ]; then
     echo "INTERNAL-ARTIFACT TRACKED (must stay gitignored):" >&2
     echo "$BAD_TRACKED" >&2

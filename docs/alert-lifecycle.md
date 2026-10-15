@@ -114,6 +114,10 @@ implements and what `test_glue.lua` drives against a fake Hammerspoon.
    and the like) run outside any frame: a step one of them sees is taken out
    at that read, as at any read outside a frame. Until then its reads stay
    on the basis it began with, so the stamps it writes move with the rest.
+   What must take no evidence across a step is told when the step is seen,
+   not when the frame ends (`clock.onHeld`: the observation ledger closes
+   its records), and values on the raw wall clock (a process's start window
+   from `ps` etime) are read on that clock, never the frame's held basis.
    Each holder is shifted under its own guard: one that fails is logged by
    name and costs only its own stamps. A source scan holds the shift to
    every time-named stamp, matched by its whole path. A wall reading kept in
@@ -139,8 +143,11 @@ A critical episode starts on the first critical tick and ends when the state
 has been below critical for 10 seconds with no action narrative holding the
 HUD, or when the run ends (`stop`, `start`, a self-test, a simulation). The
 end of an episode clears all of its memory (banner history, snooze, grace
-clocks, interaction marks, the bind throttle and the banner cooldown) and
-withdraws its banner, so the next episode starts clean.
+clocks, interaction marks, the bind throttle and the banner cooldown, and
+the unattended deferral and decision-row stamps) and withdraws its banner,
+so the next episode starts clean. One record outlives it: a freeze or
+terminate that failed on a process stays final for that process (its pid
+and start time) until the process is gone.
 
 ## Identity
 

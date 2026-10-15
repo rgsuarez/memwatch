@@ -18,6 +18,20 @@ local function check(name, got, want)
 end
 
 local UNATTENDED_FREEZE = '{"unattended":"freeze"}'
+
+-- The observation ledger's rows (memwatch-observe.jsonl), decoded.
+local function ledgerRowsFor(W)
+  local lfm = require("memwatch_lfm")
+  local rows = {}
+  local f = io.open(W.home .. "/projects/memwatch/memwatch-observe.jsonl", "r")
+  if not f then return rows end
+  for line in f:lines() do
+    local r = lfm.jsonDecode(line)
+    if r then rows[#rows + 1] = r end
+  end
+  f:close()
+  return rows
+end
 local UNATTENDED_KILL = '{"unattended":"kill"}'
 
 -- Run a scenario in a fresh world; fn(W, mw) does the driving.
@@ -602,7 +616,8 @@ scenario("menu offender quit binds or refuses", nil, function(W)
   W.run(12)
   W.probeFails = true
   W.kern = 4
-  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  -- Wait for the runaway reading (the first sample can name it as the hog).
+  runUntil(W, 40, function() return bodyNames(W, "leaker") and bodyNames(W, "MB/min") end)
   local item = W.menuItem("Force Quit leaker")
   check("menu: the offender's Force Quit is listed", item ~= nil, true)
   if item then item.fn() end
@@ -752,7 +767,7 @@ scenario("an unattended action refused as stale posts no receipt", '{"unattended
   W.run(40)                         -- muted, armed, bound
   W.reusePid(4242, "leaker", 9000)
   W.grow(4242, 220)
-  local refused = runUntil(W, 40, function() return logHas(W, "answered:rebind:leaker(4242):stale") end)
+  local refused = runUntil(W, 60, function() return logHas(W, "answered:rebind:leaker(4242):stale") end)
   check("receipt: the stale attempt is refused and rebinds", refused, true)
   local refusedAt = W.now
   check("receipt: nothing signaled to the newcomer on the old binding", W.signalsTo(4242), "")
@@ -1551,6 +1566,1442 @@ scenario("a signal that cannot be sent ends its narrative", nil, function(W)
   check("send: and the next click acts", W.signalsTo(4242), "TERM")
 end)
 
+-- ---- sampler: launch order, not the wall clock, orders tables ----
+-- (round 3) The wall clock steps back 120 s (NTP at wake, a VM resume).
+-- Tables must keep landing: ordering by wall-clock launch time discarded
+-- every one until real time caught up.
+scenario("a clock stepped back does not stall the sampler", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(30)
+  check("clock: samples land before the step", mw.debug().sampleAgeSec <= 6, true)
+  W.wallOffset = -120
+  W.run(60)
+  check("clock: and keep landing after it", mw.debug().sampleAgeSec <= 6, true)
+end)
+
+-- ---- unattended state: what outlives an episode, and what proves an exit ----
+-- (round 3) A failed freeze or terminate is never retried on the same
+-- process, across episodes too: the episode's end keeps the final latch.
+scenario("a failed freeze stays final across episodes", UNATTENDED_FREEZE, function(W, mw)
+  W.addProc(4242, "wedged", 2000, { unstoppable = true })
+  local growth = W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.run(20)
+  check("final-episode: the STOP went out, and it did not stop", W.signalsTo(4242), "STOP")
+  growth:stop()                     -- it pauses, and pressure eases
+  W.kern = 1
+  check("final-episode: the state leaves critical",
+    runUntil(W, 300, function() return mw.debug().state ~= "critical" end), true)
+  W.run(20)                         -- settled: the episode ends
+  W.grow(4242, 220)                 -- the same process runs away again
+  W.kern = 4
+  check("final-episode: a new episode alerts on it",
+    runUntil(W, 120, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end), true)
+  W.run(200)
+  check("final-episode: and never signals it again", W.signalsTo(4242), "STOP")
+end)
+
+-- (round 3) While ps stalls, the last complete table predates a process
+-- the top stream has seen since. That table is no proof the process
+-- exited, so its unattended records (a failed freeze's final latch, the
+-- decision stamp) are kept: one STOP, not one per grace window.
+scenario("a stalled ps table does not prune a top-fed offender", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  runUntil(W, 200, function() return W.signalsTo(4242) ~= "" end)
+  W.run(400)
+  check("stale-gc: one STOP for a process that never stops", W.signalsTo(4242), "STOP")
+  local decisions = 0
+  for _, r in ipairs(ledgerRowsFor(W)) do
+    if r.point == "decision" and r.pid == 4242 then decisions = decisions + 1 end
+  end
+  check("stale-gc: one decision row, not one per grace window or tick", decisions, 1)
+end)
+
+-- (round 6) The same across a wall clock stepped back: the last complete
+-- table's launch and the top stream's sightings stay on one basis, so the
+-- final latch is kept: still one STOP.
+scenario("a step back while ps stalls does not prune a top-fed offender", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  runUntil(W, 200, function() return W.signalsTo(4242) ~= "" end)
+  W.run(20)
+  W.wallOffset = -300
+  W.run(400)
+  check("step-gc: one STOP for a process that never stops, across a step back", W.signalsTo(4242), "STOP")
+end)
+
+-- (round 7) The same with a ps table in flight across the step, which
+-- arrives after it: its launch, read where the clock shift moved it, sits on
+-- the sightings' basis whichever way the clock steps, with or without the
+-- monotonic clock, so the final latch is kept: one STOP.
+for _, case in ipairs({
+  { how = "back", offset = -300 },
+  { how = "forward", offset = 10 },
+  { how = "back, with no monotonic clock", offset = -300, noMono = true },
+}) do
+  scenario("a step " .. case.how .. " with a ps table in flight does not prune a top-fed offender",
+    UNATTENDED_FREEZE, function(W, mw)
+    if case.noMono then
+      W.hs.timer.absoluteTime = nil
+      W.reloadState()
+      F.load(W, UNATTENDED_FREEZE, { keepHome = true })
+    end
+    W.kern = 4
+    runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+    W.run(1)
+    W.topEmits = true
+    W.samplerDelay = 8                -- every ps table arrives 8 s after its launch
+    W.samplerOmit = { [4242] = true } -- and none lists the top-born process
+    W.addProc(4242, "topborn", 2000, { unstoppable = true })
+    W.grow(4242, 220)
+    runUntil(W, 200, function() return W.signalsTo(4242) ~= "" end)
+    W.run(3)
+    -- A table just launched: wait out any in flight, then catch the next
+    -- launch to the tenth of a second (it lands 8 s later).
+    runUntil(W, 20, function() return (W.samplersLive or 0) == 0 end)
+    local waited = 0
+    while (W.samplersLive or 0) == 0 and waited < 30 do W.run(0.1); waited = waited + 0.1 end
+    check("inflight-step (" .. case.how .. "): a table is in flight at the step", (W.samplersLive or 0) > 0, true)
+    W.psStarved = true                -- later tables never land: this one alone is under test
+    W.run(5.5)                        -- top sights the process after the table's launch
+    W.topEmits = false                -- then goes quiet: no sighting until the table lands
+    W.wallOffset = case.offset
+    runUntil(W, 10, function() return (W.samplersLive or 0) == 0 end)
+    W.run(3)                          -- the table lands, and the GC reads it
+    W.topEmits, W.psStarved = true, false
+    W.run(400)
+    check("inflight-step (" .. case.how .. "): one STOP for a process that never stops",
+      W.signalsTo(4242), "STOP")
+  end)
+end
+
+-- ---- observation ledger: what was faced, and what became of it ----
+local function ledgerRows(W)
+  local lfm = require("memwatch_lfm")
+  local rows = {}
+  local f = io.open(W.home .. "/projects/memwatch/memwatch-observe.jsonl", "r")
+  if not f then return rows end
+  for line in f:lines() do
+    local r = lfm.jsonDecode(line)
+    if r then rows[#rows + 1] = r end
+  end
+  f:close()
+  return rows
+end
+local function decisionRow(W, pid)
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.point == "decision" and r.pid == pid then return r end
+  end
+end
+local function followups(W, seq)
+  local out = {}
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.followup_for == seq then out[#out + 1] = r end
+  end
+  table.sort(out, function(a, b) return (a.horizonSec or 0) < (b.horizonSec or 0) end)
+  return out
+end
+-- Drive one leaker to its grace-expiry decision point; returns its row.
+local function toDecision(W, pid, name)
+  leaker(W, pid, name)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, name or "leaker") end)
+  runUntil(W, 90, function() return decisionRow(W, pid) ~= nil end)
+  return decisionRow(W, pid)
+end
+
+scenario("ledger: a decision point and its follow-ups", nil, function(W)
+  local row = toDecision(W, 4242)
+  check("ledger: a decision row is written at grace expiry", row ~= nil, true)
+  if not row then return end
+  check("ledger: with unattended off nothing would have fired", row.wouldAct, "none")
+  check("ledger: the freeze-ceiling counterfactual is freeze", row.wouldActAtFreeze, "freeze")
+  check("ledger: the exact model input rides along", type(row.snapshot), "string")
+  check("ledger: the model input carries no pid", row.snapshot:find('"pid"', 1, true), nil)
+  W.run(190)
+  local fu = followups(W, row.seq)
+  check("ledger: three follow-ups", #fu, 3)
+  check("ledger: the process is still alive at +60", fu[1] and fu[1].fate, "alive")
+  check("ledger: nobody touched it", fu[3] and fu[3].operatorActionsSince, 0)
+  check("ledger: memwatch sent it nothing", fu[3] and fu[3].memwatchSignalSince, nil)
+  check("ledger: the peak since the observation only grows",
+    fu[3] ~= nil and fu[1] ~= nil and fu[3].peakSinceMB >= fu[1].peakSinceMB, true)
+end)
+
+scenario("ledger: an operator's quit is recorded as such", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger quit: decision row", false, true); return end
+  W.click("kill")
+  W.run(190)
+  local fu = followups(W, row.seq)
+  local last = fu[#fu]
+  check("ledger quit: the process is recorded as exited", last and last.fate, "exited")
+  check("ledger quit: an operator action is counted", last ~= nil and (last.operatorActionsSince or 0) >= 1, true)
+  check("ledger quit: memwatch's own TERM is recorded", last and last.memwatchSignalSince, "terminate")
+end)
+
+scenario("ledger: memwatch's freeze is recorded as such", UNATTENDED_FREEZE, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger freeze: decision row", false, true); return end
+  check("ledger freeze: the live mode would have frozen", row.wouldAct, "freeze")
+  W.run(190)
+  local fu = followups(W, row.seq)
+  local last = fu[#fu]
+  check("ledger freeze: the process is recorded as frozen", last and last.fate, "frozen")
+  check("ledger freeze: memwatch's STOP is recorded", last and last.memwatchSignalSince, "freeze")
+  check("ledger freeze: the frozen ledger agrees", last and last.frozenLedger, true)
+  check("ledger freeze: no operator action", last and last.operatorActionsSince, 0)
+end)
+
+scenario("ledger: a partial process table proves nothing", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger partial: decision row", false, true); return end
+  W.samplerExit = 1                 -- every table from here on is cut off
+  W.samplerOmit = { [4242] = true } -- before it reaches the observed process
+  W.run(65)
+  local fu = followups(W, row.seq)
+  check("ledger partial: absence from a partial table is unknown, not exited",
+    fu[1] and fu[1].fate, "unknown")
+  check("ledger partial: and says why", fu[1] and fu[1].fateDetail, "incomplete-sample")
+end)
+
+scenario("ledger: a late sampler delivery is not a pid reuse", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger stall: decision row", false, true); return end
+  W.samplerDelay = 40
+  W.run(190)
+  local reused = false
+  for _, r in ipairs(followups(W, row.seq)) do
+    if r.fateDetail == "pid-reused" then reused = true end
+  end
+  check("ledger stall: a 40 s delivery stall never reads as a reused pid", reused, false)
+end)
+
+-- ---- round 2: every follow-up field comes from the observation's own evidence ----
+-- A table read before the process exited, delivered 40 s late, must not
+-- report it alive at +60: freshness counts from acquisition.
+scenario("ledger: a late table cannot vouch for a process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger late: decision row", false, true); return end
+  W.samplerDelay = 40
+  W.run(30)
+  W.procs[4242] = nil               -- it exits 30 s after the decision point
+  W.run(40)
+  local fu = followups(W, row.seq)
+  check("ledger late: +60 does not report a process that is gone as alive",
+    fu[1] ~= nil and fu[1].fate ~= "alive", true)
+end)
+
+-- A signal memwatch sends to a same-name process that later took the pid
+-- is not the observed process's fate.
+scenario("ledger: a signal to the pid's next process is not the observed one's", nil, function(W, mw)
+  local row = toDecision(W, 4242, "node")
+  if not row then check("ledger signal: decision row", false, true); return end
+  W.procs[4242] = nil               -- the observed process exits on its own
+  W.run(8)
+  W.reusePid(4242, "node", 9000)    -- a same-name process takes the pid
+  W.grow(4242, 220)
+  W.run(20)
+  mw.killPid(4242, "node")          -- memwatch terminates the newcomer
+  W.run(50)
+  local fu = followups(W, row.seq)
+  check("ledger signal: the observed process exited", fu[1] and fu[1].fate, "exited")
+  check("ledger signal: memwatch's TERM to the newcomer is not attributed to it",
+    fu[1] ~= nil and fu[1].memwatchSignalSince == nil, true)
+end)
+
+-- A process that grows and exits before the first follow-up keeps the peak
+-- it reached, though the tracker forgets it.
+scenario("ledger: the peak survives the process leaving the tracker", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger peak: decision row", false, true); return end
+  local w0 = row.offender.weightMB
+  W.grow(4242, 600)
+  W.run(20)
+  local peakNow = math.floor(W.procs[4242].rssKB / 1024)
+  W.procs[4242] = nil
+  W.run(50)
+  local fu = followups(W, row.seq)
+  check("ledger peak: the peak since the observation is kept",
+    fu[1] ~= nil and (fu[1].peakSinceMB or 0) > w0 + 5000 and (fu[1].peakSinceMB or 0) <= peakNow, true)
+end)
+
+-- A decision row marks only ticks where the live unattended gate stands
+-- open: a process the operator froze from the menu before its grace ran
+-- out is answered, so it gets none.
+scenario("ledger: a menu freeze before grace leaves no decision row", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") and bodyNames(W, "MB/min") end)
+  W.run(20)
+  local row
+  for _, it in ipairs(W.menuItems()) do
+    if type(it.title) == "string" and it.title:find("(pid 4242)", 1, true) and it.menu then row = it end
+  end
+  if row then row.menu[1].fn() end -- Freeze leaker
+  W.run(5)
+  check("ledger gate: frozen from the menu", W.procs[4242].state, "T")
+  W.run(120)
+  check("ledger gate: no decision row for an answered process", decisionRow(W, 4242), nil)
+end)
+
+scenario("ledger: observe=false writes nothing", '{"observe":false}', function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(150)
+  check("ledger off: no observation ledger at all", #ledgerRows(W), 0)
+end)
+
+scenario("ledger: jetsam reports in the window are counted", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger jetsam: decision row", false, true); return end
+  W.jetsam = { ["JetsamEvent-2026-10-15-010203.ips"] = W.now + 10,
+               ["JetsamEvent-2026-10-14-010203.ips"] = W.now - 3600 }
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("ledger jetsam: the report written after the observation is counted", fu[1] and fu[1].jetsamSince, 1)
+end)
+
+-- (round 8) The age of the last row written is a duration on the
+-- monotonic clock: -1 before any row, then the seconds since the last one,
+-- whatever the wall clock does.
+scenario("ledger: the last row's age reads as a duration", nil, function(W, mw)
+  check("age: -1 before any row", mw.debug().observe.lastAgeSec, -1)
+  local row = toDecision(W, 4242)
+  if not row then check("age: decision row", false, true); return end
+  local a = mw.debug().observe.lastAgeSec
+  check("age: small and non-negative after a row (" .. tostring(a) .. ")", type(a) == "number" and a >= 0 and a <= 30, true)
+  W.wallOffset = -300
+  W.run(1)
+  local b = mw.debug().observe.lastAgeSec
+  check("age: a step back does not move it (" .. tostring(b) .. ")", type(b) == "number" and b >= 0 and b <= 31, true)
+end)
+
+-- (round 8) A report written before a step back keeps its pre-step time,
+-- ahead of the new clock: an observation written before the clock catches
+-- up cannot place it, so its count is unknown, never a false 1.
+scenario("ledger: a report from before a step back is not placed after it", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.jetsam = { ["JetsamEvent-before-step.ips"] = W.now + (W.wallOffset or 0) }  -- written now
+  W.wallOffset = -120
+  local row
+  runUntil(W, 120, function() row = decisionRow(W, 4242); return row ~= nil end)
+  check("jetsam-step: a decision row after the step", row ~= nil, true)
+  if not row then return end
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("jetsam-step: the report from before the step is unknown, not counted", fu[1] and fu[1].jetsamSince, nil)
+end)
+
+-- (round 8) A step back longer than a process's age clamps ps's etime at
+-- 0, so its start windows would follow the clock instead of the kernel's
+-- start record, and read as a reuse. A clamped sample places no start: the
+-- ledger says it cannot tell, never that a live process exited.
+scenario("ledger: a step back longer than the process's age never reads as an exit", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(20)
+  W.wallOffset = -300                -- longer than the process's age: etime clamps at 0
+  local row
+  runUntil(W, 120, function() row = decisionRow(W, 4242); return row ~= nil end)
+  check("clamp: a decision row after the step", row ~= nil, true)
+  if not row then return end
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("clamp: three follow-ups", #fu, 3)
+  local exited = 0
+  for _, f in ipairs(fu) do if f.fate == "exited" then exited = exited + 1 end end
+  check("clamp: none reads a live process as exited (" .. exited .. ")", exited, 0)
+  check("clamp: and it is alive (control)", W.procs[4242] ~= nil, true)
+end)
+
+-- (round 3) A ps table read before the observation and delivered after it
+-- lacks a process born in between. It is no proof that process exited.
+scenario("ledger: a table read before the observation does not end it", nil, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.samplerDelay, W.topEmits = 120, true  -- every ps table lands 120 s after it was read
+  W.run(5)                                -- one is read now, before the process exists
+  W.addProc(4242, "fresh", 2000)
+  W.grow(4242, 220)
+  local seq
+  runUntil(W, 120, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point then seq = r.seq; return true end
+    end
+    return false
+  end)
+  check("pre-obs: the process is observed while that table is in flight", seq ~= nil, true)
+  W.run(200)
+  local fu = seq and followups(W, seq) or {}
+  check("pre-obs: three follow-ups", #fu, 3)
+  local exited = 0
+  for _, r in ipairs(fu) do if r.fate == "exited" then exited = exited + 1 end end
+  check("pre-obs: none calls the living process exited", exited, 0)
+  check("pre-obs: the process is alive throughout", W.procs[4242] ~= nil, true)
+end)
+
+-- (round 3) A follow-up timer that runs late (a blocked run loop) reports
+-- the horizon it names: alive at +60, though the process exited at +70.
+scenario("ledger: a late follow-up reports its own horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late: decision row", false, true); return end
+  -- The row's follow-up timers were set already; re-drive one with a lag
+  -- by writing a fresh observation under a lagging run loop.
+  W.timerLag = 90
+  W.run(46)                         -- the next advisory row, its timers 90 s late
+  W.timerLag = 0
+  local adv
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.pid == 4242 and r.point == "advisory" then adv = r end
+  end
+  check("late: an advisory row was written under the lag", adv ~= nil, true)
+  if not adv then return end
+  W.run(70)                         -- +70 after it: the process exits
+  W.procs[4242] = nil
+  W.run(200)
+  local fu = followups(W, adv.seq)
+  check("late: its +60 follow-up ran", fu[1] ~= nil and fu[1].horizonSec, 60)
+  check("late: and says alive at +60, not the exit after it", fu[1] and fu[1].fate, "alive")
+  check("late: the +180 follow-up says exited", fu[3] and fu[3].fate, "exited")
+end)
+
+-- (round 3) Follow-ups report the last signal by their horizon (a freeze,
+-- then a terminate), and a menu action on the process counts as a touch.
+scenario("ledger: freeze then terminate, and menu touches", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("signals: decision row", false, true); return end
+  W.click("freeze")
+  W.run(30)
+  check("signals: frozen", W.procs[4242] and W.procs[4242].state, "T")
+  local frozenRow = W.menuItem("   leaker")
+  local fq = frozenRow and frozenRow.menu and frozenRow.menu[2]
+  check("signals: the frozen row offers Force Quit", fq ~= nil and fq.fn ~= nil, true)
+  W.run(60)
+  fq.fn()
+  W.run(120)
+  local fu = followups(W, row.seq)
+  check("signals: +60 reports the freeze", fu[1] and fu[1].memwatchSignalSince, "freeze")
+  check("signals: +180 reports the terminate after it", fu[3] and fu[3].memwatchSignalSince, "terminate")
+  -- The freeze, the CONT a Force Quit sends a frozen process before its
+  -- TERM, and the TERM.
+  check("signals: and counts all three", fu[3] and fu[3].memwatchSignalCount, 3)
+  check("signals: the HUD click and the menu Force Quit are both touches",
+    fu[3] and fu[3].operatorTouchesSince, 2)
+end)
+
+-- (round 3) A menu action on the observed process is a touch on it.
+scenario("ledger: a menu Ignore is a touch on the process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("menu touch: decision row", false, true); return end
+  local procRow = W.menuItem("leaker")
+  local ignore = procRow and procRow.menu and procRow.menu[3]
+  check("menu touch: the row offers Ignore", ignore ~= nil and ignore.title, "Ignore for 30 min")
+  ignore.fn()
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("menu touch: counted as an action", fu[1] and fu[1].operatorActionsSince, 1)
+  check("menu touch: and as a touch on this process", fu[1] and fu[1].operatorTouchesSince, 1)
+end)
+
+-- An Ignore from the HUD marks the operator's answer through the ignore
+-- itself, as every surface's does: one touch, never two.
+scenario("ledger: a HUD Ignore is one touch on the process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("hud touch: decision row", false, true); return end
+  W.click("ignore")
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("hud touch: one touch on this process", fu[1] and fu[1].operatorTouchesSince, 1)
+end)
+
+-- (round 7) A Resume is one touch: the resume's own answer notes it, so
+-- neither the frozen row's handler nor Resume all notes it again.
+for _, case in ipairs({ { how = "Resume" }, { how = "Resume all", all = true } }) do
+  scenario("ledger: a frozen row's " .. case.how .. " is one touch", nil, function(W)
+    local row = toDecision(W, 4242)
+    if not row then check("resume touch: decision row", false, true); return end
+    W.click("freeze")                 -- one touch: the HUD's freeze
+    W.run(5)
+    local resume
+    if case.all then
+      -- Resume all is offered with two frozen rows: a second process,
+      -- frozen from its own menu row (a touch on it, not on this one).
+      W.addProc(4343, "other", 6000)
+      W.run(6)
+      local orow = W.menuItem("other ")
+      for _, it in ipairs(orow and orow.menu or {}) do
+        if it.title == "Freeze other" then it.fn() end
+      end
+      W.run(5)
+      resume = W.menuItem("Resume all")
+      resume = resume and resume.fn
+    else
+      local frow = W.menuItem("   leaker")
+      for _, it in ipairs(frow and frow.menu or {}) do
+        if type(it.title) == "string" and it.title:find("Resume", 1, true) then resume = it.fn end
+      end
+    end
+    check("resume touch (" .. case.how .. "): offered", resume ~= nil, true)
+    if resume then resume() end       -- the second touch
+    W.run(70)
+    local fu = followups(W, row.seq)
+    check("resume touch (" .. case.how .. "): the freeze and the resume, two touches, not three",
+      fu[1] and fu[1].operatorTouchesSince, 2)
+  end)
+end
+
+-- (round 8) A frozen row's Resume answers for the process the row showed,
+-- even when its entry has gone since the menu was built (the process was
+-- resumed outside memwatch and the sweep dropped it): still a touch on that
+-- process, and nothing is signaled.
+scenario("ledger: a stale frozen row's Resume is still a touch", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("stale resume: decision row", false, true); return end
+  local decidedAt = W.now
+  W.click("freeze")                 -- one touch: the HUD's freeze
+  W.run(5)
+  local resume
+  local frow = W.menuItem("   leaker")
+  for _, it in ipairs(frow and frow.menu or {}) do
+    if type(it.title) == "string" and it.title:find("Resume", 1, true) then resume = it.fn end
+  end
+  check("stale resume: offered while frozen", resume ~= nil, true)
+  W.procs[4242].state = "S"         -- resumed outside memwatch
+  local pruned = runUntil(W, 150, function()
+    return logHas(W, "frozen-prune:leaker(4242):resumed-externally")
+  end)
+  check("stale resume: the sweep drops the entry first", pruned, true)
+  check("stale resume: the row is stale before the last follow-up", W.now - decidedAt < 170, true)
+  if resume then resume() end       -- the second touch, on the stale row
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("stale resume: nothing is signaled but the freeze", W.signalsTo(4242), "STOP")
+  check("stale resume: the freeze and the stale Resume, two touches",
+    fu[3] and fu[3].operatorTouchesSince, 2)
+end)
+
+-- (round 9) A step back first seen by a late ps table (a fork that ran
+-- after the step). Its callback holds the step to its end. The observation
+-- stops collecting when the step is seen, and the table's start windows are
+-- placed on the raw wall clock its etime runs on, so a process still
+-- running is never read as gone.
+local function stepAtNextTable(W, sec)
+  W.samplerReadsLate = true
+  W.onSamplerDeliver = function()
+    W.wallOffset = (W.wallOffset or 0) - sec   -- shorter than the process's age
+    W.onSamplerDeliver = nil
+    W.samplerReadsLate = false
+  end
+end
+scenario("ledger: a step first seen by a late ps table never reads a running process as gone", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late-step: decision row", false, true); return end
+  W.run(8)                            -- before the next tick launches its table
+  stepAtNextTable(W, 30)
+  W.run(10)
+  check("late-step: the step was taken out", logHas(W, "clock-stepped-back:30s"), true)
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("late-step: the follow-up reads unknown", fu[1] and fu[1].fate, "unknown")
+  check("late-step: because the clock stepped", fu[1] and fu[1].fateDetail, "clock-step")
+  check("late-step: the process was running throughout", W.procs[4242] ~= nil, true)
+end)
+
+-- (round 9) The next observation after such a table takes its start window
+-- from the tracker: placed on the raw wall clock, it is the process's own,
+-- so the tables after it see the same process, not a successor.
+scenario("ledger: an observation after a late table's step keeps the process's identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late-step-next: decision row", false, true); return end
+  local tD = W.now
+  W.run(52)                           -- the table before the next decision point
+  stepAtNextTable(W, 30)
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("late-step-next: the next decision row is written (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("late-step-next: its follow-up sees the same process alive", fu[1] and fu[1].fate, "alive")
+end)
+
+-- (round 9) A follow-up reads the clock first: a step it is the first to see
+-- closes its record at once, though its callback holds the step to its end,
+-- so it reports nothing from after the step.
+scenario("ledger: a step first seen by a follow-up closes its record before it reads", nil, function(W)
+  W.timerLag = 0.5                    -- follow-ups fire between ticks
+  local row = toDecision(W, 4242)
+  if not row then check("fu-step: decision row", false, true); return end
+  local tD = W.now
+  W.run((tD + 60.25) - W.now)
+  W.wallOffset = (W.wallOffset or 0) - 30
+  W.run(1)
+  local fu = followups(W, row.seq)
+  check("fu-step: the follow-up came", fu[1] ~= nil, true)
+  check("fu-step: and was the first to see the step", logHas(W, "clock-stepped-back:30s"), true)
+  check("fu-step: it reads unknown", fu[1] and fu[1].fate, "unknown")
+  check("fu-step: because the clock stepped", fu[1] and fu[1].fateDetail, "clock-step")
+  check("fu-step: with no readings", fu[1] and (fu[1].sampleAgeSec == nil and fu[1].jetsamSince == nil), true)
+end)
+
+-- (round 9) A step first seen by the tick that launches a slow table: the
+-- launch's reading for start windows is the raw wall clock ps's etime runs
+-- on, so the next observation keeps the process's identity.
+scenario("ledger: a step first seen by the tick launching a slow table keeps identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("launch-step: decision row", false, true); return end
+  local tD = W.now
+  W.run(49)                           -- just before a tick 10 s ahead of the next decision point
+  -- The step lands inside that tick (as it reads the memory counters), so
+  -- the tick is the first to see it and holds it while it launches a table
+  -- that takes 8 s: it lands before the next decision row is written, which
+  -- takes its start window from it.
+  W.onVmStat = function()
+    W.onVmStat = nil
+    W.wallOffset = (W.wallOffset or 0) - 100
+    W.samplerDelay = 8
+  end
+  W.run(1.5)
+  W.samplerDelay = nil
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("launch-step: the next decision row is written (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(190)
+  local fu = followups(W, nextRow.seq)
+  check("launch-step: the first follow-up sees the same process alive", fu[1] and fu[1].fate, "alive")
+  for i = 2, 3 do
+    check("launch-step: follow-up " .. i .. " never reads it gone", fu[i] and fu[i].fate ~= "exited", true)
+  end
+end)
+
+-- (round 10) ps read its table before a step back its own delivery is first
+-- to see: the raw launch and delivery readings sit on two sides of the step,
+-- so the window widens by its size, and the next observation never reads
+-- the process as gone.
+scenario("ledger: a table read before a step its delivery sees keeps identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("read-before-step: decision row", false, true); return end
+  W.run(54)                           -- before the tick ahead of the next decision point:
+  W.samplerReadDelay = 3              -- its ps reads 3 s after its launch (beyond the 1 s slack),
+  W.samplerDelay = 4                  -- and the table lands 4 s after it, the last before that point
+  W.onSamplerDeliver = function()
+    W.onSamplerDeliver = nil
+    W.samplerReadDelay, W.samplerDelay = nil, nil
+    W.wallOffset = (W.wallOffset or 0) - 100   -- between the read and the delivery
+  end
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("read-before-step: the step was taken out (control)", logHas(W, "clock-stepped-back:100s"), true)
+  check("read-before-step: the next decision row is written", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("read-before-step: its follow-up never reads the process gone (" .. tostring(fu[1] and fu[1].fate) .. ")",
+    fu[1] ~= nil and fu[1].fate ~= "exited", true)
+end)
+
+-- (round 11) A table whose launch record is gone: it was read before a step
+-- back, terminated by the watchdog but still delivered late (a fork stuck in
+-- the kernel), and 16 failed launches since evicted its record. The tracker
+-- windows it places widen by every step back so far, so the decision row
+-- that takes its start from them never reads the process as gone.
+scenario("ledger: a table without its launch record keeps identity across a step", nil, function(W, mw)
+  local row = toDecision(W, 4242)
+  if not row then check("recordless: decision row", false, true); return end
+  local tD = W.now
+  local attempts0 = W.samplerStartAttempts or 0
+  -- The next launch (table k) reads 3 s after its launch and delivers 105 s
+  -- after it; the watchdog lets it go at 20 s, and it still delivers.
+  W.samplerReadDelay, W.samplerDelay, W.terminatedStillDelivers = 3, 105, true
+  runUntil(W, 10, function() return (W.samplerStartAttempts or 0) > attempts0 end)
+  local launchK = W.now
+  W.samplerReadDelay, W.samplerDelay = nil, nil
+  W.samplerStartFails = true          -- every launch after it fails to start
+  W.run(4)                            -- ps reads its table
+  -- Then the clock steps back further than the table has left to fly (102
+  -- s), so its delivery reads earlier than its read: unwidened, its window
+  -- ends before the process's start.
+  W.wallOffset = (W.wallOffset or 0) - 200
+  local deliveredK
+  W.onSamplerDeliver = function() deliveredK = W.now; W.onSamplerDeliver = nil end
+  runUntil(W, 110, function() return deliveredK ~= nil end)
+  check("recordless: the step was taken out (control)", logHas(W, "clock-stepped-back:200s"), true)
+  check("recordless: table k delivered late (control)", deliveredK ~= nil and deliveredK - launchK > 100, true)
+  check("recordless: 16 launches failed after it, so its record is gone (control)",
+    (W.samplerStartAttempts or 0) - attempts0 - 1 >= 16, true)
+  W.terminatedStillDelivers = nil
+  -- The next decision row, the first written after table k, takes its start
+  -- from the tracker as k left it.
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not before[r.seq] then nextRow = nextRow or r end
+    end
+    return nextRow ~= nil
+  end)
+  check("recordless: a decision row after table k (" .. math.floor(W.now - tD) .. " s on)", nextRow ~= nil, true)
+  W.samplerStartFails = false         -- tables flow again, read on the new clock
+  if not nextRow then return end
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("recordless: its follow-up came", fu[1] ~= nil, true)
+  check("recordless: and never reads the process gone (" .. tostring(fu[1] and fu[1].fate) .. ")",
+    fu[1] ~= nil and fu[1].fate ~= "exited", true)
+end)
+
+-- (round 9) The jetsam blind ceiling is a raw file time: a second step back
+-- never lowers it, so a report from before the first step is never counted
+-- by an observation written before the clock catches up with it.
+scenario("ledger: a second step back does not lower the jetsam blind ceiling", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  local R = W.now + (W.wallOffset or 0)
+  W.jetsam = { ["JetsamEvent-before-steps.ips"] = R }  -- written now
+  W.wallOffset = -120
+  W.run(10)                           -- the first step is seen
+  W.wallOffset = -180
+  W.run(5)                            -- and the second
+  local function wall() return W.now + W.wallOffset end
+  runUntil(W, 200, function() return wall() > R - 58 end)
+  local seen = {}
+  for _, r in ipairs(ledgerRows(W)) do seen[r.seq or -1] = true end
+  local row, rowWall
+  runUntil(W, 70, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not seen[r.seq] then row = r end
+    end
+    if row and not rowWall then rowWall = wall() end
+    return row ~= nil
+  end)
+  check("jetsam-steps: a decision row after both steps", row ~= nil, true)
+  if not row then return end
+  check("jetsam-steps: written before the clock caught up with the report (control)", rowWall < R, true)
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("jetsam-steps: the report from before the steps is unknown, not counted", fu[1] and fu[1].jetsamSince, nil)
+end)
+
+-- (round 9) Launch records stay bounded to the last 16 launches, whatever
+-- happens to the tables.
+scenario("sampler: launch records stay bounded to the last 16", nil, function(W, mw)
+  W.run(6)
+  W.psStarved = true                  -- no table comes back; the watchdog relaunches
+  W.run(20 * 25)
+  local n = mw.debug().samplerLaunchRecords
+  check("bound: records kept (" .. tostring(n) .. ")", n, 16)
+end)
+
+-- (round 9) A table that cannot start leaves no record and no handle: the
+-- next tick launches again, rather than waiting out the watchdog.
+scenario("sampler: a table that cannot start is launched again at the next tick", nil, function(W, mw)
+  W.run(6)
+  local before = W.samplerStartAttempts or 0
+  W.samplerStartFails = true
+  W.run(30)
+  local attempts = (W.samplerStartAttempts or 0) - before
+  check("failed-start: launched again every tick (" .. attempts .. " in 30 s)", attempts >= 5, true)
+  check("failed-start: no record kept for a launch that never started", mw.debug().samplerLaunchRecords, 0)
+  check("failed-start: and no task handle held", mw.debug().samplerRunning, false)
+  W.samplerStartFails = false
+  W.run(6)
+  check("failed-start: tables flow again once it can start", mw.debug().sampleAgeSec <= 6, true)
+end)
+
+-- (round 3) A ledger that cannot be written is counted and logged, not
+-- reported as written.
+scenario("ledger: a write that fails is counted and logged", nil, function(W, mw)
+  os.execute("mkdir -p '" .. W.home .. "/projects/memwatch/memwatch-observe.jsonl'")  -- a directory: open fails
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(120)                        -- advisory rows, and a decision point, all attempted
+  local d = mw.debug().observe
+  check("write-fail: no row is reported written", d.rows, 0)
+  check("write-fail: the failures are counted", d.errors >= 1, true)
+  check("write-fail: and logged", logHas(W, "observe-open"), true)
+end)
+
+scenario("ledger: a pid taken over by another process", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("ledger reuse: decision row", false, true); return end
+  W.reusePid(4242, "somethingelse", 500)
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("ledger reuse: the observed process is recorded as exited", fu[1] and fu[1].fate, "exited")
+  check("ledger reuse: with the pid reuse named", fu[1] and fu[1].fateDetail, "pid-reused")
+end)
+
+-- ---- PR round 4: follow-ups read their horizon, whenever their timers run ----
+-- An advisory row whose follow-up timers run lagSec (default 90) late (a
+-- blocked run loop); returns the row.
+local function laggedAdvisory(W, after, lagSec)
+  W.timerLag = lagSec or 90
+  local adv
+  runUntil(W, 60, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point == "advisory" and r.seq > after then adv = r end
+    end
+    return adv ~= nil
+  end)
+  W.timerLag = 0
+  return adv, W.now
+end
+
+-- A freeze after the +60 horizon, and the machine's recovery after it,
+-- stay out of the +60 follow-up that runs at +150.
+scenario("ledger: a late follow-up reads the freeze and the machine as of its horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late state: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq)
+  check("late state: an advisory row was written under the lag", adv ~= nil, true)
+  if not adv then return end
+  local avail0 = adv.availPct
+  check("late state: the row reads the machine under pressure", avail0 ~= nil and avail0 < 50, true)
+  W.run(70)
+  W.click("freeze")                 -- +70: frozen after the +60 horizon
+  W.run(30)
+  W.kern, W.availPct = 1, 80        -- +100: the machine recovers
+  W.run(200)
+  local fu = followups(W, adv.seq)
+  check("late state: three follow-ups", #fu, 3)
+  check("late state: +60 says running, not the freeze after it", fu[1] and fu[1].fate, "alive")
+  check("late state: +60's frozen ledger had no entry yet", fu[1] and fu[1].frozenLedger, false)
+  check("late state: +60 reads the pressure at +60", fu[1] and fu[1].availPct, avail0)
+  check("late state: +60's change since the row is none", fu[1] and fu[1].availDelta, 0)
+  check("late state: +60's state is the state at +60", fu[1] and fu[1].state, "critical")
+  check("late state: +120 says frozen (control)", fu[2] and fu[2].fate, "frozen")
+  check("late state: +120's ledger held it (control)", fu[2] and fu[2].frozenLedger, true)
+  check("late state: +120 reads the recovery (control)",
+    fu[2] ~= nil and fu[2].availPct ~= nil and fu[2].availPct > avail0 + 25, true)
+end)
+
+-- A resume between the horizon and its late timer: frozen at +60, though
+-- running when the timer ran.
+scenario("ledger: a late follow-up keeps a freeze its process left after the horizon", nil, function(W, mw)
+  local row = toDecision(W, 4242)
+  if not row then check("late resume: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq)
+  if not adv then check("late resume: advisory row", false, true); return end
+  W.run(30)
+  W.click("freeze")                 -- +30: frozen before the +60 horizon
+  W.run(60)
+  mw.resumePid(4242)                -- +90: resumed after it
+  W.run(200)
+  local fu = followups(W, adv.seq)
+  check("late resume: +60 says frozen, though running when the timer ran", fu[1] and fu[1].fate, "frozen")
+  check("late resume: +60's ledger held it", fu[1] and fu[1].frozenLedger, true)
+  check("late resume: +120 says running again (control)", fu[2] and fu[2].fate, "alive")
+  check("late resume: the resume is memwatch's own signal", fu[2] and fu[2].memwatchSignalSince, "resume")
+end)
+
+-- An operator action inside the horizon counts however late the timer
+-- runs (here more than ten minutes, with a later action meanwhile), and
+-- one after the horizon does not.
+scenario("ledger: a late follow-up counts the operator actions by its horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late actions: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq, 700)
+  if not adv then check("late actions: advisory row", false, true); return end
+  local function menuAction(prefix)
+    local procRow = W.menuItem("leaker")
+    for _, it in ipairs(procRow and procRow.menu or {}) do
+      if type(it.title) == "string" and it.title:sub(1, #prefix) == prefix and it.fn then
+        it.fn(); return true
+      end
+    end
+    return false
+  end
+  W.run(20)
+  W.click("snooze")                 -- +20: inside every horizon
+  W.run(60)
+  check("late actions: the menu offers Ignore", menuAction("Ignore"), true)   -- +80
+  W.run(620)
+  check("late actions: and Activity Monitor", menuAction("Show in Activity Monitor"), true)  -- +700
+  W.run(400)
+  local fu = followups(W, adv.seq)
+  check("late actions: the follow-ups ran more than ten minutes late", fu[1] ~= nil, true)
+  check("late actions: +60 counts the one by +60", fu[1] and fu[1].operatorActionsSince, 1)
+  check("late actions: +120 counts both by +120", fu[2] and fu[2].operatorActionsSince, 2)
+end)
+
+-- A clock stepped back after the observation: nothing in its record can be
+-- placed before or after a horizon, so the follow-ups say so instead of
+-- calling a living process exited or mixing readings from both sides.
+scenario("ledger: a clock stepped back leaves its follow-ups unknown", nil, function(W, mw)
+  local row = toDecision(W, 4242)
+  if not row then check("step: decision row", false, true); return end
+  W.jetsam = { ["JetsamEvent-2026-a.ips"] = W.now + 5 }   -- a report dated inside the window
+  W.run(10)
+  local before = 0
+  for _, r in ipairs(ledgerRows(W)) do if r.seq and r.seq > before then before = r.seq end end
+  W.wallOffset = -120
+  local after, nextDecision
+  runUntil(W, 75, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point and r.seq > before then
+        after = after or r
+        if r.point == "decision" then nextDecision = r end
+      end
+    end
+    return nextDecision ~= nil
+  end)
+  -- The cadence stamps from before the step re-based to it: rows go on
+  -- within the advisory interval, and the next decision row comes one grace
+  -- window after the step, not once the wall clock has caught up.
+  check("step: a row is written within a minute of the step", after ~= nil, true)
+  check("step: the next decision row comes within a grace window of the step", nextDecision ~= nil, true)
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("step: three follow-ups", #fu, 3)
+  local unknown, stepped, exited, metrics = 0, 0, 0, 0
+  for _, r in ipairs(fu) do
+    if r.fate == "unknown" then unknown = unknown + 1 end
+    if r.fateDetail == "clock-step" then stepped = stepped + 1 end
+    if r.fate == "exited" then exited = exited + 1 end
+    if r.availPct ~= nil or r.peakSinceMB ~= nil or r.operatorActionsSince ~= nil or r.jetsamSince ~= nil then
+      metrics = metrics + 1
+    end
+  end
+  check("step: every follow-up is unknown", unknown, 3)
+  check("step: and says the clock stepped", stepped, 3)
+  check("step: none calls the living process exited", exited, 0)
+  check("step: none reports a reading it cannot place (jetsam included)", metrics, 0)
+
+  check("step: the process is alive throughout", W.procs[4242] ~= nil, true)
+  -- A row written after the step has ordinary follow-ups (control).
+  local fa = after and followups(W, after.seq) or {}
+  check("step: a row written after the step reads alive at +60", fa[1] and fa[1].fate, "alive")
+  check("step: and reads the machine", fa[1] ~= nil and fa[1].availPct ~= nil, true)
+end)
+
+-- A process only the top stream named (ps stalled) is bound by its start
+-- time at the alert; that seeds the identity its follow-ups compare, so
+-- once ps recovers they can see it alive.
+scenario("ledger: a top-born offender is told apart by its bound start time", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  local row
+  runUntil(W, 200, function() row = decisionRow(W, 4242); return row ~= nil end)
+  check("top-born: a decision row while ps is stalled", row ~= nil, true)
+  if not row then return end
+  check("top-born: its identity comes from the bound start time", row.identityBasis, "lstart")
+  W.psStarved = false               -- ps recovers
+  W.run(200)
+  local fu = followups(W, row.seq)
+  local alive = 0
+  for _, r in ipairs(fu) do if r.fate == "alive" or r.fate == "frozen" then alive = alive + 1 end end
+  check("top-born: the follow-ups after ps recovers see it", alive >= 2, true)
+  check("top-born: none calls it exited", (function()
+    for _, r in ipairs(fu) do if r.fate == "exited" then return true end end
+    return false end)(), false)
+end)
+
+-- Follow-up timers that never run (a stalled run loop): the records stop
+-- collecting once far past their last horizon, and the tick log with them.
+scenario("ledger: records whose follow-ups never run stop growing", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.timersStall = true
+  W.run(2000)
+  local mid = mw.debug().observe
+  check("stall: rows were written", (mid.rows or 0) >= 30, true)
+  -- A row every 45 s and a decision row every grace window: about 30 are
+  -- younger than the 780 s a record collects for. Without the bound, all.
+  check("stall: only records near their horizons still collect", mid.pending <= 40, true)
+  W.procs[4242] = nil               -- the runaway ends and the machine calms:
+  W.kern, W.availPct = 1, 80        -- no new rows
+  W.run(900)
+  local d = mw.debug().observe
+  check("stall: once calm, no record is still collecting", d.pending, 0)
+  check("stall: the tick log is cut back to the newest reading", d.ticks <= 2, true)
+  W.timersStall = false
+end)
+
+-- A rotation that keeps failing stops the live file at twice its cap, and
+-- counts each failure; a generation that exists but cannot be read is
+-- still moved on, never overwritten.
+scenario("ledger: a rotation that keeps failing caps the live file", nil, function(W, mw)
+  local observe = require("memwatch_observe")
+  observe.cfg.maxBytes = 3000
+  local dir = W.home .. "/projects/memwatch/"
+  local path = dir .. "memwatch-observe.jsonl"
+  -- .2 is a file and .3 a non-empty directory: the first step (.2 -> .3)
+  -- fails every time, so no rotation finishes.
+  local g2 = assert(io.open(path .. ".2", "w")); g2:write("old\n"); g2:close()
+  os.execute("mkdir -p '" .. path .. ".3/keep'")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(900)
+  local f = io.open(path, "r")
+  local size = f and f:seek("end") or 0
+  if f then f:close() end
+  check("rotate-fail: the live file stops near twice its cap", size > 3000 and size < 2 * 3000 + 5000, true)
+  check("rotate-fail: each failed rotation is counted", mw.debug().observe.errors >= 2, true)
+  check("rotate-fail: and logged", logHas(W, "observe-rotate"), true)
+  check("rotate-fail: the generation that could not move is intact", (function()
+    local h = io.open(path .. ".2", "r"); local t = h and h:read("a"); if h then h:close() end
+    return t end)(), "old\n")
+  observe.cfg.maxBytes = 4e6
+end)
+
+scenario("ledger: an unreadable generation is moved on, not overwritten", nil, function(W, mw)
+  local observe = require("memwatch_observe")
+  observe.cfg.maxBytes = 3000
+  local path = W.home .. "/projects/memwatch/memwatch-observe.jsonl"
+  local g1 = assert(io.open(path .. ".1", "w")); g1:write("generation one\n"); g1:close()
+  os.execute("chmod 000 '" .. path .. ".1'")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  -- Until the first rotation: the unreadable .1 must have moved to .2.
+  local found = runUntil(W, 600, function()
+    if not os.rename(path .. ".2", path .. ".2") then return false end
+    os.execute("chmod 644 '" .. path .. ".2'")
+    local h = io.open(path .. ".2", "r")
+    local t = h and h:read("a")
+    if h then h:close() end
+    return t ~= nil
+  end)
+  local h = io.open(path .. ".2", "r")
+  local t = h and h:read("a")
+  if h then h:close() end
+  check("unreadable: a rotation ran", found, true)
+  check("unreadable: the unreadable generation moved on, intact", t, "generation one\n")
+  check("unreadable: no rotation failed", mw.debug().observe.errors, 0)
+  os.execute("chmod 644 '" .. path .. ".1' 2>/dev/null")
+  observe.cfg.maxBytes = 4e6
+end)
+
+-- The watchdog terminates a sampler that has not reported and launches
+-- another; the terminated one's exit callback must not clear the newer
+-- handle, or the next tick launches a third ps beside the second.
+scenario("a terminated sampler's callback keeps the newer sampler's handle", nil, function(W, mw)
+  W.run(12)
+  W.terminateCallsBack = true
+  W.samplerDelay = 30               -- every ps outlives the 20 s watchdog
+  W.samplersMax = W.samplersLive or 0
+  W.run(120)
+  check("sampler handle: the watchdog replaced stalled samplers", W.samplersMax >= 1, true)
+  check("sampler handle: never two ps running at once", W.samplersMax, 1)
+  W.samplerDelay = 0.05
+  W.terminateCallsBack = false
+  W.run(30)
+  check("sampler handle: samples land again once ps answers (control)", mw.debug().sampleAgeSec <= 6, true)
+end)
+
+-- A ps table that exited 0 but is missing memwatch's own row was cut
+-- short: its absences prove nothing. With the row there, they do.
+scenario("ledger: a table without memwatch's own row proves no exit", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("self row: decision row", false, true); return end
+  W.samplerOmit = { [4242] = true, [777] = true }   -- cut short, yet exit 0
+  W.run(65)
+  local fu = followups(W, row.seq)
+  check("self row: the cut table is not read as an exit", fu[1] and fu[1].fate, "unknown")
+  check("self row: and says the table was incomplete", fu[1] and fu[1].fateDetail, "incomplete-sample")
+  W.samplerOmit = { [4242] = true }                 -- whole: memwatch's own row is there
+  W.run(125)
+  fu = followups(W, row.seq)
+  check("self row: a whole table's absence is an exit (control)", fu[3] and fu[3].fate, "exited")
+end)
+
+-- ---- the adjudicator's verdict is filed only under its own process ----
+-- A remote adjudicator in the fake: the key is a throwaway file, the
+-- endpoint is never reached (the fake records each request and answers it
+-- with a canned verdict).
+-- In the fake's own scratch tree, so the suite needs no system temp file.
+local LFM_KEYDIR = F.scratchDir()
+local LFM_KEYFILE = LFM_KEYDIR .. "/lfm-key"
+do
+  local kf = assert(io.open(LFM_KEYFILE, "w"))
+  kf:write("fake-key-for-tests\n")
+  kf:close()
+end
+local REMOTE_LFM = '{"lfm":{"enabled":true,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
+  .. LFM_KEYFILE .. '"}}'
+local function cannedVerdict(action)
+  return function()
+    return 200, '{"choices":[{"message":{"content":"{\\"action\\":\\"' .. action
+      .. '\\",\\"process_class\\":\\"build\\",\\"confidence\\":0.9,\\"rationale\\":\\"test\\"}"}}]}'
+  end
+end
+
+scenario("a pid taken over before the dispatch probe gets no verdict", REMOTE_LFM, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 2                        -- pressure up, no HUD: dispatch is the only probe of the pid
+  local first = runUntil(W, 120, function() return #(W.httpPosts or {}) >= 1 end)
+  check("dispatch: the adjudicator is asked about the offender (control)", first, true)
+  W.run(5)
+  check("dispatch: its verdict is filed (control)", mw.debug().lfm.cached >= 1, true)
+  check("dispatch: and logged as the offender's", logHas(W, "lfm-verdict:leaker(4242)"), true)
+  local posts = #W.httpPosts
+  W.takeOverBeforeProbe = 4242      -- the next probe finds a same-name newcomer
+  runUntil(W, 120, function() return W.takeOverBeforeProbe == nil end)
+  W.run(2)
+  check("dispatch: the probe found the newcomer", W.takeOverBeforeProbe, nil)
+  check("dispatch: no request carries the old process's snapshot under the newcomer",
+    #W.httpPosts, posts)
+  check("dispatch: and the skip is logged", logHas(W, "lfm-dispatch-skip:leaker(4242):identity-changed"), true)
+end)
+
+-- The decision ledger's rows (memwatch-lfm.jsonl), decoded.
+local function decisionRows(W)
+  local lfm = require("memwatch_lfm")
+  local rows = {}
+  local f = io.open(W.home .. "/projects/memwatch/memwatch-lfm.jsonl", "r")
+  if not f then return rows end
+  for line in f:lines() do
+    local r = lfm.jsonDecode(line)
+    if r then rows[#rows + 1] = r end
+  end
+  f:close()
+  return rows
+end
+local function unattendedRow(W, adjudicator)
+  for _, r in ipairs(decisionRows(W)) do
+    if r.adjudicator == adjudicator then return r end
+  end
+end
+local REMOTE_LFM_FREEZE = '{"unattended":"freeze","lfm":{"enabled":true,"advisoryIntervalSec":600,'
+  .. '"remoteServer":"https://lfm.invalid","remoteKeyFile":"' .. LFM_KEYFILE .. '"}}'
+
+-- A fresh verdict on the offender's own snapshot is the model's call at
+-- grace expiry: its wait defers the deterministic freeze.
+scenario("a verdict on the offender's own snapshot defers the freeze", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  local acted = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("verdict: the grace-expiry decision is the model's", acted, true)
+  local r = unattendedRow(W, "lfm")
+  check("verdict: and it waits", r and r.action, "wait")
+  check("verdict: so nothing was stopped yet", W.signalsTo(4242), "")
+end)
+
+-- (round 6) A wall clock stepped back while a model's wait defers the
+-- freeze: the deferral's first wait moves with the step, so the freeze
+-- comes when the deferral ends (120 s of real time from the first wait),
+-- not a grace early, and the shift runs cleanly with a deferral in place.
+scenario("a step back while a wait defers the freeze keeps the deferral whole", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("defer-step: the model's wait deferred the freeze", waited, true)
+  local firstWait = W.now
+  -- A step smaller than the process's age: ps's etime is wall time less the
+  -- start, so a step back longer than the age leaves it at zero and the
+  -- start window unplaceable (the dispatch then refuses, and the
+  -- deterministic policy decides).
+  W.wallOffset = -60
+  local stopped = runUntil(W, 300, function() return W.signalsTo(4242):find("STOP", 1, true) ~= nil end)
+  check("defer-step: the freeze still comes", stopped, true)
+  check("defer-step: the shift ran without error", logHas(W, "error:clock-shift"), false)
+  check("defer-step: at the deferral's end, in real time, neither early nor late (" .. math.floor(W.now - firstWait) .. " s)",
+    W.now - firstWait >= 100 and W.now - firstWait <= 140, true)
+end)
+
+-- A verdict asked about a process the dispatch could not tie to its
+-- snapshot is filed, but never drives the grace-expiry decision: the
+-- deterministic freeze runs. Here only top has named the process (ps is
+-- stalled, so no start window), and the alert's bind probe failed (a fork
+-- under pressure) while the dispatch probe a moment later succeeded.
+scenario("a verdict whose snapshot is not its process's own never acts", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  W.kern = 2
+  runUntil(W, 60, function() return mw.debug().state == "elevated" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.probeFailsOnce = 1              -- the alert's first bind probe fails
+  W.addProc(4242, "topborn", 2000)
+  W.grow(4242, 220)
+  local asked = runUntil(W, 120, function() return mw.debug().lfm.cached >= 1 end)
+  check("unverified: the adjudicator answered about the top-born offender", asked, true)
+  check("unverified: the alert's bind probe was the one that failed", W.probeFailsOnce, 0)
+  -- An unverified verdict is not fresh, so it is asked again once the alert
+  -- has bound the process; that answer never comes here, so the cached,
+  -- unverified one is all there is at grace expiry.
+  local posts = #W.httpPosts
+  W.httpReply = nil
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  check("unverified: it was asked again", #W.httpPosts > posts, true)
+  check("unverified: the deterministic freeze ran at grace expiry", W.signalsTo(4242), "STOP")
+  check("unverified: the decision was not the model's", unattendedRow(W, "lfm"), nil)
+  check("unverified: it was the deterministic policy's",
+    unattendedRow(W, "deterministic-fallback") ~= nil, true)
+end)
+
+-- (round 6) An unverified verdict is asked again once something can
+-- verify it (the alert binding the process since it was asked), or once
+-- per advisory interval: never every tick. Here the process's start time
+-- names no instant, so no answer about it can ever be tied to it.
+scenario("an unverified verdict is not asked again every tick", REMOTE_LFM, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242, "node")
+  W.procs[4242].lstart = "Mon Feb 30 10:00:00 2026"
+  W.run(12)
+  W.kern = 4
+  local asked = runUntil(W, 120, function() return #(W.httpPosts or {}) >= 1 end)
+  check("unverified-rate: the adjudicator was asked", asked, true)
+  W.run(5)
+  local before = #W.httpPosts
+  W.run(60)
+  local n = #W.httpPosts - before
+  check("unverified-rate: at most twice in a minute, not every tick (" .. n .. ")", n <= 2, true)
+  check("unverified-rate: but still asked again (control)", n >= 1, true)
+end)
+
+-- (round 7) A verdict is about the binding it was asked about. The same
+-- binding is not asked about again; once the alert binds a newcomer that
+-- took the pid (here a click on the stale binding is refused and rebinds
+-- it), the newcomer is asked about once, not every tick.
+local REMOTE_LFM_QUIET = '{"lfm":{"enabled":true,"advisoryIntervalSec":600,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
+  .. LFM_KEYFILE .. '"}}'
+scenario("a verdict asked about one binding is asked again once for another", REMOTE_LFM_QUIET, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  local asked = runUntil(W, 120, function() return #(W.httpPosts or {}) >= 1 end)
+  check("rebind: the adjudicator was asked", asked, true)
+  W.run(5)
+  local before = #W.httpPosts
+  W.run(15)
+  check("rebind: the same binding is not asked about again", #W.httpPosts - before, 0)
+  W.reusePid(4242, "node", 9000)      -- the process exits; a same-name newcomer takes its pid
+  W.run(2)
+  local mark = #W.httpPosts
+  W.click("freeze")                   -- refused on the stale binding; the alert binds the newcomer
+  check("rebind: the stale click signaled nothing", W.signalsTo(4242), "")
+  local again = runUntil(W, 10, function() return #W.httpPosts > mark end)
+  check("rebind: the newcomer's binding is asked about at once", again, true)
+  W.run(30)
+  check("rebind: once, not every tick (" .. (#W.httpPosts - mark) .. ")", #W.httpPosts - mark, 1)
+end)
+
+-- (round 9) A verdict about a binding the alert has since replaced leaves
+-- the cache at once: with the newcomer's answer still on its way, nothing
+-- about the old binding is left to consume.
+scenario("a verdict about a replaced binding leaves the cache at once", REMOTE_LFM_QUIET, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  local cached = runUntil(W, 120, function() return (mw.debug().lfm.cached or 0) > 0 end)
+  W.run(5)
+  check("evict: a verdict is cached (control)", cached and (mw.debug().lfm.cached or 0) > 0, true)
+  W.httpDelay = 60                    -- the newcomer's answer takes a minute
+  W.reusePid(4242, "node", 9000)
+  W.run(2)
+  W.click("freeze")                   -- refused on the stale binding; the alert binds the newcomer
+  -- Once the newcomer is an extreme runaway too, the old verdict (still
+  -- fresh, same kind) would be usable: only its binding tells it apart.
+  W.run(20)
+  check("evict: the old binding's verdict is gone before the new one lands", mw.debug().lfm.cached, 0)
+end)
+
+-- ---- PR round 5: kept horizons, closed records, the launch-order line ----
+-- A follow-up that runs after its record stopped collecting still reads
+-- the machine at its horizon (the record kept it).
+scenario("ledger: a follow-up that runs after its record expired keeps its horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("expired: decision row", false, true); return end
+  local adv = laggedAdvisory(W, row.seq, 900)   -- its timers run 900 s late, past the record's 780 s
+  if not adv then check("expired: advisory row", false, true); return end
+  W.run(1100)
+  local fu = followups(W, adv.seq)
+  check("expired: the +60 follow-up ran after the record expired", fu[1] ~= nil, true)
+  check("expired: it still reads available memory at +60", fu[1] ~= nil and fu[1].availPct ~= nil, true)
+  check("expired: and the state", fu[1] and fu[1].state, "critical")
+end)
+
+-- A clock stepped back after the process's exit was proven: the exit
+-- stands, and nothing after the step is read.
+scenario("ledger: a step after a proven exit keeps the exit and reads nothing", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("gone-step: decision row", false, true); return end
+  W.procs[4242] = nil               -- it exits
+  W.run(10)                         -- a whole table proves it
+  W.wallOffset = -120
+  W.run(30)
+  local procRow = W.menuItem("Log snapshot")
+  if procRow and procRow.fn then procRow.fn() end   -- an operator action after the step
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("gone-step: three follow-ups", #fu, 3)
+  local exited, readings = 0, 0
+  for _, r in ipairs(fu) do
+    if r.fate == "exited" then exited = exited + 1 end
+    if r.availPct ~= nil or r.operatorActionsSince ~= nil or r.jetsamSince ~= nil or r.peakSinceMB ~= nil then
+      readings = readings + 1
+    end
+  end
+  check("gone-step: the exit proven before the step stands", exited, 3)
+  check("gone-step: and no follow-up reads anything it cannot place", readings, 0)
+end)
+
+-- Launch order is the line, not the wall clock: tables that land 8 s late
+-- (launched before an observation, delivered after it) are not read as a
+-- clock step.
+scenario("ledger: late tables are not a clock step", nil, function(W)
+  W.samplerDelay = 8
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(400)
+  local stepped, alive = 0, 0
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.followup_for then
+      if r.fateDetail == "clock-step" then stepped = stepped + 1 end
+      if r.fate == "alive" then alive = alive + 1 end
+    end
+  end
+  check("late tables: follow-ups were written", alive > 5, true)
+  check("late tables: none reads as a clock step", stepped, 0)
+end)
+
+-- A small step (3 s, under a tick) is seen against the monotonic clock.
+scenario("ledger: a small step back is seen too", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("small-step: decision row", false, true); return end
+  W.run(12.3)                       -- between ticks, with no table in flight
+  W.wallOffset = -3
+  W.run(200)
+  local fu = followups(W, row.seq)
+  check("small-step: the follow-ups say the clock stepped", fu[3] and fu[3].fateDetail, "clock-step")
+end)
+
+-- A top-born process's advisory rows carry the alert's bound start time too.
+scenario("ledger: a top-born offender's advisory rows are told apart too", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  local adv
+  runUntil(W, 200, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point == "advisory" and r.identityBasis == "lstart" then adv = r end
+    end
+    return adv ~= nil
+  end)
+  check("top-born advisory: an advisory row bound by the alert's start time", adv ~= nil, true)
+end)
+
+-- Every menu action counts, toggles included.
+scenario("ledger: a menu toggle counts as an operator action", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("toggle: decision row", false, true); return end
+  local item = W.menuItem("Log snapshot")
+  check("toggle: the menu offers Log snapshot now", item ~= nil and item.fn ~= nil, true)
+  if item and item.fn then item.fn() end
+  W.run(70)
+  local fu = followups(W, row.seq)
+  check("toggle: counted as an operator action", fu[1] and fu[1].operatorActionsSince, 1)
+end)
+
+-- In kill mode, a verdict that cannot be tied to its process leaves the
+-- decision to the deterministic policy: a terminate.
+scenario("a verdict whose snapshot is not its process's own never acts, in kill mode",
+         '{"unattended":"kill","lfm":{"enabled":true,"advisoryIntervalSec":600,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
+           .. LFM_KEYFILE .. '"}}', function(W, mw)
+  W.frontmost = { name = "Terminal", pid = 760 }
+  W.httpReply = cannedVerdict("wait")
+  W.kern = 2
+  runUntil(W, 60, function() return mw.debug().state == "elevated" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.probeFailsOnce = 1
+  W.addProc(4242, "topborn", 2000)
+  W.grow(4242, 220)
+  runUntil(W, 120, function() return mw.debug().lfm.cached >= 1 end)
+  W.httpReply = nil
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  check("unverified kill: the deterministic terminate ran", W.signalsTo(4242):sub(1, 4), "TERM")
+  check("unverified kill: the decision was not the model's", unattendedRow(W, "lfm"), nil)
+end)
+
+-- Across a clock step, a decision row still lands on the tick the
+-- unattended step acts: one row per attempt after the step.
+scenario("ledger: decision rows stay with the attempts across a clock step", UNATTENDED_FREEZE, function(W)
+  leaker(W, 4242)
+  W.procs[4242].unstoppable = true  -- every freeze fails to take, so it is attempted again
+  -- Each STOP's verifier cannot probe (for a second), so each attempt is
+  -- unconfirmed and retried after its grace.
+  W.onSignal = function(sig)
+    if sig == "STOP" then
+      W.probeFails = true
+      W.addTimer("after", 1, nil, function() W.probeFails = false end).world = true
+    end
+  end
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  W.run(20)
+  local rowsBefore, stopsBefore = 0, select(2, W.signalsTo(4242):gsub("STOP", ""))
+  for _, r in ipairs(ledgerRows(W)) do if r.point == "decision" and r.pid == 4242 then rowsBefore = rowsBefore + 1 end end
+  W.wallOffset = -120
+  W.run(200)
+  W.onSignal = nil
+  local rows = 0
+  for _, r in ipairs(ledgerRows(W)) do if r.point == "decision" and r.pid == 4242 then rows = rows + 1 end end
+  local stops = select(2, W.signalsTo(4242):gsub("STOP", ""))
+  check("aligned: attempts went on after the step", stops - stopsBefore >= 2, true)
+  check("aligned: one decision row per attempt after the step", rows - rowsBefore, stops - stopsBefore)
+end)
+
 -- ---- round 4: interactions the design pass introduced ----
 -- (round 4 P1) The sweep runs in every state now, in the same tick as an
 -- unattended freeze. A STOP that takes effect a moment later must not
@@ -1925,10 +3376,9 @@ local function legacyEntryWorld(W, state, frozenAtOffset, probeFails, opts)
   leaker(W, 4242, "node")
   W.procs[4242].state = state
   W.run(6)
-  -- Dated from the fake's own start stamp read with hand-written fields,
-  -- never through the parser under test.
-  local mm, ss = W.procs[4242].lstart:match("^Mon Oct 12 10:(%d+):(%d+) 2026$")
-  local started = os.time({ year = 2026, month = 10, day = 12, hour = 10, min = tonumber(mm), sec = tonumber(ss) })
+  -- Dated from the epoch the fake rendered its start stamp from (its wall
+  -- clock at birth, less 120 s), never through the parser under test.
+  local started = math.floor(W.procs[4242].bornWall) - 120
   local f = assert(io.open(W.home .. "/projects/memwatch/memwatch-frozen.json", "w"))
   f:write(string.format('[{"pid":4242,"name":"node","weightMB":0,"frozenAt":%d}]\n',
     started + (frozenAtOffset or 60)))
@@ -2479,7 +3929,7 @@ do
     check("step-gap: the step was seen once", logHas(W, "clock-stepped-back:120s"), true)
   end)
 
-  -- The step that counts is more than clockStepSec (2 s); less is time noise.
+  -- The step that counts is more than clock.stepSec (2 s); less is time noise.
   for _, case in ipairs({ { step = -1.9, seen = false }, { step = -2.1, seen = true } }) do
     scenario("a wall step of " .. case.step .. " s is " .. (case.seen and "" or "not ") .. "a step", nil, function(W)
       W.run(11)
@@ -3188,6 +4638,31 @@ scenario("a kill refused over the name alone keeps a stopped process's entry", n
   check("name-refuse: the process stays stopped", W.procs[4242] and W.procs[4242].state, "T")
   check("name-refuse: and keeps its row to resume it from", W.menuItem("   node") ~= nil, true)
 end)
+
+-- (round 11) Its counterpart: a Force Quit refused because the pid now holds
+-- another process (the frozen one is gone) drops the gone process's entry,
+-- and signals the newcomer nothing.
+scenario("a kill refused because the pid holds another process drops the gone one's entry", nil, function(W, mw)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.click("freeze")
+  W.run(3)
+  check("reuse-refuse: frozen (control)", mw.debug().frozenCount, 1)
+  W.reusePid(4242, "node", 9000)    -- the frozen node exits; a newer node takes the pid
+  W.run(1)
+  mw.killPid(4242, "node")
+  -- At once, by the refusal itself (a later tick's prune would drop it too).
+  check("reuse-refuse: refused (control)", logHas(W, "kill-refuse"), true)
+  check("reuse-refuse: the gone process's entry is dropped by the refusal", mw.debug().frozenCount, 0)
+  W.run(3)
+  check("reuse-refuse: the newcomer is signaled nothing", W.signalsTo(4242), "STOP")
+end)
+
+
+os.remove(LFM_KEYFILE)
+os.remove(LFM_KEYDIR)
 
 if fails == 0 then
   print("\nALL PASS")

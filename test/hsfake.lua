@@ -20,7 +20,7 @@ function F.new()
   local W = { now = 1000.0, timers = {}, nextTimer = 0, procs = {}, kern = 1, availPct = 45,
               swapUsedMB = 0, sigs = {}, notifs = {}, alerts = {}, exec = {}, unknown = {},
               probeFails = false, activation = nil, hud = nil, menu = nil,
-              etimeColumn = false }
+              etimeColumn = true }   -- the sampler reports ps etime (process age)
 
   -- ---- virtual clock and timers ----------------------------------------
   local Timer = {}
@@ -80,18 +80,27 @@ function F.new()
   end
 
   -- ---- processes ---------------------------------------------------------
-  local nextStart = 0
-  local function startStamp()
-    nextStart = nextStart + 1
-    return string.format("Mon Oct 12 10:%02d:%02d 2026", (nextStart // 60) % 60, nextStart % 60)
+  -- A process's start time as ps prints it (local time), consistent with
+  -- the etime the sampler reports for it (every fake process is reported
+  -- 120 s older than its birth, so identity windows can decide). Both are
+  -- on the wall clock, as the kernel keeps them: the start is the wall time
+  -- at birth, and etime is the wall clock now minus it, so a wall-clock
+  -- step moves etime and launch times together and the start stays put.
+  local function wallNow() return W.now + (W.wallOffset or 0) end
+  local function startStamp(bornWall)
+    return os.date("%a %b %e %H:%M:%S %Y", math.floor(bornWall) - 120)
   end
   function W.addProc(pid, name, rssMB, extra)
     local p = { pid = pid, uid = 501, comm = "/usr/local/bin/" .. name, rssKB = math.floor(rssMB * 1024),
-                lstart = startStamp(), state = "S", bornAt = W.now }
+                lstart = startStamp(wallNow()), state = "S", bornAt = W.now, bornWall = wallNow() }
     for k, v in pairs(extra or {}) do p[k] = v end
     W.procs[pid] = p
     return p
   end
+  -- Hammerspoon's own row in the sampler's table (not a fake process the
+  -- scenarios drive: it never grows, and memwatch never signals it).
+  W.selfProc = { pid = SELF_PID, uid = 501, comm = "/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon",
+                 rssKB = 300 * 1024, state = "S", bornAt = W.now - 86400, bornWall = W.now - 86400 }
   -- A same-name process taking over a pid that just exited.
   function W.reusePid(pid, name, rssMB)
     W.procs[pid] = nil
@@ -108,7 +117,7 @@ function F.new()
   end
 
   local function etime(p)
-    local s = math.max(0, math.floor(W.now - p.bornAt)) + 120
+    local s = math.max(0, math.floor(wallNow() - p.bornWall) + 120)
     return string.format("%02d:%02d", s // 60, s % 60)
   end
   local function samplerBlob()
@@ -117,14 +126,20 @@ function F.new()
       W.etimeColumn and "  PID   UID    RSS ELAPSED COMM" or "  PID   UID    RSS COMM" }
     local pids = {}
     for pid in pairs(W.procs) do pids[#pids + 1] = pid end
+    -- Hammerspoon itself is in every real table (memwatch's positive
+    -- control for a whole table).
+    if not W.procs[SELF_PID] then pids[#pids + 1] = SELF_PID end
     table.sort(pids)
     for _, pid in ipairs(pids) do
-      local p = W.procs[pid]
+      local p = W.procs[pid] or (pid == SELF_PID and W.selfProc)
+      -- samplerOmit: rows a cut-off (partial) table is missing.
+      if W.samplerOmit and W.samplerOmit[pid] then goto continue end
       if W.etimeColumn then
         rows[#rows + 1] = string.format("%5d %5d %6d %s %s", pid, p.uid, p.rssKB, etime(p), p.comm)
       else
         rows[#rows + 1] = string.format("%5d %5d %6d %s", pid, p.uid, p.rssKB, p.comm)
       end
+      ::continue::
     end
     return table.concat(rows, "\n") .. "\n"
   end
@@ -142,6 +157,14 @@ function F.new()
       if (W.probeFailsOnce or 0) > 0 then
         W.probeFailsOnce = W.probeFailsOnce - 1
         return ""
+      end
+      -- takeOverBeforeProbe: that pid's process exits and a same-name one
+      -- takes the pid just before this probe runs (one shot).
+      local tk = W.takeOverBeforeProbe
+      if tk and W.procs[tk] and ("," .. list .. ","):find("," .. tk .. ",", 1, true) then
+        W.takeOverBeforeProbe = nil
+        local old = W.procs[tk]
+        W.reusePid(tk, (old.comm:match("([^/]+)$") or "proc"), old.rssKB / 1024)
       end
       -- vanishBeforeProbe: that process exits just before this probe runs
       -- (one shot).
@@ -333,10 +356,10 @@ function F.new()
       -- timersStall: a one-shot callback that never gets to run (a run loop
       -- stalled past it), so a narrative waiting on it never finishes.
       -- timerLag: one-shots run that much late (a run loop blocked in a
-      -- probe during a storm), so an outcome can arrive after a deadline.
-      -- A timer stalled this way can be released later (W.releaseStalled):
-      -- it then runs its remaining delay from that moment, as a run loop that
-      -- unblocks does.
+      -- probe during a storm), so a follow-up or an outcome arrives after later
+      -- evidence or after a deadline. A timer stalled this way can be released
+      -- later (W.releaseStalled): it then runs its remaining delay from that
+      -- moment, as a run loop that unblocks does.
       doAfter = function(sec, fn)
         if W.timersStall then
           local t = addTimer("after", math.huge, nil, fn)
@@ -362,12 +385,41 @@ function F.new()
     task = { new = function(path, exitCb, streamCb)
       local t = { path = path }
       function t:start()
+        -- samplerStartFails: the sampler fork cannot start (start() returns
+        -- nil, as hs.task does when the fork fails); every attempt is counted.
+        if path == "/bin/sh" then
+          W.samplerStartAttempts = (W.samplerStartAttempts or 0) + 1
+          if W.samplerStartFails then return nil end
+        end
         -- psStarved: the sampler fork starts but never reports (the watchdog
         -- relaunches it; a relaunch after psStarved clears reports again).
         if path == "/bin/sh" and not W.psStarved then
-          addTimer("after", W.samplerDelay or 0.05, nil, function()
-            if streamCb then streamCb(t, samplerBlob()) end
-            exitCb(0, "", "")
+          -- ps reads the table when it runs, at launch; a starved callback
+          -- delivers that reading late (samplerDelay), as a real storm does.
+          -- samplersLive / samplersMax count the sampler forks memwatch has
+          -- neither seen finish nor terminated: overlap means two ps at once.
+          -- samplerReadsLate: ps reads its table when the delivery comes (a fork
+          -- that ran late in a storm), after onSamplerDeliver (something that
+          -- happens just before, such as a wall clock step).
+          local blob = (not W.samplerReadsLate) and samplerBlob() or nil
+          -- samplerReadDelay: ps reads its table that long after its launch
+          -- (a fork that ran a little late), before its delivery.
+          if W.samplerReadDelay then
+            blob = nil
+            addTimer("after", W.samplerReadDelay, nil, function() blob = blob or samplerBlob() end).world = true
+          end
+          t.sampler = true
+          W.samplersLive = (W.samplersLive or 0) + 1
+          W.samplersMax = math.max(W.samplersMax or 0, W.samplersLive)
+          t.delivery = addTimer("after", W.samplerDelay or 0.05, nil, function()
+            if t.done then return end
+            t.done = true
+            if not t.terminated then W.samplersLive = W.samplersLive - 1 end
+            if W.onSamplerDeliver then W.onSamplerDeliver() end
+            blob = blob or samplerBlob()
+            if streamCb then streamCb(t, blob) end
+            -- nonzero: ps failed or was cut off mid-table; 15: it was terminated
+            exitCb(t.terminated and 15 or (W.samplerExit or 0), "", "")
           end)
         end
         -- The streaming top: with topEmits set, one block every 5 s naming
@@ -390,7 +442,24 @@ function F.new()
         end
         return t
       end
-      function t:terminate() if t.timer then t.timer:stop() end end
+      function t:terminate()
+        if t.timer then t.timer:stop() end
+        -- A terminated sampler stops counting as running. With
+        -- terminateCallsBack it also reports at once, as SIGTERM ends it:
+        -- exit 15, its table lost.
+        if t.sampler and not t.done then
+          W.samplersLive = W.samplersLive - 1
+          -- terminatedStillDelivers: a fork stuck in the kernel takes the TERM
+          -- only when it runs again, and then reports the table it read, late,
+          -- exit 15 (memwatch has let it go: it no longer counts as running).
+          if W.terminatedStillDelivers then t.terminated = true; return end
+          t.done = true
+          if W.terminateCallsBack then
+            if t.delivery then t.delivery:stop() end
+            addTimer("after", 0.05, nil, function() exitCb(15, "", "") end)
+          end
+        end
+      end
       function t:isRunning() return false end
       function t:pid() return 9999 end
       return t
@@ -430,8 +499,35 @@ function F.new()
       W.alerts[#W.alerts + 1] = { t = W.now, text = text }
       if W.onAlert then W.onAlert(text) end
     end },
-    http = { asyncPost = function() end },
-    fs = { dir = function() return function() return nil end end },
+    -- Every POST is recorded; with httpReply(url, body) -> status, body set,
+    -- it is answered after httpDelay (default 0.2 s).
+    http = { asyncPost = function(url, body, headers, cb)
+      W.httpPosts = W.httpPosts or {}
+      W.httpPosts[#W.httpPosts + 1] = { url = url, body = body, at = W.now }
+      if W.httpReply and cb then
+        addTimer("after", W.httpDelay or 0.2, nil, function() cb(W.httpReply(url, body)) end)
+      end
+    end },
+    -- W.jetsam: { [name] = modification epoch } of kernel jetsam reports.
+    fs = {
+      dir = function()
+        local names = {}
+        for n in pairs(W.jetsam or {}) do names[#names + 1] = n end
+        local i = 0
+        return function() i = i + 1; return names[i] end
+      end,
+      attributes = function(path, key)
+        local m = (W.jetsam or {})[path:match("[^/]+$")]
+        if m then
+          if key == "modification" then return m end
+          return { modification = m }
+        end
+        -- Any other path is a real file in the scratch home: it exists when
+        -- renaming it onto itself succeeds (a stat, needing no read access).
+        if key == nil and os.rename(path, path) then return { mode = "file" } end
+        return nil
+      end,
+    },
   }
   W.hs = hs
 
@@ -474,6 +570,7 @@ local function scratchDir()
   end
   error("no writable scratch directory (set HSFAKE_ROOT)")
 end
+F.scratchDir = scratchDir
 
 -- opts.keepHome reloads into the world's existing home (a Hammerspoon
 -- reload: the config, the frozen ledger and the logs survive).

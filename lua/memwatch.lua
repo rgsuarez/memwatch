@@ -17,6 +17,7 @@
 local core  = require("memwatch_core")
 local procs = require("memwatch_procs")
 local lfm   = require("memwatch_lfm")
+local observe = require("memwatch_observe")
 
 local M = {}
 
@@ -40,10 +41,16 @@ local topCache     = { map = nil, at = 0 }  -- per-pid CMPRS from async top
 local lastPsList   = {}
 local lastRanked   = {}   -- top hogs by RSS+CMPRS weight (menu rows)
 local lastRuns     = {}   -- current runaway list, ignores applied
-local lastRunsAll  = {}   -- every runaway, before the answered filters (for GC)
 local lastOffender = nil  -- the process alerts name right now
 local lastExtreme  = false -- extreme runaway currently on the books
-local lastSampleAt = 0    -- when a sampler callback last landed
+-- The sampler fork: the task in flight and when it launched; when a
+-- callback last landed (at); and the run behind lastPsList: its launch
+-- order (seq: an integer, immune to wall-clock steps), when it was launched
+-- (nil: unknown, start windows unbounded), and whether it exited 0 (its
+-- table is whole).
+local sampler = { task = nil, startedAt = 0, at = 0,
+                  seq = 0, nextSeq = 0, launchedAt = nil, complete = false,
+                  launches = {} }  -- [seq] = { at, steps }: in-flight launches; at moves with a step
 -- The wall and monotonic clock readings at the last wall read (clock.now
 -- and clock.shift, below the state they shift, keep waits whole across a
 -- wall clock stepped back), and the step that counts as one.
@@ -105,7 +112,7 @@ local function markHolds(mark, at, pid, lstart, name)
   return true
 end
 local unattendedFiredFor = {} -- [pid] = { at, lstart } of the last unattended adjudication
-local unattendedWaitStreak = {} -- [pid] = consecutive model-wait outcomes at grace expiry
+local unattendedWaitStreak = {} -- [pid] = { firstAt, count } of model waits at grace expiry
 local unattendedSkipLogAt = 0  -- last "identity unverified" skip line (one a minute)
 local openReceipts = {}        -- [owed] = true: unattended actions whose outcome has not arrived
 local lfmServerTask  = nil    -- hs.task handle for llama-server
@@ -118,10 +125,137 @@ local lfmOffline     = false  -- timeout/self-police latch; clears at an elevate
 local lfmCalmSince   = nil    -- retire-on-calm bookkeeping
 local lfmLastAdvisoryAt = 0
 local lfmReqNonce    = 0      -- monotonic request generation
-local lfmInFlight    = nil    -- { nonce, pid, hash, at, ident }
+local lfmInFlight    = nil    -- { nonce, pid, hash, at } of the request in flight
 local lfmRemoteKey   = nil    -- bearer key for the remote adjudicator (never logged)
 local lfmRemoteCooldownUntil = 0 -- F1: remote backoff deadline (retry, not hard latch)
-local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident }
+local verdictCache   = {}     -- [pid] = { verdict, snapshotHash, reqNonce, at, ident, kind, snapshot }
+-- Passive observation ledger state and functions (cross-section, so
+-- declared here). One table, not a local each: Lua caps a chunk's locals
+-- at 200, and this file is near the cap (test_core pins the headroom).
+local obs = {
+  enabled    = true,   -- local-only outcome record; config key "observe"
+  seq        = 0,
+  lastAt     = 0,
+  decisionAt = {},     -- [pid] = { at, comm, start } of the last decision observation
+  -- lastMono: when the last row was written, on the monotonic clock (its
+  -- age is a duration, which no wall clock step moves).
+  stats      = { rows = 0, followups = 0, lastMono = nil, errors = 0 },
+  -- The evidence of each observation still awaiting follow-ups ([seq] =
+  -- observe.newEvidence), folded forward as ps samples, memwatch's own
+  -- signals and operator touches arrive, and dropped after its last horizon.
+  -- A follow-up reads only its own record (see observe.foldSample).
+  pending    = {},
+  -- Rows carry this load's session id: observation seq restarts at 1 on
+  -- every reload, so (session, seq) is the join key between a row and its
+  -- follow-ups.
+  session    = string.format("%d-%04x", os.time(), math.random(0, 0xffff)),
+  -- Every operator action on an alert or a process (HUD click, menu
+  -- action, banner button) is folded into each pending observation
+  -- (obs.noteAction), so a follow-up counts those through its own horizon.
+  -- The machine's reading at every tick ({ at, availPct, state }), kept
+  -- while a pending observation may still ask for it (obs.noteTick), so a
+  -- follow-up reads the machine as of its horizon.
+  ticks      = {},
+  path       = os.getenv("HOME") .. "/projects/memwatch/memwatch-observe.jsonl",
+  jetsamDir  = "/Library/Logs/DiagnosticReports",
+}
+
+-- A signal memwatch sent (after its identity and policy gates) folds into
+-- every pending observation of that pid; the verified target's comm and
+-- start time decide whether it was the observed process.
+function obs.noteSignal(pid, action, proc)
+  if not next(obs.pending) then return end
+  -- Bookkeeping never interrupts the action that called it.
+  local ok, err = pcall(function()
+    local sig = { action = action, at = clock.now(),
+                  comm = proc and proc.comm or nil,
+                  startEpoch = proc and observe.lstartEpochUnambiguous(proc.lstart) or nil }
+    for _, ev in pairs(obs.pending) do
+      if ev.pid == pid then observe.foldSignal(ev, sig) end
+    end
+  end)
+  if not ok then M.logSnapshot("observe-signal-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
+end
+
+-- An operator touch aimed at a process (its pid, and its bound start time
+-- when known) folds into the pending observations of that pid.
+function obs.noteTouch(off)
+  if type(off) ~= "table" or not off.pid or not next(obs.pending) then return end
+  local ok, err = pcall(function()
+    -- The tracker's comm for the pid, when it still names this process.
+    local e = tracker.procs[off.pid]
+    local comm = (e and e.comm and off.name and core.sameName(procs.friendlyName(e.comm), off.name))
+      and e.comm or nil
+    local t = { at = clock.now(), comm = comm,
+                startEpoch = observe.lstartEpochUnambiguous(off.lstart) }
+    for _, ev in pairs(obs.pending) do
+      if ev.pid == off.pid then observe.foldTouch(ev, t) end
+    end
+  end)
+  if not ok then M.logSnapshot("observe-touch-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
+end
+
+-- An operator action from any surface: folded into every pending
+-- observation, so a follow-up counts those through its horizon however
+-- late its timer runs.
+function obs.noteAction()
+  if not next(obs.pending) then return end
+  -- Bookkeeping never stops the operator's action that called it.
+  local ok, err = pcall(function()
+    local now = clock.now()
+    for _, ev in pairs(obs.pending) do observe.foldAction(ev, now) end
+  end)
+  if not ok then M.logSnapshot("observe-action-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
+end
+
+-- The frozen ledger changed (saveFrozen runs after every change): fold, for
+-- each pending observation, whether the ledger now holds its process, so a
+-- follow-up reads the ledger as of its horizon, not as the timer finds it.
+function obs.noteFrozen()
+  if not next(obs.pending) then return end
+  local ok, err = pcall(function()
+    local now = clock.now()
+    for _, ev in pairs(obs.pending) do
+      observe.foldFrozen(ev, now, observe.frozenMatches(frozen[ev.pid], ev.start0))
+    end
+  end)
+  if not ok then M.logSnapshot("observe-frozen-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
+end
+
+-- Each tick: log the machine's reading for the follow-ups, and keep each
+-- collecting record's horizon readings in the record. (A wall clock stepped
+-- back is seen by clock.now at the first read after it; clock.shift then
+-- closes every collecting record, see there.)
+function obs.noteTick(now, availPct, state)
+  local log = obs.ticks
+  log[#log + 1] = { at = now, availPct = availPct, state = state }
+  -- Each collecting record keeps the readings of the horizons it has passed,
+  -- before it can expire and the log below be cut back: a follow-up that
+  -- runs later still reads its own horizon.
+  for _, ev in pairs(obs.pending) do observe.snapshotHorizons(ev, log, now) end
+  -- A pending record whose follow-up timers never ran (a stalled run loop)
+  -- stops collecting once it is far past its last horizon: its follow-ups
+  -- read only up to their horizons, so nothing they need is lost, and
+  -- neither it nor the log below can grow without bound.
+  for seq, ev in pairs(obs.pending) do
+    if ev.expiresMono and clock.mono() > ev.expiresMono then obs.pending[seq] = nil end
+  end
+  -- Keep what a pending observation can still ask for: readings from its
+  -- observation on (and the freshness window before it). With none
+  -- pending, only this reading.
+  local oldest
+  for _, ev in pairs(obs.pending) do
+    if not oldest or ev.obsAt < oldest then oldest = ev.obsAt end
+  end
+  local keepFrom = oldest and (oldest - observe.cfg.sampleFreshSec) or now
+  local drop = 0
+  while drop < #log - 1 and log[drop + 1].at < keepFrom do drop = drop + 1 end
+  if drop > 0 then
+    local kept = {}
+    for i = drop + 1, #log do kept[#kept + 1] = log[i] end
+    obs.ticks = kept
+  end
+end
 -- Forward declarations, assigned in the kill-engine section: alertSurfaces
 -- (defined earlier in the file) calls these at tick time, and a top-level
 -- local referenced above its declaration silently splits into a global.
@@ -179,7 +313,7 @@ end
 -- logged, and the action, or the state it settles, carries on (a kill's
 -- TERM after its progress alert, a rebind after a refusal's alert).
 local function showAlert(text, sec)
-  local ok, err = pcall(hs.alert.show, "memwatch: " .. text, sec or 2.5)
+  local ok, err = pcall(function() hs.alert.show("memwatch: " .. tostring(text), sec or 2.5) end)
   if not ok then logError("alert", err) end
 end
 
@@ -302,6 +436,9 @@ local function applyLocalConfig()
   -- Desktop alert surfaces (HUD + banners). Muting them never disarms the
   -- unattended engine or the menu-bar state icon.
   if type(conf.alerts) == "boolean" then alertsEnabled = conf.alerts end
+  -- The passive observation ledger is on by default (local file only, no
+  -- action, no network); "observe": false turns it off.
+  if type(conf.observe) == "boolean" then obs.enabled = conf.observe end
   if type(conf.lfm) == "table" then
     for k, v in pairs(conf.lfm) do
       if lfm.cfg[k] ~= nil and type(v) == type(lfm.cfg[k]) then lfm.cfg[k] = v end
@@ -422,8 +559,10 @@ end
 -- is still alive under load keeps the picture current.
 local function assessProcesses(now)
   local totalMB = (lastMetrics.totalGB or 0) * 1024
-  local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
-  lastRunsAll = runs
+  -- Ages are against start windows on the raw wall clock: the same instant
+  -- as now, on that clock (now itself stays on a held frame's basis).
+  local rawAt = now + clock.pending
+  local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil, rawAt)
   -- An answered process is no candidate, by its own state: ignored, held
   -- frozen by memwatch (stopped, so its extreme latch is history, not
   -- growth), or verified gone while its last samples age out. A frozen or
@@ -615,6 +754,16 @@ local function recordFor(map, off, create)
   end
   return r
 end
+-- Every operator touch on an alert or a process (HUD click, menu action,
+-- banner button) bumps one monotonic counter. An observation compares it
+-- across its follow-up window, so a human intervention is never hidden by a
+-- later raise resetting the per-process answered marks.
+function obs.byOperator(fn)
+  return function(...)
+    obs.noteAction()
+    return fn(...)
+  end
+end
 local hudHold        = false  -- a kill narrative owns the body text
 local hudHoldUntil   = 0      -- a hold no narrative released by now is released
 local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 2 + 2 + 3, then 4 s to settle)
@@ -629,6 +778,7 @@ local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 2 + 2 
 -- withdraws a veto another answer still holds.
 local function markInteracted(off, pending, supersedeOnly)
   if not off or off.synthetic then return nil end
+  obs.noteTouch(off)
   -- The operator acting on a process supersedes memwatch's own action in
   -- flight on that very process: its pending KILL escalation is withheld
   -- and its late progress touches nothing (rule 4). A veto only ever
@@ -877,7 +1027,7 @@ end
 -- snoozed, unless a narrative of its own holds it. The episode it routes
 -- to is this run's: after a stop or start, only a verified exit (a fact
 -- about the process, not the episode) is kept.
--- (hs.alert directly: alertUpdate is declared further down the file.)
+-- (showAlert directly: alertUpdate is declared further down the file.)
 local function surfaceUpdate(target, click)
   local gen = runGen
   return function(text, done, outcome)
@@ -963,7 +1113,9 @@ local function buildHud()
               textColor = { white = 0.6, alpha = 1 }, textSize = 13, trackMouseUp = true }
   hud:mouseCallback(guard("hud-click", function(_, evt, id)
     if evt ~= "mouseUp" then return end
-    -- A click answers the alert (and stands unattended action down for this
+    obs.noteAction()
+    -- Every click is an operator touch for the observation ledger. It
+    -- answers the alert (and stands unattended action down for this
     -- process) only when it does something: an action dispatched on a
     -- bound identity, Ignore, close, or opening Activity Monitor. A refused
     -- click and a self-test button do not.
@@ -1082,7 +1234,7 @@ local function buildMenu()
     { title = string.format("Compressor (info) %.1f GB", m.compGB), disabled = true },
     { title = "-" },
   }
-  local sinceSample = lastSampleAt > 0 and (clock.now() - lastSampleAt) or 0
+  local sinceSample = sampler.at > 0 and (clock.now() - sampler.at) or 0
   if sinceSample > 15 then
     items[#items + 1] = {
       title = string.format("\u{26A0} process data %.0fs stale (system under load)", sinceSample),
@@ -1117,24 +1269,24 @@ local function buildMenu()
       title = string.format("%-22s %5.1f GB  (pid %d)", name:sub(1, 22), p.weightMB / 1024, pid),
       menu = {
         { title = "Freeze " .. name .. note, disabled = (lst == nil) or nil,
-          fn = function()
+          fn = obs.byOperator(function()
             local click = markInteracted(target, true)
             M.freezePid(pid, name, surfaceUpdate(target, click), { weightMB = wMB, expectedLstart = lst })
-          end },
+          end) },
         { title = "Force Quit " .. name .. note, disabled = (lst == nil) or nil,
-          fn = function()
+          fn = obs.byOperator(function()
             local click = markInteracted(target, true)
             M.killPid(pid, name, surfaceUpdate(target, click), { expectedLstart = lst })
-          end },
+          end) },
         { title = "Ignore for 30 min",
-          fn = function() M.ignore(pid, name, lst) end },
+          fn = obs.byOperator(function() M.ignore(pid, name, lst) end) },
         { title = "Show in Activity Monitor",
           -- Opening Activity Monitor on this process answers it, as the
-          -- HUD's button does.
-          fn = function()
+          -- HUD's button does (markInteracted also notes the touch).
+          fn = obs.byOperator(function()
             markInteracted(target)
             hs.application.launchOrFocus("Activity Monitor")
-          end },
+          end) },
       },
     }
   end
@@ -1153,22 +1305,25 @@ local function buildMenu()
         title = string.format("   %-20s %s \u{00B7} %.0f min", (e.name or "?"):sub(1, 20), held, mins),
         menu = {
           { title = "Resume " .. (e.name or "?"),
-            -- The identity the row showed: a Resume answers for it even if
-            -- its entry has gone since the menu opened.
-            fn = function() M.resumePid(pid, nil, { pid = pid, name = e.name, lstart = e.lstart }) end },
+            -- The identity the row showed: a Resume answers for it (and notes
+            -- the touch) even if its entry has gone since the menu opened.
+            fn = obs.byOperator(function()
+              M.resumePid(pid, nil, { pid = pid, name = e.name, lstart = e.lstart })
+            end) },
           { title = "Force Quit " .. (e.name or "?"),
             -- The identity this row shows: a pid frozen again for another
             -- process since the menu opened is refused, not quit.
-            fn = function()
+            fn = obs.byOperator(function()
               local target = { pid = pid, name = e.name, lstart = e.lstart }
-              local click = markInteracted(target, true)
+              local click = markInteracted(target, true)   -- an answer; it notes the touch
               M.killPid(pid, e.name, surfaceUpdate(target, click), { expectedLstart = e.lstart })
-            end },
+            end) },
         },
       }
     end
     if #frozenRows > 1 then
-      items[#items + 1] = { title = "Resume all", fn = function() M.resumeAll() end }
+      -- (Each resume's answer notes its own touch.)
+      items[#items + 1] = { title = "Resume all", fn = obs.byOperator(function() M.resumeAll() end) }
     end
   end
   items[#items + 1] = { title = "-" }
@@ -1186,7 +1341,7 @@ local function buildMenu()
     end
     local bound = off.lstart or bindingOf(hudOffender) or bindingOf(critNotifOff)
     items[#items + 1] = { title = label, disabled = off.synthetic == true or nil,
-      fn = function()
+      fn = obs.byOperator(function()
         local lst, why = bound, nil
         if not lst then
           local p
@@ -1204,25 +1359,25 @@ local function buildMenu()
         end
         local click = markInteracted(target, true)
         M.killPid(off.pid, off.name, surfaceUpdate(target, click), { expectedLstart = lst })
-      end }
+      end) }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
-      fn = function() M.ignore(off.pid, off.name, bound) end }
+      fn = obs.byOperator(function() M.ignore(off.pid, off.name, bound) end) }
     items[#items + 1] = { title = "-" }
   end
   items[#items + 1] = { title = "Open Activity Monitor",
-    fn = function() hs.application.launchOrFocus("Activity Monitor") end }
+    fn = obs.byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) }
   items[#items + 1] = { title = "Log snapshot now",
-    fn = function() M.logSnapshot("manual") end }
+    fn = obs.byOperator(function() M.logSnapshot("manual") end) }
   items[#items + 1] = { title = string.format("Desktop alerts: %s", alertsEnabled and "on" or "off"),
-    fn = function() M.setAlertsEnabled(not alertsEnabled) end }
+    fn = obs.byOperator(function() M.setAlertsEnabled(not alertsEnabled) end) }
   items[#items + 1] = { title = string.format("LFM adjudication: %s",
       lfm.cfg.enabled
         and (lfmRemoteActive() and ("on (remote: " .. lfm.cfg.remoteModel .. ")")
              or (lfmServerReady and "on (warm)" or "on"))
         or "off"),
-    fn = function() M.setLfmEnabled(not lfm.cfg.enabled) end }
+    fn = obs.byOperator(function() M.setLfmEnabled(not lfm.cfg.enabled) end) }
   items[#items + 1] = { title = "Open value report",
-    fn = function() M.report() end }
+    fn = obs.byOperator(function() M.report() end) }
   return items
 end
 
@@ -1307,6 +1462,7 @@ local function notifyCrit(m)
   if not notified then critNotified[#critNotified + 1] = critNotifOff or { none = true } end
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
+      obs.noteAction()
       local target = { pid = off.pid, name = off.name, lstart = lstart }
       local click = markInteracted(target, true)
       M.killPid(off.pid, off.name, surfaceUpdate(target, click), { expectedLstart = lstart })
@@ -1345,45 +1501,80 @@ end
 -- would drop exactly the process this tool exists to catch. ~600 rows parse
 -- in well under a millisecond. No -m: we sort ourselves, and ps's
 -- memory-sort is precisely the work that crawls when the system is dying.
+-- etime rides the same fork (no new process): it gives every pid a real age,
+-- which the adjudicator snapshot and the observation ledger carry as ageSec.
 local SAMPLER_CMD = "/usr/sbin/sysctl -n kern.memorystatus_vm_pressure_level vm.swapusage; "
-                 .. "/bin/ps -Axo pid,uid,rss,comm"
+                 .. "/bin/ps -Axo pid,uid,rss,etime,comm"
 local SAMPLE_WATCHDOG_SEC = 20
 local SAMPLE_STALE_SEC    = 30
 
-local sampleTask, sampleStartedAt = nil, 0
 local lastPsBlob = ""     -- consumed by the process tracker
 
 local function launchSampler(onDone)
   local now = clock.now()
-  if sampleTask then
-    if (now - sampleStartedAt) < SAMPLE_WATCHDOG_SEC then return end
-    pcall(function() sampleTask:terminate() end)
-    sampleTask = nil
+  if sampler.task then
+    if (now - sampler.startedAt) < SAMPLE_WATCHDOG_SEC then return end
+    pcall(function() sampler.task:terminate() end)
+    sampler.task = nil
   end
-  sampleStartedAt = now
+  sampler.startedAt = now
+  -- This task's own launch, recorded three ways for its callback. For start
+  -- windows, the raw wall reading clock.now just took (ps reads its table,
+  -- and etime, on that clock, on one side of a step or the other, so start
+  -- windows span both; see procs.startWindow), never this callback's basis,
+  -- which a step held to the frame's end leaves on the old one. For the
+  -- unattended-state GC and the fold's ordering, a record the clock shift
+  -- moves with the tracker's sightings, so the two never sit on two bases
+  -- whichever way the clock steps. And the step-back total so far, so the
+  -- delivery can widen its windows by any step taken in between.
+  local launchedAt = clock.wallAt
+  sampler.nextSeq = sampler.nextSeq + 1
+  local seq = sampler.nextSeq   -- and its place in launch order
+  -- Records of launches delivered or overtaken go, and so does any older
+  -- than the last 16 launches (a table that never came back), so the set
+  -- stays bounded whatever happens to the tables.
+  for old in pairs(sampler.launches) do
+    if old <= sampler.seq or old <= seq - 16 then sampler.launches[old] = nil end
+  end
+  -- steps: the step-back total so far (taken out, or held in this frame),
+  -- so the delivery can tell how far the raw clock moved in between.
+  sampler.launches[seq] = { at = now, steps = clock.stepTotal + clock.pending }
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
   -- without a streaming drain hs.task never reads the pipe, ps blocks
   -- mid-write, and the task deadlocks until the watchdog TERMs it (observed
   -- live as intermittent sampler death that tracked the process count).
   -- The streaming callback exists purely to drain; assembly happens at exit.
   local acc = {}
-  sampleTask = hs.task.new("/bin/sh",
+  local task
+  task = hs.task.new("/bin/sh",
     guard("sampler", function(exitCode)
-      sampleTask = nil
+      -- Only this task's own handle: when the watchdog has terminated this
+      -- task and launched another, clearing the newer handle would let the
+      -- next tick launch a third ps beside it.
+      if sampler.task == task then sampler.task = nil end
       -- Keep partial output even on a nonzero exit: under memory pressure ps
       -- can fail mid-table, and a partial process list beats a blank one.
-      -- The parsers treat garbage as calm, never as alarm.
+      -- The parsers treat garbage as calm, never as alarm. The exit code
+      -- rides along so consumers that infer absence (a process is gone
+      -- because its row is missing) can refuse a partial table.
       if exitCode ~= 0 then
         logError("sampler-exit", "code " .. tostring(exitCode))
       end
-      onDone(table.concat(acc))
+      onDone(table.concat(acc), exitCode, launchedAt, seq)
     end),
     function(_, stdOut)
       acc[#acc + 1] = stdOut or ""
       return true
     end,
     { "-c", SAMPLER_CMD })
-  if sampleTask then sampleTask:start() end
+  sampler.task = task
+  -- A launch that never started gets no callback: its record goes now, and
+  -- so does its handle, so the next tick launches again rather than waiting
+  -- out the watchdog for a task that was never running.
+  if not (task and task:start()) then
+    sampler.launches[seq] = nil
+    if sampler.task == task then sampler.task = nil end
+  end
 end
 
 -- Enrichment half: runs when the sampler fork returns. Refreshes the kernel
@@ -1391,9 +1582,28 @@ end
 -- state decision: under heavy pressure this fork can starve for tens of
 -- seconds (a live drill measured ~95s of stalled callbacks during a swap
 -- storm), and the verdict must never be hostage to it.
-local function onSample(blob)
+local function onSample(blob, exitCode, launchedAt, seq)
   local now = clock.now()
-  lastSampleAt = now
+  -- The same instant on the raw wall clock, for start windows (see below).
+  local rawDeliveredAt = clock.wallAt
+  local launch = seq and sampler.launches[seq] or nil
+  -- A step back between the launch and this delivery moved the raw clock by
+  -- its size, and ps read on one side of it or the other: start windows
+  -- widen by it. Without the launch's record it is unknown.
+  local steppedSec = launch and math.max(0, (launch.steps or 0) - (clock.stepTotal + clock.pending)) or nil
+  if seq then sampler.launches[seq] = nil end
+  -- A callback from a sampler launched before the one already applied holds
+  -- an older table: it never replaces a newer one. Launch order, not the
+  -- wall clock, decides: a clock stepped back (wake-time NTP, a VM resume)
+  -- must not discard every table until real time catches up.
+  if seq and seq < sampler.seq then return end
+  sampler.seq = seq or sampler.seq
+  sampler.at = now
+  -- What the unattended-state GC compares with the tracker's sightings:
+  -- the launch record the clock shift moved with them. Without one the
+  -- launch is unknown (nil), and the GC prunes nothing: never the unshifted
+  -- wall reading, which would put the two on two bases.
+  sampler.launchedAt = launch and launch.at or nil
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -1403,13 +1613,59 @@ local function onSample(blob)
   -- Per-process pipeline: fresh identities and RSS from ps, then the shared
   -- assessment. Attribution continuity under load is the top stream's job.
   lastPsList = procs.parsePsList(blob)
-  procs.update(tracker, lastPsList, now, topCache.map)
+  -- A table is whole (its absences prove exits) only when ps exited 0 AND
+  -- it lists memwatch's own process, the positive control: a table cut
+  -- short that still exited 0 is missing that row as surely as others.
+  local selfListed = false
+  for _, p in ipairs(lastPsList) do
+    if p.pid == hs.processInfo.processID then selfListed = true; break end
+  end
+  sampler.complete = (exitCode == 0) and selfListed
+  -- Start windows are anchored to the kernel's start record, and ps's etime
+  -- runs on the raw wall clock: a window is placed with raw readings at
+  -- launch and delivery (launchedAt, rawDeliveredAt), never this callback's basis,
+  -- which a step held back to the frame's end leaves on the old one. A
+  -- table whose launch record is gone cannot tell how far the clock moved
+  -- since its launch, but every step back so far bounds it: the tracker's
+  -- windows from it widen by that (none when the clock never stepped), so
+  -- an observation that takes its start from them reads unknown, never a
+  -- reuse.
+  local widenSec = steppedSec or -(clock.stepTotal + clock.pending)
+  procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, widenSec)
   lastRanked = procs.rankByWeight(lastPsList, topCache.map, 5)
   -- The watchdog and its own adjudicator never appear as offenders.
   for i = #lastRanked, 1, -1 do
     if protectedPids[lastRanked[i].pid] then table.remove(lastRanked, i) end
   end
   assessProcesses(now)
+  -- Every pending observation folds this sample into its evidence: presence
+  -- by acquisition time (this sampler's launch), weight and peak, or proof
+  -- its process is gone.
+  if next(obs.pending) then
+    local rows = {}
+    for _, p in ipairs(lastPsList) do rows[p.pid] = p end
+    for _, ev in pairs(obs.pending) do
+      local row = rows[ev.pid]
+      local e = row and tracker.procs[ev.pid] or nil
+      -- An etime of 0 places no start: it is either a process in its first
+      -- second, or one younger than a step back, whose etime the clamp holds
+      -- at 0 so its window would follow the clock rather than the kernel's
+      -- start record (and read as a reuse). Either way the sample is no
+      -- evidence of identity.
+      local placeable = row and type(row.etimeSec) == "number" and row.etimeSec > 0
+      observe.foldSample(ev, {
+        complete = sampler.complete, row = row,
+        -- No identity evidence from a table whose launch record is gone:
+        -- how far the clock moved since its launch is unknown.
+        start1 = placeable and steppedSec ~= nil
+          and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil,
+        weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
+        -- Ordering and the fold's own step check compare the launch with
+        -- the observation's time, so they read the launch record the shift
+        -- moved (memwatch's basis), not the raw reading the windows use.
+        seq = seq, launchedAt = sampler.launchedAt or launchedAt, deliveredAt = now })
+    end
+  end
 end
 
 -- End the episode: its banner goes, and every record it kept (the banner
@@ -1425,6 +1681,16 @@ local function resetEpisode()
   hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil
   bindTriedAt = {}
   exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil
+  -- A new episode is a new decision sequence: deferral, re-adjudication
+  -- stamps and decision-row stamps start over. A failed action's final
+  -- latch does not: memwatch never retries a freeze or terminate that
+  -- already failed on the same process (the GC drops it once the process
+  -- is gone, and a new start time on the pid clears it).
+  local finals = {}
+  for pid, f in pairs(unattendedFiredFor) do
+    if f.final then finals[pid] = { final = true, lstart = f.lstart, at = f.at } end
+  end
+  unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, finals, {}
 end
 
 -- The unattended receipt, posted when the action completes and saying what
@@ -1492,21 +1758,40 @@ end
 -- unattended coverage while the crisis continues. Each adjudication stamps
 -- the time; another full grace window must pass before the same offender is
 -- adjudicated again. A freeze or terminate that failed on a process (it
--- survived) is never retried on that same process.
+-- survived) is never retried on that same process. (The step itself is
+-- unattendedStep, below; this gate is what it asks first.)
+--
+-- The unattended gate for this tick's offender (core.unattendedGate over the
+-- alert's state), read without side effects. The live unattended step and
+-- the observation ledger ask the same one, so a decision row marks exactly
+-- the ticks the step could act. A freeze or terminate that already failed
+-- on the bound identity closes it.
+function obs.gateFor(offender, now)
+  local grace = hudOffender and recordFor(exposure, hudOffender, false) or nil
+  local fired = offender and unattendedFiredFor[offender.pid] or nil
+  return core.unattendedGate({
+    kind = offender and offender.kind, alertActive = alertActive, hudHold = hudHold,
+    sameAsHud = offender ~= nil and hudOffender ~= nil and core.sameOffender(hudOffender, offender),
+    answered = offender ~= nil and isAnswered(offender, now),
+    interacted = hudOffender ~= nil and interactionStands(hudOffender, now),
+    final = fired ~= nil and fired.final == true and hudOffender ~= nil
+      and hudOffender.lstart ~= nil and fired.lstart == hudOffender.lstart,
+    bound = hudOffender ~= nil and hudOffender.lstart ~= nil,
+    exposureSec = grace and grace.sec or 0, graceSec = core.cfg.cool.autoKillGraceSec,
+  })
+end
+
 local function unattendedStep(offender, now)
   local mode = core.resolveUnattended(core.cfg)
-  if mode == "off" or not offender or offender.kind ~= "extreme" then return end
-  if not alertActive or hudHold then return end
-  if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
-  if interactionStands(hudOffender, now) or isAnswered(offender, now) then return end
-  local grace = recordFor(exposure, hudOffender, false)
-  if not grace or (grace.sec or 0) < core.cfg.cool.autoKillGraceSec then return end
+  if mode == "off" then return end
+  local gate = obs.gateFor(offender, now)
+  if gate == "closed" then return end
   -- Act only on the identity the alert bound and surfaced, never on a name:
   -- without a bound start time (the probe failed) skip this tick and stay
   -- armed; the refresh retries the bind. The same start time keys the
   -- fired/streak state, so a same-name pid reuse starts clean.
   local lstart = hudOffender.lstart
-  if not lstart then
+  if gate == "unbound" then
     if (now - (unattendedSkipLogAt or 0)) > 60 then
       unattendedSkipLogAt = now
       M.logSnapshot(string.format("unattended-skip:identity-unverified:%s(%d)",
@@ -1534,7 +1819,7 @@ local function unattendedStep(offender, now)
   local sinceFired = now - ((fired and fired.at) or 0)
   if sinceFired < core.cfg.cool.autoKillGraceSec then return end
   unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
-  local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender)
+  local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now)
   M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
     action, offender.name, offender.pid, adjudicator))
   writeDecisionOutcome(offender, action, adjudicator, rationale, rails, extra)
@@ -1733,6 +2018,29 @@ local function alertSurfaces(state, now)
     exposureTickAt = now
     exposureHead = (alertActive and not hudHold and hudOffender and hudOffender.kind == "extreme")
       and recordFor(exposure, hudOffender, true) or nil
+    -- Passive observation at every WOULD-BE decision point, whatever the
+    -- unattended mode (including off): the record of exactly what an
+    -- adjudicator would have faced, once per offender process per grace
+    -- window (observe.decisionDue). The stamp carries the process's comm and
+    -- start window, so a pid reused within the window cannot suppress the
+    -- new process's row. Fork-free. Error boundary: the observation layer
+    -- may never break alerting.
+    local decGrace = hudOffender and recordFor(exposure, hudOffender, false) or nil
+    local decEntry = offender and tracker.procs[offender.pid] or nil
+    local decStamp = offender and observe.liveStamp(obs.decisionAt[offender.pid], decEntry) or nil
+    if observe.decisionDue({
+         enabled = obs.enabled, gate = obs.gateFor(offender, now),
+         sinceLastSec = decStamp and (now - decStamp.at) or nil,
+         graceSec = core.cfg.cool.autoKillGraceSec,
+       }) then
+      -- Stamped before the write on purpose: a throwing write must not retry every tick.
+      obs.decisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,
+                                          start = observe.startOf(decEntry) }
+      local okObs, errObs = pcall(obs.writeObservation, "decision", offender, now,
+        { graceElapsedSec = decGrace and decGrace.sec or 0,
+          lstart = (hudOffender and hudOffender.pid == offender.pid) and hudOffender.lstart or nil })
+      if not okObs then logError("observe-decision", errObs) end
+    end
     unattendedStep(offender, now)
   else
     exposureTickAt, exposureHead = nil, nil
@@ -1762,7 +2070,14 @@ function clock.shift(delta)
   -- malformed record) is logged by name, and every other holder is still
   -- shifted, so a bad holder costs only its own stamps.
   local steps = {
-    { "unattended", function() for _, f in pairs(unattendedFiredFor) do f.at = sh(f.at) end end },
+    { "unattended", function()
+      for _, f in pairs(unattendedFiredFor) do f.at = sh(f.at) end
+      -- The deferral of a model's wait counts from its first wait ({ firstAt,
+      -- count }); anything else here is left as it is.
+      for _, w in pairs(unattendedWaitStreak) do
+        if type(w) == "table" then w.firstAt = sh(w.firstAt) end
+      end
+    end },
     { "receipts", function()
       for owed in pairs(openReceipts) do owed.dueAt, owed.releaseAt = sh(owed.dueAt), sh(owed.releaseAt) end
     end },
@@ -1778,6 +2093,8 @@ function clock.shift(delta)
     { "tracker", function()
       for _, e in pairs(tracker.procs) do
         e.lastSeen, e.extremeUntil = sh(e.lastSeen), sh(e.extremeUntil)
+        -- (Its start window is not shifted: it is anchored to the kernel's
+        -- start record, which a step does not move; see procs.startWindow.)
         for _, smp in ipairs(e.ring or {}) do smp.t = sh(smp.t) end
       end
     end },
@@ -1789,9 +2106,28 @@ function clock.shift(delta)
       unattendedSkipLogAt, lastFrozenSweepAt = sh(unattendedSkipLogAt), sh(lastFrozenSweepAt)
     end },
     { "sampler", function()
-      lastSampleAt, sampleStartedAt, prevCountersAt = sh(lastSampleAt), sh(sampleStartedAt), sh(prevCountersAt)
+      sampler.at, sampler.startedAt, prevCountersAt = sh(sampler.at), sh(sampler.startedAt), sh(prevCountersAt)
+      sampler.launchedAt = sh(sampler.launchedAt)
+      for _, l in pairs(sampler.launches) do l.at = sh(l.at) end
       topCache.at, topStartedAt, topRespawnAt, topIdleSince =
         sh(topCache.at), sh(topStartedAt), sh(topRespawnAt), sh(topIdleSince)
+    end },
+    -- The observation ledger's cadence and its tick log move with the rest,
+    -- so a decision row still lands on the tick the unattended step acts and
+    -- a record observed after the step reads one basis. Its collecting
+    -- records are not shifted: none can place what arrives against its
+    -- horizons any more, so each stops collecting and says so (clockStep),
+    -- gone or not.
+    { "observation", function()
+      -- Report files written before the step keep their pre-step times, up
+      -- to the step's size ahead of the new basis: an observation written
+      -- before the new clock catches up with them cannot place them.
+      -- It is a ceiling in raw file time, so a later step never moves it.
+      obs.jetsamBlindUntil = math.max(obs.jetsamBlindUntil or 0, (clock.wallAt or 0) - delta)
+      obs.lastAt = sh(obs.lastAt)
+      for _, st in pairs(obs.decisionAt) do st.at = sh(st.at) end
+      for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end
+      for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
     end },
     { "adjudicator", function()
       if lfmInFlight then lfmInFlight.at = sh(lfmInFlight.at) end
@@ -1843,6 +2179,13 @@ function clock.now()
   if delta < -clock.stepSec then
     if clock.depth > 0 then
       clock.pending = clock.pending + delta
+      -- The stamps wait for the frame's end, but what must take no evidence
+      -- across a step is told now (clock.onHeld): nothing the rest of this
+      -- callback reads can be dated against what came before it.
+      if clock.onHeld then
+        local ok, err = pcall(clock.onHeld, delta)
+        if not ok then logError("clock-on-held", err) end
+      end
     else
       clock.apply(delta)
     end
@@ -1903,15 +2246,31 @@ local function tick()
 
   local sig = core.signals(m, lastRates, lastKern, lastExtreme)
   local state, changed, reason = core.smStep(smState, sig, now)
+  -- The reading the observation follow-ups read as of their horizons, with
+  -- the monotonic clock beside the wall clock to tell a step back.
+  -- Bookkeeping: it never interrupts the tick.
+  local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state)
+  if not okTick then logError("observe-tick", errTick) end
   titleSnap.causeTag = sig.swapStorm and "SWAP" or string.format("MEM %.0f%%", m.availPct)
   if changed then M.logSnapshot("state:" .. reason) end
-  -- GC the recycled-pid unattended state BEFORE alertSurfaces consumes it:
-  -- if a pid left the runaway set (old process gone) its streak/fired stamp
-  -- must be cleared before this tick's unattended decision can read it, or a
-  -- recycled pid could inherit stale state for one tick.
-  gcUnattendedState()
+  -- GC the unattended state of processes proven gone BEFORE alertSurfaces
+  -- consumes it (see gcUnattendedState: absence from a complete ps table
+  -- taken after the pid was last seen), so a recycled pid cannot inherit a
+  -- prior process's state for one tick.
+  gcUnattendedState(now)
   settleOpenReceipts(now)
   alertSurfaces(state, now)
+  -- Passive observation on the advisory cadence while pressure is up: the
+  -- distribution of offenders an adjudicator would have been asked about,
+  -- not only the extreme ones that reach a decision point.
+  if obs.enabled and state ~= "ok" and lastOffender
+     and (now - obs.lastAt) >= observe.cfg.intervalSec then
+    obs.lastAt = now
+    local okObs, errObs = pcall(obs.writeObservation, "advisory", lastOffender, now,
+      { lstart = lastOffender.lstart
+          or ((hudOffender and hudOffender.pid == lastOffender.pid) and hudOffender.lstart or nil) })
+    if not okObs then logError("observe-advisory", errObs) end
+  end
   -- Frozen-ledger liveness sweep, in every state: a frozen pid is no
   -- candidate, so a phantom entry (the process died, its pid was reused)
   -- would hide the newcomer mid-crisis. One fork covers every entry, at
@@ -1922,10 +2281,10 @@ local function tick()
   -- and say it LOUDLY when it coincides with real pressure. The 2026-07-07
   -- near-crash sat at 9% headroom with the sampler frozen and only a quiet
   -- amber dot; degraded plus pressured must page the human.
-  if lastSampleAt > 0 and (now - lastSampleAt) > SAMPLE_STALE_SEC then
+  if sampler.at > 0 and (now - sampler.at) > SAMPLE_STALE_SEC then
     if (now - lastStaleLogAt) > 60 then
       lastStaleLogAt = now
-      M.logSnapshot(string.format("sampler-stale:%.0fs", now - lastSampleAt))
+      M.logSnapshot(string.format("sampler-stale:%.0fs", now - sampler.at))
     end
     -- Not muted: with desktop alerts off, this page is the only sign that
     -- memwatch has gone blind while pressure is up.
@@ -1937,7 +2296,7 @@ local function tick()
       staleNotif = hs.notify.new({
         title           = "memwatch degraded during pressure",
         subTitle        = string.format("process attribution stale %.0fs \u{00B7} avail %.0f%%",
-                                        now - lastSampleAt, m.availPct),
+                                        now - sampler.at, m.availPct),
         informativeText = "The system gauge is live but per-process detection is not. Open Activity Monitor if pressure climbs.",
         withdrawAfter   = 0,
       }):send()
@@ -2079,6 +2438,9 @@ local FROZEN_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-frozen.jso
 local FREEZE_PENDING_SEC = 30   -- a freeze's entry is its verifier's until then
 
 local function saveFrozen()
+  -- Every change to the ledger is saved here, so the pending observations
+  -- learn it here too (before anything that can fail to persist it).
+  obs.noteFrozen()
   local list = lfm.jsonArray({})
   for _, e in pairs(frozen) do list[#list + 1] = e end
   table.sort(list, function(a, b) return (a.frozenAt or 0) < (b.frozenAt or 0) end)
@@ -2093,6 +2455,14 @@ end
 -- never reads pre-step stamps (rule 8).
 function clock.afterShift()
   if next(frozen) then saveFrozen() end
+end
+-- A step seen inside a callback closes every collecting observation at
+-- once, as one seen outside a callback does: the rest of the callback (a
+-- ps table whose etime is on the new basis, a follow-up that has just read
+-- the clock) cannot be dated against the observation. The shift's own
+-- observation step closes them again, harmlessly, when the frame ends.
+function clock.onHeld()
+  for _, ev in pairs(obs.pending) do observe.noteClockStep(ev) end
 end
 
 -- A ledger writer changes only its own process's entry: the slot holds
@@ -2339,6 +2709,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   frozen[pid] = entry
   saveFrozen()
   local stopSent = send("STOP", pid)
+  if stopSent then obs.noteSignal(pid, "freeze", proc) end
   -- Whether the STOP went out is part of the entry. One that could not be
   -- sent leaves no entry, at once: whatever state the process is in, memwatch
   -- did not put it there (a stop by anyone else is not memwatch's to resume).
@@ -2387,7 +2758,9 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
         -- (holder), or nothing. Undo it only on a process seen stopped. If
         -- that CONT cannot be sent, a fresh probe decides: the same process,
         -- still stopped (or a probe that cannot answer), stays in the ledger,
-        -- bound to its own start time, so the menu can resume it.
+        -- bound to its own start time, so the menu can resume it. (This CONT
+        -- is no signal to the process the freeze verified, so the observation
+        -- ledger does not record it.)
         if stopSent and holder and core.isStopped(holder) and not send("CONT", pid) then
           local st2, again = probe(pid)
           local still = st2 == "unknown"
@@ -2508,6 +2881,7 @@ function M.resumePid(pid, onUpdate, shown)
     onUpdate(string.format("couldn't send CONT to %s; it stays frozen, try again", e.name or tostring(pid)), true)
     return
   end
+  obs.noteSignal(pid, "resume", proc)
   afterHeld(0.5, guard("resume-verify", function()
     local again, awhy = resolveSignalTarget(pid, e.name, e.lstart)
     if awhy == "unverified" then
@@ -2545,16 +2919,21 @@ end
 ------------------------------------------------------------------------------
 
 local LFM_LEDGER_PATH = os.getenv("HOME") .. "/projects/memwatch/memwatch-lfm.jsonl"
-local LFM_LEDGER_MAX_BYTES = 2e6
+-- Rows carry their serialized snapshot (about four times the old row), and
+-- the value report reads only the live generation, so it is sized to hold
+-- as many rows as before.
+local LFM_LEDGER_MAX_BYTES = 8e6
 
+-- An unwritable ledger is logged, never silent; logError's per-label limit
+-- keeps a persistently failing path to one line a minute.
 local function appendLedger(line)
-  local f = io.open(LFM_LEDGER_PATH, "a")
-  if not f then return end
+  local f, err = io.open(LFM_LEDGER_PATH, "a")
+  if not f then logError("lfm-ledger-open", err); return end
   if f:seek("end") > LFM_LEDGER_MAX_BYTES then
     f:close()
     os.rename(LFM_LEDGER_PATH, LFM_LEDGER_PATH .. ".1")
-    f = io.open(LFM_LEDGER_PATH, "a")
-    if not f then return end
+    f, err = io.open(LFM_LEDGER_PATH, "a")
+    if not f then logError("lfm-ledger-open", err); return end
   end
   f:write(line)
   f:close()
@@ -2563,13 +2942,19 @@ end
 -- One decision record per unattended adjudication (either adjudicator).
 -- The ledger is local and gitignored; the value report renders it.
 writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails, extra)
+  -- The name is stored sanitized, as in the observation ledger: a local
+  -- basename for display and for re-deriving categories, never model input.
+  -- The category itself is derived from the raw name.
   local rec = {
     at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     adjudicator = adjudicator,
     action = action,
-    offender = { name = offender.name, kind = offender.kind or "?",
+    offender = { name = observe.sanitizeName(offender.name), kind = offender.kind or "?",
                  weightMB = math.floor(offender.weightMB or 0),
-                 slopeMBmin = math.floor(offender.slopeMBmin or 0) },
+                 slopeMBmin = math.floor(offender.slopeMBmin or 0),
+                 peakSlopeMBmin = math.floor(offender.peakSlopeMBmin or 0),
+                 ageSec = offender.ageSec,
+                 category = lfm.categorize(offender.name, nil) },
     state = smState.state,
     availPct = math.floor(lastMetrics.availPct or 0),
     rationale = rationale,
@@ -2579,6 +2964,13 @@ writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails,
     for k, v in pairs(extra) do rec[k] = v end
   end
   local line = lfm.ledgerLine(rec)
+  -- The serialized snapshot is what makes a row replayable; it is also the
+  -- only large field. Keep every line well under the decoder's 64 KB cap
+  -- (an oversize line would be silently skipped by every reader).
+  if line and #line > 60000 and rec.snapshot then
+    rec.snapshot, rec.snapshotDropped = nil, true
+    line = lfm.ledgerLine(rec)
+  end
   if line then appendLedger(line) end
   -- 60s outcome follow-up: what actually happened to the process and the
   -- availability trajectory after the action.
@@ -2604,12 +2996,16 @@ writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails,
 end
 
 -- Consume the freshest cached verdict for the bound offender: pid keyed,
--- identity re-validated live, age-bounded. The snapshot hash in the entry is
--- ledger correlation, never a consumption predicate.
+-- identity re-validated live, age-bounded, and computed for the SAME
+-- detector kind this decision sees (lfm.verdictUsable). The snapshot hash in
+-- the entry is ledger correlation, never a consumption predicate.
 local function consumeVerdict(offender)
   local e = verdictCache[offender.pid]
-  if not e or not e.verdict then return nil end
-  if (clock.now() - (e.at or 0)) > lfm.cfg.verdictFreshSec then return nil end
+  if not lfm.verdictUsable(e, offender, clock.now(), lfm.cfg.verdictFreshSec) then
+    return nil
+  end
+  -- Only a verdict whose snapshot was proven to be its process's own.
+  if not (e.ident and e.ident.verified) then return nil end
   local proc = resolveSignalTarget(offender.pid,
     e.ident and e.ident.name or offender.name,
     e.ident and e.ident.lstart or nil)
@@ -2630,8 +3026,9 @@ end
 -- Choose the unattended action. A fresh model verdict is refined through
 -- the deterministic rails within the mode ceiling; no verdict means the
 -- deterministic policy acts exactly as the legacy autoKill did (the mode is
--- the action, extreme-only, policy-gated inside the signal path).
-resolveUnattendedAction = function(mode, offender)
+-- the action, extreme-only, policy-gated inside the signal path). now is
+-- the decision tick's clock.
+resolveUnattendedAction = function(mode, offender, now)
   -- The foreground termination rail must fire in the LIVE path, not only in
   -- the advisory snapshot: lastOffender never carries a foreground flag, so
   -- compute it here against the frontmost app before applyVerdict.
@@ -2672,26 +3069,32 @@ resolveUnattendedAction = function(mode, offender)
     -- a model wait DEFERS the deterministic policy, protecting a
     -- false-positive extreme (a build burst resolves within a window or
     -- two), but an inert or over-conservative model must not capture the
-    -- decision forever while a true runaway grinds the machine down. After
-    -- three consecutive model-wait outcomes on the same offender at grace
-    -- expiry, the deterministic policy proceeds.
+    -- decision forever while a true runaway grinds the machine down. Once
+    -- lfm.cfg.maxDeferSec has elapsed since the FIRST model wait on this
+    -- offender at grace expiry, the deterministic policy proceeds. The bound
+    -- is time, not a wait count: a 90 s verdict cache against a 60 s grace
+    -- cadence let one cached wait count twice under the old counter. It is
+    -- measured on the tick's clock, never on a read after the probe forks
+    -- above, so tick-aligned waits at 0, 60 and 120 s exhaust on the third.
     if eff == "wait" then
-      local streak = (unattendedWaitStreak[offender.pid] or 0) + 1
-      unattendedWaitStreak[offender.pid] = streak
-      if streak >= 3 then
+      local w, exhausted = lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)
+      unattendedWaitStreak[offender.pid] = w
+      if exhausted then
         -- The model's wait rationale is SUPERSEDED here, so do not attach it
         -- to the deterministic action (it would mislabel the report card).
         local action = deterministicAction(mode, foreground)
         local drails = { "deterministic", "wait-deferral-exhausted" }
         return action, "deterministic-fallback", nil, drails,
-          { model = lfm.cfg.model, deferrals = streak,
+          { model = lfm.cfg.model, deferrals = w.count,
+            deferredSec = math.floor(now - w.firstAt),
             supersededModelAction = "wait" }
       end
     else
-      unattendedWaitStreak[offender.pid] = 0
+      unattendedWaitStreak[offender.pid] = nil
     end
     return eff, "lfm", e.verdict.rationale, rails,
-      { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence }
+      { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence,
+        verdictKind = e.kind, snapshot = e.snapshot }
   end
   return deterministicAction(mode, foreground), "deterministic-fallback", nil, { "deterministic" }, nil
 end
@@ -3091,6 +3494,205 @@ local function buildLfmSnapshot(offender)
   }, (withForeground(offender) or {}).foreground
 end
 
+------------------------------------------------------------------------------
+-- passive observation ledger (memwatch-observe.jsonl; see memwatch_observe)
+------------------------------------------------------------------------------
+
+
+-- Append one line; true only when it reached the file, so the counters
+-- count written rows. A nil line (an encode failure), an open failure and a
+-- write or close failure each count as an error and return false.
+function obs.appendObserve(line)
+  if not line then obs.stats.errors = obs.stats.errors + 1; return false end
+  local f, err = io.open(obs.path, "a")
+  if not f then
+    obs.stats.errors = obs.stats.errors + 1
+    logError("observe-open", err)
+    return false
+  end
+  local size = f:seek("end")
+  if size > observe.cfg.maxBytes then
+    f:close()
+    -- A rotation that cannot finish stops, and the row goes on the live
+    -- file (over its cap) rather than a generation being overwritten; past
+    -- twice the cap, rows are refused instead, so a rename that keeps
+    -- failing cannot grow the file without bound. A generation exists if
+    -- the path does (stat), readable or not: one skipped as absent would be
+    -- overwritten by the step after it.
+    local rotated, rerr = observe.rotate(observe.rotationPlan(obs.path, observe.cfg.keep),
+      function(path) return hs.fs.attributes(path) ~= nil end, os.rename)
+    if not rotated then
+      obs.stats.errors = obs.stats.errors + 1
+      logError("observe-rotate", rerr)
+      if size > 2 * observe.cfg.maxBytes then return false end
+    end
+    f, err = io.open(obs.path, "a")
+    if not f then
+      obs.stats.errors = obs.stats.errors + 1
+      logError("observe-open", err)
+      return false
+    end
+  end
+  local wrote, werr = f:write(line)
+  local closed, cerr = f:close()
+  if not (wrote and closed) then
+    obs.stats.errors = obs.stats.errors + 1
+    logError("observe-write", werr or cerr)   -- a full disk often fails only the flush at close
+    return false
+  end
+  return true
+end
+
+-- Jetsam reports written since `since` (epoch), from a native directory
+-- listing and each report's modification time (an epoch, so no local-time
+-- name parsing and no daylight-saving shift): no fork. nil means "could not
+-- look", never zero.
+function obs.jetsamSince(since, untilT)
+  if obs.jetsamBlindUntil and type(since) == "number" and since < obs.jetsamBlindUntil then return nil end
+  local times = {}
+  local ok = pcall(function()
+    for name in hs.fs.dir(obs.jetsamDir) do
+      if name:sub(1, 12) == "JetsamEvent-" then
+        local m = hs.fs.attributes(obs.jetsamDir .. "/" .. name, "modification")
+        if type(m) == "number" then times[#times + 1] = m end
+      end
+    end
+  end)
+  if not ok then return nil end
+  return observe.countSince(times, since - 5, (untilT or clock.now()) + 5)
+end
+
+-- Write one observation row and schedule its follow-ups. point is
+-- "advisory" (the pressure cadence), "decision" (an extreme offender at
+-- grace expiry) or "synthetic" (memwatch.testObserve). Never forks: the
+-- snapshot is built from tick state, fates come from the latest ps sample
+-- and the frozen ledger, exit-cause evidence from a directory listing.
+obs.writeObservation = function(point, offender, now, extra)
+  if not obs.enabled or type(offender) ~= "table" then return end
+  extra = extra or {}
+  local snap, foreground = buildLfmSnapshot(offender)
+  local user = lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })
+  obs.seq = obs.seq + 1
+  local seq = obs.seq
+  local obsIso = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  local mode = core.resolveUnattended(core.cfg)
+  -- A decision point records what the deterministic policy fires under the
+  -- live mode (none while unattended is off) and, beside it, the decision a
+  -- model would own at grace expiry under the freeze ceiling. Advisory rows
+  -- are not decision points. foreground is the fork-free name match; the
+  -- live path also walks the process tree and treats an undeterminable
+  -- frontmost app as foreground, so under kill mode a row can read
+  -- terminate where the live policy would freeze.
+  local wouldAct, wouldActAtFreeze = "none", nil
+  if point == "decision" or point == "synthetic" then
+    wouldAct = (mode == "off") and "none" or deterministicAction(mode, foreground)
+    wouldActAtFreeze = deterministicAction("freeze", foreground)
+  end
+  -- The observed process's identity: the tracker's comm and the start
+  -- window of its latest ps sighting; failing that (a process the top
+  -- stream named while ps was stalled), the start time the alert bound.
+  -- Without either, no later sample can tell it apart from a successor,
+  -- and the row says so (identityBasis absent).
+  local pid = offender.pid
+  local e0 = tracker.procs[pid]
+  local start0, identityBasis = observe.startOf(e0), "window"
+  if not start0 then
+    -- An age on the raw clock, as every age is (lstart is a kernel record).
+    start0 = observe.startFromLstart(extra.lstart, now + clock.pending)
+    identityBasis = start0 and "lstart" or "none"
+  end
+  local row = observe.row({
+    at = obsIso, session = obs.session, seq = seq, point = point, synthetic = extra.synthetic,
+    state = smState.state, kern = lastKern,
+    availPct = lastMetrics.availPct, swapGB = lastMetrics.swapGB,
+    compressorGB = lastMetrics.compGB,
+    swapoutRate = lastRates.swapOut, compRate = lastRates.comp, runawayCount = #lastRuns,
+    mode = mode, lfmEnabled = lfm.cfg.enabled,
+    wouldAct = wouldAct, wouldActAtFreeze = wouldActAtFreeze,
+    graceElapsedSec = extra.graceElapsedSec,
+    category = lfm.categorize(offender.name, nil),
+    offender = { pid = offender.pid, name = offender.name, kind = offender.kind,
+                 weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
+                 peakSlopeMBmin = offender.peakSlopeMBmin, ageSec = offender.ageSec,
+                 foreground = foreground },
+    snapshot = user, snapshotHash = user and lfm.snapshotHash(user) or nil,
+    identityBasis = identityBasis,
+  })
+  -- An oversize row drops its snapshot, never the row. A row that was not
+  -- written gets no follow-ups and no sequence number back.
+  local line = observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)
+  if not obs.appendObserve(line) then return nil end
+  obs.stats.rows = obs.stats.rows + 1
+  obs.stats.lastMono = clock.mono()
+  -- Follow-ups: what actually became of this process, and of the machine.
+  -- From here on the observation's own evidence record collects every
+  -- sample (from the first sampler launched after this row), signal, touch,
+  -- operator action and frozen-ledger change aimed at that same process,
+  -- and the follow-ups read it, and the tick log, as of their horizons:
+  -- never point-in-time state as a late timer finds it.
+  local weight0 = offender.weightMB or 0
+  local horizons = extra.horizons or observe.cfg.horizons
+  local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
+                                   start0 = start0, obsAt = now, weightMB = weight0,
+                                   minSeq = sampler.nextSeq + 1, horizons = horizons })
+  observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))
+  -- Its life is a duration (on the monotonic clock): a step back, which
+  -- closes the record, never lengthens it.
+  ev.expiresMono = clock.mono() + (horizons[#horizons] or 0) + 600
+  obs.pending[seq] = ev
+  local avail0 = lastMetrics.availPct or 0
+  for i, h in ipairs(horizons) do
+    afterHeld(h, guard("observe-followup", function()
+      -- Read the clock first: a step back since the last read is seen here,
+      -- and closes the record, before anything is read from it.
+      clock.now()
+      if i == #horizons then obs.pending[seq] = nil end
+      -- Read as of the horizon instant, however late this timer ran.
+      local tH = now + h
+      local fate, detail = observe.fateAt(ev, tH)
+      local at = observe.asOf(ev, tH) or {}   -- empty after a clock step
+      -- The horizon's reading as the record kept it (snapshotHorizons), or
+      -- from the log when no tick has passed the horizon yet; none after a
+      -- clock step.
+      local mt = nil
+      if not ev.clockStep then
+        local kept = ev.metricsAt[h]
+        if kept == nil then kept = observe.metricAt(obs.ticks, tH) end
+        mt = kept or nil
+      end
+      local present = fate == "alive" or fate == "frozen"
+      local weightNow = present and at.weightMB or nil
+      local sig = at.signal
+      local frozenNow = nil   -- true, false, or nil (cannot tell)
+      if not ev.clockStep then frozenNow = observe.frozenAt(ev, tH) end
+      local fline = lfm.ledgerLine({
+        at = os.date("!%Y-%m-%dT%H:%M:%SZ"), session = obs.session,
+        followup_for = seq, observed_at = obsIso,
+        horizonSec = h, synthetic = extra.synthetic == true or nil, pid = pid,
+        fate = fate, fateDetail = detail,
+        sampleAgeSec = (ev.seenAcq and not ev.clockStep) and math.floor(tH - ev.seenAcq) or nil,
+        weightMB = weightNow and math.floor(weightNow) or nil,
+        weightDeltaMB = weightNow and math.floor(weightNow - weight0) or nil,
+        peakSinceMB = at.peakMB and math.floor(at.peakMB) or nil,
+        availPct = mt and math.floor(mt.availPct) or nil,
+        availDelta = mt and math.floor(mt.availPct - avail0) or nil,
+        state = mt and mt.state or nil,
+        frozenLedger = frozenNow,
+        operatorActionsSince = at.actions,
+        operatorTouchesSince = at.touches,
+        operatorTouchesUncertain = (at.touchesUncertain or 0) > 0 and at.touchesUncertain or nil,
+        memwatchSignalSince = sig and sig.action or nil,
+        memwatchSignalUncertain = sig and sig.uncertain or nil,
+        memwatchSignalCount = (at.signalCount or 0) > 1 and at.signalCount or nil,
+        jetsamSince = (not ev.clockStep) and obs.jetsamSince(now, tH) or nil,
+        operatorActionsDropped = at.actionsDropped,
+      })
+      if obs.appendObserve(fline) then obs.stats.followups = obs.stats.followups + 1 end
+    end))
+  end
+  return seq
+end
+
 -- Remote adjudicator: active when enabled + configured + key loaded. The
 -- remote brain replaces the local server lifecycle, never the rails.
 lfmRemoteActive = function()
@@ -3108,12 +3710,27 @@ local function dispatchAdjudication(offender, why)
   if not ((remote or (lfmServerReady and lfmServerPort)) and not lfmInFlight) then return end
   local proc = probePid(offender.pid)
   if not proc then return end
+  -- The snapshot below is built from the tracker's data for this pid, and
+  -- its verdict is filed under the probed identity: they must be one
+  -- process. A pid taken over between the last sample and this probe would
+  -- file one process's verdict under the next one's identity. A process
+  -- that cannot be told apart is still asked (its verdict is advisory), but
+  -- the verdict never drives an action (consumeVerdict).
+  local bound = (hudOffender and hudOffender.pid == offender.pid) and hudOffender.lstart or nil
+  local source = observe.sameSource(tracker.procs[offender.pid], proc, bound)
+  if source == "different" then
+    M.logSnapshot(string.format("lfm-dispatch-skip:%s(%d):identity-changed",
+      offender.name or "?", offender.pid))
+    return
+  end
   local snap, foreground = buildLfmSnapshot(offender)
-  -- Redact raw process names to deterministic categories for a remote
-  -- frontier model (panel F4.1): a capable model reading an attacker-
-  -- controlled name is a real injection vector; the local path keeps names
-  -- (the 230M is not steerable and the config default follows lfm.cfg).
-  local user, serr = lfm.serializeSnapshot(snap, { redactNames = remote and lfm.cfg.redactNames })
+  -- Redact raw process names to deterministic categories (panel F4.1) on
+  -- BOTH paths: a capable model reading an attacker-controlled name is a
+  -- real injection vector whether it is served remotely or on loopback. The
+  -- local path used to keep raw names because the inert 230M could not be
+  -- steered; that assumption breaks the moment a capable local model (a
+  -- fine-tuned or decision model) takes the seat. lfm.cfg.redactNames rules.
+  local user, serr = lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })
   if not user then
     M.logSnapshot("lfm-serialize-error:" .. tostring(serr))
     return
@@ -3135,7 +3752,13 @@ local function dispatchAdjudication(offender, why)
   lfmReqNonce = lfmReqNonce + 1
   local nonce = lfmReqNonce
   local hash = lfm.snapshotHash(user)
-  local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart }
+  -- boundLstart: the start time the alert had bound when it was asked (the
+  -- offender's own, else the HUD's binding of the same pid, the one the
+  -- source check above used; nil while unbound). A verdict asked about one
+  -- binding is asked again once the alert binds another (a first binding,
+  -- or a pid reused since), never every tick.
+  local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart,
+                  verified = source == "same", boundLstart = offender.lstart or bound }
   local pid = offender.pid
   local sentAt, sentMono = clock.now(), clock.mono()
   lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
@@ -3165,19 +3788,25 @@ local function dispatchAdjudication(offender, why)
         return
       end
       local latencyMs = math.floor((clock.mono() - sentMono) * 1000)
+      -- kind: the DISPATCH-time detector kind this verdict answers (the
+      -- closure's offender table is replaced, never mutated, each tick), so
+      -- consumption can refuse a verdict whose premise has since changed.
+      -- snapshot: the exact serialized input, carried into the acting row.
       verdictCache[pid] = {
         verdict = verdict, snapshotHash = hash, reqNonce = nonce,
         at = clock.now(), ident = ident,
+        kind = offender.kind, snapshot = user,
       }
       M.logSnapshot(string.format("lfm-verdict:%s(%d):%s:conf=%.2f:%dms",
         ident.name, pid, verdict.action, verdict.confidence, latencyMs))
       writeDecisionOutcome(
         { name = ident.name, kind = offender.kind, pid = pid,
           weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
+          peakSlopeMBmin = offender.peakSlopeMBmin, ageSec = offender.ageSec,
           foreground = foreground },
         verdict.action, "lfm-advisory", verdict.rationale, nil,
         { model = remote and lfm.cfg.remoteModel or lfm.cfg.model, snapshotHash = hash,
-          confidence = verdict.confidence, latencyMs = latencyMs })
+          confidence = verdict.confidence, latencyMs = latencyMs, snapshot = user })
     end))
   -- Unified timeout policy: any request still in flight at the watchdog
   -- latches the adjudicator offline until calm. The local path also retires
@@ -3291,10 +3920,27 @@ lfmTick = function(state, now, interesting)
   -- consumer needs a verdict to consume).
   if ((lfmServerReady) or (lfmRemoteActive() and not lfmOffline))
      and interesting and lastOffender then
+    -- "Fresh" is the consumer's own predicate: an entry computed for a
+    -- different detector kind is not fresh, so a hog-to-extreme promotion
+    -- re-adjudicates at critical instead of waiting out the old verdict.
     local cached = verdictCache[lastOffender.pid]
-    local fresh = cached and (now - (cached.at or 0)) <= lfm.cfg.verdictFreshSec
+    local usable = lfm.verdictUsable(cached, lastOffender, now, lfm.cfg.verdictFreshSec)
+    -- The alert has bound a start time other than the one the verdict was
+    -- asked about (a first binding, or a pid reused since): the verdict is
+    -- about another binding, so it is neither fresh nor kept (it goes from
+    -- the cache; consumption re-checks the live process against the
+    -- verdict's own start time as well).
+    local rebound = usable and lastOffender.lstart ~= nil
+      and lastOffender.lstart ~= (cached.ident and cached.ident.boundLstart)
+    if rebound then verdictCache[lastOffender.pid] = nil end
+    local fresh = usable and not rebound and cached.ident ~= nil and cached.ident.verified == true
     local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
-    if (lfm.cfg.advisory and due) or (state == "critical" and not fresh and not lfmInFlight) then
+    -- An unverified verdict never acts, and asking again verifies nothing
+    -- until something changed: it is asked again once the alert binds
+    -- another start time than the one asked about, or once per advisory
+    -- interval. One request is in flight at a time.
+    local reask = not fresh and (not usable or due or rebound)
+    if (lfm.cfg.advisory and due) or (state == "critical" and reask and not lfmInFlight) then
       lfmLastAdvisoryAt = now
       dispatchAdjudication(lastOffender, state == "critical" and "critical" or "advisory")
     end
@@ -3308,22 +3954,37 @@ lfmTick = function(state, now, interesting)
   end
 end
 
--- Drop per-offender unattended state (fired stamp, wait streak) for any pid
--- that is not a currently-tracked runaway, so a recycled pid cannot inherit
--- a prior process's streak or fired stamp and trigger a premature action.
--- The signal path also re-validates identity, but this keeps the DECISION
--- from ever consuming stale streak state. Runs every tick regardless of LFM.
-gcUnattendedState = function()
-  -- Every runaway counts, answered or not: a process filtered off the alert
-  -- candidates (frozen, gone, ignored) is not thereby dead, and its records
-  -- (a final failed-action latch above all) must outlive the filter.
-  local liveRun = {}
-  for _, r in ipairs(lastRunsAll) do liveRun[r.pid] = true end
+-- Drop per-offender unattended state (fired stamp, wait streak, decision
+-- stamp) when its process is gone: absent from the latest COMPLETE ps table
+-- (a partial table proves nothing), taken after the pid was last seen
+-- alive. Absence from the runaway list never prunes: a sampler stall can
+-- age a live runaway off that list and restart its deferral clock, and a
+-- process filtered off the candidates (frozen, gone, ignored) keeps its
+-- records, a final failed-action latch above all. A recycled pid cannot
+-- inherit a prior process's state either: the unattended step resets it
+-- when the bound start time changes, and the episode's end clears all but
+-- the final latches (resetEpisode). Runs every tick regardless of LFM.
+gcUnattendedState = function(now)
+  -- Proof of a pid's exit is its absence from a COMPLETE ps table taken
+  -- after the last evidence it was alive. A table from a stalled sampler
+  -- predates what the top stream has seen since, so a pid top saw after
+  -- that table was launched is not gone, however long ps stays stalled.
+  if not sampler.complete or not sampler.launchedAt then return end
+  local alive = {}
+  for _, p in ipairs(lastPsList) do alive[p.pid] = true end
+  local function gone(pid)
+    if alive[pid] then return false end
+    local e = tracker.procs[pid]
+    return not (e and e.lastSeen and e.lastSeen > sampler.launchedAt)
+  end
   for pid in pairs(unattendedWaitStreak) do
-    if not liveRun[pid] then unattendedWaitStreak[pid] = nil end
+    if gone(pid) then unattendedWaitStreak[pid] = nil end
   end
   for pid in pairs(unattendedFiredFor) do
-    if not liveRun[pid] then unattendedFiredFor[pid] = nil end
+    if gone(pid) then unattendedFiredFor[pid] = nil end
+  end
+  for pid in pairs(obs.decisionAt) do
+    if gone(pid) then obs.decisionAt[pid] = nil end
   end
 end
 
@@ -3397,6 +4058,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
   -- wait before SIGKILL. Continue it first so the graceful signal can land.
   local contSent = false
   if frozenEntry or core.isStopped(proc) then contSent = send("CONT", pid) end
+  if contSent then obs.noteSignal(pid, "continue", proc) end
   M.logSnapshot(string.format("kill-term:%s(%d)", liveName, pid))
   onUpdate(string.format("terminating %s\u{2026}", liveName), false)
   if not send("TERM", pid) then
@@ -3430,6 +4092,9 @@ function M.killPid(pid, expectedName, onUpdate, opts)
     end, { expectedLstart = proc.lstart, weightMB = frozenEntry and frozenEntry.weightMB })
     return
   end
+  -- The TERM is the signal of record: a KILL escalation below carries out
+  -- the same decision.
+  obs.noteSignal(pid, "terminate", proc)
   local killSent = false
   local function verify()
     afterHeld(k.verifySec + k.settleSec, guard("kill-verify", function()
@@ -3609,7 +4274,7 @@ function M.stop()
   lfmInFlight = nil     -- a late reply from this run is discarded, not cached
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
-  if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
+  if sampler.task then pcall(function() sampler.task:terminate() end); sampler.task = nil end
   stopTopStream()
   if lfmServerTask then retireLfmServer("stop") end
   flashState = nil
@@ -3627,7 +4292,9 @@ function M.debug()
     rates          = { swapOut = lastRates.swapOut, comp = lastRates.comp },
     streamAlive    = topTask ~= nil,
     topCacheAgeSec = topCache.at > 0 and math.floor(now - topCache.at) or -1,
-    sampleAgeSec   = lastSampleAt > 0 and math.floor(now - lastSampleAt) or -1,
+    sampleAgeSec   = sampler.at > 0 and math.floor(now - sampler.at) or -1,
+    samplerLaunchRecords = (function() local n = 0; for _ in pairs(sampler.launches) do n = n + 1 end; return n end)(),
+    samplerRunning = sampler.task ~= nil,
     tracked        = tracked,
     runs           = #lastRuns,
     ranked         = #lastRanked,
@@ -3648,6 +4315,15 @@ function M.debug()
                        offline = lfmOffline, pid = lfmServerPid, port = lfmServerPort,
                        remote = lfmRemoteActive() and lfm.cfg.remoteModel or nil,
                        cached = (function() local n = 0; for _ in pairs(verdictCache) do n = n + 1 end; return n end)() },
+    observe        = { enabled = obs.enabled, rows = obs.stats.rows,
+                       followups = obs.stats.followups, errors = obs.stats.errors,
+                       lastAgeSec = obs.stats.lastMono and math.floor(clock.mono() - obs.stats.lastMono) or -1,
+                       pending = (function()
+                         local n = 0
+                         for _ in pairs(obs.pending) do n = n + 1 end
+                         return n
+                       end)(),
+                       ticks = #obs.ticks },
   }
 end
 
@@ -3803,6 +4479,33 @@ function M.testRemote()
         (verdict.rationale or ""):sub(1, 80)))
     end))
   return "memwatch.testRemote dispatched; watch memwatch.log for test-remote lines"
+end
+
+-- One-shot synthetic probe of the observation path: writes a row tagged
+-- synthetic (excluded from any dataset built from the ledger) for a fake
+-- extreme offender and schedules its follow-ups at 2, 4 and 6 s, with NO
+-- real process and NO memory load. Usage: hs -c "memwatch.testObserve()".
+-- A console call is one clock frame, as every callback is: a step seen in
+-- the middle of the probe is applied when it ends.
+function M.testObserve()
+  clock.enter()
+  local ok, out = pcall(function()
+    if not obs.enabled then return "observation ledger disabled (observe=false)" end
+    local now = clock.now()
+    local fake = { pid = -1, name = "memwatch-observe-probe", kind = "extreme",
+                   weightMB = 9200, slopeMBmin = 11000, peakSlopeMBmin = 12000,
+                   ageSec = 40, foreground = false }
+    local seq = obs.writeObservation("synthetic", fake, now,
+      { synthetic = true, horizons = { 2, 4, 6 } })
+    if not seq then
+      return "memwatch.testObserve could NOT write its row (see memwatch.debug().observe.errors and memwatch.log)"
+    end
+    return string.format("memwatch.testObserve wrote synthetic row %d; follow-ups land in ~6 s in %s",
+      seq, obs.path)
+  end)
+  clock.leave()
+  if not ok then error(out, 0) end
+  return out
 end
 
 -- Render the value report from the local ledgers and open it.

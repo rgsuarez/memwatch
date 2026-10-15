@@ -56,20 +56,49 @@ M.cfg = {
   absFrac            = 0.40,  -- fraction of total RAM
 }
 
--- Parse `ps -Axo pid,uid,rss,comm -m` rows out of the sampler blob. Lines
+-- ps's elapsed-time column (`etime`, "[[dd-]hh:]mm:ss"; macOS ps has no
+-- `etimes`) to seconds. Returns nil for anything else, so a malformed field
+-- reads as "age unknown", never as a fabricated age.
+function M.parseEtime(s)
+  if type(s) ~= "string" then return nil end
+  local d, h, m, sec = s:match("^(%d+)%-(%d+):(%d+):(%d+)$")
+  if not d then
+    d = 0
+    h, m, sec = s:match("^(%d+):(%d+):(%d+)$")
+    if not h then
+      h = 0
+      m, sec = s:match("^(%d+):(%d+)$")
+      if not m then return nil end
+    end
+  end
+  return tonumber(d) * 86400 + tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(sec)
+end
+
+-- Parse `ps -Axo pid,uid,rss,etime,comm` rows out of the sampler blob. Lines
 -- that do not look like a process row (the sysctl lines, the header) are
--- skipped. rss arrives in KB; comm is the remainder of the line and may
--- contain spaces.
+-- skipped. rss arrives in KB; etime becomes etimeSec (process age); comm is
+-- the remainder of the line and may contain spaces. The four-column shape
+-- without etime still parses (etimeSec nil), so older fixtures and a sampler
+-- that lost the column degrade to "age unknown" rather than to garbage.
 function M.parsePsList(text)
   local list = {}
   for line in (text or ""):gmatch("[^\n]+") do
-    local pid, uid, rss, comm = line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+    local pid, uid, rss, et, comm =
+      line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+([%d%-:]+)%s+(.+)$")
+    -- A five-column row keeps its shape even when its elapsed time does not
+    -- parse (age unknown): the bad token never becomes part of the command.
+    local etimeSec = et and M.parseEtime(et) or nil
+    if not pid then
+      pid, uid, rss, comm = line:match("^%s*(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+      etimeSec = nil
+    end
     if pid then
       list[#list + 1] = {
-        pid   = tonumber(pid),
-        uid   = tonumber(uid),
-        rssMB = tonumber(rss) / 1024,
-        comm  = comm,
+        pid      = tonumber(pid),
+        uid      = tonumber(uid),
+        rssMB    = tonumber(rss) / 1024,
+        etimeSec = etimeSec,
+        comm     = comm,
       }
     end
   end
@@ -153,15 +182,51 @@ function M.newTracker(cfg)
   return { cfg = cfg or M.cfg, procs = {} }
 end
 
+-- The window a process's start time is known to, from one ps sample. ps
+-- read the table at some instant between the sampler's launch and its
+-- delivery, and etime truncates to whole seconds, so the true start lies in
+-- [launchedAt - etime - 1, deliveredAt - etime]. Callback latency widens
+-- the window; it never shifts it. A wall clock stepped back while the
+-- sample was in flight delivers it "before" its launch, so the window spans
+-- the earlier of the two times to the later. That alone is not enough: ps
+-- read the clock on one side of the step or the other, so either bound may
+-- be off by the step's size, and steppedSec (the step back taken between
+-- launch and delivery, or a bound on it) widens both. Without a launch time
+-- the window has no lower bound. etimeSec rides along because identity
+-- comparisons need the process's age at that sample.
+function M.startWindow(etimeSec, launchedAt, deliveredAt, steppedSec)
+  if type(etimeSec) ~= "number" or type(deliveredAt) ~= "number" then return nil end
+  -- steppedSec: a step back taken between launch and delivery. ps read on
+  -- one side of it or the other, so either bound may be off by its size.
+  local widen = (type(steppedSec) == "number" and steppedSec > 0) and steppedSec or 0
+  local hasLaunch = type(launchedAt) == "number"
+  local from = hasLaunch and math.min(launchedAt, deliveredAt) or -math.huge
+  local to = hasLaunch and math.max(launchedAt, deliveredAt) or deliveredAt
+  return { lo = from - widen - etimeSec - 1, hi = to + widen - etimeSec, etimeSec = etimeSec }
+end
+
 -- Feed one ps snapshot into the tracker. pid reuse is detected by a comm
--- change (ps has no etimes on this macOS), which resets that pid's history.
+-- change, which resets that pid's history. etime (when the sampler carries
+-- it) fixes each pid's start time, so consumers get a real process age
+-- (ageSec) instead of none, plus the start window of the latest sample
+-- (startLo/startHi, see startWindow; launchedAt is when the sampler behind
+-- psList was launched). startedAt is that window's midpoint when launchedAt
+-- bounds it: ps read the table somewhere between launch and delivery, so
+-- the callback time alone would under-report the age by the whole delivery
+-- latency (measured at 60-95 s in storms). Without launchedAt it is
+-- now - etime. wallAt, when given, is the raw wall reading at delivery for
+-- the windows (etime's own clock); now (memwatch's basis) dates the
+-- sightings. Start time is deliberately NOT used to detect reuse
+-- here: a young runaway falsely read as a new process would lose its growth
+-- history mid-incident. Signal paths re-validate identity with lstart, and
+-- the observation ledger compares windows, never point estimates.
 --
 -- Rings hold FOOTPRINT WEIGHT (rss + this pid's compressed size from the
 -- most recent top sample, sticky between top refreshes), not raw RSS. A
 -- machine under load compresses a fast allocator's pages in near-real-time,
 -- deflating its RSS while it grows; weight keeps climbing and stays visible.
 -- topMap may be nil or stale; the last known cmprs carries forward.
-function M.update(tr, psList, now, topMap)
+function M.update(tr, psList, now, topMap, launchedAt, wallAt, steppedSec)
   local cfg = tr.cfg
   local n = 0
   for _ in pairs(tr.procs) do n = n + 1 end
@@ -185,6 +250,12 @@ function M.update(tr, psList, now, topMap)
       if t then e.cmprsMB = t.cmprsMB end
       local w = p.rssMB + (e.cmprsMB or 0)
       e.uid, e.lastSeen, e.rssMB, e.weightMB = p.uid, now, p.rssMB, w
+      if p.etimeSec then
+        local at = wallAt or now
+        local sw = M.startWindow(p.etimeSec, launchedAt, at, steppedSec)
+        e.startLo, e.startHi, e.etimeSec = sw.lo, sw.hi, sw.etimeSec
+        e.startedAt = (sw.lo > -math.huge) and (sw.lo + sw.hi) / 2 or (at - p.etimeSec)
+      end
       local ring = e.ring
       ring[#ring + 1] = { t = now, v = w }
       if #ring > cfg.windowSamples then table.remove(ring, 1) end
@@ -291,7 +362,7 @@ end
 --   { pid, name, comm, uid, rssMB, slopeMBmin, kind }
 -- kind: "extreme" (fires even at ok), "sustained" (watch at ok, alert once
 -- elevated), "absolute" (attribution only while the system is critical).
-function M.runaways(tr, now, systemState, totalMB)
+function M.runaways(tr, now, systemState, totalMB, wallNow)
   local cfg = tr.cfg
   local out = {}
   for pid, e in pairs(tr.procs) do
@@ -330,6 +401,8 @@ function M.runaways(tr, now, systemState, totalMB)
         out[#out + 1] = { pid = pid, name = e.name, comm = e.comm, uid = e.uid,
                           rssMB = e.rssMB or 0, weightMB = e.weightMB or e.rssMB or 0,
                           slopeMBmin = slope, peakSlopeMBmin = e.peakSlopeMBmin or 0,
+                          -- startedAt is on the raw wall clock (see update): so is the age.
+                          ageSec = e.startedAt and math.max(0, math.floor((wallNow or now) - e.startedAt)) or nil,
                           kind = kind }
       end
     end
@@ -356,6 +429,7 @@ function M.rankByWeight(psList, topMap, n)
     rows[#rows + 1] = {
       pid = p.pid, uid = p.uid, comm = p.comm, name = M.friendlyName(p.comm),
       rssMB = p.rssMB, cmprsMB = cmprs, weightMB = p.rssMB + cmprs,
+      ageSec = p.etimeSec and math.floor(p.etimeSec) or nil,
     }
   end
   table.sort(rows, function(a, b) return a.weightMB > b.weightMB end)
@@ -393,7 +467,7 @@ function M.pickOffender(runawayList, ranked, systemState, peakFn)
     local h = ranked[1]
     return { pid = h.pid, name = h.name, comm = h.comm, uid = h.uid,
              rssMB = h.rssMB, weightMB = h.weightMB, kind = "hog",
-             slopeMBmin = 0,
+             slopeMBmin = 0, ageSec = h.ageSec,
              peakSlopeMBmin = peakFn and peakFn(h.pid) or 0 }, nil
   end
   return nil, nil

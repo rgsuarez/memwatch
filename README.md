@@ -209,6 +209,10 @@ Pure-logic unit tests (state machine, detector, kill policy, parsers):
 cd ~/projects/memwatch && lua test_core.lua
 ```
 
+The public-tree firewall refuses to scan without the maintainer's local term
+list, so a public clone runs it as
+`MEMWATCH_PUBLIC_CLONE=1 bash eval/checks/no-internal-refs.sh`.
+
 Visual self-test and full-surface simulation (no real process involved; the
 fake offender probes as already exited, so clicking Force Quit is safe):
 

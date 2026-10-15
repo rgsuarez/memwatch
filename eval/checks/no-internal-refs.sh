@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # no-internal-refs.sh: the public-tree firewall.
 #
-# Fails (exit 1) when internal references or internal-only artifacts appear in
-# the tracked tree, or in a named input file about to leave the machine.
-# Runs at every commit, before every external review send, and before every
-# push. Deterministic grep only; artifact SHAPES are pinned by tests instead.
+# Scans the tracked tree, or the named input files about to leave the
+# machine, for internal references and internal-only artifacts. Runs at
+# every commit, before every external review send, and before every push.
+# Deterministic grep only; artifact SHAPES are pinned by tests instead.
+#
+# Exit codes:
+#   0  clean
+#   1  an internal reference, or a tracked internal-only artifact, was found
+#   2  refused to scan blind: the local term list is missing, or holds no
+#      effective pattern (only blank and # lines). A public clone has no
+#      local list by design and sets MEMWATCH_PUBLIC_CLONE=1 to scan with the
+#      structural patterns alone.
+# test-no-internal-refs.sh pins this contract.
 #
 # Usage:
 #   eval/checks/no-internal-refs.sh              # scan the tracked tree
@@ -29,9 +38,21 @@ PATTERNS=(
 )
 LOCAL_TERMS="$(dirname "$0")/internal-terms.txt"
 if [ -f "$LOCAL_TERMS" ]; then
-  while IFS= read -r pat; do
-    [ -n "$pat" ] && [ "${pat#\#}" = "$pat" ] && PATTERNS+=("$pat")
+  effective=0
+  # `|| [ -n "$pat" ]` keeps a final line that has no trailing newline.
+  while IFS= read -r pat || [ -n "$pat" ]; do
+    [[ "$pat" =~ ^[[:space:]]*$ ]] && continue   # blank
+    [ "${pat#\#}" != "$pat" ] && continue        # comment
+    PATTERNS+=("$pat")
+    effective=$((effective + 1))
   done < "$LOCAL_TERMS"
+  # Fail closed: a list with no effective pattern scans as blind as a missing
+  # one, so it gets the same refusal and the same public-clone opt-in.
+  if [ "$effective" -eq 0 ] && [ "${MEMWATCH_PUBLIC_CLONE:-0}" != "1" ]; then
+    echo "no-internal-refs: $LOCAL_TERMS has no effective pattern (only blank and # lines)," >&2
+    echo "no-internal-refs: so the scan would be blind; refusing (MEMWATCH_PUBLIC_CLONE=1 opts out)" >&2
+    exit 2
+  fi
 elif [ "${MEMWATCH_PUBLIC_CLONE:-0}" != "1" ]; then
   # Fail closed: a maintainer worktree without the local term list would scan
   # with only the structural patterns and pass blind. A plain public clone

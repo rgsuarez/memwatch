@@ -128,9 +128,10 @@ function F.new()
     local list = cmd:match("^/bin/ps %-p ([%d,]+) %-o pid=,uid=,state=,lstart=,comm=")
     if list then
       if W.probeFails then return "" end
-      local rows, seen = {}, {}
-      for ps in list:gmatch("%d+") do
-        local pid = tonumber(ps)
+      local rows, seen, order = {}, {}, {}
+      for ps in list:gmatch("%d+") do order[#order + 1] = tonumber(ps) end
+      table.sort(order)                -- ps lists processes in pid order
+      for _, pid in ipairs(order) do
         if not seen[pid] then
           seen[pid] = true
           local p = W.procs[pid]
@@ -242,11 +243,17 @@ function F.new()
   local hs = {
     -- forkRaises models io.popen itself failing (hs.execute then raises);
     -- killRaises fails only the signal sends, after the probes succeeded.
+    -- probeSignaled models a ps killed mid-reply: its partial output, and
+    -- hs.execute's status saying a signal ended it.
     execute = function(cmd)
       if (W.forkRaises and cmd:find("^/bin/")) or (W.killRaises and cmd:find("^/bin/kill")) then
         error("fork: Resource temporarily unavailable")
       end
-      return exec(cmd), true
+      local out = exec(cmd)
+      if W.probeSignaled and cmd:find("^/bin/ps %-p") then
+        return out:sub(1, math.max(0, math.floor(#out / 2))), nil, "signal", 9
+      end
+      return out, true, "exit", 0
     end,
     processInfo = { processID = SELF_PID },
     timer = {

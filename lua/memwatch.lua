@@ -1521,11 +1521,16 @@ protectedPids[selfPid] = true
 -- or hs.execute can raise, and both read as unknown.
 probeRows = function(pids)
   local list = {}
-  for _, p in ipairs(pids) do list[#list + 1] = string.format("%d", p) end
+  for _, p in ipairs(pids) do
+    if math.type(p) == "integer" or (type(p) == "number" and p == math.floor(p)) then
+      list[#list + 1] = string.format("%d", p)
+    end
+  end
   list[#list + 1] = string.format("%d", selfPid)
-  local ok, out = pcall(hs.execute, string.format(
+  local ok, out, _, how = pcall(hs.execute, string.format(
     "/bin/ps -p %s -o pid=,uid=,state=,lstart=,comm= 2>/dev/null", table.concat(list, ",")))
-  if not ok then return nil end
+  -- A ps killed by a signal may have left partial output: unknown.
+  if not ok or how == "signal" then return nil end
   return core.parseProbeRows(out, selfPid)
 end
 

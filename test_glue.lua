@@ -1022,6 +1022,26 @@ scenario("an unconfirmed unattended freeze is announced", '{"unattended":"freeze
   W.probeFails = false
 end)
 
+-- ---- round 5: what round 4 found ----
+-- A ps killed mid-reply can leave the control row and a cut-off target
+-- line: that proves nothing, so nothing is concluded or signaled.
+scenario("a ps cut off by a signal is not an exit", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.probeSignaled = true
+  W.click("freeze")
+  W.run(8)
+  W.probeSignaled = false
+  check("cut-off: nothing was signaled", W.signalsTo(4242), "")
+  check("cut-off: the alert stands", W.hudShowing() and bodyNames(W, "leaker"), true)
+  W.click("freeze")
+  W.run(3)
+  check("cut-off: the retry acts", W.signalsTo(4242), "STOP")
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

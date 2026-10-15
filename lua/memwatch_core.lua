@@ -391,14 +391,17 @@ end
 -- memwatch's own pid is always in the list as a positive control: without
 -- its row the probe did not run (a fork failed under pressure, or the reply
 -- is cut short), so nothing in the reply may be read as a process being
--- gone. Returns pid -> { pid, uid, state, lstart, comm }, or nil (unknown).
+-- gone. Every line must parse: one that does not is a reply cut off or
+-- garbled, and a missing row beside it proves nothing either. Returns
+-- pid -> { pid, uid, state, lstart, comm }, or nil (unknown).
 function M.parseProbeRows(out, selfPid)
   if type(out) ~= "string" then return nil end
   local rows = {}
   for line in out:gmatch("[^\n]+") do
-    local pid, uid, state, lstart, comm = line:match(
-      "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
-    if pid then
+    if line:match("%S") then
+      local pid, uid, state, lstart, comm = line:match(
+        "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
+      if not pid then return nil end
       pid = tonumber(pid)
       rows[pid] = { pid = pid, uid = tonumber(uid), state = state, lstart = lstart, comm = comm }
     end

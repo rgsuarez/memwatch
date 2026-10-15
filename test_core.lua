@@ -841,6 +841,17 @@ do
     "unknown")
   check("probe: a nil reply (the fork raised) is unknown", (core.probeResult(core.parseProbeRows(nil, SELF), 4242)), "unknown")
   check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
+  check("probe: the control row beside a cut-off line is unknown, not absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n 4242   50", SELF), 4242)),
+    "unknown")
+  check("probe: a complete reply that omits the pid is absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF), 4242)),
+    "absent")
+  local selfOnly = core.parseProbeRows(
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF)
+  check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
 end
 
 -- ---- identity: continuity versus memory ----

@@ -979,13 +979,25 @@ end
 -- timeout). Transient timers must go through the held helpers; exactly one
 -- bare constructor of each kind may exist, inside the helper itself.
 do
+  -- Count constructors in CODE only: a comment quoting one (the incident
+  -- narratives here do) must neither trip nor satisfy the pin.
+  local function stripComments(text)
+    text = text:gsub("%-%-%[(=*)%[.-%]%1%]", "")   -- block comments
+    return (text:gsub("%-%-[^\n]*", ""))           -- line comments
+  end
+  local function count(text, pat)
+    local _, n = stripComments(text):gsub(pat, "")
+    return n
+  end
   local f = assert(io.open("lua/memwatch.lua", "r"))
   local src = f:read("a")
   f:close()
-  local _, afterCount = src:gsub("hs%.timer%.doAfter%(", "")
-  local _, untilCount = src:gsub("hs%.timer%.doUntil%(", "")
-  check("held-timer: doAfter only inside afterHeld", afterCount, 1)
-  check("held-timer: doUntil only inside untilHeld", untilCount, 1)
+  check("held-timer: doAfter only inside afterHeld", count(src, "hs%.timer%.doAfter%("), 1)
+  check("held-timer: doUntil only inside untilHeld", count(src, "hs%.timer%.doUntil%("), 1)
+  check("held-timer: a commented constructor is not counted (control)",
+    count("-- hs.timer.doAfter(5, f)\n--[[ hs.timer.doUntil(p) ]]\n", "hs%.timer%.do%a+%("), 0)
+  check("held-timer: a real constructor is counted (control)",
+    count("local t = hs.timer.doAfter(5, f) -- note\n", "hs%.timer%.doAfter%("), 1)
 end
 
 -- ---- alert surfaces: offender identity, banner steps, HUD raises ----
@@ -1075,11 +1087,27 @@ do
   local hide = closeBody:find("M.hideHud()", 1, true)
   check("hud glue: a close restarts the raise clock before hiding",
     restart ~= nil and hide ~= nil and restart < hide, true)
+  local poll = body("local function untilHeld(pred, action, interval)")
+  check("poller glue: untilHeld located", #poll > 200, true)
+  check("poller glue: an error no longer ends the poller (control: old shape caught)",
+    ("done = done == true or not ok"):find("or not ok", 1, true) ~= nil
+      and poll:find("or not ok", 1, true) == nil, true)
+  check("poller glue: a continuous error run gives up", poll:find("UNTIL_GIVEUP_SEC", 1, true) ~= nil, true)
+  check("poller glue: the retire probe cannot skip the KILL deadline",
+    src:find("local okGone, gone = pcall(function()", 1, true) ~= nil, true)
+  local police = src:find('"memwatch: adjudicator over budget"', 1, true)
+  check("receipt glue: the over-budget notice ignores the mute",
+    police ~= nil and not src:sub(police - 200, police):find("if alertsEnabled then", 1, true), true)
   local test = body("function M.test(level, seconds)")
   local clearAt = test:find("critNotif, critNotifOff = nil, nil", 1, true)
   local postAt = test:find("notifyCrit(lastMetrics)", 1, true)
   check("self-test glue: a fresh run clears the previous banner first",
     clearAt ~= nil and postAt ~= nil and clearAt < postAt, true)
+  check("self-test glue: a stale resume is a no-op", test:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
+  local sim = body("function M.simulate(seconds)")
+  check("simulate glue: a stale resume is a no-op", sim:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
+  local stop = body("function M.stop()")
+  check("lifecycle glue: stop orphans pending resumes", stop:find("runGen = runGen + 1", 1, true) ~= nil, true)
   local mute = body("function M.setAlertsEnabled(on)")
   check("mute glue: unmuting lets the banner return with the HUD", mute:find("lastNotifyAt = 0", 1, true) ~= nil, true)
 end

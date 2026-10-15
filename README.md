@@ -105,8 +105,8 @@ notifications are set to the Alerts style; the HUD is the dependable surface.
 `hs -c "memwatch.setAlertsEnabled(false)"`). Muting hides the HUD and the
 banners only: the menu-bar state icon, logging, and the unattended engine
 stay live, and action receipts (an autonomous freeze/quit, frozen processes
-surviving a reload) still notify. Unmuting during an episode restores its HUD
-and banner.
+surviving a reload, the adjudicator killed for exceeding its memory budget)
+still notify. Unmuting during an episode restores its HUD and banner.
 
 The dropdown menu shows the state and its cause, kernel level, live rates,
 headroom, top-5 processes by true weight (each with Force Quit / Ignore

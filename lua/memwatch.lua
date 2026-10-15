@@ -49,6 +49,7 @@ local alertsEnabled = true  -- desktop alert surfaces (HUD + banners); menu togg
 local alertActive   = false -- a critical alert episode is live (HUD up, or muted-but-armed)
 local critNotif     = nil   -- the live critical banner; one at a time, withdrawn on recovery
 local critNotifOff  = nil   -- { pid, name, lstart } the live banner names (nil = none identified)
+local runGen        = 0     -- bumped by start/stop: a held resume from an older run is a no-op
 -- All of the above are declared here, at the top, on purpose: a local
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
@@ -148,12 +149,26 @@ local function afterHeld(sec, fn)
   heldTimers[t] = true
   return t
 end
+-- An erroring predicate is polled again, not treated as done: escalations
+-- live inside predicates (the retire poller's SIGKILL, the health poll's
+-- timeout retire), and one failed probe must not skip them. A run of errors
+-- is logged once; a predicate that has errored continuously for
+-- UNTIL_GIVEUP_SEC is ended so a broken one cannot poll forever.
+local UNTIL_GIVEUP_SEC = 120
 local function untilHeld(pred, action, interval)
   local t
+  local erroringSince = nil
   t = hs.timer.doUntil(function()
     local ok, done = pcall(pred)
-    if not ok then logError("until-held", done) end
-    done = done == true or not ok  -- an erroring predicate ends its poller
+    local now = hs.timer.secondsSinceEpoch()
+    if ok then
+      erroringSince = nil
+    elseif not erroringSince then
+      erroringSince = now
+      logError("until-held", done)
+    end
+    done = (ok and done == true)
+      or (erroringSince ~= nil and (now - erroringSince) >= UNTIL_GIVEUP_SEC)
     if done then heldTimers[t] = nil end
     return done
   end, action, interval)
@@ -1575,10 +1590,14 @@ local function retireLfmServer(reason)
       -- Success requires the tracked pid gone AND our hold on the port
       -- released: the port counts as released if it is free OR now held by
       -- a process that is NOT ours (an unrelated squatter must not keep our
-      -- retire waiting, and we already refuse to signal it above).
-      local portReleased = (not port) or portFree(port) or not listenerIsOurs(listenerPid(port))
-      local gone = not pidAlive(pid) and portReleased
-      if gone then return true end
+      -- retire waiting, and we already refuse to signal it above). A probe
+      -- that errors reads as "not gone yet" so the KILL deadline below
+      -- still runs.
+      local okGone, gone = pcall(function()
+        local portReleased = (not port) or portFree(port) or not listenerIsOurs(listenerPid(port))
+        return not pidAlive(pid) and portReleased
+      end)
+      if okGone and gone then return true end
       if hs.timer.secondsSinceEpoch() > deadline then
         signalTargets("KILL")
         return hs.timer.secondsSinceEpoch() > deadline + 3
@@ -1960,13 +1979,13 @@ lfmTick = function(state, now, interesting)
         if footprintMB > lfm.cfg.maxServerMB then
         M.logSnapshot(string.format("lfm-self-police:footprint=%dMB(rss=%d+cmprs=%d)>cap=%dMB",
           math.floor(footprintMB), math.floor(p.rssMB or 0), math.floor(cmprsMB), lfm.cfg.maxServerMB))
-        if alertsEnabled then
-          hs.notify.new({ title = "memwatch: adjudicator over budget",
-            informativeText = string.format(
-              "llama-server hit %d MB (cap %d); killed and latched offline.",
-              math.floor(footprintMB), lfm.cfg.maxServerMB),
-            withdrawAfter = 30 }):send()
-        end
+        -- An action receipt (memwatch killed its own adjudicator and
+        -- latched it offline), so it notifies even with alerts muted.
+        hs.notify.new({ title = "memwatch: adjudicator over budget",
+          informativeText = string.format(
+            "llama-server hit %d MB (cap %d); killed and latched offline.",
+            math.floor(footprintMB), lfm.cfg.maxServerMB),
+          withdrawAfter = 30 }):send()
         retireLfmServer("self-police")
         lfmOffline = true
         return
@@ -2188,6 +2207,7 @@ function M.start()
 end
 
 function M.stop()
+  runGen = runGen + 1   -- orphans any pending self-test or simulate resume
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
@@ -2275,7 +2295,9 @@ function M.test(level, seconds)
     -- to bind); the HUD's is safe to click: pid 99999 probes as exited.
     raiseHud(lastOffender, "Memory CRITICAL (self-test)")
   end
+  local gen = runGen
   afterHeld(dur, guard("test-resume", function()
+    if gen ~= runGen then return end   -- stopped or restarted meanwhile
     M.hideHud()
     lastOffender = nil
     smState = core.newSMState(hs.timer.secondsSinceEpoch())
@@ -2302,7 +2324,9 @@ function M.simulate(seconds)
   applyFlash("critical")
   if not flashTimer then renderTitleNow() end
   raiseHud(fake, "Runaway process (simulation)")
+  local gen = runGen
   afterHeld(dur, guard("simulate-end", function()
+    if gen ~= runGen then return end   -- stopped or restarted meanwhile
     M.hideHud()
     lastOffender = nil
     smState = core.newSMState(hs.timer.secondsSinceEpoch())

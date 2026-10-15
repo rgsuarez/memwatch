@@ -57,7 +57,10 @@ The model is an advisor inside hard rails, never an autonomous authority.
   stream has named that no alert has bound yet) is asked and logged, but
   never drives a decision, in any mode: the deterministic policy acts. It is
   not counted as fresh, so the offender is asked again once the alert has
-  bound it.
+  bound it. A verdict records the start time the alert had bound when it
+  was asked: once the alert binds another (a newcomer that took the pid),
+  that verdict is neither fresh nor kept, and the newcomer is asked about
+  once (one request is in flight at a time).
 - **A clock stepped back never extends a wait.** A verdict or a first model
   wait stamped after now reads as stale, or as spent.
 - **A model wait is bounded in time.** A model wait defers the

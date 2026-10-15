@@ -13,7 +13,7 @@ can be checked against them.
 | State | Entered when | Left when |
 |---|---|---|
 | written | its row is appended (a row that cannot be written gets no follow-ups) | at once |
-| collecting | the row is written: its record is in `obs.pending` | its last horizon's follow-up runs, 10 min after that horizon (`expiresAt`), or a clock step closes it |
+| collecting | the row is written: its record is in `obs.pending` | its last horizon's follow-up runs, 10 min after that horizon (`expiresMono`, on the monotonic clock), or a clock step closes it |
 | reporting | each horizon timer runs | the follow-up line is appended |
 | done | collecting ends | (the timers' closures keep the record for a timer that runs later) |
 
@@ -74,9 +74,14 @@ runs after its record stopped collecting still reads its own horizon.
   wall advance more), or in a table launched after the observation that
   reads earlier, or delivered before its own launch. Then every collecting
   record is closed, and the advisory cadence, the decision windows and the
-  tick log re-base to the step. The sampler in flight keeps its launch on
-  the monotonic clock, so a step between its launch and its delivery never
-  splits it.
+  tick log re-base to the step.
+- A sampler's launch is read two ways. Its start windows use the wall
+  reading taken at launch, which no step moves (they are anchored to the
+  kernel's start record). The unattended-state GC uses the launch record
+  the shift moves with the tracker's sightings, so a step between the launch
+  and the delivery, back or forward, never puts the two on two bases.
+- Durations run on the monotonic clock: a record's life after its last
+  horizon, and the age of the last row written (`debug().observe`).
 
 ## Identity model
 

@@ -71,6 +71,11 @@ PATTERNS=(
   "$SENTINEL"
 )
 STRUCTURAL=${#PATTERNS[@]}   # patterns past this index are local terms
+SENTINEL_SLOT=0                # the sentinel's 1-based slot among the structural patterns
+for i in "${!PATTERNS[@]}"; do
+  if [ "${PATTERNS[$i]}" = "$SENTINEL" ]; then SENTINEL_SLOT=$((i + 1)); break; fi
+done
+[ "$SENTINEL_SLOT" -gt 0 ] || { echo "no-internal-refs: the sentinel is missing from the structural patterns" >&2; exit 2; }
 LOCAL_TERMS="$SCRIPT_DIR/internal-terms.txt"
 if [ -f "$LOCAL_TERMS" ] && [ ! -r "$LOCAL_TERMS" ]; then
   # Present but unreadable: as blind as missing, so the same refusal (2), not
@@ -149,7 +154,9 @@ scan_file() {
   local idx=0
   for pat in "${PATTERNS[@]}"; do
     idx=$((idx + 1))
-    if [ "$sentinelOk" = 1 ] && [ "$pat" = "$SENTINEL" ]; then continue; fi
+    # The exemption is the sentinel's own slot, never its text: a local term
+    # that happens to equal it is still scanned.
+    if [ "$sentinelOk" = 1 ] && [ "$idx" = "$SENTINEL_SLOT" ]; then continue; fi
     # grep -q itself, never a pipe: under pipefail a pipe into head turns a
     # large match set into SIGPIPE, which would read as no match. 0 is a
     # match, 1 none, anything else a file that could not be scanned. -a reads

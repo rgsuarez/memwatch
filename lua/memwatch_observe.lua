@@ -261,7 +261,7 @@ function M.newEvidence(a)
            horizons = a.horizons or M.cfg.horizons, metricsAt = {},
            weight0 = a.weightMB, peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil,
            gone = nil, lastMiss = nil, misses = {}, samples = {}, signals = {},
-           touches = 0, touchesUncertain = 0, touchLog = {}, actions = {}, actionsDropped = 0,
+           touches = 0, touchesUncertain = 0, touchLog = {}, actions = {},
            frozenLog = {}, clockStep = nil }
 end
 
@@ -369,7 +369,6 @@ end
 function M.foldAction(ev, at)
   if ev.clockStep then return end
   if #ev.actions >= M.cfg.maxActions then
-    ev.actionsDropped = (ev.actionsDropped or 0) + 1
     ev.droppedBy = ev.droppedBy or {}
     for _, h in ipairs(ev.horizons or {}) do
       if type(at) == "number" and type(ev.obsAt) == "number" and at <= ev.obsAt + h then

@@ -160,6 +160,12 @@ printf 'carries %s here\n' "$term" > "$tmp/outside/lua/memwatch_report.lua"
 printf 'emits %s here, and %s\n' "$(printf '%s:%s' league full)" "$term" > "$tmp/lua/memwatch_report.lua"
 expect 1 "the report module is exempt from its sentinel only: a local term in it fails"
 printf 'emits %s here\n' "$(printf '%s:%s' league full)" > "$tmp/lua/memwatch_report.lua"
+# (round 7) The exemption is the sentinel's slot, not its text: a local term
+# that equals the sentinel is still scanned in the exempt file.
+printf '%s\n%s\n' "$term" "$(printf '%s:%s' league full)" > "$terms"
+expect 1 "a local term equal to the sentinel is not exempted with it"
+printf '%s\n' "$term" > "$terms"
+expect 0 "and without that term the exempt file passes again (control)"
 expect_named 1 "named: an exempt file name outside the repository is scanned" "$tmp/outside" "lua/memwatch_report.lua"
 expect_named 1 "named: and so by its absolute path" "/" "$tmp/outside/lua/memwatch_report.lua"
 git -C "$tmp" rm -q --cached lua/memwatch_report.lua

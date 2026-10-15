@@ -49,7 +49,8 @@ local lastExtreme  = false -- extreme runaway currently on the books
 -- (nil: unknown, start windows unbounded), and whether it exited 0 (its
 -- table is whole).
 local sampler = { task = nil, startedAt = 0, at = 0,
-                  seq = 0, nextSeq = 0, launchedAt = nil, complete = false }
+                  seq = 0, nextSeq = 0, launchedAt = nil, complete = false,
+                  launches = {} }  -- [seq] = { at }: in-flight launches, moved by a step
 -- The wall and monotonic clock readings at the last wall read (clock.now
 -- and clock.shift, below the state they shift, keep waits whole across a
 -- wall clock stepped back), and the step that counts as one.
@@ -136,7 +137,9 @@ local obs = {
   seq        = 0,
   lastAt     = 0,
   decisionAt = {},     -- [pid] = { at, comm, start } of the last decision observation
-  stats      = { rows = 0, followups = 0, lastAt = 0, errors = 0 },
+  -- lastMono: when the last row was written, on the monotonic clock (its
+  -- age is a duration, which no wall clock step moves).
+  stats      = { rows = 0, followups = 0, lastMono = nil, errors = 0 },
   -- The evidence of each observation still awaiting follow-ups ([seq] =
   -- observe.newEvidence), folded forward as ps samples, memwatch's own
   -- signals and operator touches arrive, and dropped after its last horizon.
@@ -147,10 +150,8 @@ local obs = {
   -- follow-ups.
   session    = string.format("%d-%04x", os.time(), math.random(0, 0xffff)),
   -- Every operator action on an alert or a process (HUD click, menu
-  -- action, banner button) is counted, and folded into each pending
-  -- observation (obs.noteAction), so a follow-up counts those through its
-  -- own horizon.
-  operatorActions = 0,
+  -- action, banner button) is folded into each pending observation
+  -- (obs.noteAction), so a follow-up counts those through its own horizon.
   -- The machine's reading at every tick ({ at, availPct, state }), kept
   -- while a pending observation may still ask for it (obs.noteTick), so a
   -- follow-up reads the machine as of its horizon.
@@ -194,11 +195,10 @@ function obs.noteTouch(off)
   if not ok then M.logSnapshot("observe-touch-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
 end
 
--- An operator action from any surface: counted, and folded into every
--- pending observation, so a follow-up counts those through its horizon
--- however late its timer runs.
+-- An operator action from any surface: folded into every pending
+-- observation, so a follow-up counts those through its horizon however
+-- late its timer runs.
 function obs.noteAction()
-  obs.operatorActions = obs.operatorActions + 1
   if not next(obs.pending) then return end
   -- Bookkeeping never stops the operator's action that called it.
   local ok, err = pcall(function()
@@ -238,7 +238,7 @@ function obs.noteTick(now, availPct, state)
   -- read only up to their horizons, so nothing they need is lost, and
   -- neither it nor the log below can grow without bound.
   for seq, ev in pairs(obs.pending) do
-    if ev.expiresAt and now > ev.expiresAt then obs.pending[seq] = nil end
+    if ev.expiresMono and clock.mono() > ev.expiresMono then obs.pending[seq] = nil end
   end
   -- Keep what a pending observation can still ask for: readings from its
   -- observation on (and the freshness window before it). With none
@@ -1270,10 +1270,8 @@ local function buildMenu()
         title = string.format("   %-20s %s \u{00B7} %.0f min", (e.name or "?"):sub(1, 20), held, mins),
         menu = {
           { title = "Resume " .. (e.name or "?"),
-            fn = obs.byOperator(function()
-              obs.noteTouch({ pid = pid, name = e.name, lstart = e.lstart })
-              M.resumePid(pid)
-            end) },
+            -- (resumePid's answer notes the touch.)
+            fn = obs.byOperator(function() M.resumePid(pid) end) },
           { title = "Force Quit " .. (e.name or "?"),
             -- The identity this row shows: a pid frozen again for another
             -- process since the menu opened is refused, not quit.
@@ -1286,10 +1284,8 @@ local function buildMenu()
       }
     end
     if #frozenRows > 1 then
-      items[#items + 1] = { title = "Resume all", fn = obs.byOperator(function()
-        for p, e in pairs(frozen) do obs.noteTouch({ pid = p, name = e.name, lstart = e.lstart }) end
-        M.resumeAll()
-      end) }
+      -- (Each resume's answer notes its own touch.)
+      items[#items + 1] = { title = "Resume all", fn = obs.byOperator(function() M.resumeAll() end) }
     end
   end
   items[#items + 1] = { title = "-" }
@@ -1485,12 +1481,19 @@ local function launchSampler(onDone)
     sampler.task = nil
   end
   sampler.startedAt = now
-  -- This task's own launch, for its callback: the wall reading (ps reads
-  -- its table, and etime, on one side of a step or the other, so start
-  -- windows span both; see procs.startWindow) and the monotonic one.
-  local launchedAt, launchMono = now, clock.mono()
+  -- This task's own launch, read two ways for its callback. For start
+  -- windows, the wall reading as taken (ps reads its table, and etime, on
+  -- one side of a step or the other, so start windows span both; see
+  -- procs.startWindow). For the unattended-state GC, a record the clock
+  -- shift moves with the tracker's sightings, so the two never sit on two
+  -- bases whichever way the clock steps.
+  local launchedAt = now
   sampler.nextSeq = sampler.nextSeq + 1
   local seq = sampler.nextSeq   -- and its place in launch order
+  for old in pairs(sampler.launches) do
+    if old <= sampler.seq then sampler.launches[old] = nil end   -- delivered or overtaken
+  end
+  sampler.launches[seq] = { at = now }
   -- The full ps table runs ~55-70KB, which straddles the 64KB pipe buffer:
   -- without a streaming drain hs.task never reads the pipe, ps blocks
   -- mid-write, and the task deadlocks until the watchdog TERMs it (observed
@@ -1512,7 +1515,7 @@ local function launchSampler(onDone)
       if exitCode ~= 0 then
         logError("sampler-exit", "code " .. tostring(exitCode))
       end
-      onDone(table.concat(acc), exitCode, launchedAt, seq, launchMono)
+      onDone(table.concat(acc), exitCode, launchedAt, seq)
     end),
     function(_, stdOut)
       acc[#acc + 1] = stdOut or ""
@@ -1528,8 +1531,10 @@ end
 -- state decision: under heavy pressure this fork can starve for tens of
 -- seconds (a live drill measured ~95s of stalled callbacks during a swap
 -- storm), and the verdict must never be hostage to it.
-local function onSample(blob, exitCode, launchedAt, seq, launchMono)
+local function onSample(blob, exitCode, launchedAt, seq)
   local now = clock.now()
+  local launch = seq and sampler.launches[seq] or nil
+  if seq then sampler.launches[seq] = nil end
   -- A callback from a sampler launched before the one already applied holds
   -- an older table: it never replaces a newer one. Launch order, not the
   -- wall clock, decides: a clock stepped back (wake-time NTP, a VM resume)
@@ -1537,11 +1542,9 @@ local function onSample(blob, exitCode, launchedAt, seq, launchMono)
   if seq and seq < sampler.seq then return end
   sampler.seq = seq or sampler.seq
   sampler.at = now
-  -- What the unattended-state GC compares with the tracker's sightings: the
-  -- launch on the wall clock as it reads now (now, less the time since), so
-  -- a step between launch and delivery never puts the two on two bases.
-  -- (nil: launch unknown.)
-  sampler.launchedAt = launchMono and (now - (clock.mono() - launchMono)) or launchedAt
+  -- What the unattended-state GC compares with the tracker's sightings:
+  -- the launch record the clock shift moved with them. (nil: launch unknown.)
+  sampler.launchedAt = launch and launch.at or launchedAt
   local samp = core.parseSampler(blob)
   lastKern = samp.kernLevel
   if blob ~= "" then lastSwapBytes = samp.swapBytes end
@@ -2020,6 +2023,7 @@ function clock.shift(delta)
     { "sampler", function()
       sampler.at, sampler.startedAt, prevCountersAt = sh(sampler.at), sh(sampler.startedAt), sh(prevCountersAt)
       sampler.launchedAt = sh(sampler.launchedAt)
+      for _, l in pairs(sampler.launches) do l.at = sh(l.at) end
       topCache.at, topStartedAt, topRespawnAt, topIdleSince =
         sh(topCache.at), sh(topStartedAt), sh(topRespawnAt), sh(topIdleSince)
     end },
@@ -3479,7 +3483,7 @@ obs.writeObservation = function(point, offender, now, extra)
   local line = observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)
   if not obs.appendObserve(line) then return nil end
   obs.stats.rows = obs.stats.rows + 1
-  obs.stats.lastAt = now
+  obs.stats.lastMono = clock.mono()
   -- Follow-ups: what actually became of this process, and of the machine.
   -- From here on the observation's own evidence record collects every
   -- sample (from the first sampler launched after this row), signal, touch,
@@ -3492,7 +3496,9 @@ obs.writeObservation = function(point, offender, now, extra)
                                    start0 = start0, obsAt = now, weightMB = weight0,
                                    minSeq = sampler.nextSeq + 1, horizons = horizons })
   observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))
-  ev.expiresAt = now + (horizons[#horizons] or 0) + 600
+  -- Its life is a duration (on the monotonic clock): a step back, which
+  -- closes the record, never lengthens it.
+  ev.expiresMono = clock.mono() + (horizons[#horizons] or 0) + 600
   obs.pending[seq] = ev
   local avail0 = lastMetrics.availPct or 0
   for i, h in ipairs(horizons) do
@@ -4147,7 +4153,7 @@ function M.debug()
                        cached = (function() local n = 0; for _ in pairs(verdictCache) do n = n + 1 end; return n end)() },
     observe        = { enabled = obs.enabled, rows = obs.stats.rows,
                        followups = obs.stats.followups, errors = obs.stats.errors,
-                       lastAgeSec = obs.stats.lastAt > 0 and math.floor(now - obs.stats.lastAt) or -1,
+                       lastAgeSec = obs.stats.lastMono and math.floor(clock.mono() - obs.stats.lastMono) or -1,
                        pending = (function()
                          local n = 0
                          for _ in pairs(obs.pending) do n = n + 1 end

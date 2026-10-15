@@ -2369,7 +2369,7 @@ do
   -- Fates come only from the observation's own evidence: every sample folds
   -- in with its completeness and its start window, and the operator signal
   -- is the monotonic counter, not the resettable HUD flag.
-  local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt, seq, launchMono)")
+  local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt, seq)")
   check("observe glue: onSample located", #sampleBody > 300, true)
   check("observe glue: each sample folds in with its completeness",
     sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
@@ -2522,10 +2522,10 @@ do
   check("decision ledger glue: both opens log a failure", openLogs, 2)
   check("decision ledger glue: no silent open failure remains", ledgerBody:find("if not f then return end", 1, true), nil)
   check("decision ledger glue: logError limits each label to one line a minute",
-    src:find("if (now - (lastErrorAt[label] or 0)) < 60 then return end", 1, true) ~= nil, true)
+    src:find("if lastErrorMono[label] and (now - lastErrorMono[label]) < 60 then return end", 1, true) ~= nil, true)
   -- The sampler tells its consumer how it ended and when it was launched.
-  check("sampler glue: callback forwards exit code and launch time (wall and monotonic)",
-    src:find("onDone(table.concat(acc), exitCode, launchedAt, seq, launchMono)", 1, true) ~= nil, true)
+  check("sampler glue: callback forwards exit code, launch time and launch order",
+    src:find("onDone(table.concat(acc), exitCode, launchedAt, seq)", 1, true) ~= nil, true)
   check("sampler glue: completeness comes from the exit code",
     src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
   check("sampler glue: the tracker gets the launch time",
@@ -2567,8 +2567,8 @@ do
   local nb = src:find("actionButtonClicked then", 1, true)
   check("operator actions: the banner's Force Quit counts",
     nb ~= nil and src:sub(nb, nb + 80):find("obs.noteAction()", 1, true) ~= nil, true)
-  check("operator actions: every count is timed (one place increments it)",
-    select(2, src:gsub("obs%.operatorActions = obs%.operatorActions %+ 1", "")), 1)
+  check("operator actions: one place folds them into the pending records",
+    select(2, src:gsub("observe%.foldAction%(", "")), 1)
 end
 
 -- ---- glue pins: the live path must use the predicates above ----
@@ -2747,6 +2747,19 @@ do
   local under = ev0()
   observe.foldAction(under, 1001)
   check("dropped: a record under the cap drops none (control)", observe.asOf(under, 1180).actionsDropped, nil)
+  -- (round 7) A drop exactly at a horizon's instant counts by that horizon,
+  -- as a kept action does; a record with horizons of its own (the
+  -- synthetic probe's 2, 4 and 6 s) is dated by them.
+  local edge = ev0()
+  for i = 1, observe.cfg.maxActions do observe.foldAction(edge, 1000 + i * 0.01) end
+  observe.foldAction(edge, 1060)     -- dropped at the +60 instant
+  check("dropped: a drop at the horizon's instant counts by it", observe.asOf(edge, 1060).actionsDropped, 1)
+  local custom = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000, weightMB = 100,
+    horizons = { 2, 4, 6 } })
+  for i = 1, observe.cfg.maxActions do observe.foldAction(custom, 1000 + i * 0.001) end
+  observe.foldAction(custom, 1003)   -- after +2, by +4
+  check("dropped: custom horizons date their own drops (none by +2)", observe.asOf(custom, 1002).actionsDropped, nil)
+  check("dropped: custom horizons date their own drops (one by +4)", observe.asOf(custom, 1004).actionsDropped, 1)
   -- A miss that a later sighting resolved is not the reason a later horizon
   -- has no fresh sighting.
   local same = { lo = 999, hi = 1001 }
@@ -2783,7 +2796,6 @@ do
   local notWall = {
     erroringSince = "an error run is a duration, timed on the monotonic clock",
     obsAt = "a ledger record is closed on a step, never shifted",
-    expiresAt = "a ledger record is closed on a step, never shifted",
     metricsAt = "a ledger record's map of horizon readings, not a stamp",
     wallAt = "the detector's own last reading",
     monoAt = "the detector's own last reading (monotonic)",
@@ -2857,6 +2869,12 @@ do
     -- Log rows: an ISO time string written out with the row, never held
     -- or compared (the decision record, and its follow-up).
     rec = "not a stamp: a decision record's ISO time",
+    sampler = "sampler (its last delivery and its launch)", log = "observation (the tick log, obs.ticks)",
+    decisionAt = "observation (obs.decisionAt)", finals = "not held: the GC's own snapshot of final latches, in one call",
+    sig = "not held: an action signal, folded at once into the pending records (which a step closes)",
+    t = "not held: a touch, folded at once into the pending records (which a step closes)",
+    times = "not held: report files' modification times, counted in one call",
+    launches = "sampler (its in-flight launch records)",
     offender = "not a stamp: the follow-up row's ISO time (the row is built inside a call on offender)",
   }
   local function lowerStamps(text)
@@ -2919,6 +2937,8 @@ do
   -- a function is listed here with how it is used, or the scan fails.
   local functionLocal = {
     sentAt = "dispatch: copied into lfmInFlight.at (shifted) in the same call; latency: a monotonic reading",
+    launchedAt = "launchSampler: the wall reading at launch, for start windows, which a step must not move "
+      .. "(they are anchored to the kernel's start record); the GC reads the shifted launch record instead",
   }
   local function localStamps(text)
     local miss = {}
@@ -2984,15 +3004,18 @@ do
   -- the unattended-state GC compares, read on the wall clock as it reads now.
   check("clock.shift: the ledger's tick log moves with the step",
     body:find("for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end", 1, true) ~= nil, true)
-  check("sampler: the GC's launch is read as of now, from the monotonic clock",
-    src:find("sampler.launchedAt = launchMono and (now - (clock.mono() - launchMono)) or launchedAt", 1, true) ~= nil, true)
+  check("sampler: the GC's launch is the record the shift moved with the sightings",
+    src:find("sampler.launchedAt = launch and launch.at or launchedAt", 1, true) ~= nil
+      and body:find("for _, l in pairs(sampler.launches) do l.at = sh(l.at) end", 1, true) ~= nil, true)
   -- One reader of the wall clock: clock.now. clock.mono reads the
   -- monotonic clock, or the wall clock through clock.now when there is
   -- none, and nothing reads os.time.
   local _, raw = src:gsub("hs%.timer%.secondsSinceEpoch%(%)", "")
   check("wall reads: only clock.now reads the wall clock raw", raw, 1)
   local _, osTime = src:gsub("os%.time%(%)", "")
-  check("wall reads: no os.time", osTime, 0)
+  check("wall reads: os.time only names the ledger's session (never a stamp)", osTime, 1)
+  check("wall reads: that one is the session id",
+    src:find('session    = string.format("%d-%04x", os.time(), math.random(0, 0xffff)),', 1, true) ~= nil, true)
   local ma = src:find("function clock.mono()", 1, true)
   local mz = ma and src:find("\nend\n", ma, true)
   local mono = (ma and mz) and src:sub(ma, mz) or ""

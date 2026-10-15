@@ -1641,6 +1641,51 @@ scenario("a step back while ps stalls does not prune a top-fed offender", UNATTE
   check("step-gc: one STOP for a process that never stops, across a step back", W.signalsTo(4242), "STOP")
 end)
 
+-- (round 7) The same with a ps table in flight across the step, which
+-- arrives after it: its launch, read where the clock shift moved it, sits on
+-- the sightings' basis whichever way the clock steps, with or without the
+-- monotonic clock, so the final latch is kept: one STOP.
+for _, case in ipairs({
+  { how = "back", offset = -300 },
+  { how = "forward", offset = 10 },
+  { how = "back, with no monotonic clock", offset = -300, noMono = true },
+}) do
+  scenario("a step " .. case.how .. " with a ps table in flight does not prune a top-fed offender",
+    UNATTENDED_FREEZE, function(W, mw)
+    if case.noMono then
+      W.hs.timer.absoluteTime = nil
+      W.reloadState()
+      F.load(W, UNATTENDED_FREEZE, { keepHome = true })
+    end
+    W.kern = 4
+    runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+    W.run(1)
+    W.topEmits = true
+    W.samplerDelay = 8                -- every ps table arrives 8 s after its launch
+    W.samplerOmit = { [4242] = true } -- and none lists the top-born process
+    W.addProc(4242, "topborn", 2000, { unstoppable = true })
+    W.grow(4242, 220)
+    runUntil(W, 200, function() return W.signalsTo(4242) ~= "" end)
+    W.run(3)
+    -- A table just launched: wait out any in flight, then catch the next
+    -- launch to the tenth of a second (it lands 8 s later).
+    runUntil(W, 20, function() return (W.samplersLive or 0) == 0 end)
+    local waited = 0
+    while (W.samplersLive or 0) == 0 and waited < 30 do W.run(0.1); waited = waited + 0.1 end
+    check("inflight-step (" .. case.how .. "): a table is in flight at the step", (W.samplersLive or 0) > 0, true)
+    W.psStarved = true                -- later tables never land: this one alone is under test
+    W.run(5.5)                        -- top sights the process after the table's launch
+    W.topEmits = false                -- then goes quiet: no sighting until the table lands
+    W.wallOffset = case.offset
+    runUntil(W, 10, function() return (W.samplersLive or 0) == 0 end)
+    W.run(3)                          -- the table lands, and the GC reads it
+    W.topEmits, W.psStarved = true, false
+    W.run(400)
+    check("inflight-step (" .. case.how .. "): one STOP for a process that never stops",
+      W.signalsTo(4242), "STOP")
+  end)
+end
+
 -- ---- observation ledger: what was faced, and what became of it ----
 local function ledgerRows(W)
   local lfm = require("memwatch_lfm")
@@ -1931,6 +1976,42 @@ scenario("ledger: a HUD Ignore is one touch on the process", nil, function(W)
   local fu = followups(W, row.seq)
   check("hud touch: one touch on this process", fu[1] and fu[1].operatorTouchesSince, 1)
 end)
+
+-- (round 7) A Resume is one touch: the resume's own answer notes it, so
+-- neither the frozen row's handler nor Resume all notes it again.
+for _, case in ipairs({ { how = "Resume" }, { how = "Resume all", all = true } }) do
+  scenario("ledger: a frozen row's " .. case.how .. " is one touch", nil, function(W)
+    local row = toDecision(W, 4242)
+    if not row then check("resume touch: decision row", false, true); return end
+    W.click("freeze")                 -- one touch: the HUD's freeze
+    W.run(5)
+    local resume
+    if case.all then
+      -- Resume all is offered with two frozen rows: a second process,
+      -- frozen from its own menu row (a touch on it, not on this one).
+      W.addProc(4343, "other", 6000)
+      W.run(6)
+      local orow = W.menuItem("other ")
+      for _, it in ipairs(orow and orow.menu or {}) do
+        if it.title == "Freeze other" then it.fn() end
+      end
+      W.run(5)
+      resume = W.menuItem("Resume all")
+      resume = resume and resume.fn
+    else
+      local frow = W.menuItem("   leaker")
+      for _, it in ipairs(frow and frow.menu or {}) do
+        if type(it.title) == "string" and it.title:find("Resume", 1, true) then resume = it.fn end
+      end
+    end
+    check("resume touch (" .. case.how .. "): offered", resume ~= nil, true)
+    if resume then resume() end       -- the second touch
+    W.run(70)
+    local fu = followups(W, row.seq)
+    check("resume touch (" .. case.how .. "): the freeze and the resume, two touches, not three",
+      fu[1] and fu[1].operatorTouchesSince, 2)
+  end)
+end
 
 -- (round 3) A ledger that cannot be written is counted and logged, not
 -- reported as written.

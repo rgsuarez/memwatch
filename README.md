@@ -205,28 +205,39 @@ and the machine. Each observation keeps its own evidence, folded in as
 events arrive: every process sample, every signal memwatch sends and every
 operator action aimed at that same process (matched by its start time, so a
 process that later takes the pid is never mistaken for it). A follow-up
-reads only that record.
+reads only that record, as of its horizon instant (the observation time
+plus 60, 120 or 180 s), so one whose timer ran late reports the horizon it
+names, not what happened after it. A process table read before the
+observation proves nothing about it and is ignored.
 
 The fate is one of:
 - `alive`: seen as the same process in a sample read within 15 s of the
-  horizon (freshness counts from when the table was read, not when it
-  arrived);
-- `exited`: proven gone by a sample (detail `pid-reused` when another
-  process holds the pid);
+  horizon, or after it (freshness counts from when the table was read, not
+  when it arrived);
+- `exited`: proven gone by a sample delivered by the horizon (detail
+  `pid-reused` when another process holds the pid);
 - `frozen`: alive, and memwatch's frozen ledger holds this same process;
-- `unknown`: details `stale-sample`, `incomplete-sample` or
-  `identity-uncertain`.
+- `unknown`: details `stale-sample`, `incomplete-sample`,
+  `identity-uncertain` or `pre-observation-sample`.
 
 Each follow-up also carries:
-- the weight, and `peakSinceMB` (kept even if the process leaves the
-  tracker);
-- `sampleAgeSec`;
+- the weight at the horizon, and `peakSinceMB` through it (kept even if the
+  process leaves the tracker);
+- `sampleAgeSec`, the horizon's distance from the freshest sighting
+  (negative when that sighting came after the horizon);
 - available memory, and kernel jetsam reports by file time;
 - `frozenLedger`;
 - `operatorActionsSince` (any operator action) and `operatorTouchesSince`
-  (actions on this process);
-- `memwatchSignalSince`, a terminate or freeze memwatch itself sent to this
-  process, so its own actions never read as natural exits.
+  (actions on this process), through the horizon; `operatorTouchesUncertain`
+  counts actions whose process could not be told apart from a newcomer on
+  the pid;
+- `memwatchSignalSince`, the last terminate or freeze memwatch itself sent
+  to this process by the horizon (`memwatchSignalCount` when there was more
+  than one), so its own actions never read as natural exits.
+
+A start time matches the observed process only when its start window could
+not also hold the pid's next process: for a process younger than that
+window (a young process, or a stalled sample) the match is uncertain.
 
 Pending follow-ups do not survive a reload.
 

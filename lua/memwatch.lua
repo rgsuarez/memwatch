@@ -126,9 +126,11 @@ local obs = {
   -- every reload, so (session, seq) is the join key between a row and its
   -- follow-ups.
   session    = string.format("%d-%04x", os.time(), math.random(0, 0xffff)),
-  -- Every operator touch on an alert or a process (HUD click, menu action,
-  -- banner button) bumps this monotonic counter (see byOperator).
+  -- Every operator action on an alert or a process (HUD click, menu
+  -- action, banner button) is counted and timed (obs.noteAction), so a
+  -- follow-up counts those through its own horizon.
   operatorActions = 0,
+  actionTimes = {},
   path       = os.getenv("HOME") .. "/projects/memwatch/memwatch-observe.jsonl",
   jetsamDir  = "/Library/Logs/DiagnosticReports",
 }
@@ -138,22 +140,43 @@ local obs = {
 -- start time decide whether it was the observed process.
 function obs.noteSignal(pid, action, proc)
   if not next(obs.pending) then return end
-  local sig = { action = action, at = hs.timer.secondsSinceEpoch(),
-                comm = proc and proc.comm or nil,
-                startEpoch = proc and observe.lstartEpoch(proc.lstart) or nil }
-  for _, ev in pairs(obs.pending) do
-    if ev.pid == pid then observe.foldSignal(ev, sig) end
-  end
+  -- Bookkeeping never interrupts the action that called it.
+  local ok, err = pcall(function()
+    local sig = { action = action, at = hs.timer.secondsSinceEpoch(),
+                  comm = proc and proc.comm or nil,
+                  startEpoch = proc and observe.lstartEpoch(proc.lstart) or nil }
+    for _, ev in pairs(obs.pending) do
+      if ev.pid == pid then observe.foldSignal(ev, sig) end
+    end
+  end)
+  if not ok then M.logSnapshot("observe-signal-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
 end
 
 -- An operator touch aimed at a process (its pid, and its bound start time
 -- when known) folds into the pending observations of that pid.
 function obs.noteTouch(off)
   if type(off) ~= "table" or not off.pid or not next(obs.pending) then return end
-  local t = { startEpoch = observe.lstartEpoch(off.lstart) }
-  for _, ev in pairs(obs.pending) do
-    if ev.pid == off.pid then observe.foldTouch(ev, t) end
-  end
+  local ok, err = pcall(function()
+    -- The tracker's comm for the pid, when it still names this process.
+    local e = tracker.procs[off.pid]
+    local comm = (e and e.comm and off.name and core.sameName(procs.friendlyName(e.comm), off.name))
+      and e.comm or nil
+    local t = { at = hs.timer.secondsSinceEpoch(), comm = comm,
+                startEpoch = observe.lstartEpoch(off.lstart) }
+    for _, ev in pairs(obs.pending) do
+      if ev.pid == off.pid then observe.foldTouch(ev, t) end
+    end
+  end)
+  if not ok then M.logSnapshot("observe-touch-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
+end
+
+-- An operator action from any surface: counted, and timed.
+function obs.noteAction()
+  local now = hs.timer.secondsSinceEpoch()
+  obs.operatorActions = obs.operatorActions + 1
+  local times = obs.actionTimes
+  times[#times + 1] = now
+  while times[1] and times[1] < now - 600 do table.remove(times, 1) end
 end
 -- Forward declarations, assigned in the kill-engine section: alertSurfaces
 -- (defined earlier in the file) calls these at tick time, and a top-level
@@ -616,7 +639,7 @@ end
 -- later raise resetting the per-process answered marks.
 function obs.byOperator(fn)
   return function(...)
-    obs.operatorActions = obs.operatorActions + 1
+    obs.noteAction()
     return fn(...)
   end
 end
@@ -890,7 +913,7 @@ local function buildHud()
               textColor = { white = 0.6, alpha = 1 }, textSize = 13, trackMouseUp = true }
   hud:mouseCallback(guard("hud-click", function(_, evt, id)
     if evt ~= "mouseUp" then return end
-    obs.operatorActions = obs.operatorActions + 1
+    obs.noteAction()
     -- Every click is an operator touch for the observation ledger. It
     -- answers the alert (and stands unattended action down for this
     -- process) only when it does something: an action dispatched on a
@@ -1043,9 +1066,12 @@ local function buildMenu()
             M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
           end) },
         { title = "Ignore for 30 min",
-          fn = obs.byOperator(function() M.ignore(pid, name) end) },
+          fn = obs.byOperator(function() obs.noteTouch(target); M.ignore(pid, name) end) },
         { title = "Show in Activity Monitor",
-          fn = obs.byOperator(function() hs.application.launchOrFocus("Activity Monitor") end) },
+          fn = obs.byOperator(function()
+            obs.noteTouch(target)
+            hs.application.launchOrFocus("Activity Monitor")
+          end) },
       },
     }
   end
@@ -1064,16 +1090,24 @@ local function buildMenu()
           (e.weightMB or 0) / 1024, mins),
         menu = {
           { title = "Resume " .. (e.name or "?"),
-            fn = obs.byOperator(function() M.resumePid(pid) end) },
+            fn = obs.byOperator(function()
+              obs.noteTouch({ pid = pid, name = e.name, lstart = e.lstart })
+              M.resumePid(pid)
+            end) },
           { title = "Force Quit " .. (e.name or "?"),
             fn = obs.byOperator(function()
-              M.killPid(pid, e.name, surfaceUpdate({ pid = pid, name = e.name, lstart = e.lstart }))
+              local target = { pid = pid, name = e.name, lstart = e.lstart }
+              obs.noteTouch(target)
+              M.killPid(pid, e.name, surfaceUpdate(target))
             end) },
         },
       }
     end
     if #frozenRows > 1 then
-      items[#items + 1] = { title = "Resume all", fn = obs.byOperator(function() M.resumeAll() end) }
+      items[#items + 1] = { title = "Resume all", fn = obs.byOperator(function()
+        for p, e in pairs(frozen) do obs.noteTouch({ pid = p, name = e.name, lstart = e.lstart }) end
+        M.resumeAll()
+      end) }
     end
   end
   items[#items + 1] = { title = "-" }
@@ -1112,7 +1146,10 @@ local function buildMenu()
         M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
       end) }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
-      fn = obs.byOperator(function() M.ignore(off.pid, off.name) end) }
+      fn = obs.byOperator(function()
+        obs.noteTouch({ pid = off.pid, name = off.name, lstart = bound })
+        M.ignore(off.pid, off.name)
+      end) }
     items[#items + 1] = { title = "-" }
   end
   items[#items + 1] = { title = "Open Activity Monitor",
@@ -1213,7 +1250,7 @@ local function notifyCrit(m)
   if not notified then critNotified[#critNotified + 1] = critNotifOff or { none = true } end
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
-      obs.operatorActions = obs.operatorActions + 1
+      obs.noteAction()
       local target = { pid = off.pid, name = off.name, lstart = lstart }
       markInteracted(target, true)
       M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lstart })
@@ -2739,7 +2776,7 @@ end
 -- listing and each report's modification time (an epoch, so no local-time
 -- name parsing and no daylight-saving shift): no fork. nil means "could not
 -- look", never zero.
-function obs.jetsamSince(since)
+function obs.jetsamSince(since, untilT)
   local times = {}
   local ok = pcall(function()
     for name in hs.fs.dir(obs.jetsamDir) do
@@ -2750,7 +2787,7 @@ function obs.jetsamSince(since)
     end
   end)
   if not ok then return nil end
-  return observe.countSince(times, since - 5, hs.timer.secondsSinceEpoch() + 5)
+  return observe.countSince(times, since - 5, (untilT or hs.timer.secondsSinceEpoch()) + 5)
 end
 
 -- Write one observation row and schedule its follow-ups. point is
@@ -2813,35 +2850,38 @@ obs.writeObservation = function(point, offender, now, extra)
                                    start0 = observe.startOf(e0), obsAt = now, weightMB = weight0 })
   obs.pending[seq] = ev
   local avail0 = lastMetrics.availPct or 0
-  local ops0 = obs.operatorActions
   local horizons = extra.horizons or observe.cfg.horizons
   for i, h in ipairs(horizons) do
     afterHeld(h, guard("observe-followup", function()
       if i == #horizons then obs.pending[seq] = nil end
-      local t = hs.timer.secondsSinceEpoch()
+      -- Read as of the horizon instant, however late this timer ran.
+      local tH = now + h
       local frozenSame = observe.frozenMatches(frozen[pid], ev.start0)
-      local fate, detail = observe.fateAt(ev, t, frozenSame == true)
+      local fate, detail = observe.fateAt(ev, tH, frozenSame == true)
+      local at = observe.asOf(ev, tH)
       local present = fate == "alive" or fate == "frozen"
-      local weightNow = present and ev.lastWeightMB or nil
-      local sig = ev.signals[1]
+      local weightNow = present and at.weightMB or nil
+      local sig = at.signal
       local availNow = lastMetrics.availPct or 0
       local fline = lfm.ledgerLine({
         at = os.date("!%Y-%m-%dT%H:%M:%SZ"), session = obs.session,
         followup_for = seq, observed_at = obsIso,
         horizonSec = h, synthetic = extra.synthetic == true or nil, pid = pid,
         fate = fate, fateDetail = detail,
-        sampleAgeSec = ev.seenAcq and math.floor(t - ev.seenAcq) or nil,
+        sampleAgeSec = ev.seenAcq and math.floor(tH - ev.seenAcq) or nil,
         weightMB = weightNow and math.floor(weightNow) or nil,
         weightDeltaMB = weightNow and math.floor(weightNow - weight0) or nil,
-        peakSinceMB = ev.peakMB and math.floor(ev.peakMB) or nil,
+        peakSinceMB = at.peakMB and math.floor(at.peakMB) or nil,
         availPct = math.floor(availNow), availDelta = math.floor(availNow - avail0),
         state = smState.state,
         frozenLedger = frozenSame,
-        operatorActionsSince = obs.operatorActions - ops0,
-        operatorTouchesSince = ev.touches,
+        operatorActionsSince = observe.countSince(obs.actionTimes, now, tH),
+        operatorTouchesSince = at.touches,
+        operatorTouchesUncertain = at.touchesUncertain > 0 and at.touchesUncertain or nil,
         memwatchSignalSince = sig and sig.action or nil,
         memwatchSignalUncertain = sig and sig.uncertain or nil,
-        jetsamSince = obs.jetsamSince(now),
+        memwatchSignalCount = at.signalCount > 1 and at.signalCount or nil,
+        jetsamSince = obs.jetsamSince(now, tH),
       })
       if obs.appendObserve(fline) then obs.stats.followups = obs.stats.followups + 1 end
     end))

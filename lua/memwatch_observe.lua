@@ -196,16 +196,22 @@ function M.lstartEpoch(s)
                    hour = tonumber(h), min = tonumber(mi), sec = tonumber(sec) })
 end
 
--- Is a process with this start epoch (and comm) the observed one? "same"
--- when the epoch falls inside the observation's start window, "different"
--- when outside it or the comm differs, "unknown" when either side lacks
--- the data to tell.
+-- Is a process with this start epoch (and comm) the observed one?
+-- "different" when the comm differs or the epoch falls outside the
+-- observation's start window. Inside the window it is "same" only when the
+-- window could not also hold the pid's next process: that one starts after
+-- the observed process was last seen alive, at least its etime after its
+-- start, so it can fall inside only while the window is wider than that age
+-- (a young process, or a stalled sample). Then, and whenever either side
+-- lacks the data, "unknown". identity() draws the same line.
 function M.matchStart(start0, comm0, epoch, comm)
   if comm0 and comm and comm0 ~= comm then return "different" end
   if type(start0) ~= "table" or type(epoch) ~= "number" then return "unknown" end
   local slack = M.cfg.clockSlackSec
-  if epoch >= start0.lo - slack and epoch <= start0.hi + slack then return "same" end
-  return "different"
+  if epoch < start0.lo - slack or epoch > start0.hi + slack then return "different" end
+  local width = (start0.hi - start0.lo) + 2 * slack
+  if type(start0.etimeSec) == "number" and start0.etimeSec >= width then return "same" end
+  return "unknown"
 end
 
 -- The evidence an observation keeps about its process, folded forward as
@@ -218,20 +224,28 @@ end
 -- a: { pid, comm0, start0, obsAt, weightMB }
 function M.newEvidence(a)
   return { pid = a.pid, comm0 = a.comm0, start0 = a.start0, obsAt = a.obsAt,
-           peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil, gone = nil,
-           lastMiss = nil, signals = {}, touches = 0 }
+           weight0 = a.weightMB, peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil,
+           gone = nil, lastMiss = nil, samples = {}, signals = {},
+           touches = 0, touchesUncertain = 0, touchLog = {} }
 end
 
 -- Fold one ps sample. s: { complete, row (the pid's row or nil), start1
 -- (the row's start window), weightMB (the row's weight), launchedAt,
 -- deliveredAt }. Presence counts from the sample's ACQUISITION bound (its
 -- launch: ps read the table between launch and delivery), so a sample
--- delivered late is exactly as fresh as its launch says. A different
--- process under the pid (another comm, or disjoint start windows) proves
--- the observed one gone, as does absence from a complete table; absence
--- from a partial table proves nothing.
+-- delivered late is exactly as fresh as its launch says. A sample launched
+-- before the observation says nothing about what followed it (a stalled
+-- table can land after the observation and lack a process born since), so
+-- it is ignored. A different process under the pid (another comm, or
+-- disjoint start windows) proves the observed one gone, as does absence
+-- from a complete table; absence from a partial table proves nothing. The
+-- proof is dated by its delivery: the table was read by then.
 function M.foldSample(ev, s)
   if ev.gone then return end
+  if type(s.launchedAt) ~= "number" or s.launchedAt < ev.obsAt then
+    ev.lastMiss = "pre-observation-sample"
+    return
+  end
   if s.row then
     local diff = (ev.comm0 and s.row.comm and s.row.comm ~= ev.comm0)
       or M.identity(ev.start0, s.start1) == "reused"
@@ -243,12 +257,11 @@ function M.foldSample(ev, s)
       ev.lastMiss = "identity-uncertain"
       return
     end
-    if type(s.launchedAt) == "number" and (ev.seenAcq == nil or s.launchedAt > ev.seenAcq) then
-      ev.seenAcq = s.launchedAt
-    end
+    if ev.seenAcq == nil or s.launchedAt > ev.seenAcq then ev.seenAcq = s.launchedAt end
     if type(s.weightMB) == "number" then
       ev.lastWeightMB = s.weightMB
       if ev.peakMB == nil or s.weightMB > ev.peakMB then ev.peakMB = s.weightMB end
+      ev.samples[#ev.samples + 1] = { at = s.launchedAt, weightMB = s.weightMB }
     end
     ev.lastMiss = nil
   elseif s.complete then
@@ -267,29 +280,63 @@ function M.foldSignal(ev, sig)
   ev.signals[#ev.signals + 1] = { action = sig.action, at = sig.at, uncertain = (m ~= "same") or nil }
 end
 
--- Fold one operator touch aimed at this pid (t: { comm, startEpoch } when
--- known): a touch on a different process under the pid does not count.
+-- Fold one operator touch aimed at this pid (t: { at, comm, startEpoch }
+-- when known): a touch on a different process under the pid does not
+-- count, and one whose process cannot be told apart counts apart, as
+-- uncertain.
 function M.foldTouch(ev, t)
-  if M.matchStart(ev.start0, ev.comm0, t and t.startEpoch, t and t.comm) == "different" then return end
-  ev.touches = ev.touches + 1
+  local m = M.matchStart(ev.start0, ev.comm0, t and t.startEpoch, t and t.comm)
+  if m == "different" then return end
+  local uncertain = m ~= "same"
+  if uncertain then ev.touchesUncertain = ev.touchesUncertain + 1 else ev.touches = ev.touches + 1 end
+  ev.touchLog[#ev.touchLog + 1] = { at = t and t.at, uncertain = uncertain or nil }
 end
 
--- What became of the observed process by follow-up time t, from its
--- evidence alone. Returns fate, detail.
---   exited  : proven gone by a sample (detail "pid-reused" when a different
---             process holds the pid)
+-- What became of the observed process by horizon instant t (the
+-- observation time plus the horizon, never the moment a late timer ran),
+-- from its evidence alone. Returns fate, detail.
+--   exited  : proven gone by a sample delivered by t (detail "pid-reused"
+--             when a different process holds the pid)
 --   alive   : seen, as the same process, in a sample ACQUIRED within
---             sampleFreshSec of t
+--             sampleFreshSec of t, or after it (a process alive later was
+--             alive at t)
 --   frozen  : alive, and memwatch's frozen ledger holds this same process
---   unknown : no such evidence (detail: stale-sample, incomplete-sample, or
---             identity-uncertain)
+--   unknown : no such evidence (detail: stale-sample, incomplete-sample,
+--             identity-uncertain, or pre-observation-sample)
 function M.fateAt(ev, t, frozenSame)
-  if ev.gone then return "exited", (ev.gone.how == "pid-reused") and "pid-reused" or nil end
+  if ev.gone and (ev.gone.at == nil or ev.gone.at <= t) then
+    return "exited", (ev.gone.how == "pid-reused") and "pid-reused" or nil
+  end
   if ev.seenAcq and ev.seenAcq >= t - M.cfg.sampleFreshSec then
     if frozenSame then return "frozen", nil end
     return "alive", nil
   end
   return "unknown", ev.lastMiss or "stale-sample"
+end
+
+-- The evidence as of horizon instant t: the weight of the last sighting
+-- acquired by t, the peak since the observation through t, the last
+-- memwatch signal sent by t (and how many), and the operator touches by t
+-- (certain, and uncertain). A follow-up whose timer ran late reports the
+-- horizon it names, not what happened after it.
+function M.asOf(ev, t)
+  local out = { weightMB = nil, peakMB = ev.weight0, signal = nil, signalCount = 0,
+                touches = 0, touchesUncertain = 0 }
+  for _, s in ipairs(ev.samples or {}) do
+    if s.at <= t then
+      out.weightMB = s.weightMB
+      if out.peakMB == nil or s.weightMB > out.peakMB then out.peakMB = s.weightMB end
+    end
+  end
+  for _, sig in ipairs(ev.signals or {}) do
+    if sig.at == nil or sig.at <= t then out.signal, out.signalCount = sig, out.signalCount + 1 end
+  end
+  for _, tc in ipairs(ev.touchLog or {}) do
+    if tc.at == nil or tc.at <= t then
+      if tc.uncertain then out.touchesUncertain = out.touchesUncertain + 1 else out.touches = out.touches + 1 end
+    end
+  end
+  return out
 end
 
 -- Does a frozen-ledger entry hold the observed process? From the entry's

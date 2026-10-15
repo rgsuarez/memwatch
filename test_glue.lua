@@ -1589,6 +1589,80 @@ scenario("ledger: jetsam reports in the window are counted", nil, function(W)
   check("ledger jetsam: the report written after the observation is counted", fu[1] and fu[1].jetsamSince, 1)
 end)
 
+-- (round 3) A ps table read before the observation and delivered after it
+-- lacks a process born in between. It is no proof that process exited.
+scenario("ledger: a table read before the observation does not end it", nil, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.samplerDelay, W.topEmits = 120, true  -- every ps table lands 120 s after it was read
+  W.run(5)                                -- one is read now, before the process exists
+  W.addProc(4242, "fresh", 2000)
+  W.grow(4242, 220)
+  local seq
+  runUntil(W, 120, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and r.point then seq = r.seq; return true end
+    end
+    return false
+  end)
+  check("pre-obs: the process is observed while that table is in flight", seq ~= nil, true)
+  W.run(200)
+  local fu = seq and followups(W, seq) or {}
+  check("pre-obs: three follow-ups", #fu, 3)
+  local exited = 0
+  for _, r in ipairs(fu) do if r.fate == "exited" then exited = exited + 1 end end
+  check("pre-obs: none calls the living process exited", exited, 0)
+  check("pre-obs: the process is alive throughout", W.procs[4242] ~= nil, true)
+end)
+
+-- (round 3) A follow-up timer that runs late (a blocked run loop) reports
+-- the horizon it names: alive at +60, though the process exited at +70.
+scenario("ledger: a late follow-up reports its own horizon", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("late: decision row", false, true); return end
+  -- The row's follow-up timers were set already; re-drive one with a lag
+  -- by writing a fresh observation under a lagging run loop.
+  W.timerLag = 90
+  W.run(46)                         -- the next advisory row, its timers 90 s late
+  W.timerLag = 0
+  local adv
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.pid == 4242 and r.point == "advisory" then adv = r end
+  end
+  check("late: an advisory row was written under the lag", adv ~= nil, true)
+  if not adv then return end
+  W.run(70)                         -- +70 after it: the process exits
+  W.procs[4242] = nil
+  W.run(200)
+  local fu = followups(W, adv.seq)
+  check("late: its +60 follow-up ran", fu[1] ~= nil and fu[1].horizonSec, 60)
+  check("late: and says alive at +60, not the exit after it", fu[1] and fu[1].fate, "alive")
+  check("late: the +180 follow-up says exited", fu[3] and fu[3].fate, "exited")
+end)
+
+-- (round 3) Follow-ups report the last signal by their horizon (a freeze,
+-- then a terminate), and a menu action on the process counts as a touch.
+scenario("ledger: freeze then terminate, and menu touches", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("signals: decision row", false, true); return end
+  W.click("freeze")
+  W.run(30)
+  check("signals: frozen", W.procs[4242] and W.procs[4242].state, "T")
+  local frozenRow = W.menuItem("   leaker")
+  local fq = frozenRow and frozenRow.menu and frozenRow.menu[2]
+  check("signals: the frozen row offers Force Quit", fq ~= nil and fq.fn ~= nil, true)
+  W.run(60)
+  fq.fn()
+  W.run(120)
+  local fu = followups(W, row.seq)
+  check("signals: +60 reports the freeze", fu[1] and fu[1].memwatchSignalSince, "freeze")
+  check("signals: +180 reports the terminate after it", fu[3] and fu[3].memwatchSignalSince, "terminate")
+  check("signals: and counts both", fu[3] and fu[3].memwatchSignalCount, 2)
+  check("signals: the HUD click and the menu Force Quit are both touches",
+    fu[3] and fu[3].operatorTouchesSince, 2)
+end)
+
 scenario("ledger: a pid taken over by another process", nil, function(W)
   local row = toDecision(W, 4242)
   if not row then check("ledger reuse: decision row", false, true); return end

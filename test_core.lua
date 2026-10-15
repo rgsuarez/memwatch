@@ -1724,9 +1724,73 @@ do
     observe.lstartEpoch("Mon Oct  5 10:00:01 2026") ~= nil, true)
   check("lstartEpoch: garbage is nil", observe.lstartEpoch("not a time"), nil)
   check("frozen: the ledger entry of the observed process matches",
-    observe.frozenMatches({ lstart = "Mon Oct 12 10:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1 }), true)
+    observe.frozenMatches({ lstart = "Mon Oct 12 10:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1, etimeSec = 900 }), true)
   check("frozen: a stale entry of an earlier process does not",
-    observe.frozenMatches({ lstart = "Mon Oct 12 09:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1 }), false)
+    observe.frozenMatches({ lstart = "Mon Oct 12 09:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1, etimeSec = 900 }), false)
+  check("frozen: a young process's window cannot tell a successor apart",
+    observe.frozenMatches({ lstart = "Mon Oct 12 10:00:01 2026" }, { lo = atStart - 30, hi = atStart + 10, etimeSec = 20 }), nil)
+
+  -- (round 3) A start epoch inside a window wider than the process's age
+  -- could be the pid's next process: unknown, not same.
+  local youngW = { lo = 1000, hi = 1035, etimeSec = 20 }
+  check("matchStart: inside an old process's window is the same process",
+    observe.matchStart({ lo = 1000, hi = 1002, etimeSec = 900 }, "/bin/x", 1001, "/bin/x"), "same")
+  check("matchStart: inside a young process's wide window is unknown",
+    observe.matchStart(youngW, "/bin/x", 1020, "/bin/x"), "unknown")
+  check("matchStart: outside the window is a different process",
+    observe.matchStart(youngW, "/bin/x", 1100, "/bin/x"), "different")
+  check("matchStart: another comm is a different process",
+    observe.matchStart(youngW, "/bin/x", 1020, "/bin/y"), "different")
+  -- So a signal to a successor that started inside such a window is kept as
+  -- uncertain, and a touch on it counts apart.
+  local yev = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = youngW, obsAt = 1040, weightMB = 1 })
+  observe.foldSignal(yev, { action = "terminate", at = 1050, comm = "/bin/x", startEpoch = 1030 })
+  check("matchStart: a signal to a possible successor is uncertain", yev.signals[1] and yev.signals[1].uncertain, true)
+  observe.foldTouch(yev, { at = 1051, startEpoch = 1030 })
+  check("touch: an undecidable touch does not count as certain", yev.touches, 0)
+  check("touch: it counts apart, as uncertain", yev.touchesUncertain, 1)
+  observe.foldTouch(yev, { at = 1052 })
+  check("touch: a touch with no start time is uncertain too", yev.touchesUncertain, 2)
+
+  -- (round 3) A sample launched before the observation proves nothing
+  -- about what followed it: not an exit, a reuse, a sighting or a weight.
+  local pre = ev0()
+  observe.foldSample(pre, { complete = true, row = nil, launchedAt = 995, deliveredAt = 1030 })
+  local fpre, dpre = observe.fateAt(pre, 1060)
+  check("pre-observation: absent from an earlier complete table is not an exit", fpre, "unknown")
+  check("pre-observation: and says why", dpre, "pre-observation-sample")
+  local preR = ev0()
+  observe.foldSample(preR, { complete = true, row = { pid = 1, comm = "/usr/bin/other" }, launchedAt = 990, deliveredAt = 1030 })
+  check("pre-observation: an earlier table's other process is not a reuse", (observe.fateAt(preR, 1060)), "unknown")
+  local preP = ev0()
+  observe.foldSample(preP, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = 900, launchedAt = 998, deliveredAt = 1030 })
+  check("pre-observation: an earlier sighting is not a sighting", preP.seenAcq, nil)
+  check("pre-observation: nor a peak", preP.peakMB, 100)
+  local noLaunch = ev0()
+  observe.foldSample(noLaunch, { complete = true, row = nil, launchedAt = nil, deliveredAt = 1030 })
+  check("pre-observation: a table with no known launch proves nothing", (observe.fateAt(noLaunch, 1060)), "unknown")
+
+  -- (round 3) A follow-up reads its horizon, not the moment its timer ran.
+  local hz = ev0()
+  observe.foldSample(hz, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 200, launchedAt = 1055, deliveredAt = 1056 })
+  observe.foldSample(hz, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 500, launchedAt = 1065, deliveredAt = 1066 })
+  observe.foldSample(hz, { complete = true, row = nil, launchedAt = 1075, deliveredAt = 1080 })
+  check("horizon: alive at +60 though it exited before a late timer ran", (observe.fateAt(hz, 1060)), "alive")
+  check("horizon: exited once the proving table was delivered", (observe.fateAt(hz, 1080)), "exited")
+  check("horizon: not before it was delivered", (observe.fateAt(hz, 1078)), "alive")
+  local a60 = observe.asOf(hz, 1060)
+  check("horizon: the weight is the last sighting by the horizon", a60.weightMB, 200)
+  check("horizon: the peak runs through the horizon only", a60.peakMB, 200)
+  check("horizon: a later horizon sees the later peak", observe.asOf(hz, 1070).peakMB, 500)
+  observe.foldSignal(hz, { action = "freeze", at = 1050, comm = "/bin/x", startEpoch = nil })
+  observe.foldSignal(hz, { action = "terminate", at = 1070, comm = "/bin/x", startEpoch = nil })
+  check("horizon: the last signal by the horizon", observe.asOf(hz, 1060).signal.action, "freeze")
+  check("horizon: a later horizon reports the later signal", observe.asOf(hz, 1100).signal.action, "terminate")
+  check("horizon: and counts both", observe.asOf(hz, 1100).signalCount, 2)
+  check("horizon: no sightings, no weight, the observation's own peak", observe.asOf(ev0(), 1060).peakMB, 100)
   check("frozen: no entry is false", observe.frozenMatches(nil, old0), false)
   check("frozen: an entry without a start time cannot tell", observe.frozenMatches({ name = "x" }, old0), nil)
 
@@ -1850,7 +1914,7 @@ do
   local dz = alertBody:find("unattendedStep(offender, now)", 1, true)
   local observePath = {
     { "writeObservation", body },
-    { "jetsamSince", fnBody("function obs.jetsamSince(since)") },
+    { "jetsamSince", fnBody("function obs.jetsamSince(since, untilT)") },
     { "appendObserve", fnBody("function obs.appendObserve(line)") },
     { "buildLfmSnapshot", fnBody("local function buildLfmSnapshot(offender)") },
     { "the decision trigger", (da and dz and da < dz) and alertBody:sub(da + 1, dz - 1) or "" },
@@ -1924,8 +1988,13 @@ do
     sampleBody:find("if launchedAt and lastSample.launchedAt and launchedAt < lastSample.launchedAt then return end", 1, true) ~= nil, true)
   check("observe glue: no point-estimate start compare remains",
     body:find("psStartedAt", 1, true), nil)
-  check("observe glue: operator actions counted across the window",
-    body:find("operatorActionsSince = obs.operatorActions - ops0", 1, true) ~= nil, true)
+  check("observe glue: operator actions counted from the observation through the horizon",
+    body:find("operatorActionsSince = observe.countSince(obs.actionTimes, now, tH),", 1, true) ~= nil, true)
+  check("observe glue: a follow-up reads its horizon instant, not its timer's",
+    body:find("local tH = now + h", 1, true) ~= nil
+      and body:find("observe.fateAt(ev, tH, frozenSame == true)", 1, true) ~= nil
+      and body:find("local at = observe.asOf(ev, tH)", 1, true) ~= nil
+      and body:find("observe.fateAt(ev, t,", 1, true) == nil, true)
   check("observe glue: the resettable HUD flag is not the operator signal",
     body:find("hudInteracted", 1, true), nil)
   check("observe glue: the frozen ledger counts only for the observed process",
@@ -1935,10 +2004,10 @@ do
   -- reads the tracker (an entry can expire, or belong to a newer process).
   local _, trackerReads = body:gsub("tracker%.procs%[pid%]", "")
   check("observe glue: the tracker is read once, at observation", trackerReads, 1)
-  check("observe glue: weight needs presence",
-    body:find("local weightNow = present and ev.lastWeightMB or nil", 1, true) ~= nil, true)
-  check("observe glue: the peak is folded as samples arrive",
-    body:find("peakSinceMB = ev.peakMB and math.floor(ev.peakMB) or nil", 1, true) ~= nil, true)
+  check("observe glue: weight needs presence, as of the horizon",
+    body:find("local weightNow = present and at.weightMB or nil", 1, true) ~= nil, true)
+  check("observe glue: the peak runs through the horizon",
+    body:find("peakSinceMB = at.peakMB and math.floor(at.peakMB) or nil", 1, true) ~= nil, true)
   check("observe glue: the 60 s window peak is gone", body:find("windowPeakMB", 1, true), nil)
   -- memwatch's own signals: recorded where each signal is sent, after the
   -- identity and policy gates, and compared with the observation time.
@@ -1972,9 +2041,10 @@ do
   local _, recordSites = src:gsub('noteSignal%(pid, "', "")
   check("signals glue: only the two signal sites record", recordSites, 2)
   check("signals glue: no pid-keyed signal record remains", src:find("memwatchSignals", 1, true), nil)
-  check("observe glue: follow-ups report the first signal to the observed process",
-    body:find("local sig = ev.signals[1]", 1, true) ~= nil
-      and body:find("memwatchSignalSince = sig and sig.action or nil", 1, true) ~= nil, true)
+  check("observe glue: follow-ups report the last signal to the observed process by the horizon",
+    body:find("local sig = at.signal", 1, true) ~= nil
+      and body:find("memwatchSignalSince = sig and sig.action or nil", 1, true) ~= nil
+      and body:find("memwatchSignalCount = at.signalCount > 1 and at.signalCount or nil", 1, true) ~= nil, true)
   local gcBody = fnBody("gcUnattendedState = function(")
   check("signals glue: gcUnattendedState located", #gcBody > 200, true)
   check("signals glue: the tick hands the GC its clock", src:find("gcUnattendedState(now)", 1, true) ~= nil, true)
@@ -2059,10 +2129,12 @@ do
   check("operator actions: the ten menu actions are wrapped", wrapped, 10)
   local hs0 = src:find('if evt ~= "mouseUp" then return end', 1, true)
   check("operator actions: HUD clicks count",
-    hs0 ~= nil and src:sub(hs0, hs0 + 160):find("obs.operatorActions = obs.operatorActions + 1", 1, true) ~= nil, true)
+    hs0 ~= nil and src:sub(hs0, hs0 + 80):find("obs.noteAction()", 1, true) ~= nil, true)
   local nb = src:find("actionButtonClicked then", 1, true)
   check("operator actions: the banner's Force Quit counts",
-    nb ~= nil and src:sub(nb, nb + 120):find("obs.operatorActions = obs.operatorActions + 1", 1, true) ~= nil, true)
+    nb ~= nil and src:sub(nb, nb + 80):find("obs.noteAction()", 1, true) ~= nil, true)
+  check("operator actions: every count is timed (one place increments it)",
+    select(2, src:gsub("obs%.operatorActions = obs%.operatorActions %+ 1", "")), 1)
 end
 
 -- ---- glue pins: the live path must use the predicates above ----

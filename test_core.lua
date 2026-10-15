@@ -843,6 +843,28 @@ do
   check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
 end
 
+-- ---- identity: continuity versus memory ----
+do
+  local full = "Google Chrome Helper (Renderer)"
+  check("name: a top-truncated name matches its full name",
+    core.sameName("Google Chrome He", full), true)
+  check("name: either way round", core.sameName(full, "Google Chrome He"), true)
+  check("name: short names must match exactly", core.sameName("node", "node2"), false)
+  check("name: a short prefix is not enough", core.sameName("Google", full), false)
+  check("continuity: a truncated name is the same offender",
+    core.sameOffender({ pid = 7, name = "Google Chrome He" }, { pid = 7, name = full, lstart = "L1" }), true)
+  local bound, other = { pid = 7, name = "node", lstart = "L1" }, { pid = 7, name = "node", lstart = "L2" }
+  local unbound = { pid = 7, name = "node" }
+  check("continuity: an unbound side matches while identity is being established",
+    core.sameOffender(unbound, bound), true)
+  check("memory: a bound record matches the same start time", core.sameRecord(bound, { pid = 7, name = "node", lstart = "L1" }), true)
+  check("memory: a different start time is a different process", core.sameRecord(bound, other), false)
+  check("memory: an unbound record never vouches for a bound process", core.sameRecord(unbound, bound), false)
+  check("memory: an unbound candidate compares by pid and name", core.sameRecord(bound, unbound), true)
+  check("memory: two unbound records compare by pid and name", core.sameRecord(unbound, { pid = 7, name = "node" }), true)
+  check("memory: another pid never matches", core.sameRecord(bound, { pid = 8, name = "node", lstart = "L1" }), false)
+end
+
 -- ---- an action's outcome is the alert's answer ----
 do
   check("answer: frozen is done",            core.answerFor("frozen"), "done")
@@ -1107,10 +1129,10 @@ do
     step(with({ hasBanner = false, offender = A, notified = true })), "---")
   check("banner: and a stale banner still goes when it returns",
     step(with({ hasBanner = true, banner = { pid = 11, name = "python3" }, offender = A, notified = true })), "W--")
-  -- Answered offenders get no banner, and lose the one they had.
-  check("banner: an answered offender gets none", step(with({ hasBanner = false, offender = A, handled = true })), "---")
-  check("banner: an answered offender's banner goes",
-    step(with({ hasBanner = true, banner = Ab, offender = A, handled = true })), "W--")
+  -- A banner naming a process since answered (frozen, gone, ignored) goes,
+  -- whoever heads the episode now (an answered process is no candidate).
+  check("banner: an answered process's banner goes when another heads the episode",
+    step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = B, sinceLastPostSec = 200 })), "WP-")
   check("banner: even once no offender is named",
     step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = nil, notified = true })), "W--")
   -- Degraded: the offender vanishes mid-episode; the banner stays (no churn).
@@ -1134,8 +1156,6 @@ do
   check("hud: an escalation preempts the snooze",
     raise({ visible = false, offender = { pid = 10, name = "node", kind = "extreme" }, episode = A,
             snooze = { off = A, kind = "hog", untilAt = 2000 }, now = 1010, sinceRaiseSec = 0, raiseSec = 60 }), true)
-  check("hud: an answered offender never returns",
-    raise({ visible = false, offender = A2, episode = A, handled = true, sinceRaiseSec = 1e9, raiseSec = 60 }), false)
   check("hud: a new offender preempts the cooldown",
     raise({ visible = false, offender = B, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), true)
   check("hud: the same offender again waits the cooldown",
@@ -1177,7 +1197,7 @@ do
     ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
       and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)
   check("hud glue: the episode's end forgets its memory",
-    surfaces:find("hudEpisodeOff, hudSnooze, hudHandled, hudStalePid = nil, nil, {}, nil", 1, true) ~= nil, true)
+    surfaces:find("hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil", 1, true) ~= nil, true)
   local closeAt = src:find('elseif id == "close" then', 1, true)
   local closeBody = closeAt and src:sub(closeAt, closeAt + 260) or ""
   check("hud glue: a close is a snooze", closeBody:find('dismissHud("snooze")', 1, true) ~= nil, true)

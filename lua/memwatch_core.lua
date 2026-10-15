@@ -454,14 +454,37 @@ function M.pruneFrozen(entries, probe)
   return kept, dropped
 end
 
--- Offender identity for the alert surfaces: pid and name, plus the start
--- time (lstart) when both sides have one bound. A missing start time never
--- forces a mismatch (it is bound lazily), but two bound ones must agree, so
--- a pid reused by a same-name process reads as a different offender.
+-- Process names from the top stream are truncated at ~16 characters, so a
+-- long name may be a prefix of the full one from ps (the same rule the
+-- signal path applies); shorter names must match exactly.
+function M.sameName(a, b)
+  if a == b then return true end
+  if type(a) ~= "string" or type(b) ~= "string" then return false end
+  if #a > #b then a, b = b, a end
+  return #a >= 15 and b:sub(1, #a) == a
+end
+
+-- Continuity for the alert surfaces ("is this still the process on
+-- screen?"): pid and name, plus the start time (lstart) when both sides
+-- have one bound. A missing start time never forces a mismatch (it is
+-- bound lazily), but two bound ones must agree, so a pid reused by a
+-- same-name process reads as a different offender.
 function M.sameOffender(a, b)
   if a == nil or b == nil then return a == b end
-  if a.pid ~= b.pid or a.name ~= b.name then return false end
+  if a.pid ~= b.pid or not M.sameName(a.name, b.name) then return false end
   return a.lstart == nil or b.lstart == nil or a.lstart == b.lstart
+end
+
+-- Memory ("was this exact process here before?"), for records that last
+-- the whole episode: a record made without a start time never vouches for
+-- a process whose start time is known (the pid may have been reused in
+-- between). With both bound they must agree; with the candidate unbound,
+-- pid and name are all anyone knows about it.
+function M.sameRecord(rec, cand)
+  if rec == nil or cand == nil then return false end
+  if rec.pid ~= cand.pid or not M.sameName(rec.name, cand.name) then return false end
+  if cand.lstart == nil then return true end
+  return rec.lstart == cand.lstart
 end
 
 -- Severity of an offender kind, for escalation: a process that moves up
@@ -482,13 +505,13 @@ function M.kindRank(kind) return KIND_RANK[kind] or 0 end
 --     episode's end resets it) and only if it has not had one this episode;
 --   * with no offender named, whatever is up stays (no churn), and a
 --     generic banner is posted at most once per episode;
---   * an offender the operator already answered (frozen, quit, ignored)
---     gets no banner, and a live one naming it goes, even once the episode
---     has no named offender at all.
+--   * a live banner naming a process since answered (memwatch holds it
+--     frozen, it is gone, or it is ignored) goes, even once the episode has
+--     no named offender at all. An answered process is never the offender.
 -- a: { hasBanner, banner = {pid,name,lstart,kind,canAct}|nil (nil with
 --      hasBanner means a generic banner is up), bannerHandled (the live
---      banner's offender is answered), offender = {pid,name,lstart,kind}|nil,
---      canAct (the offender's identity is bound now), notified, handled,
+--      banner's process is answered), offender = {pid,name,lstart,kind}|nil,
+--      canAct (the offender's identity is bound now), notified,
 --      sinceLastPostSec, cooldownSec }
 --   -> { withdraw = bool, post = bool, replace = bool }; replace means
 --      withdraw and post now, regardless of the cooldown.
@@ -498,10 +521,7 @@ function M.bannerStep(a)
   local keep = { withdraw = false, post = false, replace = false }
   -- Whether a new banner may go up for the current offender (or a generic
   -- one when none is named), with nothing in the way.
-  local function mayPost()
-    if off == nil then return (not a.notified) and cooled end
-    return (not a.handled) and (not a.notified) and cooled
-  end
+  local function mayPost() return (not a.notified) and cooled end
   if a.hasBanner and a.bannerHandled then
     -- The live banner names an offender already answered: it goes, whoever
     -- heads the episode now.
@@ -510,16 +530,12 @@ function M.bannerStep(a)
   if a.hasBanner then
     if off == nil then return keep end
     if b ~= nil and M.sameOffender(b, off) then
-      if a.handled then return { withdraw = true, post = false, replace = false } end
       if (a.canAct and not b.canAct) or M.kindRank(off.kind) > M.kindRank(b.kind) then
         return { withdraw = false, post = false, replace = true }
       end
       return keep
     end
-    if b == nil then
-      if a.handled then return keep end
-      return { withdraw = false, post = false, replace = true }
-    end
+    if b == nil then return { withdraw = false, post = false, replace = true } end
     return { withdraw = true, post = mayPost(), replace = false }
   end
   return { withdraw = false, post = mayPost(), replace = false }
@@ -538,20 +554,20 @@ local ANSWER = { frozen = "done", terminated = "done", exited = "done",
 function M.answerFor(outcome) return ANSWER[outcome] or "stand" end
 
 -- Should the HUD raise now? Never while the episode's alert is already up
--- (visible covers muted-but-armed). For a named offender:
---   * one the operator answered this episode (handled) is never raised again;
+-- (visible covers muted-but-armed). For a named offender (never an
+-- answered one: a process memwatch holds frozen, that is gone or ignored is
+-- no candidate at all):
 --   * one the operator closed (snoozed) returns when the snooze ends, or at
 --     once if its kind escalates (a quiet hog turning into a runaway);
 --   * any other process than the one this episode last raised for preempts
 --     the raise cooldown.
 -- The same process again, and no identified offender, wait the cooldown.
 -- a: { visible, offender, episode, snooze = { off, kind, untilAt }|nil,
---      handled, sinceRaiseSec, raiseSec, now }
+--      sinceRaiseSec, raiseSec, now }
 function M.hudRaiseDue(a)
   if a.visible then return false end
   local off = a.offender
   if off then
-    if a.handled then return false end
     local sn = a.snooze
     if sn and M.sameOffender(sn.off, off) then
       return M.kindRank(off.kind) > M.kindRank(sn.kind) or (a.now or 0) >= (sn.untilAt or 0)

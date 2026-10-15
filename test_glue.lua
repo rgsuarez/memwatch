@@ -601,6 +601,101 @@ scenario("unattended does not retry a failed freeze", UNATTENDED_FREEZE, functio
   check("retry: it is never tried again on the same process", W.signalsTo(4242), "STOP")
 end)
 
+-- ---- answers: by the process's own state, not a note in a list ----
+scenario("resume makes a frozen process alertable again", nil, function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(8)
+  check("resume-answer: frozen, and the alert is down", W.hudShowing(), false)
+  local row = W.menuItem("   leaker")
+  local resume = row and row.menu and row.menu[1]
+  if resume then resume.fn() end
+  W.run(2)
+  check("resume-answer: resumed", W.procs[4242].state, "S")
+  check("resume-answer: a resumed runaway is alerted again",
+    runUntil(W, 90, function() return W.hudShowing() and bodyNames(W, "leaker") end), true)
+end)
+
+scenario("a killed process does not haunt the HUD", nil, function(W)
+  leaker(W, 4242)
+  W.addProc(5151, "bigvm", 9000)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(5)
+  W.click("kill")
+  W.run(12)
+  check("ghost: the leaker is gone", W.procs[4242] == nil, true)
+  -- (the narrative text names it until the settle; a raise names "pid 4242")
+  local haunted = runUntil(W, 40, function() return W.hudShowing() and bodyNames(W, "leaker (pid 4242)") end)
+  check("ghost: the HUD never comes back for the dead process", haunted, false)
+  check("ghost: the next process is alerted instead", W.hudShowing() and bodyNames(W, "bigvm"), true)
+end)
+
+-- (round 3) A banner posted before its identity bound, upgraded in place,
+-- then a same-name process reuses the pid: the newcomer must get its own
+-- banner once the cooldown allows, not be taken for the one announced.
+scenario("banner history follows the bound identity", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.probeFails = true
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(6)
+  W.probeFails = false
+  W.run(30)
+  local b = W.liveBanners()[1]
+  check("history: the banner bound in place", b ~= nil and b.attrs.hasActionButton == true, true)
+  W.reusePid(4242, "node", 9000)
+  W.grow(4242, 220)
+  W.click("kill")                   -- the stale binding is refused and rebinds
+  W.run(10)
+  check("history: nothing was signaled on the stale binding", W.signalsTo(4242), "")
+  local fresh = runUntil(W, 240, function()
+    local live = W.liveBanners()
+    return #live == 1 and live[1] ~= b and live[1].attrs.hasActionButton == true
+  end)
+  check("history: the newcomer gets its own banner", fresh, true)
+end)
+
+-- (round 3) Ignore lasts as long as the button says, for whoever holds
+-- the pid afterwards too; it is not a permanent answer for the episode.
+scenario("ignore lasts its window", nil, function(W)
+  W.addProc(4242, "bigvm", 12000)
+  W.run(12)
+  W.probeFails = true               -- ignored before its identity could bind
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "bigvm") end)
+  W.click("ignore")
+  W.run(5)
+  W.probeFails = false
+  local early = runUntil(W, 1700, function() return W.hudShowing() and bodyNames(W, "bigvm") end)
+  check("ignore-window: hidden while the ignore lasts", early, false)
+  check("ignore-window: alerted again once the 30 minutes are up",
+    runUntil(W, 200, function() return W.hudShowing() and bodyNames(W, "bigvm") end), true)
+end)
+
+-- (round 3) A frozen process dies (memory pressure can kill a stopped
+-- process) and a same-name process takes its pid: the phantom ledger entry
+-- must not hide the newcomer for the rest of the episode.
+scenario("a dead frozen process does not hide its pid's newcomer", nil, function(W)
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "node") end)
+  W.run(5)
+  W.click("freeze")
+  W.run(8)
+  W.reusePid(4242, "node", 3000)    -- the frozen one died; a newcomer runs away
+  W.grow(4242, 300)
+  check("phantom: the newcomer is alerted while pressure lasts",
+    runUntil(W, 150, function() return W.hudShowing() and bodyNames(W, "node") end), true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

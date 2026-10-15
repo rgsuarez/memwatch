@@ -55,6 +55,9 @@ local runGen        = 0     -- bumped by start/stop: a held resume from an older
 -- declared below a function that references it silently splits into a
 -- global writer and a local reader. Three live incidents came from that.
 local ignoredUntil = {}   -- ["pid|name"] = epoch when the ignore expires
+local goneUntil    = {}   -- ["pid|name"] = verified gone: kept off the candidates
+                          -- while its last samples age out of the tracker
+local GONE_SEC     = 20   -- runawayFreshSec plus a sample period
 local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
@@ -330,10 +333,14 @@ end
 local function assessProcesses(now)
   local totalMB = (lastMetrics.totalGB or 0) * 1024
   local runs = procs.runaways(tracker, now, smState.state, totalMB > 0 and totalMB or nil)
+  -- An answered process is no candidate, by its own state: ignored, held
+  -- frozen by memwatch (stopped, so its extreme latch is history, not
+  -- growth), or verified gone while its last samples age out.
   local kept = {}
   for _, r in ipairs(runs) do
-    if (ignoredUntil[r.pid .. "|" .. r.name] or 0) < now
-       and not protectedPids[r.pid] then
+    local key = r.pid .. "|" .. r.name
+    if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
+       and not protectedPids[r.pid] and not frozen[r.pid] then
       kept[#kept + 1] = r
     end
   end
@@ -349,10 +356,11 @@ local function assessProcesses(now)
     end
   end
   -- The largest-process fallback honors the same answers: an ignored,
-  -- protected or memwatch-frozen process is never named as the hog.
+  -- protected, memwatch-frozen or gone process is never named as the hog.
   local rankedKept = {}
   for _, h in ipairs(lastRanked) do
-    if (ignoredUntil[h.pid .. "|" .. h.name] or 0) < now
+    local key = h.pid .. "|" .. h.name
+    if (ignoredUntil[key] or 0) < now and (goneUntil[key] or 0) < now
        and not protectedPids[h.pid] and not frozen[h.pid] then
       rankedKept[#rankedKept + 1] = h
     end
@@ -491,17 +499,17 @@ local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
 local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind, lstart } on screen
 local hudEpisodeOff  = nil    -- the offender this episode last raised for; survives a close
--- The alert episode (one critical episode, until it settles below critical):
+-- The alert episode (one critical episode, until it settles below critical;
+-- docs/alert-lifecycle.md has the full rules):
 --   surfaced  the offender the HUD names (hudOffender), with its own grace
 --             clock (hudShownAt) and answered flag (hudInteracted);
 --   snoozed   the operator closed its HUD: back after the raise cooldown,
 --             or at once if it escalates (hudSnooze);
---   handled   the operator (or memwatch) froze, quit or ignored it: never
---             raised again this episode, never acted on unattended
---             (hudHandled).
+--   answered  by the process's own state, not a note in a list: memwatch
+--             holds it frozen, it is gone (goneUntil), or it is ignored.
+--             None of those is a candidate, so none is raised or acted on.
 -- Every destructive action requires the identity the alert bound (lstart).
 local hudSnooze      = nil    -- { off, kind, untilAt }
-local hudHandled     = {}     -- identities answered this episode
 local hudStalePid    = nil    -- a pid whose bound identity a signal path found replaced
 local bindTriedAt    = {}     -- [pid] = last bind probe
 local BIND_RETRY_SEC = 10     -- a failing probe is retried, but never every tick
@@ -531,22 +539,25 @@ local function bindOffender(offender, prev, now, fresh)
   end
   bindTriedAt[offender.pid] = now
   offender.lstart = nil
-  local proc = resolveSignalTarget(offender.pid, offender.name, nil)
-  if proc and proc.lstart then offender.lstart = proc.lstart end
+  local proc, why = resolveSignalTarget(offender.pid, offender.name, nil)
+  if proc and proc.lstart then
+    offender.lstart = proc.lstart
+  elseif why == "exited" or (why or ""):find("^pid%-reused") then
+    -- Verified gone (or the pid holds a differently named process): the
+    -- tracker's last samples of it are stale, so it is no candidate.
+    goneUntil[offender.pid .. "|" .. offender.name] = now + GONE_SEC
+  end
 end
 
--- Has the operator (or memwatch) already answered this offender this
--- episode? An unbound table for the pid and name of an answered process is
--- bound first, so a same-name process reusing the pid is not mistaken for it.
-local function isHandled(off, now)
-  if not off then return false end
-  for _, h in ipairs(hudHandled) do
-    if h.pid == off.pid and h.name == off.name then
-      if not off.lstart and h.lstart then bindOffender(off, nil, now, false) end
-      if core.sameOffender(h, off) then return true end
-    end
-  end
-  return false
+-- Is this process answered, by its own state? memwatch holds it frozen (the
+-- ledger's start time agreeing when both are known), it is verified gone,
+-- or it is ignored. A pure read: it never probes.
+local function isAnswered(off, now)
+  if not off or not off.pid then return false end
+  local key = off.pid .. "|" .. (off.name or "")
+  local f = frozen[off.pid]
+  if f and not (f.lstart and off.lstart and f.lstart ~= off.lstart) then return true end
+  return (goneUntil[key] or 0) > now or (ignoredUntil[key] or 0) > now
 end
 
 local HUD_W, HUD_H = 380, 176
@@ -565,19 +576,19 @@ function M.hideHud()
 end
 
 -- Every hide that answers the alert goes through here, so no path can quietly
--- re-arm it: "snooze" (the close button: not now; back after the raise
--- cooldown, or at once if it escalates) or "handled" (frozen, quit or
--- ignored: not raised again this episode, never acted on unattended).
+-- re-arm it: "snooze" (the close button, or an action the process survived:
+-- not now; back after the raise cooldown, or at once if it escalates) or
+-- "done" (frozen, quit, gone or ignored: the process's own state keeps it
+-- off the candidates, so nothing needs remembering here).
 local function dismissHud(how, off)
   off = off or hudOffender
   local now = hs.timer.secondsSinceEpoch()
   if off and not off.synthetic then
-    if how == "handled" then
-      hudHandled[#hudHandled + 1] = identityOf(off)
-      hudSnooze = nil
-    else
+    if how == "snooze" then
       hudSnooze = { off = identityOf(off), kind = off.kind,
                     untilAt = now + core.cfg.cool.hudRaiseSec }
+    elseif hudSnooze and core.sameOffender(hudSnooze.off, off) then
+      hudSnooze = nil
     end
   end
   lastHudRaiseAt = now
@@ -599,7 +610,10 @@ local function settleAction(target, outcome)
     lastHudRaiseAt = 0
     M.hideHud()
   elseif answer == "done" then
-    dismissHud("handled", target)
+    if outcome ~= "frozen" then
+      goneUntil[target.pid .. "|" .. (target.name or "")] = hs.timer.secondsSinceEpoch() + GONE_SEC
+    end
+    dismissHud("done", target)
   elseif answer == "snooze" then
     dismissHud("snooze", target)
   else
@@ -698,7 +712,7 @@ local function buildHud()
       if hudOffender and not hudOffender.synthetic then
         M.ignore(hudOffender.pid, hudOffender.name)
       end
-      dismissHud("handled")
+      dismissHud("done")
     elseif id == "monitor" or id == "monitor-label" then
       hs.application.launchOrFocus("Activity Monitor")
     elseif id == "close" then
@@ -872,20 +886,23 @@ local function notifyCrit(m)
     and hudOffender.name == off.name) and hudOffender.lstart or nil)) or nil
   local canAct = off ~= nil and lstart ~= nil and not off.synthetic
   -- The episode's notification history outlives the live banner: an
-  -- offender that hands off and comes back has already been announced.
-  local notified = false
+  -- offender that hands off and comes back has already been announced. It
+  -- is memory, so it matches by exact identity (core.sameRecord): a record
+  -- made before the start time was known never vouches for a process whose
+  -- start time is known, and a banner that binds in place upgrades its own
+  -- record rather than leaving an unbound one behind.
+  local cand = off and { pid = off.pid, name = off.name, lstart = lstart, kind = off.kind } or nil
+  local record = nil
   for _, n in ipairs(critNotified) do
-    if (off == nil and n.none) or (off ~= nil and not n.none and core.sameOffender(n, off)) then
-      notified = true
+    if (off == nil and n.none) or (off ~= nil and not n.none and core.sameRecord(n, cand)) then
+      record = n
       break
     end
   end
+  local notified = record ~= nil
   local step = core.bannerStep({ hasBanner = critNotif ~= nil, banner = critNotifOff,
-                                 offender = off and { pid = off.pid, name = off.name, lstart = lstart,
-                                                      kind = off.kind } or nil,
-                                 canAct = canAct, notified = notified,
-                                 handled = off ~= nil and isHandled(off, now),
-                                 bannerHandled = critNotifOff ~= nil and isHandled(critNotifOff, now),
+                                 offender = cand, canAct = canAct, notified = notified,
+                                 bannerHandled = critNotifOff ~= nil and isAnswered(critNotifOff, now),
                                  sinceLastPostSec = now - lastNotifyAt,
                                  cooldownSec = core.cfg.notifyCooldownSec })
   if (step.withdraw or step.replace) and critNotif then
@@ -918,8 +935,18 @@ local function notifyCrit(m)
   -- only when the offender's start time is bound: the click passes it as
   -- expectedLstart, so a pid reused since the post is refused, never
   -- signaled. Until then the banner upgrades in place once it binds.
+  -- An in-place replace of this process's own banner is the same
+  -- announcement: the banner's history record (the very table posted) takes
+  -- the newly bound identity, rather than leaving an unbound record behind.
+  -- A new post adds one record; nothing is ever recorded twice.
+  local wasBanner = critNotifOff
   critNotifOff = off and { pid = off.pid, name = off.name, lstart = lstart, kind = off.kind,
                            canAct = canAct } or nil
+  if step.replace and wasBanner and critNotifOff and wasBanner.lstart == nil and lstart ~= nil
+     and core.sameOffender(wasBanner, critNotifOff) then
+    wasBanner.lstart = lstart
+    notified = true
+  end
   if not notified then critNotified[#critNotified + 1] = critNotifOff or { none = true } end
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
@@ -1065,7 +1092,7 @@ local function unattendedStep(offender, now)
   if mode == "off" or not offender or offender.kind ~= "extreme" then return end
   if not alertActive or hudInteracted or hudHold then return end
   if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
-  if frozen[offender.pid] or isHandled(offender, now) then return end
+  if isAnswered(offender, now) then return end
   if (now - hudShownAt) < core.cfg.cool.autoKillGraceSec then return end
   -- Act only on the identity the alert bound and surfaced, never on a name:
   -- without a bound start time (the probe failed) skip this tick and stay
@@ -1144,7 +1171,7 @@ local function alertSurfaces(state, now)
         bindOffender(offender, nil, now, true)
       end
       if core.hudRaiseDue({ visible = false, offender = offender, episode = hudEpisodeOff,
-                            snooze = hudSnooze, handled = offender ~= nil and isHandled(offender, now),
+                            snooze = hudSnooze,
                             sinceRaiseSec = now - lastHudRaiseAt,
                             raiseSec = core.cfg.cool.hudRaiseSec, now = now }) then
         lastHudRaiseAt = now
@@ -1203,7 +1230,7 @@ local function alertSurfaces(state, now)
       end
       critNotified = {}
       lastNotifyAt = 0
-      hudEpisodeOff, hudSnooze, hudHandled, hudStalePid = nil, nil, {}, nil
+      hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil
       bindTriedAt = {}
     end
   end
@@ -1238,9 +1265,11 @@ local function tick()
   -- recycled pid could inherit stale state for one tick.
   gcUnattendedState()
   alertSurfaces(state, now)
-  -- Frozen-ledger liveness sweep (calm only: probing forks a ps per entry,
-  -- and a phantom entry is harmless mid-crisis).
-  if state == "ok" then frozenSweep(now) end
+  -- Frozen-ledger liveness sweep, in every state: a frozen pid is no
+  -- candidate, so a phantom entry (the process died, its pid was reused)
+  -- would hide the newcomer mid-crisis. One fork covers every entry, at
+  -- most once per frozenSweepSec, and only while the ledger is non-empty.
+  frozenSweep(now)
 
   -- Honesty when degraded: if the fork has not reported for a while, say so,
   -- and say it LOUDLY when it coincides with real pressure. The 2026-07-07
@@ -1452,12 +1481,12 @@ local function frozenReconcile()
   end
 end
 
--- Calm-state liveness sweep for the frozen ledger. The startup reconcile
+-- Liveness sweep for the frozen ledger. The startup reconcile
 -- validates entries at load, but a frozen process that exits BETWEEN
 -- reloads leaves a phantom entry (2026-07-09 field finding: a dead VM pid
 -- held frozenCount=1 for two days because nothing re-probed after load).
--- Same identity semantics as the reconcile (lstart + stopped state), on a
--- calm cadence only per fork discipline.
+-- Same identity semantics as the reconcile (lstart + stopped state), one
+-- fork for all entries per frozenSweepSec.
 frozenSweep = function(now)
   if not next(frozen) then return end
   if (now - lastFrozenSweepAt) < core.cfg.cool.frozenSweepSec then return end
@@ -2450,9 +2479,10 @@ function M.ignore(pid, name)
     lastOffender = nil
     titleSnap.offenderName, titleSnap.offenderGB = nil, nil
   end
-  -- An ignore is an answer: if the alert is on this process, it is handled.
-  if hudOffender and hudOffender.pid == pid and hudOffender.name == name then
-    dismissHud("handled", hudOffender)
+  -- An ignore is an answer: the ignore list keeps the process off every
+  -- surface for its window, and the HUD on it comes down.
+  if hudOffender and hudOffender.pid == pid and core.sameName(hudOffender.name, name) then
+    dismissHud("done", hudOffender)
   end
 end
 
@@ -2595,7 +2625,7 @@ function M.test(level, seconds)
     critNotif, critNotifOff = nil, nil
     critNotified = {}
     lastNotifyAt = 0
-    hudEpisodeOff, hudSnooze, hudHandled = nil, nil, {}
+    hudEpisodeOff, hudSnooze = nil, nil
     -- A synthetic offender: its surfaces never signal, whatever process may
     -- really hold pid 99999 (no binding, no banner action, inert buttons).
     lastOffender = { pid = 99999, name = "FakeProc", weightMB = 22 * 1024,

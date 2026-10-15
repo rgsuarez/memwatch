@@ -920,6 +920,84 @@ scenario("a refused click does not disarm unattended", UNATTENDED_FREEZE, functi
     runUntil(W, 120, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242), "STOP")
 end)
 
+-- (round 4) An action whose probe failed before any signal (unverified)
+-- left the process untouched, so it is no answer: once probes recover,
+-- unattended still acts. Each surface: the HUD, the banner, a menu row;
+-- and a click whose outcome never came back lapses at the hold deadline.
+local function armedEpisode(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  return runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+end
+local function freezesWithin(W, sec)
+  return runUntil(W, sec, function() return W.signalsTo(4242) ~= "" end) and W.signalsTo(4242)
+end
+
+scenario("an unverified HUD click does not disarm unattended", UNATTENDED_FREEZE, function(W)
+  check("unverified-hud: the alert names the runaway", armedEpisode(W), true)
+  W.run(5)
+  W.probeFails = true
+  W.click("freeze")
+  W.run(6)
+  check("unverified-hud: nothing was signaled", W.signalsTo(4242), "")
+  W.probeFails = false
+  check("unverified-hud: unattended freezes once probes recover", freezesWithin(W, 120), "STOP")
+end)
+
+scenario("an unverified banner click does not disarm unattended", UNATTENDED_FREEZE, function(W)
+  check("unverified-banner: the alert names the runaway", armedEpisode(W), true)
+  W.run(8)
+  local b = W.liveBanners()[1]
+  check("unverified-banner: the banner offers Force Quit", b ~= nil and b.attrs.hasActionButton == true, true)
+  W.probeFails = true
+  if b then W.clickBanner(b) end
+  W.run(3)
+  check("unverified-banner: nothing was signaled", W.signalsTo(4242), "")
+  W.probeFails = false
+  check("unverified-banner: unattended freezes once probes recover", freezesWithin(W, 120), "STOP")
+end)
+
+scenario("an unverified menu click does not disarm unattended", UNATTENDED_FREEZE, function(W)
+  check("unverified-menu: the alert names the runaway", armedEpisode(W), true)
+  W.run(5)
+  local row = W.menuItem("leaker")
+  local freeze = row and row.menu and row.menu[1]
+  check("unverified-menu: the row offers Freeze", freeze ~= nil and freeze.disabled == nil, true)
+  W.probeFails = true
+  if freeze then freeze.fn() end
+  W.run(3)
+  check("unverified-menu: nothing was signaled", W.signalsTo(4242), "")
+  W.probeFails = false
+  check("unverified-menu: unattended freezes once probes recover", freezesWithin(W, 120), "STOP")
+end)
+
+scenario("a click whose signal went out still answers", UNATTENDED_FREEZE, function(W)
+  W.addProc(4242, "leaker", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker (pid") end)
+  W.run(5)
+  -- The STOP goes out (and does nothing); its verifier's probe fails.
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  W.click("freeze")
+  W.run(1)
+  W.onSignal, W.probeFails = nil, false
+  W.run(120)
+  check("answered: the operator's STOP is the only signal", W.signalsTo(4242), "STOP")
+end)
+
+scenario("a click whose outcome never came back lapses", UNATTENDED_FREEZE, function(W)
+  check("lapse: the alert names the runaway", armedEpisode(W), true)
+  W.run(5)
+  W.killRaises = true               -- the TERM send itself fails
+  W.click("kill")
+  W.run(2)
+  W.killRaises = false
+  check("lapse: unattended freezes after the hold deadline", freezesWithin(W, 150), "STOP")
+end)
+
 -- (round 3) A banner Force Quit is the operator's answer: unattended does
 -- not act on that process during the operator's TERM escalation.
 scenario("a banner Force Quit stands unattended down", UNATTENDED_FREEZE, function(W)

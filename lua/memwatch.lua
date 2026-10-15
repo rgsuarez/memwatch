@@ -547,12 +547,38 @@ local function recordFor(map, off, create)
   if r and r.lstart == nil and off.lstart then r.lstart = off.lstart end
   return r
 end
-local function markInteracted(off)
-  if off and not off.synthetic then recordFor(interacted, off, true) end
-end
 local hudHold        = false  -- a kill narrative owns the body text
 local hudHoldUntil   = 0      -- a hold no narrative released by now is released
-local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 3 + 4 s)
+local HOLD_MAX_SEC   = 45     -- longer than any narrative (kill: 7 + 2 + 2 + 2 + 3, then 4 s to settle)
+-- An operator action on a process answers it for unattended purposes.
+-- Ignore, close and opening Activity Monitor answer at once. An action
+-- handed to a signal engine is pending until its outcome: one that did
+-- nothing (unverified: the probe failed before any signal) is no answer,
+-- any other outcome confirms it, and a pending mark whose outcome never
+-- came back lapses at the hold deadline.
+local function markInteracted(off, pending)
+  if not off or off.synthetic then return end
+  local r = recordFor(interacted, off, true)
+  if not pending then
+    r.confirmed, r.pendingUntil = true, nil
+  elseif not r.confirmed then
+    r.pendingUntil = hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
+  end
+end
+local function settleInteraction(target, outcome)
+  local r = recordFor(interacted, target, false)
+  if not r or r.confirmed then return end
+  if outcome == "unverified" then
+    interacted[procKey(target)] = nil
+  else
+    r.confirmed, r.pendingUntil = true, nil
+  end
+end
+-- Does the operator's answer stand this process's unattended action down?
+local function interactionStands(off, now)
+  local r = recordFor(interacted, off, false)
+  return r ~= nil and (r.confirmed or (r.pendingUntil or 0) > now)
+end
 local hudBelowCritSince = nil
 local lastHudRaiseAt = 0
 local hudOffender    = nil    -- { pid, name, weightMB, slopeMBmin, kind, lstart } on screen
@@ -690,6 +716,7 @@ end
 -- holds it now as a new alert), or nothing at all (unverified: the alert
 -- stands as it was, still retryable).
 local function settleAction(target, outcome)
+  settleInteraction(target, outcome)
   local answer = core.answerFor(outcome)
   M.logSnapshot(string.format("answered:%s:%s(%d):%s", answer, target.name or "?",
     target.pid or -1, outcome or "none"))
@@ -716,6 +743,7 @@ local function surfaceUpdate(target)
   return function(text, done, outcome)
     hs.alert.show("memwatch: " .. text, 2.5)
     if not done then return end
+    settleInteraction(target, outcome)
     if outcome == "stale" then
       identityRefused(target)
     elseif core.answerFor(outcome) == "done" then
@@ -806,7 +834,7 @@ local function buildHud()
         end
         return
       end
-      markInteracted(target)
+      markInteracted(target, true)
       hudHold, hudHoldUntil = true, hs.timer.secondsSinceEpoch() + HOLD_MAX_SEC
       -- The narrative belongs to this run: after a stop, start or
       -- diagnostic it touches nothing (the signal engine still finishes the
@@ -925,12 +953,12 @@ local function buildMenu()
       menu = {
         { title = "Freeze " .. name .. note, disabled = (lst == nil) or nil,
           fn = function()
-            markInteracted(target)
+            markInteracted(target, true)
             M.freezePid(pid, name, surfaceUpdate(target), { weightMB = wMB, expectedLstart = lst })
           end },
         { title = "Force Quit " .. name .. note, disabled = (lst == nil) or nil,
           fn = function()
-            markInteracted(target)
+            markInteracted(target, true)
             M.killPid(pid, name, surfaceUpdate(target), { expectedLstart = lst })
           end },
         { title = "Ignore for 30 min",
@@ -995,7 +1023,7 @@ local function buildMenu()
           if why and why:find("^pid%-reused") then identityRefused(target) end
           return
         end
-        markInteracted(off)
+        markInteracted(target, true)
         M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lst })
       end }
     items[#items + 1] = { title = string.format("Ignore %s for 30 min", off.name),
@@ -1100,9 +1128,9 @@ local function notifyCrit(m)
   if not notified then critNotified[#critNotified + 1] = critNotifOff or { none = true } end
   critNotif = hs.notify.new(guard("notify-action", function(notif)
     if canAct and notif:activationType() == hs.notify.activationTypes.actionButtonClicked then
-      markInteracted(off)
-      M.killPid(off.pid, off.name,
-        surfaceUpdate({ pid = off.pid, name = off.name, lstart = lstart }), { expectedLstart = lstart })
+      local target = { pid = off.pid, name = off.name, lstart = lstart }
+      markInteracted(target, true)
+      M.killPid(off.pid, off.name, surfaceUpdate(target), { expectedLstart = lstart })
     end
   end), {
     title             = "Memory pressure: CRITICAL",
@@ -1257,7 +1285,7 @@ local function unattendedStep(offender, now)
   if mode == "off" or not offender or offender.kind ~= "extreme" then return end
   if not alertActive or hudHold then return end
   if not (hudOffender and core.sameOffender(hudOffender, offender)) then return end
-  if recordFor(interacted, hudOffender, false) or isAnswered(offender, now) then return end
+  if interactionStands(hudOffender, now) or isAnswered(offender, now) then return end
   local grace = recordFor(exposure, hudOffender, false)
   if not grace or (grace.sec or 0) < core.cfg.cool.autoKillGraceSec then return end
   -- Act only on the identity the alert bound and surfaced, never on a name:

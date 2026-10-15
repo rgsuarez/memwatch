@@ -112,9 +112,14 @@ named, and a hog that escalates to `extreme` starts its clock then. Every
 raise (the HUD coming back after being down) starts all clocks over.
 
 An operator action on a process, from any surface, marks it answered for
-unattended purposes until the next raise. A click that did nothing (an
-unbound refusal, a self-test button) is not an answer. memwatch never
-retries a freeze or terminate that already failed on the same process.
+unattended purposes until the next raise. Ignore, close and opening
+Activity Monitor answer at once. A freeze or Force Quit answers when its
+outcome arrives: one that signaled nothing (`unverified`, the probe failed
+before any signal) is no answer, and one whose outcome never arrives stops
+counting at the hold deadline (45 seconds). A click that did nothing in
+any other way (an unbound refusal, a self-test button) is not an answer
+either. memwatch never retries a freeze or terminate that already failed
+on the same process.
 
 Receipts for unattended actions report what happened (frozen, terminated,
 refused, could not verify), and are posted when the action completes.

@@ -1938,6 +1938,33 @@ do
     observe.liveStamp(stamp, { comm = "/bin/x", startLo = 1500, startHi = 1502, etimeSec = 60 }), nil)
   local youngStamp = { at = 100, comm = "/bin/x", start = { lo = 999, hi = 1003, etimeSec = 1 } }
   check("liveStamp: an undecidable identity keeps it", observe.liveStamp(youngStamp, live), youngStamp)
+  -- A step back replays a stretch of wall time (observe.replaySpan): from
+  -- the stepped clock as it read at the previous reading to the old clock as
+  -- it would read now. Read at 1000 (mono 500), next at 905 (mono 510): a
+  -- 105 s step somewhere in those 10 s.
+  local span = observe.replaySpan(1000, 500, 905, 510, -105, 10)
+  check("replaySpan: from the stepped clock at the previous reading", span.lo, 895)
+  check("replaySpan: to the old clock now", span.hi, 1010)
+  check("replaySpan: a start born 3 s after the previous reading lies in it",
+    observe.startReplayed({ lo = 897, hi = 898 }, { span }), true)
+  check("replaySpan: anchored at the detecting reading instead, it would escape (control)",
+    observe.startReplayed({ lo = 897, hi = 898 }, { { lo = 905 - 2, hi = 1010 } }), false)
+  local blind = observe.replaySpan(1000, nil, 900, nil, -100, 10)
+  check("replaySpan: without a monotonic clock both ends widen", blind.lo == 890 and blind.hi == 1010, true)
+  check("replaySpan: nothing without a previous reading", observe.replaySpan(nil, nil, 900, 5, -100, 10), nil)
+  -- Each step keeps its own stretch; a start between two is untouched.
+  local spans = { { lo = 100, hi = 200 }, { lo = 500, hi = 600 } }
+  check("startReplayed: a start in a stretch", observe.startReplayed({ lo = 150, hi = 151 }, spans), true)
+  check("startReplayed: a start between two stretches is untouched",
+    observe.startReplayed({ lo = 300, hi = 301 }, spans), false)
+  check("startReplayed: a start before every stretch is untouched",
+    observe.startReplayed({ lo = 50, hi = 51 }, spans), false)
+  check("startReplayed: no window, no stretches", observe.startReplayed(nil, spans) or observe.startReplayed({ lo = 150, hi = 151 }, nil), false)
+  -- A stretch matters until the clock has run past it.
+  local live2 = observe.replaysAt(spans, 300, 2)
+  check("replaysAt: a stretch the clock has run past no longer matters", #live2 == 1 and live2[1].lo == 500, true)
+  check("replaysAt: one it has not still does", #observe.replaysAt(spans, 150, 2), 2)
+  check("replaysAt: whole-second slack at the end", #observe.replaysAt(spans, 201, 2), 2)
   check("liveStamp: no tracker entry keeps it", observe.liveStamp(stamp, nil), stamp)
   check("liveStamp: no stamp is nil", observe.liveStamp(nil, live), nil)
 
@@ -2560,6 +2587,15 @@ do
     src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, widenSec)", 1, true) ~= nil, true)
   -- (round 11) A table whose launch record is gone widens the tracker's
   -- windows by every step back so far: a bound on the steps since its launch.
+  -- Each step back keeps its replayed stretch; observations refuse a start in
+  -- one that still matters, and keep them for their samples' windows.
+  check("replay glue: each step records its stretch",
+    src:find("observe.replaySpan(prevWall, prevMono, wall, mono, delta, 2 * core.cfg.pollSec)", 1, true) ~= nil, true)
+  check("replay glue: an observation checks the stretches that matter now",
+    src:find("local replays = obs.replaysAt(now + clock.pending)", 1, true) ~= nil
+      and src:find("ev.replays = replays", 1, true) ~= nil, true)
+  check("replay glue: a sample's window is checked against its record's stretches",
+    src:find("if start1 and obs.startReplayed(start1, ev.replays) then start1 = nil end", 1, true) ~= nil, true)
   check("sampler glue: a table without its launch record widens by every step back so far",
     src:find("local widenSec = steppedSec or -(clock.stepTotal + clock.pending)", 1, true) ~= nil, true)
   -- (round 11) Ages read the raw clock, at the runaways and from lstart.

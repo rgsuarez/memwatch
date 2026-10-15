@@ -1624,6 +1624,23 @@ scenario("a stalled ps table does not prune a top-fed offender", UNATTENDED_FREE
   check("stale-gc: one decision row, not one per grace window or tick", decisions, 1)
 end)
 
+-- (round 6) The same across a wall clock stepped back: the last complete
+-- table's launch and the top stream's sightings stay on one basis, so the
+-- final latch is kept: still one STOP.
+scenario("a step back while ps stalls does not prune a top-fed offender", UNATTENDED_FREEZE, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  runUntil(W, 200, function() return W.signalsTo(4242) ~= "" end)
+  W.run(20)
+  W.wallOffset = -300
+  W.run(400)
+  check("step-gc: one STOP for a process that never stops, across a step back", W.signalsTo(4242), "STOP")
+end)
+
 -- ---- observation ledger: what was faced, and what became of it ----
 local function ledgerRows(W)
   local lfm = require("memwatch_lfm")
@@ -2293,6 +2310,30 @@ scenario("a verdict on the offender's own snapshot defers the freeze", REMOTE_LF
   local r = unattendedRow(W, "lfm")
   check("verdict: and it waits", r and r.action, "wait")
   check("verdict: so nothing was stopped yet", W.signalsTo(4242), "")
+end)
+
+-- (round 6) A wall clock stepped back while a model's wait defers the
+-- freeze: the deferral's first wait moves with the step, so the freeze
+-- comes when the deferral ends (120 s of real time from the first wait),
+-- not a grace early, and the shift runs cleanly with a deferral in place.
+scenario("a step back while a wait defers the freeze keeps the deferral whole", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("defer-step: the model's wait deferred the freeze", waited, true)
+  local firstWait = W.now
+  -- A step smaller than the process's age: ps's etime is wall time less the
+  -- start, so a step back longer than the age leaves it at zero and the
+  -- start window unplaceable (the dispatch then refuses, and the
+  -- deterministic policy decides).
+  W.wallOffset = -60
+  local stopped = runUntil(W, 300, function() return W.signalsTo(4242):find("STOP", 1, true) ~= nil end)
+  check("defer-step: the freeze still comes", stopped, true)
+  check("defer-step: the shift ran without error", logHas(W, "error:clock-shift"), false)
+  check("defer-step: at the deferral's end, in real time, neither early nor late (" .. math.floor(W.now - firstWait) .. " s)",
+    W.now - firstWait >= 100 and W.now - firstWait <= 140, true)
 end)
 
 -- A verdict asked about a process the dispatch could not tie to its

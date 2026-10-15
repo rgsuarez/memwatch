@@ -2870,6 +2870,12 @@ do
     body:find('if type(w) == "table" then w.firstAt = sh(w.firstAt) end', 1, true) ~= nil, true)
   check("unattended grace: a future stamp restarts from now (fails closed)",
     src:find("if fired and type(fired.at) == \"number\" and fired.at > now then fired.at = now end", 1, true) ~= nil, true)
+  -- The ledger's own stamps that a step moves: the tick log, and the launch
+  -- the unattended-state GC compares, read on the wall clock as it reads now.
+  check("clock.shift: the ledger's tick log moves with the step",
+    body:find("for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end", 1, true) ~= nil, true)
+  check("sampler: the GC's launch is read as of now, from the monotonic clock",
+    src:find("sampler.launchedAt = launchMono and (now - (clock.mono() - launchMono)) or launchedAt", 1, true) ~= nil, true)
   local _, raw = src:gsub("hs%.timer%.secondsSinceEpoch%(%)", "")
   check("wall reads: only the two clock readers read the wall clock raw", raw, 2)
 end

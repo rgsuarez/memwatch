@@ -60,12 +60,15 @@ ROOT="$(pwd -P)"
 # (model cards, HF repos, license) are PUBLIC and not matched. A local,
 # gitignored eval/checks/internal-terms.txt (one pattern per line) adds
 # machine-specific terms without ever committing them to the public tree.
+# The sentinel the report files emit, named once: the pattern list and its
+# exemption below both use it, so neither can drift from the other.
+SENTINEL='league:full'
 PATTERNS=(
   '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
   '\b[0-9a-f]{32}\b'
   '\b[A-Z]{2,6}-[0-9]{2,}\b'
   'notion\.so|app\.notion\.com'
-  'league:full'
+  "$SENTINEL"
 )
 STRUCTURAL=${#PATTERNS[@]}   # patterns past this index are local terms
 LOCAL_TERMS="$SCRIPT_DIR/internal-terms.txt"
@@ -146,7 +149,7 @@ scan_file() {
   local idx=0
   for pat in "${PATTERNS[@]}"; do
     idx=$((idx + 1))
-    if [ "$sentinelOk" = 1 ] && [ "$pat" = "league:full" ]; then continue; fi
+    if [ "$sentinelOk" = 1 ] && [ "$pat" = "$SENTINEL" ]; then continue; fi
     # grep -q itself, never a pipe: under pipefail a pipe into head turns a
     # large match set into SIGPIPE, which would read as no match. 0 is a
     # match, 1 none, anything else a file that could not be scanned. -a reads

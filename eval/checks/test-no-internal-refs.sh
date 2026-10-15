@@ -210,10 +210,15 @@ clean
 
 # (round 5) A term list that is there but cannot be read is as blind as a
 # missing one: refused (2), not reported like a found reference (1).
-chmod 000 "$terms"
-expect 2 "an unreadable term list is refused"
-chmod 644 "$terms"
-expect 0 "a readable term list scans again (control)"
+# (Root reads a mode-000 file anyway, so the case cannot be staged as root.)
+if [ "$(id -u)" != 0 ]; then
+  chmod 000 "$terms"
+  expect 2 "an unreadable term list is refused"
+  chmod 644 "$terms"
+  expect 0 "a readable term list scans again (control)"
+else
+  echo "skip  an unreadable term list (running as root, which reads it anyway)"
+fi
 
 # Not a git tree: a tree scan that finds no files is blind, not clean.
 notgit="$(mktemp -d)"

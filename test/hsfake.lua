@@ -145,6 +145,19 @@ function F.new()
     local list = cmd:match("^/bin/ps %-p ([%d,]+) %-o pid=,uid=,state=,lstart=,comm=")
     if list then
       if W.probeFails then return "" end
+      -- probeFailsOnce: the next n probes fail (a fork that fails now and then).
+      if (W.probeFailsOnce or 0) > 0 then
+        W.probeFailsOnce = W.probeFailsOnce - 1
+        return ""
+      end
+      -- takeOverBeforeProbe: that pid's process exits and a same-name one
+      -- takes the pid just before this probe runs (one shot).
+      local tk = W.takeOverBeforeProbe
+      if tk and W.procs[tk] and ("," .. list .. ","):find("," .. tk .. ",", 1, true) then
+        W.takeOverBeforeProbe = nil
+        local old = W.procs[tk]
+        W.reusePid(tk, (old.comm:match("([^/]+)$") or "proc"), old.rssKB / 1024)
+      end
       local rows, seen, order = {}, {}, {}
       for ps in list:gmatch("%d+") do order[#order + 1] = tonumber(ps) end
       table.sort(order)                -- ps lists processes in pid order
@@ -388,7 +401,15 @@ function F.new()
     end },
     application = { launchOrFocus = function() end, frontmostApplication = function() return nil end },
     alert = { show = function(text) W.alerts[#W.alerts + 1] = { t = W.now, text = text } end },
-    http = { asyncPost = function() end },
+    -- Every POST is recorded; with httpReply(url, body) -> status, body set,
+    -- it is answered after httpDelay (default 0.2 s).
+    http = { asyncPost = function(url, body, headers, cb)
+      W.httpPosts = W.httpPosts or {}
+      W.httpPosts[#W.httpPosts + 1] = { url = url, body = body, at = W.now }
+      if W.httpReply and cb then
+        addTimer("after", W.httpDelay or 0.2, nil, function() cb(W.httpReply(url, body)) end)
+      end
+    end },
     -- W.jetsam: { [name] = modification epoch } of kernel jetsam reports.
     fs = {
       dir = function()

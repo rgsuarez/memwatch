@@ -459,6 +459,24 @@ function M.metricAt(log, t, freshSec)
   return nil
 end
 
+-- Is the process a probe found under a pid (probe: { comm, lstart }) the
+-- one a tracker entry's data came from? From the entry's start window when
+-- it has one: matchStart's answer for the probe's comm and start time.
+-- Without a window (a process only the top stream has named), from the
+-- start time an alert bound to that pid: "same" when it is the probe's,
+-- "different" when not; else "unknown".
+function M.sameSource(entry, probe, boundLstart)
+  if type(probe) ~= "table" then return "unknown" end
+  local w = M.startOf(entry)
+  if w then
+    return M.matchStart(w, entry.comm, M.lstartEpoch(probe.lstart), probe.comm)
+  end
+  if type(boundLstart) == "string" and type(probe.lstart) == "string" then
+    return (boundLstart == probe.lstart) and "same" or "different"
+  end
+  return "unknown"
+end
+
 -- Does a frozen-ledger entry hold the observed process? From the entry's
 -- bound start time against the observation's start window; nil when that
 -- cannot be told.

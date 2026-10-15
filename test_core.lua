@@ -2119,6 +2119,28 @@ do
     print("note  lstart strict: this zone keeps no daylight time; the fold case is not exercised")
   end
 
+  -- Dispatch: the probed process must be the one the snapshot's data came from.
+  local tStart = os.time({ year = 2026, month = 10, day = 12, hour = 10, min = 0, sec = 1 })
+  local entry = { comm = "/bin/x", startLo = tStart - 1, startHi = tStart + 1, etimeSec = 900 }
+  local stampA = os.date("%a %b %e %H:%M:%S %Y", tStart)
+  local stampB = os.date("%a %b %e %H:%M:%S %Y", tStart + 600)
+  check("sameSource: the tracker's process is the probed one",
+    observe.sameSource(entry, { comm = "/bin/x", lstart = stampA }), "same")
+  check("sameSource: a pid taken over since the sample is not",
+    observe.sameSource(entry, { comm = "/bin/x", lstart = stampB }), "different")
+  check("sameSource: another program under the pid is not",
+    observe.sameSource(entry, { comm = "/bin/y", lstart = stampA }), "different")
+  check("sameSource: a young process's wide window cannot tell",
+    observe.sameSource({ comm = "/bin/x", startLo = tStart - 30, startHi = tStart + 30, etimeSec = 40 },
+      { comm = "/bin/x", lstart = stampA }), "unknown")
+  check("sameSource: without a window, the alert's bound start time decides",
+    observe.sameSource({ comm = nil }, { comm = "/bin/x", lstart = stampA }, stampA), "same")
+  check("sameSource: and refuses another start time",
+    observe.sameSource({ comm = nil }, { comm = "/bin/x", lstart = stampB }, stampA), "different")
+  check("sameSource: with neither, nothing can be told",
+    observe.sameSource(nil, { comm = "/bin/x", lstart = stampA }, nil), "unknown")
+  check("sameSource: no probe, nothing", observe.sameSource(entry, nil), "unknown")
+
   local rowB = observe.row({ offender = { pid = 1 }, identityBasis = "lstart" })
   check("row: the identity basis is recorded", rowB.identityBasis, "lstart")
 end

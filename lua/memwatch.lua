@@ -2446,6 +2446,8 @@ local function consumeVerdict(offender)
   if not lfm.verdictUsable(e, offender, hs.timer.secondsSinceEpoch(), lfm.cfg.verdictFreshSec) then
     return nil
   end
+  -- Only a verdict whose snapshot was proven to be its process's own.
+  if not (e.ident and e.ident.verified) then return nil end
   local proc = resolveSignalTarget(offender.pid,
     e.ident and e.ident.name or offender.name,
     e.ident and e.ident.lstart or nil)
@@ -3126,6 +3128,19 @@ local function dispatchAdjudication(offender, why)
   if not ((remote or (lfmServerReady and lfmServerPort)) and not lfmInFlight) then return end
   local proc = probePid(offender.pid)
   if not proc then return end
+  -- The snapshot below is built from the tracker's data for this pid, and
+  -- its verdict is filed under the probed identity: they must be one
+  -- process. A pid taken over between the last sample and this probe would
+  -- file one process's verdict under the next one's identity. A process
+  -- that cannot be told apart is still asked (its verdict is advisory), but
+  -- the verdict never drives an action (consumeVerdict).
+  local bound = (hudOffender and hudOffender.pid == offender.pid) and hudOffender.lstart or nil
+  local source = observe.sameSource(tracker.procs[offender.pid], proc, bound)
+  if source == "different" then
+    M.logSnapshot(string.format("lfm-dispatch-skip:%s(%d):identity-changed",
+      offender.name or "?", offender.pid))
+    return
+  end
   local snap, foreground = buildLfmSnapshot(offender)
   -- Redact raw process names to deterministic categories (panel F4.1) on
   -- BOTH paths: a capable model reading an attacker-controlled name is a
@@ -3155,7 +3170,8 @@ local function dispatchAdjudication(offender, why)
   lfmReqNonce = lfmReqNonce + 1
   local nonce = lfmReqNonce
   local hash = lfm.snapshotHash(user)
-  local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart }
+  local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart,
+                  verified = source == "same" }
   local pid = offender.pid
   local sentAt = hs.timer.secondsSinceEpoch()
   lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }

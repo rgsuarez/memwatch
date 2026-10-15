@@ -2199,6 +2199,104 @@ scenario("ledger: a table without memwatch's own row proves no exit", nil, funct
   check("self row: a whole table's absence is an exit (control)", fu[3] and fu[3].fate, "exited")
 end)
 
+-- ---- the adjudicator's verdict is filed only under its own process ----
+-- A remote adjudicator in the fake: the key is a throwaway file, the
+-- endpoint is never reached (the fake records each request and answers it
+-- with a canned verdict).
+local LFM_KEYFILE = os.tmpname()
+do
+  local kf = assert(io.open(LFM_KEYFILE, "w"))
+  kf:write("fake-key-for-tests\n")
+  kf:close()
+end
+local REMOTE_LFM = '{"lfm":{"enabled":true,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
+  .. LFM_KEYFILE .. '"}}'
+local function cannedVerdict(action)
+  return function()
+    return 200, '{"choices":[{"message":{"content":"{\\"action\\":\\"' .. action
+      .. '\\",\\"process_class\\":\\"build\\",\\"confidence\\":0.9,\\"rationale\\":\\"test\\"}"}}]}'
+  end
+end
+
+scenario("a pid taken over before the dispatch probe gets no verdict", REMOTE_LFM, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 2                        -- pressure up, no HUD: dispatch is the only probe of the pid
+  local first = runUntil(W, 120, function() return #(W.httpPosts or {}) >= 1 end)
+  check("dispatch: the adjudicator is asked about the offender (control)", first, true)
+  W.run(5)
+  check("dispatch: its verdict is filed (control)", mw.debug().lfm.cached >= 1, true)
+  check("dispatch: and logged as the offender's", logHas(W, "lfm-verdict:leaker(4242)"), true)
+  local posts = #W.httpPosts
+  W.takeOverBeforeProbe = 4242      -- the next probe finds a same-name newcomer
+  runUntil(W, 120, function() return W.takeOverBeforeProbe == nil end)
+  W.run(2)
+  check("dispatch: the probe found the newcomer", W.takeOverBeforeProbe, nil)
+  check("dispatch: no request carries the old process's snapshot under the newcomer",
+    #W.httpPosts, posts)
+  check("dispatch: and the skip is logged", logHas(W, "lfm-dispatch-skip:leaker(4242):identity-changed"), true)
+end)
+
+-- The decision ledger's rows (memwatch-lfm.jsonl), decoded.
+local function decisionRows(W)
+  local lfm = require("memwatch_lfm")
+  local rows = {}
+  local f = io.open(W.home .. "/projects/memwatch/memwatch-lfm.jsonl", "r")
+  if not f then return rows end
+  for line in f:lines() do
+    local r = lfm.jsonDecode(line)
+    if r then rows[#rows + 1] = r end
+  end
+  f:close()
+  return rows
+end
+local function unattendedRow(W, adjudicator)
+  for _, r in ipairs(decisionRows(W)) do
+    if r.adjudicator == adjudicator then return r end
+  end
+end
+local REMOTE_LFM_FREEZE = '{"unattended":"freeze","lfm":{"enabled":true,"advisoryIntervalSec":600,'
+  .. '"remoteServer":"https://lfm.invalid","remoteKeyFile":"' .. LFM_KEYFILE .. '"}}'
+
+-- A fresh verdict on the offender's own snapshot is the model's call at
+-- grace expiry: its wait defers the deterministic freeze.
+scenario("a verdict on the offender's own snapshot defers the freeze", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  local acted = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("verdict: the grace-expiry decision is the model's", acted, true)
+  local r = unattendedRow(W, "lfm")
+  check("verdict: and it waits", r and r.action, "wait")
+  check("verdict: so nothing was stopped yet", W.signalsTo(4242), "")
+end)
+
+-- A verdict asked about a process the dispatch could not tie to its
+-- snapshot is filed, but never drives the grace-expiry decision: the
+-- deterministic freeze runs. Here only top has named the process (ps is
+-- stalled, so no start window), and the alert's bind probe failed (a fork
+-- under pressure) while the dispatch probe a moment later succeeded.
+scenario("a verdict whose snapshot is not its process's own never acts", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  W.kern = 2
+  runUntil(W, 60, function() return mw.debug().state == "elevated" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  W.probeFailsOnce = 1              -- the alert's first bind probe fails
+  W.addProc(4242, "topborn", 2000)
+  W.grow(4242, 220)
+  local asked = runUntil(W, 120, function() return mw.debug().lfm.cached >= 1 end)
+  check("unverified: the adjudicator answered about the top-born offender", asked, true)
+  check("unverified: the alert's bind probe was the one that failed", W.probeFailsOnce, 0)
+  runUntil(W, 150, function() return W.signalsTo(4242) ~= "" end)
+  check("unverified: the deterministic freeze ran at grace expiry", W.signalsTo(4242), "STOP")
+  check("unverified: the decision was not the model's", unattendedRow(W, "lfm"), nil)
+  check("unverified: it was the deterministic policy's",
+    unattendedRow(W, "deterministic-fallback") ~= nil, true)
+end)
+
 -- ---- round 4: interactions the design pass introduced ----
 -- (round 4 P1) The sweep runs in every state now, in the same tick as an
 -- unattended freeze. A STOP that takes effect a moment later must not
@@ -2324,6 +2422,7 @@ scenario("a kill never drops a newer process's ledger entry", nil, function(W)
   check("newer-ledger: and still listed under Frozen by memwatch", W.menuItem("   node") ~= nil, true)
 end)
 
+os.remove(LFM_KEYFILE)
 if fails == 0 then
   print("\nALL PASS")
 else

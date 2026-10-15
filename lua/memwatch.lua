@@ -1189,15 +1189,17 @@ end
 -- happened. A freeze or terminate that changed a process always notifies,
 -- even with desktop alerts muted (silence there turns a muted alert into a
 -- mystery hang); an action that signaled nothing is logged, not announced.
-local RECEIPT_OUTCOMES = { frozen = true, terminated = true, failed = true }
+local RECEIPT_OUTCOMES = { frozen = true, terminated = true, failed = true, unconfirmed = true }
 local function unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
   if not RECEIPT_OUTCOMES[outcome] then return end
   local why = (adjudicator == "lfm")
     and ("Model-adjudicated (unverified): " .. (rationale or "")):sub(1, 120)
     or "Extreme runaway, no response to the alert."
+  local tail = (outcome == "unconfirmed")
+    and "Check the memwatch menu (Frozen by memwatch) or Activity Monitor." or why
   hs.notify.new({ title = "memwatch unattended " .. action,
                   subTitle = string.format("%s (pid %d)", target.name, target.pid),
-                  informativeText = string.format("%s \u{00B7} %s", text or outcome, why),
+                  informativeText = string.format("%s \u{00B7} %s", text or outcome, tail),
                   withdrawAfter = 0 }):send()
 end
 
@@ -1678,8 +1680,9 @@ end
 -- Freeze: same identity probe and policy gate as kill, then SIGSTOP with a
 -- verified stop state and a persisted ledger entry. Memory is NOT released
 -- by a freeze; the win is stopping the growth reversibly. The final
--- onUpdate carries the outcome: frozen, exited, stale, refused, failed or
--- unverified.
+-- onUpdate carries the outcome: frozen, exited, stale, refused, failed,
+-- unverified (nothing was signaled) or unconfirmed (STOP went out; its
+-- result could not be verified).
 function M.freezePid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
   opts = opts or {}
@@ -1741,7 +1744,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     local reprobe, rwhy = resolveSignalTarget(pid, proc.liveName, proc.lstart)
     if rwhy == "unverified" then
       M.logSnapshot(string.format("freeze-unverified:%s(%d)", proc.liveName, pid))
-      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unverified")
+      onUpdate(string.format("sent STOP to %s; can't verify it stopped", proc.liveName), true, "unconfirmed")
     elseif not reprobe then
       sh(string.format("/bin/kill -CONT %d 2>/dev/null", pid))
       frozen[pid] = nil
@@ -2581,8 +2584,9 @@ end
 -- target is still alive (re-validated again), then verify death and report
 -- how much memory actually came back. onUpdate(text, done, outcome) drives
 -- whichever surface initiated the kill; the final call (done) carries what
--- happened: terminated, exited, stale, refused, failed or unverified
--- (core.answerFor turns it into the alert's answer).
+-- happened: terminated, exited, stale, refused, failed, unverified (nothing
+-- was signaled) or unconfirmed (TERM went out; its result could not be
+-- verified). core.answerFor turns it into the alert's answer.
 function M.killPid(pid, expectedName, onUpdate, opts)
   onUpdate = onUpdate or alertUpdate
   opts = opts or {}
@@ -2663,7 +2667,7 @@ function M.killPid(pid, expectedName, onUpdate, opts)
       local reclaimedGB = math.max(0, (m.availPct - availBefore) / 100 * totalGB)
       if vwhy == "unverified" then
         M.logSnapshot(string.format("kill-unverified:%s(%d)", liveName, pid))
-        onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true, "unverified")
+        onUpdate(string.format("sent TERM to %s; can't verify the result", liveName), true, "unconfirmed")
       elseif not still then
         -- Gone, or the pid now holds another process: the original exited.
         if frozen[pid] then frozen[pid] = nil; saveFrozen() end

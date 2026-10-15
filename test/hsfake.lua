@@ -149,6 +149,7 @@ function F.new()
     if sig then
       kp = tonumber(kp)
       W.sigs[#W.sigs + 1] = { t = W.now, sig = sig, pid = kp }
+      if W.onSignal then W.onSignal(sig, kp) end
       local p = W.procs[kp]
       if p then
         -- ignoreTerm: a process that survives TERM; unkillable: one that

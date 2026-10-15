@@ -1005,6 +1005,23 @@ scenario("a reused pid's newcomer gets its own grace", UNATTENDED_FREEZE, functi
   check("reuse-grace: only after a grace of its own", W.sigs[#W.sigs].t - backAt >= 55, true)
 end)
 
+-- (round 4 P1) A STOP that went out but could not be verified changed a
+-- process: the muted operator is told, truthfully, and how to check.
+scenario("an unconfirmed unattended freeze is announced", '{"unattended":"freeze","alerts":false}', function(W)
+  W.onSignal = function(sig) if sig == "STOP" then W.probeFails = true end end
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 90, function() return W.signalsTo(4242) ~= "" end)
+  W.run(3)
+  W.onSignal = nil
+  local n = W.notices("memwatch unattended freeze")[1]
+  check("unconfirmed: a receipt is posted though alerts are muted", n ~= nil, true)
+  check("unconfirmed: it says the result is unverified",
+    n ~= nil and (n.attrs.informativeText or ""):find("can't verify", 1, true) ~= nil, true)
+  W.probeFails = false
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

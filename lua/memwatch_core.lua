@@ -567,6 +567,9 @@ end
 --   snooze  refused by policy, or signaled but survived: ask again later
 --   stand   unverified (or unknown): nothing is concluded, and the alert
 --           stays as it was, visible and retryable
+--   (unconfirmed, a signal sent whose result could not be verified, also
+--   stands; unlike unverified, something may have changed, so it is
+--   announced)
 local ANSWER = { frozen = "done", terminated = "done", exited = "done",
                  stale = "rebind", refused = "snooze", failed = "snooze" }
 function M.answerFor(outcome) return ANSWER[outcome] or "stand" end

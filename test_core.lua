@@ -888,6 +888,7 @@ do
   check("answer: a policy refusal snoozes",  core.answerFor("refused"), "snooze")
   check("answer: a survivor snoozes",        core.answerFor("failed"), "snooze")
   check("answer: unverified stands",         core.answerFor("unverified"), "stand")
+  check("answer: unconfirmed stands",        core.answerFor("unconfirmed"), "stand")
   check("answer: no outcome stands",         core.answerFor(nil), "stand")
   check("answer: an unknown outcome stands", core.answerFor("bogus"), "stand")
 end

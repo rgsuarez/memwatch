@@ -22,6 +22,8 @@
 --       --candidate <name> [--out result.json]
 --   lua eval/score-episodes.lua controls --dir <episodes> --fit-dir <dev episodes>
 --   lua eval/score-episodes.lua tau --dir <dev episodes> --decisions <rows.jsonl> [--key <key.json>]
+--   gate also takes --prevalence <weights.json> ({ category = count } from field
+--   decisions) for a field-weighted diagnostic beside the pre-registered gate.
 -- Candidates: always-freeze | never-act | rule | tree | oracle | noisy-oracle |
 --   decisions (recorded model decisions, --decisions <rows.jsonl> [--key] --tau <x>)
 
@@ -179,7 +181,10 @@ local SELF_LIMITING = {
   database = true,
 }
 
-local function catOf(st) return lfm.categorize(st.snapshot.offender.name, nil) end
+local function catOf(st)
+  local off = st and st.snapshot and st.snapshot.offender
+  return off and lfm.categorize(off.name, nil) or "unknown"
+end
 
 -- Feature vector for the tree baseline (everything a model would see).
 function M.features(st)
@@ -448,19 +453,23 @@ function M.score(episodes, decide, cfg)
   -- the candidate (a bystander still latched extreme at the deferral bound);
   -- no candidate can prevent those, so they cancel in a paired comparison.
   local s = { nRunaway = 0, nSavable = 0, nLate = 0, misses = 0, wrongful = 0,
-              wrongfulByFloor = 0, perEpisode = {}, perFamily = {} }
+              wrongfulByFloor = 0, perEpisode = {}, perFamily = {}, perCategory = {} }
   for _, ep in ipairs(episodes) do
     local res = M.play(ep, decide, cfg)
     local o = M.outcome(ep, res)
     local fam = s.perFamily[ep.family] or { runaway = 0, savable = 0, misses = 0, wrongful = 0 }
     s.perFamily[ep.family] = fam
+    -- The category the model sees (production categorizer over the name).
+    local cname = ep.steps[1] and catOf(ep.steps[1]) or "unknown"
+    local cat = s.perCategory[cname] or { runaway = 0, savable = 0, misses = 0, wrongful = 0 }
+    s.perCategory[cname] = cat
     if o.class == "runaway" then
-      s.nRunaway = s.nRunaway + 1; fam.runaway = fam.runaway + 1
-      if o.missed then s.misses = s.misses + 1; fam.misses = fam.misses + 1 end
+      s.nRunaway = s.nRunaway + 1; fam.runaway = fam.runaway + 1; cat.runaway = cat.runaway + 1
+      if o.missed then s.misses = s.misses + 1; fam.misses = fam.misses + 1; cat.misses = cat.misses + 1 end
     elseif o.class == "savable" then
-      s.nSavable = s.nSavable + 1; fam.savable = fam.savable + 1
+      s.nSavable = s.nSavable + 1; fam.savable = fam.savable + 1; cat.savable = cat.savable + 1
       if o.wrongful then
-        s.wrongful = s.wrongful + 1; fam.wrongful = fam.wrongful + 1
+        s.wrongful = s.wrongful + 1; fam.wrongful = fam.wrongful + 1; cat.wrongful = cat.wrongful + 1
         if res.by == "floor" then s.wrongfulByFloor = s.wrongfulByFloor + 1 end
       end
     else
@@ -473,6 +482,27 @@ function M.score(episodes, decide, cfg)
   s.missUpper = M.cpUpper(s.misses, s.nRunaway, cfg.confidence)
   s.wrongfulRate = s.nSavable > 0 and s.wrongful / s.nSavable or 0
   return s
+end
+
+-- A diagnostic, not the gate: miss and wrongful-freeze rates re-weighted by
+-- how often each category actually reaches a decision point in the field
+-- (weights = { [category] = count }). The held-out set balances categories
+-- on purpose, so its raw rates say little about the processes a deployment
+-- meets most. Categories with weight but no episodes of a class are left out
+-- of that class's average and listed in `uncovered`.
+function M.prevalenceWeighted(s, weights)
+  local out = { missRate = nil, wrongfulRate = nil, uncovered = {} }
+  local mW, mSum, wW, wSum = 0, 0, 0, 0
+  for cname, w in pairs(weights or {}) do
+    local c = s.perCategory[cname]
+    if c and c.runaway > 0 then mW = mW + w; mSum = mSum + w * (c.misses / c.runaway) end
+    if c and c.savable > 0 then wW = wW + w; wSum = wSum + w * (c.wrongful / c.savable) end
+    if not c or c.runaway == 0 or c.savable == 0 then out.uncovered[#out.uncovered + 1] = cname end
+  end
+  table.sort(out.uncovered)
+  if mW > 0 then out.missRate = mSum / mW end
+  if wW > 0 then out.wrongfulRate = wSum / wW end
+  return out
 end
 
 -- Paired comparison of two scored runs over the same savable episodes.
@@ -524,6 +554,7 @@ local function parse(argv)
     elseif k == "--tree-depth" then a.depth = tonumber(v)
     elseif k == "--decisions" then a.decisions = v elseif k == "--key" then a.key = v
     elseif k == "--tau" then a.tau = tonumber(v)
+    elseif k == "--prevalence" then a.prevalence = v
     else error("unknown argument " .. tostring(k)) end
     i = i + 2
   end
@@ -565,6 +596,20 @@ function M.main(argv)
     local g = M.gate(eps, decide, baselines)
     for bn, b in pairs(g.baselines) do print(summary("base:" .. bn, b)) end
     print(summary("cand:" .. name, g.candidate))
+    if a.prevalence then
+      local pf = assert(io.open(a.prevalence, "r"))
+      local weights = assert(lfm.jsonDecode(pf:read("a")), "bad --prevalence file")
+      pf:close()
+      local rows = { { "cand:" .. name, g.candidate } }
+      for bn, b in pairs(g.baselines) do rows[#rows + 1] = { "base:" .. bn, b } end
+      for _, r in ipairs(rows) do
+        local pw = M.prevalenceWeighted(r[2], weights)
+        print(string.format("%-16s field-weighted: miss %s  wrongful %s%s", r[1],
+          pw.missRate and string.format("%.3f", pw.missRate) or "n/a",
+          pw.wrongfulRate and string.format("%.3f", pw.wrongfulRate) or "n/a",
+          #pw.uncovered > 0 and ("  (not covered: " .. table.concat(pw.uncovered, ",") .. ")") or ""))
+      end
+    end
     print(string.format("best baseline: %s  paired improvement point %.3f lower95 %s  ->  G7 %s",
       tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
       g.pass and "PASS" or "FAIL"))

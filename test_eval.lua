@@ -239,6 +239,19 @@ do
   check("tau sweep: and keeps the confident savable waits", best.wrongful, 0)
 end
 
+-- ---- field-weighted diagnostic ----
+do
+  local s = { perCategory = {
+    ["search-tool"] = { runaway = 10, savable = 10, misses = 0, wrongful = 5 },
+    ["build-tool"]  = { runaway = 10, savable = 10, misses = 1, wrongful = 1 },
+    vm              = { runaway = 0,  savable = 10, misses = 0, wrongful = 2 },
+  } }
+  local pw = sc.prevalenceWeighted(s, { ["search-tool"] = 3, ["build-tool"] = 1, editor = 5 })
+  check("prevalence: wrongful weighted by field share", math.abs(pw.wrongfulRate - (3 * 0.5 + 1 * 0.1) / 4) < 1e-9, true)
+  check("prevalence: miss weighted by field share", math.abs(pw.missRate - (1 * 0.1) / 4) < 1e-9, true)
+  check("prevalence: a category with no episodes is reported uncovered", pw.uncovered[1], "editor")
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

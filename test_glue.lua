@@ -2386,6 +2386,34 @@ scenario("an unverified verdict is not asked again every tick", REMOTE_LFM, func
   check("unverified-rate: but still asked again (control)", n >= 1, true)
 end)
 
+-- (round 7) A verdict is about the binding it was asked about. The same
+-- binding is not asked about again; once the alert binds a newcomer that
+-- took the pid (here a click on the stale binding is refused and rebinds
+-- it), the newcomer is asked about once, not every tick.
+local REMOTE_LFM_QUIET = '{"lfm":{"enabled":true,"advisoryIntervalSec":600,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
+  .. LFM_KEYFILE .. '"}}'
+scenario("a verdict asked about one binding is asked again once for another", REMOTE_LFM_QUIET, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242, "node")
+  W.run(12)
+  W.kern = 4
+  local asked = runUntil(W, 120, function() return #(W.httpPosts or {}) >= 1 end)
+  check("rebind: the adjudicator was asked", asked, true)
+  W.run(5)
+  local before = #W.httpPosts
+  W.run(15)
+  check("rebind: the same binding is not asked about again", #W.httpPosts - before, 0)
+  W.reusePid(4242, "node", 9000)      -- the process exits; a same-name newcomer takes its pid
+  W.run(2)
+  local mark = #W.httpPosts
+  W.click("freeze")                   -- refused on the stale binding; the alert binds the newcomer
+  check("rebind: the stale click signaled nothing", W.signalsTo(4242), "")
+  local again = runUntil(W, 10, function() return #W.httpPosts > mark end)
+  check("rebind: the newcomer's binding is asked about at once", again, true)
+  W.run(30)
+  check("rebind: once, not every tick (" .. (#W.httpPosts - mark) .. ")", #W.httpPosts - mark, 1)
+end)
+
 -- ---- PR round 5: kept horizons, closed records, the launch-order line ----
 -- A follow-up that runs after its record stopped collecting still reads
 -- the machine at its horizon (the record kept it).

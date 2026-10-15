@@ -3507,11 +3507,12 @@ local function dispatchAdjudication(offender, why)
   lfmReqNonce = lfmReqNonce + 1
   local nonce = lfmReqNonce
   local hash = lfm.snapshotHash(user)
-  -- bound: whether the alert had bound the process when it was asked; an
-  -- unverified verdict is asked again only once that changes (or per
-  -- advisory interval), never every tick.
+  -- boundLstart: the start time the alert had bound when it was asked (nil
+  -- while unbound). A verdict asked about one binding is asked again once
+  -- the alert binds another (a first binding, or a pid reused since), never
+  -- every tick.
   local ident = { name = procs.friendlyName(proc.comm), lstart = proc.lstart,
-                  verified = source == "same", bound = offender.lstart ~= nil }
+                  verified = source == "same", boundLstart = offender.lstart }
   local pid = offender.pid
   local sentAt, sentMono = clock.now(), clock.mono()
   lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }
@@ -3678,13 +3679,18 @@ lfmTick = function(state, now, interesting)
     -- re-adjudicates at critical instead of waiting out the old verdict.
     local cached = verdictCache[lastOffender.pid]
     local usable = lfm.verdictUsable(cached, lastOffender, now, lfm.cfg.verdictFreshSec)
-    local fresh = usable and cached.ident ~= nil and cached.ident.verified == true
+    -- The alert has bound a start time other than the one the verdict was
+    -- asked about (a first binding, or a pid reused since): the verdict is
+    -- about another binding, so it is neither fresh nor kept.
+    local rebound = usable and lastOffender.lstart ~= nil
+      and lastOffender.lstart ~= (cached.ident and cached.ident.boundLstart)
+    local fresh = usable and not rebound and cached.ident ~= nil and cached.ident.verified == true
     local due = (now - lfmLastAdvisoryAt) >= lfm.cfg.advisoryIntervalSec
     -- An unverified verdict never acts, and asking again verifies nothing
-    -- until something changed: it is asked again once the alert has bound
-    -- the process since it was asked, or once per advisory interval.
-    local reask = not fresh and (not usable or due
-      or (lastOffender.lstart ~= nil and not (cached.ident and cached.ident.bound)))
+    -- until something changed: it is asked again once the alert binds
+    -- another start time than the one asked about, or once per advisory
+    -- interval. One request is in flight at a time.
+    local reask = not fresh and (not usable or due or rebound)
     if (lfm.cfg.advisory and due) or (state == "critical" and reask and not lfmInFlight) then
       lfmLastAdvisoryAt = now
       dispatchAdjudication(lastOffender, state == "critical" and "critical" or "advisory")

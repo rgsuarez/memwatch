@@ -1227,6 +1227,22 @@ do
   check("fate: frozen but the pid was reused",
     (fateOf({ frozen = true, psRow = { pid = 1, comm = "/usr/bin/other" } })), "exited")
 
+  -- Follow-ups read the tracker entry only when it is provably the observed
+  -- process: the same comm, and start windows identity() calls same.
+  check("startOf: the entry's window", observe.startOf({ startLo = 1, startHi = 3, etimeSec = 9 }).hi, 3)
+  check("startOf: no window, nil", observe.startOf({ comm = "/bin/x" }), nil)
+  check("startOf: no entry, nil", observe.startOf(nil), nil)
+  local live = { comm = "/bin/x", startLo = 999, startHi = 1001, etimeSec = 9060, weightMB = 5 }
+  check("sameProcess: same comm and window", observe.sameProcess(live, "/bin/x", old0), live)
+  check("sameProcess: a different comm is absent", observe.sameProcess(live, "/bin/y", old0), nil)
+  check("sameProcess: a same-comm pid reuse is absent",
+    observe.sameProcess({ comm = "/bin/x", startLo = 1500, startHi = 1502, etimeSec = 60 }, "/bin/x", old0), nil)
+  check("sameProcess: an undecidable identity is absent",
+    observe.sameProcess(live, "/bin/x", { lo = 999, hi = 1003, etimeSec = 1 }), nil)
+  check("sameProcess: no comm at observation proves nothing",
+    observe.sameProcess({ startLo = 999, startHi = 1001, etimeSec = 9060 }, nil, old0), nil)
+  check("sameProcess: no entry is absent", observe.sameProcess(nil, "/bin/x", old0), nil)
+
   -- Jetsam report names carry their local timestamp.
   local times = observe.jetsamTimes({ "JetsamEvent-2026-10-12-235154.ips",
     "JetsamEvent-2026-10-12-023117.ips", "not-a-report.ips", "JetsamEvent-garbage.ips" })
@@ -1238,6 +1254,10 @@ do
 
   check("observe: ring max", observe.ringMax({ { v = 3 }, { v = 9 }, { v = 4 } }), 9)
   check("observe: empty ring", observe.ringMax({}), nil)
+  local ringT = { { t = 10, v = 50 }, { t = 20, v = 30 }, { t = 30, v = 40 } }
+  check("observe: ring max since an instant skips older samples", observe.ringMax(ringT, 15), 40)
+  check("observe: ring max without an instant takes every sample", observe.ringMax(ringT), 50)
+  check("observe: ring max with nothing since the instant is nil", observe.ringMax(ringT, 31), nil)
   local plan = observe.rotationPlan("/tmp/x.jsonl", 3)
   check("rotation: oldest moves first", plan[1][1] .. ">" .. plan[1][2], "/tmp/x.jsonl.2>/tmp/x.jsonl.3")
   check("rotation: live file moves last", plan[#plan][1] .. ">" .. plan[#plan][2], "/tmp/x.jsonl>/tmp/x.jsonl.1")
@@ -1301,6 +1321,60 @@ do
     body:find("hudInteracted", 1, true), nil)
   check("observe glue: the frozen ledger is recorded beside the fate",
     body:find("frozenLedger = frozen[pid] ~= nil", 1, true) ~= nil, true)
+  -- Weight and peak come only from a provably-same tracker entry, and the
+  -- peak is a running maximum since the observation, not the 60 s ring.
+  check("observe glue: the follow-up reads the tracker only through the identity gate",
+    body:find("local e = observe.sameProcess(tracker.procs[pid], comm0, start0)", 1, true) ~= nil, true)
+  local _, trackerReads = body:gsub("tracker%.procs%[pid%]", "")
+  check("observe glue: the tracker is read at observation and through the gate, nowhere else",
+    trackerReads, 2)
+  check("observe glue: weight needs presence and proven identity",
+    body:find("local weightNow = (present and e) and e.weightMB or nil", 1, true) ~= nil, true)
+  check("observe glue: the ring counts only samples since the observation",
+    body:find("observe.ringMax(e.ring, obsAt)", 1, true) ~= nil, true)
+  check("observe glue: the peak is the running maximum since the observation",
+    body:find("peakSinceMB = math.floor(peakSince)", 1, true) ~= nil, true)
+  check("observe glue: the 60 s window peak is gone", body:find("windowPeakMB", 1, true), nil)
+  -- memwatch's own signals: recorded where each signal is sent, after the
+  -- identity and policy gates, and compared with the observation time.
+  local function fnBody(header)
+    local a = src:find(header, 1, true)
+    local z = a and src:find("\nend\n", a, true)
+    return (a and z) and src:sub(a, z) or ""
+  end
+  local function recordedAtSend(text, send, record)
+    local gate = text:find("core.killAllowed(", 1, true)
+    local s0, s1 = text:find(send, 1, true)
+    local r0 = text:find(record, 1, true)
+    local _, n = text:gsub(record:gsub("%p", "%%%0"), "")
+    return gate ~= nil and s0 ~= nil and r0 ~= nil and s0 > gate and r0 > s1 and n == 1
+      and text:sub(s1 + 1, r0 - 1):match("^%s*$") ~= nil
+  end
+  check("signals glue: the order check accepts a record right after a gated send (control)",
+    recordedAtSend("core.killAllowed(p)\nSEND()\n  RECORD()\n", "SEND()", "RECORD()"), true)
+  check("signals glue: the order check refuses a record before the gate (positive control)",
+    recordedAtSend("RECORD()\ncore.killAllowed(p)\nSEND()\n", "SEND()", "RECORD()"), false)
+  check("signals glue: the order check refuses a record apart from its send (positive control)",
+    recordedAtSend("core.killAllowed(p)\nSEND()\nother()\nRECORD()\n", "SEND()", "RECORD()"), false)
+  local killBody, freezeBody = fnBody("function M.killPid("), fnBody("function M.freezePid(")
+  check("signals glue: killPid located", #killBody > 500, true)
+  check("signals glue: freezePid located", #freezeBody > 500, true)
+  check("signals glue: a terminate is recorded at its TERM, after the gates",
+    recordedAtSend(killBody, 'sh(string.format("/bin/kill -TERM %d 2>/dev/null", pid))',
+      'memwatchSignals[pid] = { at = hs.timer.secondsSinceEpoch(), action = "terminate" }'), true)
+  check("signals glue: a freeze is recorded at its STOP, after the gates",
+    recordedAtSend(freezeBody, 'sh(string.format("/bin/kill -STOP %d 2>/dev/null", pid))',
+      'memwatchSignals[pid] = { at = hs.timer.secondsSinceEpoch(), action = "freeze" }'), true)
+  local _, recordSites = src:gsub("memwatchSignals%[pid%] = {", "")
+  check("signals glue: only the two signal sites record", recordSites, 2)
+  check("observe glue: follow-ups mark memwatch's own signals since the observation",
+    body:find("memwatchSignalSince = (sig and sig.at >= obsAt) and sig.action or nil", 1, true) ~= nil, true)
+  local gcBody = fnBody("gcUnattendedState = function(")
+  check("signals glue: gcUnattendedState located", #gcBody > 200, true)
+  check("signals glue: signal records age out",
+    gcBody:find("if (now - (s.at or 0)) > MEMWATCH_SIGNAL_KEEP_SEC then memwatchSignals[pid] = nil end",
+      1, true) ~= nil, true)
+  check("signals glue: the tick hands the GC its clock", src:find("gcUnattendedState(now)", 1, true) ~= nil, true)
   -- The sampler tells its consumer how it ended and when it was launched.
   check("sampler glue: callback forwards exit code and launch time",
     src:find("onDone(table.concat(acc), exitCode, launchedAt)", 1, true) ~= nil, true)

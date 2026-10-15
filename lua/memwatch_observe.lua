@@ -124,6 +124,24 @@ function M.identity(w0, w1)
   return "unknown"
 end
 
+-- The start window a tracker entry carries from its latest ps sighting
+-- (procs.update), in the shape identity() compares; nil without one.
+function M.startOf(e)
+  if type(e) ~= "table" or type(e.startLo) ~= "number" then return nil end
+  return { lo = e.startLo, hi = e.startHi, etimeSec = e.etimeSec }
+end
+
+-- The tracker entry for an observed pid, only when it is provably the
+-- observed process: the same comm, and start windows identity() calls
+-- "same". A reused pid's new process, or an identity that cannot be
+-- decided, reads as absent, so a follow-up never takes weight or peak from
+-- a different process.
+function M.sameProcess(e, comm0, start0)
+  if type(e) ~= "table" or comm0 == nil or e.comm ~= comm0 then return nil end
+  if M.identity(start0, M.startOf(e)) ~= "same" then return nil end
+  return e
+end
+
 -- What became of an observed process at a follow-up horizon, decided only
 -- from data the tick already holds, and only from a fresh COMPLETE sample:
 -- absence from a truncated table proves nothing. Returns fate, detail.
@@ -177,10 +195,15 @@ function M.countSince(times, since, untilT)
 end
 
 -- Largest value in a growth ring (the tracker's 60 s footprint window).
-function M.ringMax(ring)
+-- With `since`, only samples taken at or after it count: a peak since an
+-- observation must not include the ring's older samples.
+function M.ringMax(ring, since)
   local best = nil
   for _, s in ipairs(ring or {}) do
-    if type(s.v) == "number" and (best == nil or s.v > best) then best = s.v end
+    if type(s.v) == "number" and (since == nil or (type(s.t) == "number" and s.t >= since))
+       and (best == nil or s.v > best) then
+      best = s.v
+    end
   end
   return best
 end

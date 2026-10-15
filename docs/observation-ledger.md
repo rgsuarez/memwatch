@@ -83,7 +83,13 @@ runs after its record stopped collecting still reads its own horizon.
   anchored to the kernel's start record). Both are the raw wall clock that
   ps's etime runs on, never a callback's held basis, so a table launched or
   delivered by the first callback to see a step still places each process
-  at its own start. The unattended-state GC uses the launch record
+  at its own start. A step back taken between a table's launch and its
+  delivery puts those two readings on two sides of it, and ps read on one
+  side or the other, so the window widens by the step's size (a wide window
+  can read the identity as unknown, never as a reuse). A process's age is
+  read on the same raw clock as its window. Ordering, and the fold's own
+  step check, compare the launch with the observation's time, so they read
+  the shifted launch record instead. The unattended-state GC uses the launch record
   the shift moves with the tracker's sightings, so a step between the launch
   and the delivery, back or forward, never puts the two on two bases. A
   launch that never started leaves no record and no handle, so the next

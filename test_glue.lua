@@ -2200,9 +2200,41 @@ scenario("ledger: a step first seen by the tick launching a slow table keeps ide
   if not nextRow then return end
   W.run(190)
   local fu = followups(W, nextRow.seq)
-  for i = 1, 3 do
-    check("launch-step: follow-up " .. i .. " sees the same process", fu[i] and fu[i].fate ~= "exited", true)
+  check("launch-step: the first follow-up sees the same process alive", fu[1] and fu[1].fate, "alive")
+  for i = 2, 3 do
+    check("launch-step: follow-up " .. i .. " never reads it gone", fu[i] and fu[i].fate ~= "exited", true)
   end
+end)
+
+-- (round 10) ps read its table before a step back its own delivery is first
+-- to see: the raw launch and delivery readings sit on two sides of the step,
+-- so the window widens by its size, and the next observation never reads
+-- the process as gone.
+scenario("ledger: a table read before a step its delivery sees keeps identity", nil, function(W)
+  local row = toDecision(W, 4242)
+  if not row then check("read-before-step: decision row", false, true); return end
+  W.run(54)                           -- before the tick ahead of the next decision point:
+  W.samplerReadDelay = 3              -- its ps reads 3 s after its launch (beyond the 1 s slack),
+  W.samplerDelay = 4                  -- and the table lands 4 s after it, the last before that point
+  W.onSamplerDeliver = function()
+    W.onSamplerDeliver = nil
+    W.samplerReadDelay, W.samplerDelay = nil, nil
+    W.wallOffset = (W.wallOffset or 0) - 100   -- between the read and the delivery
+  end
+  local nextRow
+  runUntil(W, 30, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and r.seq ~= row.seq then nextRow = r end
+    end
+    return nextRow ~= nil
+  end)
+  check("read-before-step: the step was taken out (control)", logHas(W, "clock-stepped-back:100s"), true)
+  check("read-before-step: the next decision row is written", nextRow ~= nil, true)
+  if not nextRow then return end
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("read-before-step: its follow-up never reads the process gone (" .. tostring(fu[1] and fu[1].fate) .. ")",
+    fu[1] ~= nil and fu[1].fate ~= "exited", true)
 end)
 
 -- (round 9) The jetsam blind ceiling is a raw file time: a second step back

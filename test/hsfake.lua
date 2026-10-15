@@ -402,6 +402,12 @@ function F.new()
           -- that ran late in a storm), after onSamplerDeliver (something that
           -- happens just before, such as a wall clock step).
           local blob = (not W.samplerReadsLate) and samplerBlob() or nil
+          -- samplerReadDelay: ps reads its table that long after its launch
+          -- (a fork that ran a little late), before its delivery.
+          if W.samplerReadDelay then
+            blob = nil
+            addTimer("after", W.samplerReadDelay, nil, function() blob = blob or samplerBlob() end).world = true
+          end
           t.sampler = true
           W.samplersLive = (W.samplersLive or 0) + 1
           W.samplersMax = math.max(W.samplersMax or 0, W.samplersLive)

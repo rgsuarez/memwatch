@@ -44,6 +44,15 @@ The model is an advisor inside hard rails, never an autonomous authority.
   cached per process; the grace-expiry decision consumes a fresh cached
   verdict or, if none exists, acts deterministically at once. The extreme
   detection and alerting path issues no synchronous model call ever.
+- **A verdict answers the snapshot it was given.** A cached verdict is
+  consumed only if it was computed for the same detector kind the decision
+  now sees. A verdict about a large, steady bystander is never applied to
+  the same process after it has been caught in a runaway; the offender is
+  re-adjudicated instead. Entries without a recorded kind are never used.
+- **A model wait is bounded in time.** A model wait defers the
+  deterministic policy, but only for `maxDeferSec` (120 s by default)
+  from the first wait on that offender; after that the deterministic
+  policy acts regardless.
 - **Disabled or unavailable means the base system.** If the feature is off,
   the model server is not running, a request times out, or the reply is
   malformed, memwatch behaves exactly as it does without the feature: the
@@ -60,9 +69,13 @@ The model is an advisor inside hard rails, never an autonomous authority.
 Process names and paths are attacker-controlled and reach the model as
 data. The defenses:
 
-- Names are structurally sanitized before serialization: validated as
-  UTF-8, backticks neutralized so a name cannot break the data fence, and
-  bidirectional-control characters stripped.
+- By default the model never sees a raw name at all. `redactNames` (on by
+  default, applied on every serving path, local and remote) replaces each
+  name with a category from a fixed vocabulary, so no attacker-controlled
+  string reaches the model.
+- With redaction off, names are structurally sanitized before
+  serialization: validated as UTF-8, backticks neutralized so a name cannot
+  break the data fence, and bidirectional-control characters stripped.
 - The snapshot is fenced and labeled as data, and the system prompt states
   that instruction-looking text inside the data is itself evidence of
   suspicion.
@@ -92,8 +105,21 @@ separately from memwatch's MIT code under the LFM Open License v1.0; see
 ## What it records
 
 Every adjudication (advisory or acting) lands in an append-only decision
-ledger (`memwatch-lfm.jsonl`, gitignored): the snapshot hash, model,
-latency, the raw and validated verdict, the rails applied, the effective
-action, and a 60-second outcome follow-up. The **Open value report** menu
-item renders the ledger into a self-contained dashboard. Nothing in the
-ledger or report leaves the machine.
+ledger (`memwatch-lfm.jsonl`, gitignored). Each row holds:
+
+- the exact serialized snapshot the model was given, and its hash;
+- the model, latency and validated verdict;
+- the detector kind the verdict answered;
+- the rails applied and the effective action;
+- a 60-second outcome follow-up.
+
+That makes every row replayable through a different model.
+
+The **Open value report** menu item renders the ledger into a
+self-contained dashboard. Nothing in the ledger or report leaves the
+machine.
+
+With the feature on or off, the passive observation ledger
+(`memwatch-observe.jsonl`; see the README) records every moment an
+adjudicator would have been consulted and what happened afterward. That is
+the outcome record new models are evaluated against.

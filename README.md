@@ -140,6 +140,23 @@ metric operationally defined:
 
 ![memwatch value report](docs/report-scoreboard.png)
 
+### Observation ledger (passive, default ON)
+
+Independently of adjudication, memwatch keeps a passive observation ledger,
+`memwatch-observe.jsonl` (local and gitignored). It writes a row at every
+moment an adjudicator would have been consulted, and every 45 s while
+pressure is up. Each row holds the exact redacted, pid-free snapshot a model
+would have received and the deterministic action that would have fired.
+Follow-ups at 60, 120 and 180 s record what actually became of the process
+and the machine: alive, exited or frozen; weight; available memory; and kernel
+jetsam reports.
+
+It never forks, never acts and never leaves the machine. It exists so that
+adjudicators can be judged against real outcomes rather than synthetic
+scenarios alone. Set `"observe": false` in the local config to turn it off.
+`hs -c "memwatch.testObserve()"` writes one synthetic-tagged row to prove the
+path end to end.
+
 ## Layout
 
 ```
@@ -148,12 +165,14 @@ metric operationally defined:
   lua/memwatch_procs.lua  pure: ps/top parsers, growth rings, runaway detection, ranking
   lua/memwatch_lfm.lua    pure: LFM JSON codec, prompt, serializer, validator, rails (opt-in)
   lua/memwatch_report.lua pure: the value report renderer (opt-in)
+  lua/memwatch_observe.lua pure: observation-ledger rows, follow-up fates, jetsam report parsing
   lua/memwatch.lua        Hammerspoon glue: timers, async sampling, HUD, menu, kill/freeze, LFM lifecycle, log
   test_core.lua           unit tests for the pure modules (lua test_core.lua)
   test_report.lua         unit tests for the report renderer (lua test_report.lua)
   eval/                   the model bake-off: corpus, runner, gates, methodology
   install.sh              idempotent wiring into ~/.hammerspoon/init.lua (with backup); --with-lfm adds adjudication
   memwatch.log            state transitions, runaways, kills, errors; rotates at 1 MB
+  memwatch-observe.jsonl  passive observation ledger; rotates at 4 MB, three generations kept
 ```
 
 The verdict is fork-free: signals and the state machine run every 5s tick
@@ -197,6 +216,7 @@ hs -c "memwatch.test('elevated')"    # amber title for 12s
 hs -c "memwatch.test('critical')"    # red title + notification + HUD
 hs -c "memwatch.simulate()"          # runaway-alert demo for 20s
 hs -c "memwatch.status()"            # one-line current reading
+hs -c "memwatch.testObserve()"       # one synthetic observation row, follow-ups at 2-6 s
 ```
 
 Live end-to-end drill with a real (bounded, safe) leaker: allocate ~190 MB/s

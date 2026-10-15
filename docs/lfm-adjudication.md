@@ -63,10 +63,17 @@ The model is an advisor inside hard rails, never an autonomous authority.
   once (one request is in flight at a time).
 - **A clock stepped back never extends a wait.** A verdict or a first model
   wait stamped after now reads as stale, or as spent.
-- **A model wait is bounded in time.** A model wait defers the
-  deterministic policy, but only for `maxDeferSec` (120 s by default)
-  from the first wait on that offender; after that the deterministic
-  policy acts regardless.
+- **A model wait is bounded in time, then by headroom.** A model wait
+  defers the deterministic policy for `maxDeferSec` (120 s by default)
+  from the first wait on that offender. After that the deterministic
+  policy acts once available memory is at or below `floorAvailPct` (12% by
+  default), and at once when headroom is unknown. Past the bound, headroom
+  is checked every tick, so a runaway that eats it is frozen the tick it
+  falls to the floor, not a grace window later. A burst still holding
+  more headroom than that keeps its wait: freezing it would stall work
+  without protecting the machine. `floorAvailPct` 0 restores the old floor
+  (acting at the bound regardless). The decision record names a wait held
+  this way (`deferral-floor-held-by-headroom`).
 - **Disabled or unavailable means the base system.** If the feature is off,
   the model server is not running, a request times out, or the reply is
   malformed, memwatch behaves exactly as it does without the feature: the

@@ -1732,7 +1732,13 @@ local function unattendedStep(offender, now)
   -- never none (rule 8).
   if fired and type(fired.at) == "number" and fired.at > now then fired.at = now end
   local sinceFired = now - ((fired and fired.at) or 0)
-  if sinceFired < core.cfg.cool.autoKillGraceSec then return end
+  -- A model's wait held past its bound only by headroom is re-checked every
+  -- tick: the floor acts the tick headroom falls to floorAvailPct, not at the
+  -- next grace expiry.
+  local w = unattendedWaitStreak[offender.pid]
+  local floorDue = type(w) == "table" and w.exhausted == true
+    and lfm.floorFires(lastMetrics and lastMetrics.availPct, lfm.cfg.floorAvailPct)
+  if sinceFired < core.cfg.cool.autoKillGraceSec and not floorDue then return end
   unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
   local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now)
   M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
@@ -2941,6 +2947,22 @@ resolveUnattendedAction = function(mode, offender, now)
     if eff == "wait" then
       local w, exhausted = lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)
       unattendedWaitStreak[offender.pid] = w
+      -- The floor acts once the bound has run AND headroom is at or below
+      -- floorAvailPct: a savable burst still holding headroom is not frozen
+      -- for outlasting the bound. Past the bound, unattendedStep checks the
+      -- headroom every tick (w.exhausted), so a runaway that eats it is
+      -- frozen the tick it crosses, not a grace window later.
+      local avail = lastMetrics and lastMetrics.availPct
+      if exhausted and not lfm.floorFires(avail, lfm.cfg.floorAvailPct) then
+        w.exhausted = true
+        local held = { "lfm", "deferral-floor-held-by-headroom" }
+        for _, r in ipairs(rails or {}) do held[#held + 1] = r end
+        return eff, "lfm", e.verdict.rationale, held,
+          { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence,
+            verdictKind = e.kind, snapshot = e.snapshot, deferrals = w.count,
+            deferredSec = math.floor(now - w.firstAt), floorAvailPct = lfm.cfg.floorAvailPct,
+            availPct = avail }
+      end
       if exhausted then
         -- The model's wait rationale is SUPERSEDED here, so do not attach it
         -- to the deterministic action (it would mislabel the report card).

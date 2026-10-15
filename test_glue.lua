@@ -2397,11 +2397,42 @@ end)
 -- freeze: the deferral's first wait moves with the step, so the freeze
 -- comes when the deferral ends (120 s of real time from the first wait),
 -- not a grace early, and the shift runs cleanly with a deferral in place.
+-- The deferral floor acts only at or below floorAvailPct (12%) once the
+-- bound has run. Above it a model's wait keeps standing; past the bound,
+-- headroom is checked every tick, so the floor acts the tick it falls.
+scenario("a wait past its bound holds while headroom stays above the floor", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("floor-held: the model's wait deferred the freeze", waited, true)
+  local firstWait = W.now
+  W.run(200)                        -- well past the 120 s bound
+  check("floor-held: no freeze while headroom stays above the floor", W.signalsTo(4242), "")
+  local heldRow = false
+  for _, r in ipairs(decisionRows(W)) do
+    for _, rail in ipairs(r.rails or {}) do
+      if rail == "deferral-floor-held-by-headroom" then heldRow = true end
+    end
+  end
+  check("floor-held: the decision record says headroom held it", heldRow, true)
+  local dropAt = W.now
+  W.availPct = 10                   -- the runaway eats the headroom
+  local stopped = runUntil(W, 90, function() return W.signalsTo(4242):find("STOP", 1, true) ~= nil end)
+  check("floor-held: the floor acts once headroom falls", stopped, true)
+  check("floor-held: within a tick or two of the fall, not a grace window later (" .. math.floor(W.now - dropAt) .. " s)",
+    W.now - dropAt <= 12, true)      -- two ticks at most; the grace cadence is 60 s
+  check("floor-held: and only after the bound", dropAt - firstWait >= 120, true)
+end)
+
 scenario("a step back while a wait defers the freeze keeps the deferral whole", REMOTE_LFM_FREEZE, function(W, mw)
   W.httpReply = cannedVerdict("wait")
   leaker(W, 4242)
   W.run(12)
   W.kern = 4
+  W.availPct = 8                    -- low headroom: the floor acts at the bound
   local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
   check("defer-step: the model's wait deferred the freeze", waited, true)
   local firstWait = W.now

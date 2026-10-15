@@ -45,6 +45,11 @@ M.cfg = {
   -- (see deferralExhausted). 120 s = two further grace windows at the 60 s
   -- default, the same reach the old three-wait count had at that cadence.
   maxDeferSec = 120,
+  -- Once the deferral has run its maxDeferSec, the deterministic policy acts
+  -- only at or below this much available memory (a percentage), checked every
+  -- tick: above it a model's wait keeps standing. 0 turns the gate off (the
+  -- policy then acts at the bound, as before).
+  floorAvailPct = 12,
   maxServerMB = 2048,       -- self-police circuit: server above this is killed
   spawnMinAvailPct = 10,    -- spawn floor: no server spawn below this
   -- Remote adjudicator (an OpenAI-compatible cloud endpoint). When
@@ -791,6 +796,17 @@ end
 -- read later than the checks that follow it (behind a slow probe fork)
 -- would keep the wait that should exhaust the bound from exhausting it.
 -- Returns newState, exhausted.
+-- Does the deferral floor act now? Once the bound has run, it acts at or
+-- below floorAvailPct of available memory, and when the headroom is not
+-- known (it fails closed). A floor of 0 or less acts at once, as before.
+function M.floorFires(availPct, floorAvailPct)
+  local floor = tonumber(floorAvailPct)
+  if floor == nil then floor = M.cfg.floorAvailPct end
+  if floor <= 0 then return true end
+  if type(availPct) ~= "number" then return true end
+  return availPct <= floor
+end
+
 function M.deferralStep(state, now, maxDeferSec)
   local s
   if type(state) == "table" and type(state.firstAt) == "number" then

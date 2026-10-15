@@ -3024,6 +3024,17 @@ do
 
 end
 
+-- ---- the deferral floor, gated on headroom ----
+do
+  local lfm = require("memwatch_lfm")
+  check("floor: above the threshold it holds", lfm.floorFires(30, 12), false)
+  check("floor: at the threshold it acts", lfm.floorFires(12, 12), true)
+  check("floor: below it acts", lfm.floorFires(8, 12), true)
+  check("floor: unknown headroom acts (fails closed)", lfm.floorFires(nil, 12), true)
+  check("floor: a threshold of 0 turns the gate off (acts at the bound)", lfm.floorFires(90, 0), true)
+  check("floor: the default threshold is 12%", lfm.cfg.floorAvailPct, 12)
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

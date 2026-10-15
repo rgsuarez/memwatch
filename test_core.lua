@@ -1539,7 +1539,14 @@ do
   -- The daylight saving fold and gap, in a child with a fixed zone (this
   -- process cannot change its own). A child that does not answer fails the
   -- checks: a silent child is never read as a pass.
-  local lua = arg and arg[-1] or "lua"
+  -- The interpreter is the lowest arg index (options sit between it and
+  -- the script).
+  local lua = "lua"
+  if arg then
+    local i = -1
+    while arg[i - 1] ~= nil do i = i - 1 end
+    lua = arg[i] or lua
+  end
   local code = 'package.path = "lua/?.lua;" .. package.path; local c = require("memwatch_core"); '
     .. 'local function s(v) return v == nil and "nil" or "num" end; '
     .. 'print("ctl " .. s(c.lstartEpoch("Sun Nov  1 03:00:00 2026")) .. " fold " .. s(c.lstartEpoch("Sun Nov  1 01:30:00 2026")) '

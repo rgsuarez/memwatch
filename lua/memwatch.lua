@@ -1020,25 +1020,28 @@ end
 local function surfaceUpdate(target, click)
   local gen = runGen
   return function(text, done, outcome)
-    hs.alert.show("memwatch: " .. text, 2.5)
     if not done then
       if gen == runGen then extendInteraction(target) end
-      return
+    else
+      local answer = core.answerFor(outcome)
+      if answer == "done" and outcome ~= "frozen" then markGone(target, clock.now()) end
+      -- The click settles whatever run it ends in: its veto may stand against
+      -- an action of the run before a restart.
+      settleInteraction(target, outcome, click)
+      if gen == runGen then
+        if answer == "rebind" then
+          identityRefused(target)
+        elseif (answer == "done" or answer == "snooze")
+           and core.sameIdentity(hudOffender, target) and not hudHold then
+          -- Only a HUD bound to this very process: an outcome never answers a
+          -- HUD that might name another process (unbound, or rebound).
+          dismissHud(answer, hudOffender)
+        end
+      end
     end
-    local answer = core.answerFor(outcome)
-    if answer == "done" and outcome ~= "frozen" then markGone(target, clock.now()) end
-    -- The click settles whatever run it ends in: its veto may stand against
-    -- an action of the run before a restart.
-    settleInteraction(target, outcome, click)
-    if gen ~= runGen then return end
-    if answer == "rebind" then
-      identityRefused(target)
-    elseif (answer == "done" or answer == "snooze")
-       and core.sameIdentity(hudOffender, target) and not hudHold then
-      -- Only a HUD bound to this very process: an outcome never answers a
-      -- HUD that might name another process (unbound, or rebound).
-      dismissHud(answer, hudOffender)
-    end
+    -- Shown last: what the outcome settles never waits on, or is lost to,
+    -- the on-screen alert.
+    hs.alert.show("memwatch: " .. text, 2.5)
   end
 end
 
@@ -2798,6 +2801,17 @@ function M.resumePid(pid, onUpdate, shown)
   if not e then
     if shown then markInteracted(shown, nil, true) end
     onUpdate(string.format("pid %d is not in the frozen ledger", pid), true)
+    return
+  end
+  -- A row built for another process than the one the slot holds now (the
+  -- pid was frozen again, for a newcomer, since the menu opened) is stale:
+  -- the operator answered for the process it showed, and the one frozen now
+  -- stays frozen.
+  if shown and not core.sameIdentity(shown, e) then
+    markInteracted(shown, nil, true)
+    M.logSnapshot(string.format("resume-skip:%s(%d):stale-row", shown.name or "?", pid))
+    onUpdate(string.format("that row was for %s, no longer frozen; pid %d now holds %s, which stays frozen",
+      shown.name or "?", pid, e.name or "?"), true)
     return
   end
   -- A resume is the operator's answer, from whichever surface: it vetoes

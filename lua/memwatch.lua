@@ -45,6 +45,7 @@ local lastExtreme  = false -- extreme runaway currently on the books
 local lastSampleAt = 0    -- when a sampler callback last landed
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
+local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
 local alertsEnabled = true  -- desktop alert surfaces (HUD + banners); menu toggle, persisted
 local alertActive   = false -- a critical alert episode is live (HUD up, or muted-but-armed)
 local critNotif     = nil   -- the live critical banner; one at a time, withdrawn on recovery
@@ -272,7 +273,7 @@ local function saveLocalConfig()
       -- cannot see; rewriting it from defaults would silently drop them.
       logError("local-config-save", "not saved: existing file does not decode ("
         .. tostring(derr) .. ")")
-      return
+      return false
     end
     conf = existing
   end
@@ -284,11 +285,12 @@ local function saveLocalConfig()
   conf.lfm.resident = lfm.cfg.resident
   conf.lfm.promptVariant = lfm.cfg.promptVariant
   local enc = lfm.jsonEncode(conf)
-  if not enc then return end
+  if not enc then return false end
   local f = io.open(LOCAL_CONFIG_PATH, "w")
-  if not f then return end
+  if not f then return false end
   f:write(enc, "\n")
   f:close()
+  return true
 end
 
 -- RGB (0-1) per level. Apple system green / orange / red.
@@ -1415,16 +1417,23 @@ local function tick()
     end
     -- Not muted: with desktop alerts off, this page is the only sign that
     -- memwatch has gone blind while pressure is up.
+    -- It stays up while the condition holds (an absent operator must still
+    -- find it), refreshed every 300s as one page, and goes on recovery.
     if (sig.kernWarn or sig.availLow) and (now - lastStaleNotifyAt) > 300 then
       lastStaleNotifyAt = now
-      hs.notify.new({
+      if staleNotif then pcall(function() staleNotif:withdraw() end) end
+      staleNotif = hs.notify.new({
         title           = "memwatch degraded during pressure",
         subTitle        = string.format("process attribution stale %.0fs \u{00B7} avail %.0f%%",
                                         now - lastSampleAt, m.availPct),
         informativeText = "The system gauge is live but per-process detection is not. Open Activity Monitor if pressure climbs.",
-        withdrawAfter   = 30,   -- re-posts every 300s while degraded; self-cleaning
+        withdrawAfter   = 0,
       }):send()
     end
+  elseif staleNotif then
+    pcall(function() staleNotif:withdraw() end)
+    staleNotif = nil
+    lastStaleNotifyAt = 0
   end
 
   -- Attribution stream lifecycle: spawn at the onset of anything interesting
@@ -2456,7 +2465,7 @@ lfmTick = function(state, now, interesting)
           informativeText = string.format(
             "llama-server hit %d MB (cap %d); killed and latched offline.",
             math.floor(footprintMB), lfm.cfg.maxServerMB),
-          withdrawAfter = 30 }):send()
+          withdrawAfter = 0 }):send()
         retireLfmServer("self-police")
         lfmOffline = true
         return
@@ -2938,7 +2947,9 @@ function M.setAlertsEnabled(on)
     -- back on the next tick, so the banner must not lag behind a cooldown.
     lastNotifyAt = 0
   end
-  saveLocalConfig()
+  if not saveLocalConfig() then
+    hs.alert.show("memwatch: couldn't save the alerts setting (local config unreadable); it lasts until reload", 4)
+  end
   M.logSnapshot("alerts-" .. (alertsEnabled and "enabled" or "disabled"))
   return alertsEnabled
 end
@@ -2947,7 +2958,9 @@ end
 -- local config so the choice survives reloads.
 function M.setLfmEnabled(on)
   lfm.cfg.enabled = on == true
-  saveLocalConfig()
+  if not saveLocalConfig() then
+    hs.alert.show("memwatch: couldn't save the LFM setting (local config unreadable); it lasts until reload", 4)
+  end
   M.logSnapshot("lfm-" .. (lfm.cfg.enabled and "enabled" or "disabled"))
   return lfm.cfg.enabled
 end

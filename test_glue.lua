@@ -910,6 +910,37 @@ scenario("a simulation withdraws a real banner", nil, function(W, mw)
   check("simulate: the real banner is withdrawn", b ~= nil and b.withdrawn == true, true)
 end)
 
+-- ---- surfaces: the degraded page lasts as long as the condition ----
+-- (round 3) A 30-second page every 300 s reached an absent operator about
+-- one time in ten. It now stays up, as one page, and goes on recovery.
+scenario("the degraded page stays until recovery", '{"alerts":false}', function(W)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.run(10)
+  W.samplerDelay = 1e6              -- the sampler fork starves
+  runUntil(W, 80, function() return #W.notices("memwatch degraded") >= 1 end)
+  W.run(240)
+  local live = 0
+  for _, n in ipairs(W.notices("memwatch degraded")) do if not n.withdrawn then live = live + 1 end end
+  check("degraded: exactly one page is up minutes later", live, 1)
+  W.samplerDelay = 0.05
+  for _, t in ipairs(W.timers) do        -- deliver the starved sample now
+    if not t.stopped and t.kind == "after" and t.at > W.now + 1e5 then t.at = W.now + 0.05 end
+  end
+  W.run(30)
+  live = 0
+  for _, n in ipairs(W.notices("memwatch degraded")) do if not n.withdrawn then live = live + 1 end end
+  check("degraded: the page goes once the sampler recovers", live, 0)
+end)
+
+scenario("a toggle that cannot be saved says so", '{"unattended":"off","remoteServer":', function(W, mw)
+  mw.setAlertsEnabled(false)
+  local said = false
+  for _, a in ipairs(W.alerts) do if a.text:find("couldn't save", 1, true) then said = true end end
+  check("toggle: the operator is told the setting lasts only until reload", said, true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

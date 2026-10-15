@@ -858,6 +858,58 @@ scenario("menu rows act only on the identity bound at open", nil, function(W)
   check("rows: a row bound to the live process acts", W.signalsTo(4242), "TERM")
 end)
 
+-- ---- lifecycle: the run's end is the episode's end ----
+-- (round 3) A restart in a sustained critical episode starts a fresh one:
+-- the banner comes back with the HUD, past the old history and cooldown.
+scenario("a restart starts a fresh episode", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(6)
+  local before = W.liveBanners()[1]
+  check("restart: a banner is up before the restart", before ~= nil, true)
+  mw.start()
+  W.run(1)
+  check("restart: stop withdrew it", before ~= nil and before.withdrawn == true, true)
+  check("restart: the restarted run raises the HUD again",
+    runUntil(W, 30, function() return W.hudShowing() and bodyNames(W, "leaker") end), true)
+  check("restart: and posts the banner again", runUntil(W, 30, function() return #W.liveBanners() == 1 end), true)
+end)
+
+-- (round 3) An action narrative from before a restart must not hide or
+-- answer the restarted run's alert when it ends.
+scenario("a narrative from a stopped run touches nothing", nil, function(W, mw)
+  W.addProc(4242, "wedged", 2000, { ignoreTerm = true, unkillable = true })
+  W.grow(4242, 220)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "wedged") end)
+  W.run(5)
+  W.click("kill")
+  W.run(2)
+  mw.start()                        -- restart mid-narrative
+  runUntil(W, 30, function() return W.hudShowing() and bodyNames(W, "wedged (pid") end)
+  W.run(25)                         -- the old kill fails and its narrative ends
+  check("narrative: the restarted run's HUD is still up", W.hudShowing(), true)
+  check("narrative: and still names the process", bodyNames(W, "wedged (pid 4242)"), true)
+end)
+
+-- (round 3 P1) A simulation during a real alert must not leave the real
+-- banner's Force Quit up behind the synthetic HUD.
+scenario("a simulation withdraws a real banner", nil, function(W, mw)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  runUntil(W, 40, function() return bodyNames(W, "leaker") end)
+  W.run(6)
+  local b = W.liveBanners()[1]
+  check("simulate: a real, actionable banner is up", b ~= nil and b.attrs.hasActionButton == true, true)
+  mw.simulate(5)
+  W.run(1)
+  check("simulate: the real banner is withdrawn", b ~= nil and b.withdrawn == true, true)
+end)
+
 if fails == 0 then
   print("\nALL PASS")
 else

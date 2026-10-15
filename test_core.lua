@@ -1202,8 +1202,16 @@ do
   check("hud glue: the refresh never drops the bound table (control included)",
     ("hudOffender = offender or hudOffender"):find("hudOffender = offender or hudOffender", 1, true) ~= nil
       and surfaces:find("hudOffender = offender or hudOffender", 1, true) == nil, true)
-  check("hud glue: the episode's end forgets its memory",
-    surfaces:find("hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil", 1, true) ~= nil, true)
+  local reset = body("local function resetEpisode()")
+  check("episode glue: resetEpisode located", #reset > 100, true)
+  check("episode glue: the episode's end forgets its HUD memory",
+    reset:find("hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil", 1, true) ~= nil
+      and reset:find("exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil", 1, true) ~= nil, true)
+  check("episode glue: the episode ends at settle",
+    surfaces:find("if settled and not hudHold then resetEpisode() end", 1, true) ~= nil, true)
+  check("episode glue: and with the run", body("function M.stop()"):find("resetEpisode()", 1, true) ~= nil, true)
+  check("episode glue: stop drops a pending model request",
+    body("function M.stop()"):find("lfmInFlight = nil", 1, true) ~= nil, true)
   local closeAt = src:find('elseif id == "close" then', 1, true)
   local closeBody = closeAt and src:sub(closeAt, closeAt + 260) or ""
   check("hud glue: a close is a snooze", closeBody:find('dismissHud("snooze")', 1, true) ~= nil, true)
@@ -1228,7 +1236,7 @@ do
     notify:find("canAct = canAct, notified = notified,", 1, true) ~= nil, true)
   check("banner glue: every post joins the episode history",
     notify:find("critNotified[#critNotified + 1] = critNotifOff or { none = true }", 1, true) ~= nil, true)
-  check("banner glue: the episode's end clears the history", surfaces:find("critNotified = {}", 1, true) ~= nil, true)
+  check("banner glue: the episode's end clears the history", reset:find("critNotified = {}", 1, true) ~= nil, true)
   local raiseBody = body("local function raiseHud(offender, titleText)")
   check("hud glue: a fresh raise binds identity anew",
     raiseBody:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
@@ -1236,7 +1244,7 @@ do
     ("bindOffender(offender, hudEpisodeOff)"):find("bindOffender(offender, hudEpisodeOff)", 1, true) ~= nil
       and raiseBody:find("bindOffender(offender, hudEpisodeOff)", 1, true) == nil, true)
   local test = body("function M.test(level, seconds)")
-  local clearAt = test:find("critNotif, critNotifOff = nil, nil", 1, true)
+  local clearAt = test:find("resetEpisode()", 1, true)
   local postAt = test:find("notifyCrit(lastMetrics)", 1, true)
   check("self-test glue: a fresh run clears the previous banner first",
     clearAt ~= nil and postAt ~= nil and clearAt < postAt, true)
@@ -1256,7 +1264,9 @@ do
   check("mute glue: unmuting lets the banner return with the HUD", mute:find("lastNotifyAt = 0", 1, true) ~= nil, true)
   check("mute glue: muting forgets the episode history so unmute restores the banner",
     mute:find("critNotified = {}", 1, true) ~= nil, true)
-  check("self-test glue: a fresh run clears the episode history", test:find("critNotified = {}", 1, true) ~= nil, true)
+  check("self-test glue: a fresh run clears the episode history", test:find("resetEpisode()", 1, true) ~= nil, true)
+  check("simulate glue: a simulation starts a fresh episode too",
+    body("function M.simulate(seconds)"):find("resetEpisode()", 1, true) ~= nil, true)
 end
 
 -- ---- episode banner: the cooldown ends with the episode ----
@@ -1266,14 +1276,21 @@ end
 do
   -- True when the settle branch resets the cooldown under the settle gate
   -- itself, not under a live-banner condition that skips it.
-  local function resetsOnSettle(body)
-    local gate = body:find("if settled then", 1, true) or body:find("if settled and not hudHold then", 1, true)
-    local reset = body:find("lastNotifyAt = 0", 1, true)
-    return gate ~= nil and reset ~= nil and gate < reset
-  end
   local f = assert(io.open("lua/memwatch.lua", "r"))
   local src = f:read("a")
   f:close()
+  local rs = src:find("local function resetEpisode()", 1, true)
+  local re = rs and src:find("\nend\n", rs, true)
+  local resetBody = (rs and re) and src:sub(rs, re) or ""
+  local function resetsOnSettle(body)
+    local gate = body:find("if settled then", 1, true) or body:find("if settled and not hudHold then", 1, true)
+    local reset = body:find("lastNotifyAt = 0", 1, true)
+    local viaEpisode = body:find("resetEpisode()", 1, true)
+    if gate and viaEpisode and gate < viaEpisode then
+      return resetBody:find("lastNotifyAt = 0", 1, true) ~= nil
+    end
+    return gate ~= nil and reset ~= nil and gate < reset
+  end
   local s = src:find("local settled = (now - hudBelowCritSince) >= 10", 1, true)
   local e = s and src:find("\nend\n", s, true)
   local body = (s and e) and src:sub(s, e) or ""

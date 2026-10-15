@@ -757,9 +757,18 @@ local function buildHud()
       end
       markInteracted(target)
       hudHold = true
+      -- The narrative belongs to this run: after a stop, start or
+      -- diagnostic it touches nothing (the signal engine still finishes the
+      -- action it started on the verified identity).
+      local gen = runGen
       local narrate = function(text, done, outcome)
+        if gen ~= runGen then return end
         if hud then hud[3].text = text end
-        if done then afterHeld(4, guard("hud-close", function() settleAction(target, outcome) end)) end
+        if done then
+          afterHeld(4, guard("hud-close", function()
+            if gen == runGen then settleAction(target, outcome) end
+          end))
+        end
       end
       if isFreeze then
         M.freezePid(target.pid, target.name, narrate,
@@ -1145,6 +1154,21 @@ end
 -- breadcrumb. One reusable HUD, raise-cooldown gated, a new offender
 -- preempts the cooldown, and the body tracks live numbers unless a kill
 -- narrative owns it.
+-- End the episode: its banner goes, and every record it kept (the banner
+-- history and cooldown, the snooze, the grace clocks and answered marks,
+-- the pending rebind and the bind throttle) is forgotten, so the next
+-- episode starts clean. The episode settling and the run ending (stop,
+-- and so start; a self-test; a simulation) both end it.
+local function resetEpisode()
+  if critNotif then pcall(function() critNotif:withdraw() end) end
+  critNotif, critNotifOff = nil, nil
+  critNotified = {}
+  lastNotifyAt = 0
+  hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil
+  bindTriedAt = {}
+  exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil
+end
+
 -- The unattended receipt, posted when the action completes and saying what
 -- happened. A freeze or terminate that changed a process always notifies,
 -- even with desktop alerts muted (silence there turns a muted alert into a
@@ -1222,7 +1246,14 @@ local function unattendedStep(offender, now)
   end
   hudHold = true
   local target = { pid = offender.pid, name = offender.name, lstart = lstart, kind = offender.kind }
+  local gen = runGen
   local narrate = function(text, done, outcome)
+    if gen ~= runGen then
+      -- The run ended mid-action: still say what memwatch did, but leave
+      -- the new run's alert alone.
+      if done then unattendedReceipt(action, target, adjudicator, rationale, outcome, text) end
+      return
+    end
     if hud then hud[3].text = "AUTO: " .. text end
     if not done then return end
     if outcome == "failed" then
@@ -1231,7 +1262,9 @@ local function unattendedStep(offender, now)
     end
     unattendedReceipt(action, target, adjudicator, rationale, outcome, text)
     -- memwatch's own action answers the alert like an operator's would.
-    afterHeld(6, guard("hud-close", function() settleAction(target, outcome) end))
+    afterHeld(6, guard("hud-close", function()
+      if gen == runGen then settleAction(target, outcome) end
+    end))
   end
   -- The bound start time also protects the autonomous signal (and its
   -- TERM->KILL escalation seconds later) from acting on a pid reused since
@@ -1331,16 +1364,7 @@ local function alertSurfaces(state, now)
     -- The episode's end also ends its cooldown and its HUD memory, so the
     -- next episode posts and raises on entry instead of inheriting the last
     -- episode's quiet period.
-    if settled and not hudHold then
-      if critNotif then
-        pcall(function() critNotif:withdraw() end)
-        critNotif, critNotifOff = nil, nil
-      end
-      critNotified = {}
-      lastNotifyAt = 0
-      hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil
-      bindTriedAt = {}
-    end
+    if settled and not hudHold then resetEpisode() end
   end
 end
 
@@ -2644,11 +2668,14 @@ function M.start()
 end
 
 function M.stop()
-  runGen = runGen + 1   -- orphans any pending self-test or simulate resume
+  -- A new generation orphans any pending self-test or simulate resume, and
+  -- turns every action narrative from this run into a no-op when it ends.
+  runGen = runGen + 1
   if hud then hud:hide() end
   alertActive, hudOffender, hudHold = false, nil, false
-  if critNotif then pcall(function() critNotif:withdraw() end) end
-  critNotif, critNotifOff = nil, nil
+  hudBelowCritSince, lastHudRaiseAt = nil, 0
+  resetEpisode()        -- the run's end is the episode's end
+  lfmInFlight = nil     -- a late reply from this run is discarded, not cached
   if pollTimer then pollTimer:stop(); pollTimer = nil end
   if flashTimer then flashTimer:stop(); flashTimer = nil end
   if sampleTask then pcall(function() sampleTask:terminate() end); sampleTask = nil end
@@ -2729,11 +2756,7 @@ function M.test(level, seconds)
     -- A fresh episode: clear any banner and HUD memory an earlier run left,
     -- or a back-to-back self-test would see its own stale banner and post
     -- nothing.
-    if critNotif then pcall(function() critNotif:withdraw() end) end
-    critNotif, critNotifOff = nil, nil
-    critNotified = {}
-    lastNotifyAt = 0
-    hudEpisodeOff, hudSnooze = nil, nil
+    resetEpisode()
     -- A synthetic offender: its surfaces never signal, whatever process may
     -- really hold pid 99999 (no binding, no banner action, inert buttons).
     lastOffender = { pid = 99999, name = "FakeProc", weightMB = 22 * 1024,
@@ -2767,6 +2790,9 @@ function M.simulate(seconds)
   smState.since = hs.timer.secondsSinceEpoch()
   local fake = { pid = 99999, name = "SimRunaway", weightMB = 22 * 1024,
                  slopeMBmin = 12000, kind = "extreme", synthetic = true }
+  -- A fresh episode, as for the self-test: a real episode's banner (and its
+  -- Force Quit) does not stay up behind the simulation.
+  resetEpisode()
   lastOffender = fake
   titleSnap = { offenderName = fake.name, offenderGB = fake.weightMB / 1024, causeTag = "SWAP" }
   applyFlash("critical")

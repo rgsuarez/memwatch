@@ -164,10 +164,13 @@ end
 -- (sinceLastSec is nil when it has no live stamp; see liveStamp). The
 -- unattended mode is deliberately not an input: the ledger records what an
 -- adjudicator would face under every mode, including off, and a decision
--- row marks exactly the ticks where the live gate would act.
--- a: { enabled, gate ("open" | "unbound" | "closed"), sinceLastSec, graceSec }
+-- row marks exactly the ticks where the live gate would act. forced: the
+-- live step acts this tick ahead of its grace window (the deferral floor), so
+-- the row is due whenever the gate is open.
+-- a: { enabled, gate ("open" | "unbound" | "closed"), sinceLastSec, graceSec, forced }
 function M.decisionDue(a)
   if type(a) ~= "table" or a.enabled ~= true or a.gate ~= "open" then return false end
+  if a.forced == true then return true end
   if type(a.graceSec) ~= "number" then return false end
   -- A stamp after now (the wall clock stepped back since) counts as elapsed,
   -- as the unattended step's own grace stamp does.

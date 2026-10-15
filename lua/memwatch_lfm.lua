@@ -50,6 +50,10 @@ M.cfg = {
   -- tick: above it a model's wait keeps standing. 0 turns the gate off (the
   -- policy then acts at the bound, as before).
   floorAvailPct = 12,
+  -- ...but never past this long from the first wait, whatever the headroom:
+  -- a model holds the decision for a while, never for good. At or below
+  -- maxDeferSec it acts at the bound.
+  maxHoldSec = 600,
   maxServerMB = 2048,       -- self-police circuit: server above this is killed
   spawnMinAvailPct = 10,    -- spawn floor: no server spawn below this
   -- Remote adjudicator (an OpenAI-compatible cloud endpoint). When
@@ -777,7 +781,8 @@ end
 -- The wait-deferral bound, in SECONDS since the first model wait at grace
 -- expiry. A model wait defers the deterministic policy (protecting a
 -- false-positive extreme such as a build burst), but must never capture the
--- decision indefinitely while a true runaway grinds the machine down. The
+-- decision indefinitely while a true runaway grinds the machine down: past
+-- the bound the floor decides (floorActs: headroom, then maxHoldSec). The
 -- old bound counted waits; with verdicts cached for 90 s against a 60 s
 -- grace cadence, one cached wait could count twice and stretch the bound to
 -- about 240 s. Elapsed time cannot double-count. A first wait stamped
@@ -797,8 +802,51 @@ function M.floorFires(availPct, floorAvailPct)
   local floor = tonumber(floorAvailPct)
   if floor == nil then floor = M.cfg.floorAvailPct end
   if floor <= 0 then return true end
-  if type(availPct) ~= "number" then return true end
+  if type(availPct) ~= "number" or availPct ~= availPct then return true end
   return availPct <= floor
+end
+
+-- The headroom the floor may read from a metrics table: nil (unknown) unless
+-- the memory size was known when it was read (availKnown), since availPct
+-- reads 100 when it was not. No reading yet is unknown too.
+function M.floorHeadroom(metrics)
+  if type(metrics) ~= "table" or metrics.availKnown ~= true then return nil end
+  local a = metrics.availPct
+  if type(a) ~= "number" or a ~= a then return nil end
+  return a
+end
+
+-- Why the floor acts on a wait past its bound, or nil while it may hold:
+--   "no-floor"          floorAvailPct is 0 or less: act at the bound, as before;
+--   "hold-cap"          maxHoldSec has run since the first wait, or the first
+--                       wait is stamped after now (a step that cannot be
+--                       measured never holds the policy off);
+--   "unknown-headroom"  the headroom cannot be read (fails closed);
+--   "headroom"          available memory is at or below floorAvailPct.
+-- state is the deferral { firstAt, count }; cfg defaults to M.cfg.
+function M.floorActs(state, metrics, now, cfg)
+  cfg = cfg or M.cfg
+  local floor = tonumber(cfg.floorAvailPct) or M.cfg.floorAvailPct
+  if floor <= 0 then return "no-floor" end
+  local first = type(state) == "table" and state.firstAt or nil
+  local cap = tonumber(cfg.maxHoldSec) or M.cfg.maxHoldSec
+  if type(first) ~= "number" or type(now) ~= "number" or now < first or (now - first) >= cap then
+    return "hold-cap"
+  end
+  local headroom = M.floorHeadroom(metrics)
+  if headroom == nil then return "unknown-headroom" end
+  if M.floorFires(headroom, floor) then return "headroom" end
+  return nil
+end
+
+-- Does the floor act this tick, ahead of the grace window, on a wait the last
+-- decision held past its bound (state.exhausted)? Only while the adjudicator
+-- is enabled: with it off, the base system decides at its own cadence.
+function M.floorDue(state, metrics, now, cfg)
+  cfg = cfg or M.cfg
+  if cfg.enabled ~= true then return false end
+  if type(state) ~= "table" or state.exhausted ~= true then return false end
+  return M.floorActs(state, metrics, now, cfg) ~= nil
 end
 
 -- One model wait at grace expiry, folded into the per-offender deferral

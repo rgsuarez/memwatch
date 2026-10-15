@@ -65,25 +65,42 @@ The model is an advisor inside hard rails, never an autonomous authority.
   process never acts on another.
 - **A clock stepped back never extends a wait.** A verdict or a first model
   wait stamped after now reads as stale, or as spent.
-- **A model wait is bounded in time, then by headroom.** A model wait
-  defers the deterministic policy for `maxDeferSec` (120 s by default)
-  from the first wait on that offender. After that the deterministic
-  policy acts once available memory is at or below `floorAvailPct` (12% by
-  default), and at once when headroom is unknown. Past the bound, headroom
-  is checked every tick, so a runaway that eats it is frozen the tick it
-  falls to the floor, not a grace window later. That check ends the wait
-  it was holding: after any decision, the next one waits out the grace
-  again unless headroom holds the wait again, so an action that fails is
-  never retried every tick. A burst still holding
-  more headroom than that keeps its wait: freezing it would stall work
-  without protecting the machine. `floorAvailPct` 0 restores the old floor
-  (acting at the bound regardless). The decision record names a wait held
-  this way (`deferral-floor-held-by-headroom`).
+- **A model wait is bounded in time, then by headroom, then in time
+  again.** A model wait defers the deterministic policy for `maxDeferSec`
+  (120 s by default) from the first wait on that offender. Past that bound
+  the floor decides, and the deterministic policy acts when any of these
+  holds:
+  - available memory is at or below `floorAvailPct` (12% by default);
+  - headroom cannot be read (the memory size was unreadable, so the
+    reading is not a real 100%): the floor fails closed;
+  - `maxHoldSec` (600 s by default) has run since the first wait, whatever
+    the headroom: a model holds the decision for a while, never for good.
+    A first wait stamped after now (a clock step that could not be taken
+    out) counts as run.
+
+  Otherwise the wait holds: a burst still holding more headroom than the
+  floor would stall work for nothing if frozen.
+- **A held wait is re-checked every tick.** Past the bound, the floor is
+  checked every tick, so a runaway that eats the headroom is frozen the
+  tick it falls to the floor, not a grace window later. That check ends
+  the wait it was holding: after any decision, the next one waits out the
+  grace again unless the floor holds the wait again, so an action that
+  fails is never retried every tick. Each such act is a decision point
+  the observation ledger records on its own tick.
+- **The records say why.** A held wait's decision record carries the rail
+  `deferral-floor-held-by-headroom`. An act past the bound carries
+  `deferral-floor-fired-by-headroom`, `-by-unknown-headroom` or
+  `-by-hold-cap`. Both carry the threshold, the hold cap, the deferred
+  seconds and the headroom read (`headroomPct`). `floorAvailPct` 0 restores
+  the old floor: the policy acts at the bound regardless, with no floor
+  rail.
 - **Disabled or unavailable means the base system.** If the feature is off,
   the model server is not running, a request times out, or the reply is
   malformed, memwatch behaves exactly as it does without the feature: the
   deterministic unattended policy acts (or the HUD simply waits for you),
-  and one rate-limited log line notes the degradation.
+  and one rate-limited log line notes the degradation. Turning the feature
+  off takes effect at once: a verdict cached before the switch decides
+  nothing after it, and a held wait arms no every-tick check.
 - **memwatch protects its own adjudicator.** The model server is filtered
   out of the runaway and ranked lists and refused by the kill-policy gate,
   so memwatch can never freeze or kill the process it depends on. An

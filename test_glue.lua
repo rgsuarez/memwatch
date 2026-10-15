@@ -2464,8 +2464,45 @@ local function unattendedRow(W, adjudicator)
     if r.adjudicator == adjudicator then return r end
   end
 end
+-- Decision rows that carry a rail; the last row by an adjudicator; the
+-- observation ledger's decision rows for a pid.
+local function railRows(W, rail)
+  local out = {}
+  for _, r in ipairs(decisionRows(W)) do
+    for _, x in ipairs(r.rails or {}) do
+      if x == rail then out[#out + 1] = r; break end
+    end
+  end
+  return out
+end
+local function lastRowBy(W, adjudicator)
+  local last
+  for _, r in ipairs(decisionRows(W)) do
+    if r.adjudicator == adjudicator then last = r end
+  end
+  return last
+end
+local function obsDecisions(W, pid)
+  local out = {}
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.point == "decision" and r.pid == pid then out[#out + 1] = r end
+  end
+  return out
+end
+local function stopsWithin(W, sec)
+  return runUntil(W, sec, function() return W.signalsTo(4242):find("STOP", 1, true) ~= nil end)
+end
 local REMOTE_LFM_FREEZE = '{"unattended":"freeze","lfm":{"enabled":true,"advisoryIntervalSec":600,'
   .. '"remoteServer":"https://lfm.invalid","remoteKeyFile":"' .. LFM_KEYFILE .. '"}}'
+-- A model's wait held past its bound by headroom (30%), on the decision tick.
+local function toHeldWait(W)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  return runUntil(W, 300, function() return #railRows(W, "deferral-floor-held-by-headroom") > 0 end)
+end
 
 -- A fresh verdict on the offender's own snapshot is the model's call at
 -- grace expiry: its wait defers the deterministic freeze.
@@ -2547,6 +2584,135 @@ scenario("the floor's every-tick check ends with the wait it held", REMOTE_LFM_F
   W.run(40)                                      -- inside one grace window of that try
   check("floor-once: and is not tried again every tick (" .. (attempts() - before) .. " more in "
     .. math.floor(W.now - at) .. " s)", attempts() - before, 0)
+end)
+
+-- A held wait's record says what held it, and a floor act inside the grace
+-- window is a decision point the observation ledger records on its tick.
+scenario("a held wait's record, and the ledger row for a floor act mid-window", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-rec: headroom holds the wait", toHeldWait(W), true)
+  local r = railRows(W, "deferral-floor-held-by-headroom")[1] or {}
+  check("floor-rec: past the bound (" .. tostring(r.deferredSec) .. " s)", (r.deferredSec or 0) >= 120, true)
+  check("floor-rec: with the threshold in force", r.floorAvailPct, 12)
+  check("floor-rec: and the hold cap", r.maxHoldSec, 600)
+  check("floor-rec: the headroom it read (" .. tostring(r.headroomPct) .. ")",
+    type(r.headroomPct) == "number" and math.abs(r.headroomPct - 30) < 1, true)
+  check("floor-rec: availPct stays the row's whole-number reading", r.availPct, math.floor(r.availPct or -1))
+  W.run(25)                         -- mid-window: no grace boundary near
+  local before = #obsDecisions(W, 4242)
+  W.availPct = 10
+  check("floor-rec: the floor acts on the fall", stopsWithin(W, 15), true)
+  check("floor-rec: and the ledger records that decision point", #obsDecisions(W, 4242) - before, 1)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  local fired = false
+  for _, x in ipairs(a.rails or {}) do if x == "deferral-floor-fired-by-headroom" then fired = true end end
+  check("floor-rec: the acting record names the floor", fired, true)
+  check("floor-rec: and its threshold", a.floorAvailPct, 12)
+end)
+
+-- Headroom that cannot be read (no memory size: availPct reads 100) is
+-- unknown, and the floor fails closed on it.
+scenario("a held wait ends when headroom cannot be read", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-unknown: headroom holds the wait", toHeldWait(W), true)
+  W.run(25)
+  local at = W.now
+  W.memSizeUnknown = true
+  check("floor-unknown: the floor acts on headroom it cannot read", stopsWithin(W, 15), true)
+  check("floor-unknown: within two ticks (" .. math.floor(W.now - at) .. " s)", W.now - at <= 12, true)
+  check("floor-unknown: and says so", #railRows(W, "deferral-floor-fired-by-unknown-headroom"), 1)
+end)
+
+-- With the adjudicator turned off, the base system decides at its own
+-- cadence: a held wait arms no every-tick check, and a verdict cached before
+-- the switch decides nothing after it.
+scenario("with the adjudicator turned off, a held wait waits out the grace", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-off: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  mw.setLfmEnabled(false)
+  W.availPct = 10
+  W.run(40)
+  check("floor-off: no act on the floor's tick with the adjudicator off", W.signalsTo(4242), "")
+  check("floor-off: the base system still freezes", stopsWithin(W, 60), true)
+  check("floor-off: at its own grace (" .. math.floor(W.now - heldAt) .. " s after the held decision)",
+    W.now - heldAt >= 55, true)
+end)
+scenario("a verdict cached before the adjudicator is turned off decides nothing", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  -- The alert's first binding asks again: that answer is the verdict a
+  -- decision point would consume (the advisory one before it is not).
+  local asked = runUntil(W, 60, function() return #(W.httpPosts or {}) >= 2 end)
+  W.run(2)
+  check("off-cache: a wait verdict on the bound process is cached before the grace runs out",
+    asked and (mw.debug().lfm.cached or 0) > 0 and unattendedRow(W, "lfm") == nil, true)
+  mw.setLfmEnabled(false)
+  check("off-cache: the base system freezes at grace expiry", stopsWithin(W, 90), true)
+  check("off-cache: no model wait decided after the switch", unattendedRow(W, "lfm"), nil)
+end)
+
+-- A held wait belongs to the process it was held for: a newcomer on the pid
+-- starts its own grace and deferral, whatever the headroom.
+scenario("a held wait is not inherited by the pid's next process", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-reuse: headroom holds the wait", toHeldWait(W), true)
+  local reusedAt = W.now
+  W.reusePid(4242, "leaker", 2000)  -- the leaker's growth carries on in the newcomer
+  W.availPct = 10
+  check("floor-reuse: the newcomer is frozen in time", stopsWithin(W, 400), true)
+  check("floor-reuse: after its own grace and deferral (" .. math.floor(W.now - reusedAt) .. " s)",
+    W.now - reusedAt >= 150, true)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  check("floor-reuse: on its own deferral (" .. tostring(a.deferredSec) .. " s)", (a.deferredSec or 999) <= 130, true)
+end)
+
+-- The configured threshold and hold cap reach the decision.
+for _, case in ipairs({
+  { name = "a threshold of 0 acts at the bound", key = '"floorAvailPct":0', avail = 30, lo = 115, hi = 135 },
+  { name = "a threshold of 25 acts at 20%", key = '"floorAvailPct":25', avail = 20, lo = 115, hi = 135,
+    rail = "deferral-floor-fired-by-headroom" },
+  { name = "a hold cap of 300 s acts at 30%", key = '"maxHoldSec":300', avail = 30, lo = 295, hi = 315,
+    rail = "deferral-floor-fired-by-hold-cap" },
+}) do
+  local conf = REMOTE_LFM_FREEZE:gsub('"advisoryIntervalSec":600,', '"advisoryIntervalSec":600,' .. case.key .. ',')
+  scenario("floor config: " .. case.name, conf, function(W, mw)
+    W.httpReply = cannedVerdict("wait")
+    leaker(W, 4242)
+    W.run(12)
+    W.kern = 4
+    W.availPct = case.avail
+    local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+    check("floor config (" .. case.name .. "): the model's wait deferred the freeze", waited, true)
+    local firstWait = W.now
+    check("floor config (" .. case.name .. "): the freeze comes", stopsWithin(W, 500), true)
+    local d = W.now - firstWait
+    check("floor config (" .. case.name .. "): " .. math.floor(d) .. " s from the first wait", d >= case.lo and d <= case.hi, true)
+    if case.rail then
+      check("floor config (" .. case.name .. "): and says why", #railRows(W, case.rail), 1)
+    else
+      check("floor config (" .. case.name .. "): as before, with no floor rail",
+        #railRows(W, "deferral-floor-fired-by-headroom") + #railRows(W, "deferral-floor-held-by-headroom"), 0)
+    end
+  end)
+end
+
+-- A wall clock stepped back while a wait is held: the first wait moves with
+-- the step, so the hold cap reads the time really held (unshifted, the first
+-- wait would read as after now and end the hold at once).
+scenario("a held wait survives a step back without acting early", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-step: headroom holds the wait", toHeldWait(W), true)
+  local r = railRows(W, "deferral-floor-held-by-headroom")[1] or {}
+  W.run(10)
+  local step = (r.deferredSec or 120) + 10 + 30   -- past the first wait, short of the process's age
+  local age = W.now - W.procs[4242].bornAt
+  check("floor-step: the step (" .. step .. " s) is shorter than the process's age (" .. math.floor(age) .. " s)",
+    step < age - 10, true)
+  W.wallOffset = (W.wallOffset or 0) - step
+  W.run(30)
+  check("floor-step: no act after the step", W.signalsTo(4242), "")
+  check("floor-step: the shift ran without error", logHas(W, "error:clock-shift"), false)
+  W.availPct = 10
+  check("floor-step: and the floor still acts when headroom falls", stopsWithin(W, 15), true)
 end)
 
 -- (round 6) A wall clock stepped back while a model's wait defers the

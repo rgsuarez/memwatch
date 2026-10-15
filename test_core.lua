@@ -3078,6 +3078,67 @@ do
   check("floor: unknown headroom acts (fails closed)", lfm.floorFires(nil, 12), true)
   check("floor: a threshold of 0 turns the gate off (acts at the bound)", lfm.floorFires(90, 0), true)
   check("floor: the default threshold is 12%", lfm.cfg.floorAvailPct, 12)
+  check("floor: a NaN reading acts (unknown)", lfm.floorFires(0 / 0, 12), true)
+  check("floor: no threshold falls back to the default (30 holds)", lfm.floorFires(30, nil), false)
+  check("floor: and acts at the default (12)", lfm.floorFires(12, nil), true)
+  check("floor: a negative threshold acts at once", lfm.floorFires(90, -5), true)
+  -- Monotone in headroom: once it acts at a reading, it acts at every lower one.
+  local monotone, seen = true, false
+  for a = 100, 0, -0.5 do
+    local f = lfm.floorFires(a, 12)
+    if seen and not f then monotone = false end
+    seen = seen or f
+  end
+  check("floor: monotone in headroom", monotone, true)
+  -- The headroom the floor may read: none unless the memory size was known.
+  check("floor headroom: a known reading", lfm.floorHeadroom({ availPct = 30, availKnown = true }), 30)
+  check("floor headroom: an unknown size reads nil, not its 100", lfm.floorHeadroom({ availPct = 100, availKnown = false }), nil)
+  check("floor headroom: no flag at all is unknown (memwatch's first reading)", lfm.floorHeadroom({ availPct = 100 }), nil)
+  check("floor headroom: a NaN reading is unknown", lfm.floorHeadroom({ availPct = 0 / 0, availKnown = true }), nil)
+  check("floor headroom: no metrics is unknown", lfm.floorHeadroom(nil), nil)
+  check("metrics: a known size says so", core.metrics({}, 0, 8 * 2^30, 16384).availKnown, true)
+  check("metrics: an unknown size reads 100 but says unknown",
+    core.metrics({}, 0, 0, 16384).availKnown == false and core.metrics({}, 0, 0, 16384).availPct == 100, true)
+  check("metrics (native): an unknown size says unknown", core.metricsFromVmStat({ pageSize = 16384 }, 0).availKnown, false)
+  check("metrics (native): a known size says known",
+    core.metricsFromVmStat({ pageSize = 16384, memSize = 8 * 2^30 }, 0).availKnown, true)
+  -- Why the floor acts past the bound, or nil while it holds.
+  local cfg = { floorAvailPct = 12, maxHoldSec = 600, enabled = true }
+  local st = { firstAt = 1000, count = 3 }
+  local known = function(a) return { availPct = a, availKnown = true } end
+  check("floorActs: headroom above the floor holds", lfm.floorActs(st, known(30), 1130, cfg), nil)
+  check("floorActs: at the floor it acts on headroom", lfm.floorActs(st, known(12), 1130, cfg), "headroom")
+  check("floorActs: unreadable headroom acts (fails closed)",
+    lfm.floorActs(st, { availPct = 100, availKnown = false }, 1130, cfg), "unknown-headroom")
+  check("floorActs: the hold cap acts whatever the headroom", lfm.floorActs(st, known(90), 1600, cfg), "hold-cap")
+  check("floorActs: just under the cap it holds", lfm.floorActs(st, known(90), 1599, cfg), nil)
+  check("floorActs: a first wait stamped after now acts (no step holds the policy off)",
+    lfm.floorActs(st, known(90), 999, cfg), "hold-cap")
+  check("floorActs: no first wait acts", lfm.floorActs({}, known(90), 1130, cfg), "hold-cap")
+  check("floorActs: a threshold of 0 acts at the bound, as before",
+    lfm.floorActs(st, known(90), 1130, { floorAvailPct = 0, maxHoldSec = 600 }), "no-floor")
+  check("floorActs: a cap at or under the bound acts at the bound",
+    lfm.floorActs(st, known(90), 1120, { floorAvailPct = 12, maxHoldSec = 120 }), "hold-cap")
+  check("floorActs: the defaults hold 30% at the bound", lfm.floorActs(st, known(30), 1120), nil)
+  -- The every-tick check: only a held wait, only with the adjudicator on.
+  local held = { firstAt = 1000, count = 3, exhausted = true }
+  check("floorDue: a held wait at the floor is due", lfm.floorDue(held, known(10), 1130, cfg), true)
+  check("floorDue: a held wait above it is not", lfm.floorDue(held, known(30), 1130, cfg), false)
+  check("floorDue: a wait the last decision did not hold is not",
+    lfm.floorDue({ firstAt = 1000, count = 3 }, known(10), 1130, cfg), false)
+  check("floorDue: with the adjudicator off it never is",
+    lfm.floorDue(held, known(10), 1130, { floorAvailPct = 12, maxHoldSec = 600, enabled = false }), false)
+  check("floorDue: no wait state is not", lfm.floorDue(nil, known(10), 1130, cfg), false)
+  -- The observation row for a floor act: forced, but only through an open gate.
+  local observe = require("memwatch_observe")
+  check("decisionDue: a floor act is due inside the grace window",
+    observe.decisionDue({ enabled = true, gate = "open", sinceLastSec = 10, graceSec = 60, forced = true }), true)
+  check("decisionDue: not through a closed gate",
+    observe.decisionDue({ enabled = true, gate = "closed", sinceLastSec = 10, graceSec = 60, forced = true }), false)
+  check("decisionDue: nor with the ledger off",
+    observe.decisionDue({ enabled = false, gate = "open", sinceLastSec = 10, graceSec = 60, forced = true }), false)
+  check("decisionDue: unforced inside the window is not due (control)",
+    observe.decisionDue({ enabled = true, gate = "open", sinceLastSec = 10, graceSec = 60 }), false)
 end
 
 if fails == 0 then

@@ -378,7 +378,10 @@ function F.new()
       -- (a wall clock step in the middle of a tick).
       if W.onVmStat then W.onVmStat() end
       local total = MEM_BYTES // PAGE
-      return { pageSize = PAGE, memSize = MEM_BYTES, pagesFree = math.floor(total * W.availPct / 100),
+      -- memSizeUnknown: the native table without the memory size (memwatch
+      -- then cannot compute headroom; its availPct reads 100).
+      return { pageSize = PAGE, memSize = (not W.memSizeUnknown) and MEM_BYTES or nil,
+               pagesFree = math.floor(total * W.availPct / 100),
                pagesSpeculative = 0, pagesPurgeable = 0, fileBackedPages = 0, uncompressedPages = 0,
                swapOuts = 0, pagesCompressed = 0, pageOuts = 0 }
     end },

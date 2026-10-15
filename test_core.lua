@@ -1079,26 +1079,78 @@ do
                  slopeMBmin = 11000.2, peakSlopeMBmin = 12000, ageSec = 40 },
     runaways = runs }
   local user = lfm.serializeSnapshot(snap, { redactNames = true })
+  -- A decision row with unattended off: the deterministic policy fires
+  -- nothing, and the freeze-ceiling counterfactual rides beside it.
   local row = observe.row({ at = "2026-10-14T00:00:00Z", seq = 7, point = "decision",
     state = "critical", kern = 2, availPct = 7.6, swapGB = 15.55, compressorGB = 52.04,
     swapoutRate = 4000.9, compRate = 90000.2, runawayCount = 5, mode = "off", lfmEnabled = false,
-    wouldAct = "freeze", graceElapsedSec = 61.4, category = "unknown",
+    wouldAct = "none", wouldActAtFreeze = "freeze", graceElapsedSec = 61.4, category = "unknown",
     offender = snap.offender, snapshot = user, snapshotHash = lfm.snapshotHash(user) })
   check("observe: row point", row.point, "decision")
   check("observe: row pid is the local join key", row.pid, 4242)
   check("observe: row numbers floored", row.availPct, 7)
   check("observe: offender weight floored", row.offender.weightMB, 9000)
   check("observe: offender age carried", row.offender.ageSec, 40)
-  check("observe: wouldAct carried", row.wouldAct, "freeze")
+  check("observe: wouldAct carried", row.wouldAct, "none")
+  check("observe: freeze-ceiling counterfactual carried", row.wouldActAtFreeze, "freeze")
   check("observe: snapshot is pid-free", row.snapshot:find('"pid"', 1, true), nil)
   check("observe: snapshot is redacted", row.snapshot:find("leak.py", 1, true), nil)
   local line = lfm.ledgerLine(row)
   check("observe: row encodes", line ~= nil, true)
   check("observe: row well under the 64 KB decoder cap", #line < 16000, true)
   check("observe: row decodes back", (lfm.jsonDecode(line:sub(1, -2)) or {}).seq, 7)
+  check("observe: counterfactual survives the round trip",
+    (lfm.jsonDecode(line:sub(1, -2)) or {}).wouldActAtFreeze, "freeze")
+  local adv = observe.row({ point = "advisory", wouldAct = "none", offender = {} })
+  check("observe: advisory rows carry no counterfactual", adv.wouldActAtFreeze, nil)
+  check("observe: advisory line omits the counterfactual",
+    lfm.ledgerLine(adv):find("wouldActAtFreeze", 1, true), nil)
   check("observe: synthetic flag only when set", row.synthetic, nil)
   check("observe: synthetic flag carried",
     observe.row({ synthetic = true, offender = {} }).synthetic, true)
+
+  -- Names: attacker-controlled, stored sanitized, never model input.
+  check("name: a normal name is kept", observe.sanitizeName("clang++ -O2 v1.2_x"), "clang++ -O2 v1.2_x")
+  check("name: control bytes are replaced", observe.sanitizeName("evil\nname\t\1x"), "evil?name??x")
+  check("name: invalid UTF-8 is replaced", observe.sanitizeName("bad\xFF\xFEname"), "bad??name")
+  check("name: every non-ASCII byte is replaced", observe.sanitizeName("caf\xC3\xA9"), "caf??")
+  check("name: capped at 64 bytes", #observe.sanitizeName(string.rep("a", 100)), 64)
+  check("name: non-strings are nil", observe.sanitizeName(42), nil)
+  local hostile = "x\1\n\xFF\xFE" .. string.rep("y", 100)
+  local hrow = observe.row({ point = "decision", offender = { pid = 9, name = hostile } })
+  check("name: the row stores the sanitized name", hrow.offender.name, observe.sanitizeName(hostile))
+  local hline = lfm.ledgerLine(hrow)
+  check("name: a hostile name still yields a decodable line",
+    ((lfm.jsonDecode(hline:sub(1, -2)) or {}).offender or {}).name, "x????" .. string.rep("y", 59))
+
+  -- boundLine: an oversize row drops its snapshot, never the row.
+  local encCalls = 0
+  local function fakeEncode(r)
+    encCalls = encCalls + 1
+    return string.rep("x", (r.snapshot and #r.snapshot or 0) + 10) .. "\n"
+  end
+  local small = { snapshot = "abc" }
+  local l1 = observe.boundLine(small, fakeEncode, 100)
+  check("boundLine: under the cap keeps the snapshot", small.snapshot, "abc")
+  check("boundLine: under the cap encodes once", encCalls, 1)
+  check("boundLine: under the cap sets no drop flag", small.snapshotDropped, nil)
+  check("boundLine: under the cap returns the line", #l1, 14)
+  encCalls = 0
+  local big = { snapshot = string.rep("s", 500), snapshotHash = "h" }
+  local l2 = observe.boundLine(big, fakeEncode, 100)
+  check("boundLine: over the cap drops the snapshot", big.snapshot, nil)
+  check("boundLine: over the cap flags the drop", big.snapshotDropped, true)
+  check("boundLine: the hash survives the drop", big.snapshotHash, "h")
+  check("boundLine: over the cap re-encodes", encCalls, 2)
+  check("boundLine: the re-encoded line fits", #l2 <= 100, true)
+  local bare = {}
+  local l3 = observe.boundLine(bare, function() return string.rep("x", 200) end, 100)
+  check("boundLine: over the cap without a snapshot is left as encoded", #l3, 200)
+  check("boundLine: no snapshot, no drop flag", bare.snapshotDropped, nil)
+  local huge = observe.row({ point = "decision", offender = {}, snapshot = string.rep("z", 70000) })
+  local hl = observe.boundLine(huge, lfm.ledgerLine, observe.cfg.maxLineBytes)
+  check("boundLine: a real oversize row decodes after the drop",
+    (lfm.jsonDecode(hl:sub(1, -2)) or {}).snapshotDropped, true)
 
   -- Start windows: ps read the table between launch and delivery.
   local sw = procs.startWindow(100, 5000, 5004)
@@ -1212,6 +1264,23 @@ do
     check("observe glue: no fork via " .. forker, body:find(forker), nil)
   end
   check("observe glue: follow-ups use held timers", body:find("afterHeld(h,", 1, true) ~= nil, true)
+  -- wouldAct is what fires under the live mode; the freeze ceiling is a
+  -- separate counterfactual, and every row is bounded before it is written.
+  check("observe glue: wouldAct follows the live mode",
+    body:find('wouldAct = (mode == "off") and "none" or deterministicAction(mode, foreground)', 1, true) ~= nil, true)
+  check("observe glue: the freeze ceiling has its own field",
+    body:find('wouldActAtFreeze = deterministicAction("freeze", foreground)', 1, true) ~= nil, true)
+  check("observe glue: wouldAct is no longer the freeze-ceiling decision",
+    body:find('and deterministicAction("freeze", foreground) or "wait"', 1, true), nil)
+  check("observe glue: the row is bounded before it is appended",
+    body:find("observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)", 1, true) ~= nil, true)
+  local ds = src:find("writeDecisionOutcome = function(", 1, true)
+  local de = ds and src:find("\nend\n", ds, true)
+  local dbody = (ds and de) and src:sub(ds, de) or ""
+  check("decision ledger glue: writeDecisionOutcome located", #dbody > 200, true)
+  check("decision ledger glue: the stored name is sanitized",
+    dbody:find("name = observe.sanitizeName(offender.name)", 1, true) ~= nil, true)
+  check("decision ledger glue: no raw name is stored", dbody:find("name = offender.name", 1, true), nil)
   check("observe glue: decision point is error-bounded",
     src:find('pcall(writeObservation, "decision"', 1, true) ~= nil, true)
   check("observe glue: advisory cadence is error-bounded",

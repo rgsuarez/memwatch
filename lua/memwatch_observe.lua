@@ -1,12 +1,18 @@
 -- memwatch_observe.lua: the pure half of the passive observation ledger.
 --
 -- The observation ledger (memwatch-observe.jsonl, local and gitignored)
--- records what memwatch saw at every moment an adjudicator would have been
--- consulted, whether or not one is enabled: the exact model-input snapshot,
--- the deterministic action that would have fired, and what actually became
--- of the process 60, 120 and 180 seconds later. It is the raw material for
--- an outcome-labeled evaluation set, so it runs with the adjudicator and
--- unattended actions both off.
+-- records what memwatch saw at each grace-expiry decision point, and every
+-- 45 s while pressure is up, whether or not an adjudicator is enabled: the
+-- exact model-input snapshot, the action the deterministic policy fires
+-- under the live mode with the freeze-ceiling counterfactual beside it, and
+-- what actually became of the process 60, 120 and 180 seconds later. It is
+-- the raw material for an outcome-labeled evaluation set, so it runs with
+-- the adjudicator and unattended actions both off.
+--
+-- Two row fields are local join material, never model input: the top-level
+-- pid, and offender.name, a sanitized basename kept only so categories can
+-- be re-derived later. Neither may ever be fed to a model, and both must be
+-- stripped from any dataset built from this ledger.
 --
 -- Everything here is Hammerspoon-free (unit-tested under standalone Lua).
 -- The glue owns timers, file IO and the live process tables, and it never
@@ -23,22 +29,42 @@ M.cfg = {
   keep           = 3,               -- rotated generations kept (.1 .. .3)
   sampleFreshSec = 15,              -- ps data older than this cannot decide a fate
   clockSlackSec  = 1,               -- timestamp granularity allowed when comparing start windows
+  maxLineBytes   = 60000,           -- a longer row drops its snapshot (the decoder rejects > 64 KB)
 }
 
 local function floorOrNil(v)
   return type(v) == "number" and math.floor(v) or nil
 end
 
+-- A raw process basename is attacker-controlled: it can carry control bytes
+-- or invalid UTF-8, which make a malformed JSONL line for strict readers.
+-- Keep ASCII letters, digits and . _ - + space, replace every other byte
+-- with "?", and cap at 64 bytes. That makes the name safe to store, not safe
+-- to show a model: instruction-like text survives, which is why the name is
+-- never model input. The class is spelled as ASCII ranges rather than %w so
+-- a locale change in the host process can never widen it. Returns nil for
+-- anything that is not a string.
+function M.sanitizeName(s)
+  if type(s) ~= "string" then return nil end
+  return (s:sub(1, 64):gsub("[^A-Za-z0-9%._%-%+ ]", "?"))
+end
+
 -- Build one observation row as a plain table (the glue encodes and appends
 -- it). `snapshot` is the serialized model input exactly as an adjudicator
--- would receive it (pid-free by construction); the top-level `pid` is a
--- local join key for the follow-ups and must be stripped from any dataset
--- built from this ledger.
+-- would receive it (pid-free by construction). The top-level `pid` is a
+-- local join key for the follow-ups, and `offender.name` a sanitized
+-- basename (sanitizeName) kept only to re-derive categories: neither may
+-- ever be fed to a model, and both must be stripped from any dataset built
+-- from this ledger. `wouldAct` is what the deterministic policy fires under
+-- the live mode ("none" while it is off, and on every advisory row);
+-- `wouldActAtFreeze`, present only at decision points, is the decision a
+-- model would own at grace expiry under the freeze ceiling.
 -- a: { at, seq, point = "advisory"|"decision"|"synthetic", synthetic,
 --      state, kern, availPct, swapGB, compressorGB, swapoutRate, compRate,
---      runawayCount, mode, lfmEnabled, wouldAct, graceElapsedSec,
---      category, offender = {pid, name, kind, weightMB, slopeMBmin,
---      peakSlopeMBmin, ageSec, foreground}, snapshot, snapshotHash }
+--      runawayCount, mode, lfmEnabled, wouldAct, wouldActAtFreeze,
+--      graceElapsedSec, category, offender = {pid, name, kind, weightMB,
+--      slopeMBmin, peakSlopeMBmin, ageSec, foreground}, snapshot,
+--      snapshotHash }
 function M.row(a)
   local off = type(a.offender) == "table" and a.offender or {}
   return {
@@ -51,16 +77,33 @@ function M.row(a)
     swapoutRate = floorOrNil(a.swapoutRate), compRate = floorOrNil(a.compRate),
     runawayCount = floorOrNil(a.runawayCount),
     mode = a.mode, lfmEnabled = a.lfmEnabled == true,
-    wouldAct = a.wouldAct, graceElapsedSec = floorOrNil(a.graceElapsedSec),
+    wouldAct = a.wouldAct, wouldActAtFreeze = a.wouldActAtFreeze,
+    graceElapsedSec = floorOrNil(a.graceElapsedSec),
     pid = floorOrNil(off.pid),
     offender = {
-      name = off.name, category = a.category, kind = off.kind,
+      name = M.sanitizeName(off.name), category = a.category, kind = off.kind,
       weightMB = floorOrNil(off.weightMB), slopeMBmin = floorOrNil(off.slopeMBmin),
       peakSlopeMBmin = floorOrNil(off.peakSlopeMBmin), ageSec = floorOrNil(off.ageSec),
       foreground = off.foreground == true or nil,
     },
     snapshot = a.snapshot, snapshotHash = a.snapshotHash,
   }
+end
+
+-- Encode a row as one ledger line under `cap` bytes when the snapshot is
+-- what makes it large: the shared decoder rejects lines over 64 KB, so an
+-- oversize row would be silently skipped by every reader. The snapshot is
+-- dropped (its hash stays) and snapshotDropped marks the row; a row that is
+-- oversize without a snapshot is returned as encoded. encode is
+-- lfm.ledgerLine in the glue.
+function M.boundLine(row, encode, cap)
+  cap = cap or M.cfg.maxLineBytes
+  local line = encode(row)
+  if line and #line > cap and row.snapshot ~= nil then
+    row.snapshot, row.snapshotDropped = nil, true
+    line = encode(row)
+  end
+  return line
 end
 
 -- Identity of one pid across two samples, from their start windows (see

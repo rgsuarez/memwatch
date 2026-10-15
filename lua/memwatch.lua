@@ -1364,11 +1364,14 @@ end
 -- One decision record per unattended adjudication (either adjudicator).
 -- The ledger is local and gitignored; the value report renders it.
 writeDecisionOutcome = function(offender, action, adjudicator, rationale, rails, extra)
+  -- The name is stored sanitized, as in the observation ledger: a local
+  -- basename for display and for re-deriving categories, never model input.
+  -- The category itself is derived from the raw name.
   local rec = {
     at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     adjudicator = adjudicator,
     action = action,
-    offender = { name = offender.name, kind = offender.kind or "?",
+    offender = { name = observe.sanitizeName(offender.name), kind = offender.kind or "?",
                  weightMB = math.floor(offender.weightMB or 0),
                  slopeMBmin = math.floor(offender.slopeMBmin or 0),
                  peakSlopeMBmin = math.floor(offender.peakSlopeMBmin or 0),
@@ -1884,26 +1887,38 @@ writeObservation = function(point, offender, now, extra)
   observeSeq = observeSeq + 1
   local seq = observeSeq
   local obsIso = os.date("!%Y-%m-%dT%H:%M:%SZ")
-  local wouldAct = "none"
+  local mode = core.resolveUnattended(core.cfg)
+  -- A decision point records what the deterministic policy fires under the
+  -- live mode (none while unattended is off) and, beside it, the decision a
+  -- model would own at grace expiry under the freeze ceiling. Advisory rows
+  -- are not decision points. foreground is the fork-free name match; the
+  -- live path also walks the process tree and treats an undeterminable
+  -- frontmost app as foreground, so under kill mode a row can read
+  -- terminate where the live policy would freeze.
+  local wouldAct, wouldActAtFreeze = "none", nil
   if point == "decision" or point == "synthetic" then
-    -- What the deterministic policy would do at the freeze ceiling.
-    wouldAct = (offender.kind == "extreme") and deterministicAction("freeze", foreground) or "wait"
+    wouldAct = (mode == "off") and "none" or deterministicAction(mode, foreground)
+    wouldActAtFreeze = deterministicAction("freeze", foreground)
   end
-  appendObserve(lfm.ledgerLine(observe.row({
+  local row = observe.row({
     at = obsIso, seq = seq, point = point, synthetic = extra.synthetic,
     state = smState.state, kern = lastKern,
     availPct = lastMetrics.availPct, swapGB = lastMetrics.swapGB,
     compressorGB = lastMetrics.compGB,
     swapoutRate = lastRates.swapOut, compRate = lastRates.comp, runawayCount = #lastRuns,
-    mode = core.resolveUnattended(core.cfg), lfmEnabled = lfm.cfg.enabled,
-    wouldAct = wouldAct, graceElapsedSec = extra.graceElapsedSec,
+    mode = mode, lfmEnabled = lfm.cfg.enabled,
+    wouldAct = wouldAct, wouldActAtFreeze = wouldActAtFreeze,
+    graceElapsedSec = extra.graceElapsedSec,
     category = lfm.categorize(offender.name, nil),
     offender = { pid = offender.pid, name = offender.name, kind = offender.kind,
                  weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
                  peakSlopeMBmin = offender.peakSlopeMBmin, ageSec = offender.ageSec,
                  foreground = foreground },
     snapshot = user, snapshotHash = user and lfm.snapshotHash(user) or nil,
-  })))
+  })
+  -- An oversize row drops its snapshot, never the row.
+  local line = observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)
+  appendObserve(line)
   observeStats.rows = observeStats.rows + 1
   observeStats.lastAt = now
   -- Follow-ups: what actually became of this process, and of the machine.

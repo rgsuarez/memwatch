@@ -1093,6 +1093,11 @@ do
   -- of "action" begins right after the key's ":" token, and its first token
   -- tells the options apart.
   local cb = lfm.jsonDecode(lfm.completionBody("PROMPT"))
+  check("completion: generation stops near the action value", cb.n_predict, lfm.TOKENPROB_MAX_PREDICT)
+  check("completion: a larger budget is capped, so the reply stays under the decoder cap",
+    lfm.jsonDecode(lfm.completionBody("PROMPT", { maxTokens = 128 })).n_predict, lfm.TOKENPROB_MAX_PREDICT)
+  check("completion: a smaller budget is kept",
+    lfm.jsonDecode(lfm.completionBody("PROMPT", { maxTokens = 8 })).n_predict, 8)
   check("tokenprob body: raw probabilities, never post-sampling", cb.post_sampling_probs, false)
   check("tokenprob body: temperature 0", cb.temperature, 0)
   check("tokenprob body: the verdict schema as a grammar", cb.json_schema and cb.json_schema.properties.action ~= nil, true)

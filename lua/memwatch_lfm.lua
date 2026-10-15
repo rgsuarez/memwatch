@@ -687,11 +687,18 @@ end
 -- schema as a grammar, temperature 0, and the top nProbs RAW token
 -- probabilities at every position. Post-sampling probabilities are
 -- degenerate at temperature 0 (the chosen token at p = 1), so they are
--- never requested.
+-- never requested. Only the tokens up to the action value matter (the
+-- grammar emits "action" first), and each generated token carries nProbs
+-- candidates (about 1 KB of reply at 10), so generation stops at
+-- TOKENPROB_MAX_PREDICT: a longer reply could pass the decoder's 64 KB cap
+-- and be refused.
+local TOKENPROB_MAX_PREDICT = 16
+M.TOKENPROB_MAX_PREDICT = TOKENPROB_MAX_PREDICT
 function M.completionBody(prompt, opts)
   opts = opts or {}
   return M.jsonEncode({
-    prompt = prompt, temperature = 0, n_predict = opts.maxTokens or 128,
+    prompt = prompt, temperature = 0,
+    n_predict = math.min(opts.maxTokens or TOKENPROB_MAX_PREDICT, TOKENPROB_MAX_PREDICT),
     n_probs = opts.nProbs or 10, post_sampling_probs = false, cache_prompt = true,
     json_schema = M.OUTPUT_SCHEMA,
   })

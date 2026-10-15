@@ -80,7 +80,6 @@ local runawayLogAt = {}   -- ["pid|kind"] = last time this runaway was logged
 -- Phase 0 freeze + LFM adjudication state (cross-section, so declared here).
 local protectedPids = {}  -- pid-set memwatch never flags or signals (self + adjudicator)
 local frozen        = {}  -- [pid] = persisted frozen-ledger entry
-local freezeSeq     = 0   -- freezes made by this run (part of each freeze's token)
 local lastFrozenSweepAt = 0 -- liveness sweep bookkeeping
 
 -- A verified exit keeps the process off the candidates while its last
@@ -2079,17 +2078,19 @@ local function dropOwnEntry(pid, lstart)
     saveFrozen()
   end
 end
--- Is this slot's entry that very entry (rule 3): the same object, or the
--- same freeze's token once a reload's reconcile has rebuilt it?
-local function sameEntry(cur, e)
+-- Ledger entry tokens (rule 3).
+local entryIds = { seq = 0 }  -- seq: entries made by this run
+-- Is this slot's entry that very entry: the same object, or the same
+-- freeze's token once a reload's reconcile has rebuilt it?
+function entryIds.same(cur, e)
   return cur ~= nil and e ~= nil and (cur == e or (e.id ~= nil and cur.id == e.id))
 end
 -- A token for a new entry, from durable parts only (the pid, the time in
 -- milliseconds and a count of this run's entries): one left in the ledger
 -- by an earlier run names nothing this run made.
-local function newEntryId(pid)
-  freezeSeq = freezeSeq + 1
-  return string.format("%d/%.0f/%d", pid, clock.now() * 1000, freezeSeq)
+function entryIds.new(pid)
+  entryIds.seq = entryIds.seq + 1
+  return string.format("%d/%.0f/%d", pid, clock.now() * 1000, entryIds.seq)
 end
 
 local function loadFrozen()
@@ -2290,7 +2291,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
   -- This freeze's own token, written to the ledger with the entry: an
   -- in-process restart's reconcile rebuilds the entry as a new object, and
   -- the token is what still names it as this freeze's (rule 3).
-  entry.id = newEntryId(pid)
+  entry.id = entryIds.new(pid)
   frozen[pid] = entry
   saveFrozen()
   local stopSent = send("STOP", pid)
@@ -2319,7 +2320,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
     -- freeze's own entry (or nothing): an entry another action wrote since,
     -- for this process or the pid's next one, is never this freeze's to
     -- touch, so a freeze whose verifier runs late cannot undo a newer one.
-    local function isOurs(e) return sameEntry(e, entry) end
+    local function isOurs(e) return entryIds.same(e, entry) end
     local ours = frozen[pid] == nil or isOurs(frozen[pid])
     local function dropOurs()
       if isOurs(frozen[pid]) then
@@ -2352,7 +2353,7 @@ function M.freezePid(pid, expectedName, onUpdate, opts)
             -- Its size is unknown (the probe row has none), never the size
             -- of the process the freeze meant.
             frozen[pid] = { pid = pid, name = holderName, lstart = holder.lstart, weightMB = nil,
-                            frozenAt = clock.now(), stopSent = true, id = newEntryId(pid) }
+                            frozenAt = clock.now(), stopSent = true, id = entryIds.new(pid) }
             saveFrozen()
             M.logSnapshot(string.format("freeze-abort-cont-failed:%s(%d)", holderName, pid))
             onUpdate(string.format("%s changed identity mid-freeze, and pid %d (%s) may be left stopped; resume it from the menu",
@@ -2455,7 +2456,7 @@ function M.resumePid(pid, onUpdate)
     elseif not core.isStopped(again) then
       -- Resumed: this resume's own entry goes. A newer freeze of the same
       -- process since (its STOP still on the way) keeps its own.
-      if sameEntry(frozen[pid], e) then
+      if entryIds.same(frozen[pid], e) then
         frozen[pid] = nil
         saveFrozen()
       end

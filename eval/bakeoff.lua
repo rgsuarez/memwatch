@@ -502,8 +502,10 @@ local function episodesMode(args)
   local n, valid = 0, 0
   -- This invocation's own name, on every row: the scorer refuses a file
   -- whose rows come from more than one run (two partial runs put together,
-  -- of one model or of two).
-  local runId = string.format("%s-%06x", os.date("!%Y%m%dT%H%M%SZ"), math.random(0, 0xffffff))
+  -- of one model or of two). It is the start time and this run's private
+  -- scratch directory, which no other run holds while this one runs, so
+  -- runs started in the same second are told apart.
+  local runId = os.date("!%Y%m%dT%H%M%SZ") .. "-" .. scratch:match("([^/]+)$")
   local ok, runErr = pcall(withAuthHeader, key, function(hdr)
     local of = assert(io.open(out, "w"))
     for _, fname in ipairs(files) do

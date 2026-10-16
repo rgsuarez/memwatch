@@ -1484,6 +1484,23 @@ printf '0.010'
   check("runner: and names its label and its run", rc.label == "t" and type(rc.run) == "string", true)
   local reff = run("chat", chat, "effort", "--reasoning-effort low")
   check("runner: another run of the same model names another run", reff.run ~= nil and reff.run ~= rc.run, true)
+  -- Runs started together, in one second, are told apart.
+  local par, launches = {}, {}
+  for i = 1, 4 do
+    par[i] = root .. "/rows-par-" .. i .. ".jsonl"
+    launches[#launches + 1] = string.format("( PATH=%s:\"$PATH\" FAKE_CHAT=%s lua eval/bakeoff.lua episodes --server http://stub"
+      .. " --label t --dir %s --api chat --out %s >/dev/null 2>&1 ) &", sq(stubDir), sq(chat), sq(epDir), sq(par[i]))
+  end
+  os.execute(table.concat(launches, " ") .. " wait")
+  local parIds, parDistinct = {}, true
+  for i = 1, 4 do
+    local pf = io.open(par[i], "r")
+    local prow = pf and lfm.jsonDecode(pf:read("l") or "") or {}
+    if pf then pf:close() end
+    if type(prow.run) ~= "string" or parIds[prow.run] then parDistinct = false end
+    parIds[prow.run or "?"] = true
+  end
+  check("runner: runs started together each name their own run", parDistinct, true)
   local bl = io.open(root .. "/bodies-effort.log", "r")
   local bodies = bl and bl:read("a") or ""
   if bl then bl:close() end

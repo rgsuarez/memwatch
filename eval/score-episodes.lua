@@ -368,6 +368,10 @@ function M.loadDecisions(path, keyPath)
     kf:close()
   end
   local out, n, noP, invalid = {}, 0, 0, 0
+  -- One run per file: the rows a runner writes say what asked them, and
+  -- rows from two runs (two models, or a rerun appended to a partial run)
+  -- would score as one candidate no output names.
+  local origin
   for line in io.lines(path) do
     if line:match("%S") then
       local r = assert(lfm.jsonDecode(line), "bad decisions row")
@@ -380,7 +384,15 @@ function M.loadDecisions(path, keyPath)
         pWait = type(r.p_runaway) == "number" and (1 - r.p_runaway) or nil
       end
       assert(r.action == "freeze" or r.action == "wait", "decision action must be freeze or wait")
+      local who = string.format("%s/%s/%s", tostring(r.variant), tostring(r.api), tostring(r.model))
+      origin = origin or who
+      if who ~= origin then
+        error("the decisions come from more than one run (" .. origin .. " and " .. who .. "); score one run's rows", 0)
+      end
       out[ep] = out[ep] or {}
+      if out[ep][t] then
+        error(string.format("the decision for %s at %s s appears twice; score one run's rows", tostring(ep), tostring(t)), 0)
+      end
       out[ep][t] = { action = r.action, pWait = pWait, hash = hash }
       n = n + 1
       if type(pWait) ~= "number" then noP = noP + 1 end

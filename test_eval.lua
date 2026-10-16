@@ -261,6 +261,19 @@ do
   check("decisions: a judge's row maps through the key", d2.s1[60].action, "wait")
   check("decisions: P(wait) is 1 - p_runaway", math.abs(d2.s1[60].pWait - 0.75) < 1e-9, true)
   check("decisions: a key's snapshot hash binds the judge's row", d2.s1[60].hash, "abcd1234")
+  -- One run per file: a decision point twice, or rows two runs wrote.
+  f = assert(io.open(tmp, "w"))
+  f:write('{"episode":"r1","t":0,"action":"freeze"}\n{"episode":"r1","t":0,"action":"wait"}\n')
+  f:close()
+  local okTwice, errTwice = pcall(sc.loadDecisions, tmp)
+  check("decisions: a decision point recorded twice is refused",
+    okTwice == false and tostring(errTwice):find("appears twice", 1, true) ~= nil, true)
+  f = assert(io.open(tmp, "w"))
+  f:write('{"episode":"r1","t":0,"action":"freeze","model":"a"}\n{"episode":"s1","t":0,"action":"wait","model":"b"}\n')
+  f:close()
+  local okMixed, errMixed = pcall(sc.loadDecisions, tmp)
+  check("decisions: rows from two runs are refused",
+    okMixed == false and tostring(errMixed):find("more than one run", 1, true) ~= nil, true)
   f = assert(io.open(tmp, "w"))
   f:write('{"episode":"r1","t":0,"action":"freeze","pWait":0.1}\n{"episode":"s1","t":0,"action":"freeze","valid":false}\n')
   f:close()

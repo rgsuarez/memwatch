@@ -1257,6 +1257,25 @@ dofile("eval/score-episodes.lua")
       and fifoSaid:find("it is not a regular file", 1, true) ~= nil and os.execute("test -p " .. q(fifoOut)) == true, true)
     os.remove(fifoOut)
   end
+  -- A gate result whose removal fails (injected) refuses the clear, the
+  -- result kept: an earlier verdict must never stand as this run's.
+  do
+    local stuck = outFile .. "-stuck.json"
+    local stuckText = '{"candidate":"x","pass":true}\n'
+    local sf = assert(io.open(stuck, "w"))
+    sf:write(stuckText)
+    sf:close()
+    local realRemove = os.remove
+    os.remove = function(path) if path == stuck then return nil, path .. ": Operation not permitted", 1 end return realRemove(path) end
+    local okStuck, errStuck = pcall(sc.clearResult, stuck)
+    os.remove = realRemove
+    local sf2 = io.open(stuck, "r")
+    local stuckNow = sf2 and sf2:read("a")
+    if sf2 then sf2:close() end
+    check("cli: a gate result that cannot be removed refuses the clear, and is kept", okStuck == false
+      and tostring(errStuck):find("would read as this run's", 1, true) ~= nil and stuckNow == stuckText, true)
+    os.remove(stuck)
+  end
   os.remove(epAtOut)
   -- --out names a gate's result; the controls and tau write none.
   local okCtlOut, errCtlOut = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev, "--out", outFile })
@@ -2431,6 +2450,25 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
     for _, u in ipairs(farNames) do if bk.hostIsLocal(u) then wrongFar[#wrongFar + 1] = u end end
     check("runner: every spelling of a loopback address is this machine", table.concat(wrongLocal, " "), "")
     check("runner: and nothing else is", table.concat(wrongFar, " "), "")
+  end
+  -- A run result whose removal fails (injected) refuses the clear, the result
+  -- kept, whoever runs it (root can remove from a read-only directory).
+  do
+    local stuck = root .. "/stuck.json"
+    local stuckText = '{"label":"t","rows":[]}\n'
+    local sf = assert(io.open(stuck, "w"))
+    sf:write(stuckText)
+    sf:close()
+    local realRemove = os.remove
+    os.remove = function(path) if path == stuck then return nil, path .. ": Operation not permitted", 1 end return realRemove(path) end
+    local okStuck, errStuck = pcall(bk.clearResult, stuck)
+    os.remove = realRemove
+    local sf2 = io.open(stuck, "r")
+    local stuckNow = sf2 and sf2:read("a")
+    if sf2 then sf2:close() end
+    check("runner: a run result that cannot be removed refuses the clear, and is kept, for any user", okStuck == false
+      and tostring(errStuck):find("would read as this run's", 1, true) ~= nil and stuckNow == stuckText, true)
+    os.remove(stuck)
   end
   local okUnder, under = pcall(bk.parseArgs, { "--raw_names", "run", "--no_schema", "--redact_names" })
   check("runner: the boolean flags read under either spelling, taking no value", okUnder and under.raw_names == true

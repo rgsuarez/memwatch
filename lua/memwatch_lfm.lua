@@ -502,13 +502,13 @@ local CATEGORY_RULES = {
                          "^xcode$", "^sourcekitservice$", "^nvim$", "^vim$", "^emacs",
                          "^visual studio code" } },
   { "browser",         { "^google chrome", "^chromium", "^safari$", "^firefox", "^brave browser",
-                         "^arc$", "^microsoft edge", "^com%.apple%.webkit%.", "^[%w ]+ helper %(renderer%)$",
-                         "^[%w ]+ helper %(gpu%)$" } },
-  { "vm",              { "^com%.apple%.virtualization%.", "^qemu%-system%-", "^qemulauncher$", "^vmware",
+                         "^arc$", "^arc helper", "^microsoft edge", "^com%.apple%.webkit",
+                         "^[%w ]+ helper %(renderer%)$", "^[%w ]+ helper %(gpu%)$" } },
+  { "vm",              { "^com%.apple%.virtualization%.", "^com%.apple%.virtua$", "^qemu%-system%-", "^qemulauncher$", "^vmware",
                          "^parallels", "^virtualbox", "^com%.docker%.", "^colima$", "^colima%-", "^utm$", "^limactl$" } },
   { "model-server",    { "^llama%-server$", "^llama%-cli$", "^ollama", "^mlx", "^vllm", "^lm%-studio",
                          "^text%-generation" } },
-  { "database",        { "^postgres", "^mysqld$", "^redis%-server$", "^mongod$", "^clickhouse",
+  { "database",        { "^postgres", "^mysqld$", "^redis%-server", "^mongod$", "^clickhouse",
                          "^sqlite3?$" } },
   { "package-manager", { "^npm install", "^npm exec", "^npm$", "^yarn", "^pnpm", "^pip3?$",
                          "^pip3? install", "^brew$", "^bun install", "^uv$" } },
@@ -529,11 +529,11 @@ local CATEGORY_RULES = {
                          "^photoanalysisd$", "^mdsync$" } },
   { "search-tool",     { "^ugrep$", "^grep$", "^ripgrep$", "^rg$", "^the_silver", "^ag$", "^find$",
                          "^mdfind$", "^fd$" } },
-  { "terminal",        { "^iterm2?$", "^terminal$", "^ghostty$", "^alacritty$", "^kitty$", "^warp$",
+  { "terminal",        { "^iterm2?$", "^itermserver", "^terminal$", "^ghostty$", "^alacritty$", "^kitty$", "^warp$",
                          "^tmux" } },
   { "media",           { "^spotify", "^quicktime player$", "^vlc$", "^ffmpeg$", "^music$", "^photos$",
                          "^handbrake" } },
-  { "comms",           { "^slack", "^discord", "^zoom", "^microsoft teams", "^telegram", "^signal",
+  { "comms",           { "^slack", "^discord", "^zoom", "^microsoft teams", "^msteams", "^telegram", "^signal",
                          "^notion" } },
 }
 
@@ -569,14 +569,21 @@ end
 
 -- A name written "base (detail)" (a tool running under its runtime, such as
 -- "node (npm install)"): when the whole name matches no rule, the detail is
--- tried, then the base. The vocabulary stays closed, and the name is still
--- the process's own, so this spoofs nothing a name could not already claim.
+-- tried, then the base. The closing parenthesis may be missing: top cuts
+-- names to 16 bytes ("node (npm instal"). Plain finds and a byte scan, so
+-- the split is linear in the name. The vocabulary stays closed, and the
+-- name is still the process's own, so this spoofs nothing a name could not
+-- already claim.
 local function nameCategory(base)
   local c = ruleCategory(base)
   if c then return c end
-  local head, detail = base:match("^(.-)%s*%((.-)%)$")
-  if head then return ruleCategory(detail) or ruleCategory(head) end
-  return nil
+  local open = base:find("(", 1, true)
+  if not open then return nil end
+  local stop = (base:byte(#base) == 41) and #base - 1 or #base
+  local detail = base:sub(open + 1, stop)
+  local h = open - 1
+  while h >= 1 and isSpace(base:byte(h)) do h = h - 1 end
+  return ruleCategory(detail) or ruleCategory(base:sub(1, h))
 end
 
 -- Exported for tests and the report. Pure; returns a fixed-vocabulary token.

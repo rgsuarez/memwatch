@@ -1269,6 +1269,20 @@ do
   check("cat: a webkit content process", lfm.categorize("com.apple.WebKit.WebContent"), "browser")
   check("cat: a path-prefixed name uses its basename", lfm.categorize("/opt/homebrew/bin/rg"), "search-tool")
   check("cat: trailing slashes are dropped", lfm.categorize("/opt/homebrew/bin/rg/"), "search-tool")
+  -- Names production really sees: top cuts them to 16 bytes, and some
+  -- processes retitle themselves. Each kept the family main gave it.
+  do
+    local seen = {
+      { "com.apple.WebKit", "browser" }, { "Arc Helper", "browser" }, { "Arc Helper (Plugin)", "browser" },
+      { "Arc Helper (Rend", "browser" }, { "MSTeams", "comms" }, { "iTermServer-3.5.4", "terminal" },
+      { "redis-server *:6379", "database" }, { "node (npm instal", "build-tool" }, { "com.apple.Virtua", "vm" },
+    }
+    local wrong = {}
+    for _, c in ipairs(seen) do
+      if lfm.categorize(c[1]) ~= c[2] then wrong[#wrong + 1] = c[1] .. " -> " .. lfm.categorize(c[1]) end
+    end
+    check("cat: truncated and retitled names keep their family", table.concat(wrong, "; "), "")
+  end
   -- Linear in the name: a process can give itself any name, of any length,
   -- and a backtracking pattern over a long run would stall the tick.
   do

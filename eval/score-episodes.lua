@@ -52,8 +52,8 @@ M.cfg = {
   floorPct     = 5,     -- exhaustion, as the labels define it
   starvePct    = 8,     -- the starvation line, as the labels define it
   -- the time-to-exhaustion baseline freezes when exhaustion is projected
-  -- sooner than its horizon, fit on dev (fitTtx); this is the default when
-  -- no horizon meets the miss bound there: the next decision point
+  -- sooner than its horizon, fit on dev (fitTtx); this is the horizon of an
+  -- unfitted ttx candidate: the next decision point
   ttxHorizonSec = 60,
 }
 
@@ -279,17 +279,23 @@ end
 -- there, ties to the longer, more cautious one. At grace expiry every
 -- offender already grows at the extreme rate, so any horizon near a minute
 -- freezes nearly everything; fitting is what makes this baseline more than
--- always-freeze. No horizon meets the bound: the default.
+-- always-freeze. A fit split too small to certify the bound at any horizon
+-- (fewer runaways than a zero-miss bound needs) is fit on its misses: the
+-- fewest, then the fewest wrongful freezes, never a fixed default that
+-- would quietly weaken the comparator. Returns the horizon, and whether it
+-- met the bound.
 function M.fitTtx(fitEpisodes, cfg)
   cfg = cfg or M.cfg
-  local best, bestWrongful = nil, nil
+  local best, key = nil, nil
   for h = 0, 180, 5 do
     local s = M.score(fitEpisodes, M.candidates.ttx(h), cfg)
-    if s.missUpper <= cfg.missBound and (bestWrongful == nil or s.wrongful <= bestWrongful) then
-      best, bestWrongful = h, s.wrongful
+    local k = (s.missUpper <= cfg.missBound) and { 0, 0, s.wrongful } or { 1, s.misses, s.wrongful }
+    if key == nil or k[1] < key[1]
+       or (k[1] == key[1] and (k[2] < key[2] or (k[2] == key[2] and k[3] <= key[3]))) then
+      best, key = h, k
     end
   end
-  return best or cfg.ttxHorizonSec
+  return best, key[1] == 0
 end
 
 M.candidates["oracle"] = function()
@@ -680,16 +686,17 @@ local function summary(name, s)
 end
 
 -- The deterministic baselines, the fitted ones fit on fitEpisodes (dev).
--- Returns them, the tree, and the ttx horizon.
+-- Returns them, the tree, the ttx horizon, and whether that horizon met the
+-- miss bound on the fit split.
 function M.baselineSet(fitEpisodes, depth)
   local tree = M.fitTree(fitEpisodes, depth or 3, 5)
-  local horizon = M.fitTtx(fitEpisodes)
+  local horizon, certified = M.fitTtx(fitEpisodes)
   return {
     ["always-freeze"] = M.candidates["always-freeze"](),
     ["rule"] = M.candidates["rule"](),
     ["ttx"] = M.candidates["ttx"](horizon),
     ["tree"] = M.treeCandidate(tree),
-  }, tree, horizon
+  }, tree, horizon, certified
 end
 
 -- The power control: a candidate a share of the way from the best baseline
@@ -804,7 +811,7 @@ function M.main(argv)
         .. tostring(twin or ep.id) .. " in the evaluated set")
     end
   end
-  local baselines, tree, horizon = M.baselineSet(fitEps, a.depth)
+  local baselines, tree, horizon, certified = M.baselineSet(fitEps, a.depth)
   if a.cmd == "gate" then
     -- No default: the label-reading oracle is a control, never a candidate
     -- a gate run passes by omission.
@@ -833,7 +840,8 @@ function M.main(argv)
       g.pass and "PASS" or "FAIL"))
     status = g.pass and 0 or 1
     print("tree baseline (fit on " .. (a.fitDir or a.dir) .. "):\n" .. M.describeTree(tree, "  "))
-    print(string.format("ttx baseline horizon (fit on the same split): %d s", horizon))
+    print(string.format("ttx baseline horizon (fit on the same split): %d s%s", horizon, certified and ""
+      or " (no horizon can meet the miss bound on a split this small: fit on its fewest misses)"))
     if a.out then
       local f = assert(io.open(a.out, "w"))
       f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,

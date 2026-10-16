@@ -758,6 +758,26 @@ do
   check("decidable: at least 59 runaways, the zero-miss bound", nR >= 59, true)
   sc.cfg.bootstrap = 400
   local baselines = sc.baselineSet(fit, 3)
+  -- A fit split too small to certify the miss bound at any horizon is fit on
+  -- its own misses, not a fixed default: the zero-miss horizon with the
+  -- fewest wrongful freezes there.
+  -- (Fifty episodes: 32 runaways, under the 59 a zero-miss bound needs, and
+  -- savables enough that the best horizon is not the default.)
+  local small = {}
+  for _, ep in ipairs(fit) do if #small < 50 then small[#small + 1] = ep end end
+  local hSmall, certSmall = sc.fitTtx(small)
+  local bestW = math.huge
+  for h = 0, 180, 5 do
+    local s = sc.score(small, sc.candidates.ttx(h))
+    if s.misses == 0 then bestW = math.min(bestW, s.wrongful) end
+  end
+  local sSmall = sc.score(small, sc.candidates.ttx(hSmall))
+  check("ttx fit: a split too small to certify the bound says so", certSmall, false)
+  check("ttx fit: and is fit on its misses, then its wrongful freezes",
+    sSmall.misses == 0 and sSmall.wrongful == bestW, true)
+  check("ttx fit: (the fixture tells that from the default horizon)",
+    sc.score(small, sc.candidates.ttx(sc.cfg.ttxHorizonSec)).wrongful > bestW, true)
+  check("ttx fit: a decidable split certifies its horizon", select(2, sc.fitTtx(fit)), true)
   local gO = sc.gate(dev, sc.candidates.oracle(), baselines)
   check("decidable: some baseline meets the miss bound", gO.bestBaseline ~= nil, true)
   check("decidable: the label oracle passes the gate", gO.pass, true)

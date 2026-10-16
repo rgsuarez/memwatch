@@ -679,7 +679,9 @@ function M.parseSystemOne(text)
   end
   local pf, pw = probs.freeze, probs.wait
   if type(pf) ~= "number" or type(pw) ~= "number" then return nil, "systemone: missing option" end
-  if pf < 0 or pw < 0 or math.abs(pf + pw - 1) > 0.02 then
+  -- Each a probability in [0, 1] (NaN fails both comparisons), summing to
+  -- about 1.
+  if not (pf >= 0 and pf <= 1 and pw >= 0 and pw <= 1) or math.abs(pf + pw - 1) > 0.02 then
     return nil, "systemone: probabilities do not sum to 1"
   end
   return { action = (pf > pw) and "freeze" or "wait", pFreeze = pf, pWait = pw,
@@ -708,12 +710,23 @@ function M.completionBody(prompt, opts)
   })
 end
 
-local OPTION_PREFIX = { { "wait", "wait" }, { "free", "freeze" }, { "termin", "terminate" } }
-local function optionOf(tok)
+-- Which option a candidate token at the action value starts: the whole
+-- option word, alone or closed by the value's quote (JSON may follow), or
+-- the start of the word a tokenizer cut (at least 3 characters). A longer
+-- word that merely begins like one ("waiting", "freedom") is none of them.
+-- quoted: the token also carries the value's opening quote (a tokenizer
+-- that fuses the two).
+local OPTION_WORDS = { "wait", "freeze", "terminate" }
+local function optionOf(tok, quoted)
   if type(tok) ~= "string" then return nil end
   tok = tok:gsub("^%s+", "")
-  for _, op in ipairs(OPTION_PREFIX) do
-    if tok:sub(1, #op[1]) == op[1] or op[1]:sub(1, #tok) == tok and #tok >= 3 then return op[2] end
+  if quoted then
+    if tok:sub(1, 1) ~= '"' then return nil end
+    tok = tok:sub(2)
+  end
+  for _, word in ipairs(OPTION_WORDS) do
+    if tok == word or tok:sub(1, #word + 1) == word .. '"' then return word end
+    if #tok >= 3 and #tok < #word and word:sub(1, #tok) == tok then return word end
   end
   return nil
 end
@@ -731,13 +744,22 @@ function M.parseTokenProbs(text)
   if type(doc) ~= "table" then return nil, "tokenprob: " .. tostring(err) end
   local positions = doc.completion_probabilities
   if type(positions) ~= "table" then return nil, "tokenprob: no token probabilities" end
-  local seen, at = "", nil
+  local seen, at, quoted = "", nil, false
   for i, pos in ipairs(positions) do
     if type(pos) ~= "table" or type(pos.token) ~= "string" then
       return nil, "tokenprob: malformed position"
     end
     seen = seen .. pos.token
     if seen:find('"action"%s*:%s*"$') then at = positions[i + 1]; break end
+    -- A tokenizer that fuses the value's opening quote with the value. A
+    -- bare quote token is the quote alone: the value follows it, and the
+    -- line above finds it on the next position.
+    local nxt = positions[i + 1]
+    if seen:find('"action"%s*:%s*$') and type(nxt) == "table" and type(nxt.token) == "string"
+       and nxt.token:match('^%s*"[^"%s]') then
+      at, quoted = nxt, true
+      break
+    end
     if #seen > 256 then break end
   end
   if type(at) ~= "table" then return nil, "tokenprob: no action value" end
@@ -745,14 +767,16 @@ function M.parseTokenProbs(text)
   if type(cands) ~= "table" then return nil, "tokenprob: no candidates at the action value" end
   local p = { wait = 0, freeze = 0, terminate = 0 }
   for _, c in ipairs(cands) do
-    local op = type(c) == "table" and optionOf(c.token) or nil
+    local op = type(c) == "table" and optionOf(c.token, quoted) or nil
     local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
       or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
-    if op and pr and pr >= 0 then p[op] = p[op] + pr end
+    -- A probability outside [0, 1] (or not a number) is malformed.
+    if pr ~= nil and not (pr >= 0 and pr <= 1) then return nil, "tokenprob: a probability out of range" end
+    if op and pr then p[op] = p[op] + pr end
   end
   local mass = p.wait + p.freeze + p.terminate
   if mass < 0.5 then return nil, "tokenprob: the options carry too little probability" end
-  local chosen = optionOf(at.token)
+  local chosen = optionOf(at.token, quoted)
   if not chosen then return nil, "tokenprob: the chosen token is not an option" end
   return { action = chosen, pWait = p.wait / mass, pFreeze = p.freeze / mass,
            pTerminate = p.terminate / mass, mass = mass }
@@ -898,6 +922,9 @@ end
 function M.waitHonored(verdict, tauWait)
   if type(verdict) ~= "table" or verdict.action ~= "wait" then return false end
   if type(verdict.pWait) ~= "number" or type(tauWait) ~= "number" then return false end
+  -- Only a probability: one outside [0, 1] (or NaN) is malformed, and never
+  -- clears a threshold, even the one that disables the rail (above 1).
+  if not (verdict.pWait >= 0 and verdict.pWait <= 1) then return false end
   return verdict.pWait >= tauWait
 end
 

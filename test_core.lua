@@ -3202,6 +3202,10 @@ check("wait rail: a self-reported confidence never qualifies",
 check("wait rail: an unset threshold honors nothing", lfm.waitHonored({ action = "wait", pWait = 1 }, nil), false)
 check("wait rail: a freeze is not a wait", lfm.waitHonored({ action = "freeze", pWait = 0.95 }, 0.9), false)
 check("wait rail: no verdict", lfm.waitHonored(nil, 0.9), false)
+check("wait rail: a probability above one never qualifies, even at the disabling threshold",
+  lfm.waitHonored({ action = "wait", pWait = 1.01 }, 1.01), false)
+check("wait rail: a negative probability never qualifies", lfm.waitHonored({ action = "wait", pWait = -0.1 }, -1), false)
+check("wait rail: certainty clears a threshold of one", lfm.waitHonored({ action = "wait", pWait = 1 }, 1), true)
 
 -- ---- System One adapter (decision models): body and bounded parse ----
 do
@@ -3246,6 +3250,8 @@ do
   check("systemone parse: a missing option is refused", (lfm.parseSystemOne(reply({ freeze = 1 }))), nil)
   check("systemone parse: a bad sum is refused", (lfm.parseSystemOne(reply({ freeze = 0.7, wait = 0.7 }))), nil)
   check("systemone parse: a negative probability is refused", (lfm.parseSystemOne(reply({ freeze = 1.2, wait = -0.2 }))), nil)
+  check("systemone parse: a probability above one is refused, though the sum is within tolerance",
+    (lfm.parseSystemOne(reply({ freeze = 0, wait = 1.01 }))), nil)
   check("systemone parse: no answers is refused", (lfm.parseSystemOne('{"model":"d1"}')), nil)
   check("systemone parse: non-JSON is refused", (lfm.parseSystemOne("not json")), nil)
   check("systemone parse: empty is refused", (lfm.parseSystemOne("")), nil)
@@ -3286,6 +3292,20 @@ do
     (lfm.parseTokenProbs(tpReply("termin", { { "termin", 0.6 }, { "free", 0.4 } })) or {}).action, "terminate")
   check("tokenprob parse: the key split differently still finds the value",
     (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.9 }, { "free", 0.1 } }, { '{"', 'act', 'ion', '":', '"' })) or {}).action, "wait")
+  -- A word that merely begins like an option carries none of its mass.
+  check("tokenprob parse: unrelated words that begin like an option count for none",
+    (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.05 }, { "waiting", 0.94 }, { "free", 0.01 } }))), nil)
+  check("tokenprob parse: a word only beginning like freeze is not freeze",
+    (lfm.parseTokenProbs(tpReply("freedom", { { "freedom", 0.6 }, { "wait", 0.4 } }))), nil)
+  check("tokenprob parse: the option closed by its quote in one token",
+    (lfm.parseTokenProbs(tpReply('wait"', { { 'wait"', 0.9 }, { "free", 0.1 } })) or {}).action, "wait")
+  check("tokenprob parse: a tokenizer fusing the opening quote with the value",
+    (lfm.parseTokenProbs(tpReply('"wait', { { '"wait', 0.9 }, { '"free', 0.1 } }, { '{"', "action", '":' })) or {}).action, "wait")
+  check("tokenprob parse: the fused alternatives' probabilities count",
+    math.abs(((lfm.parseTokenProbs(tpReply('"free', { { '"free', 0.8 }, { '"wait', 0.2 } },
+      { '{"', "action", '":' })) or {}).pWait or -1) - 0.2) < 1e-6, true)
+  check("tokenprob parse: a probability above one is refused",
+    (lfm.parseTokenProbs(tpReply("wait", { { "wait", 1.5 }, { "free", 0.1 } }))), nil)
   check("tokenprob parse: options carrying too little probability are refused",
     (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.2 }, { "maybe", 0.7 } }))), nil)
   check("tokenprob parse: a reply without the action value is refused",

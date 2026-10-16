@@ -68,9 +68,7 @@ M.cfg = {
   totalMB         = 36864,  -- the deployment machine's RAM
   exhaustPct      = 5,      -- availability at which the machine is lost
   starvePct       = 8,      -- a plateau holding the machine at or below this starves it
-  decisionsMax    = 3,      -- grace expiry and two re-arms (within one alert, the floor acts by the third)
   deferralSec     = lfm.cfg.maxDeferSec, -- the deterministic floor fires here (production's default)
-  horizonSec      = 180,
   tickSec         = core.cfg.pollSec,    -- the sampler's cadence
   leadSec         = 60,     -- base-footprint history before the climb
   graceSec        = core.cfg.cool.autoKillGraceSec, -- the alert's unanswered window
@@ -78,6 +76,13 @@ M.cfg = {
   settleSec       = 10,     -- below critical this long ends the alert, as in production
   maxFill         = 0.90,   -- the offender's physical footprint plus what is available, of the machine
 }
+-- The decision count and the horizon follow the deferral bound: within one
+-- alert, waiting at every decision point reaches the floor at the last of
+-- them (grace expiry and a re-arm a grace window apart until the bound),
+-- and the horizon runs a grace window past the bound. 3 and 180 s by
+-- production's defaults.
+M.cfg.decisionsMax = math.floor(M.cfg.deferralSec / M.cfg.graceSec) + 1
+M.cfg.horizonSec = M.cfg.deferralSec + M.cfg.graceSec
 
 -- Deterministic PRNG (xorshift32), identical across Lua 5.4 and 5.5 so a
 -- (template, seed) pair always yields the same episode.

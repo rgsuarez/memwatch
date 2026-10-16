@@ -210,6 +210,16 @@ do
     end
   end
   check("hash: every step's stored hash is the scorer's, after a write and a read", stored and rt > 0, true)
+  -- The decision count and the horizon follow the bound: a generator loaded
+  -- under a 180 s bound decides four times over 240 s.
+  local lfmMod = require("memwatch_lfm")
+  local keepBound = lfmMod.cfg.maxDeferSec
+  lfmMod.cfg.maxDeferSec = 180
+  local okLonger, longer = pcall(dofile, "eval/gen-episodes.lua")
+  lfmMod.cfg.maxDeferSec = keepBound
+  check("deferral: the decision count and horizon follow the bound",
+    okLonger and (longer.cfg.decisionsMax .. "/" .. longer.cfg.horizonSec), "4/240")
+  check("deferral: and are 3 and 180 s by default", gen.cfg.decisionsMax .. "/" .. gen.cfg.horizonSec, "3/180")
   check("deferral: a generated episode records its bound",
     gen.episode(dofile("eval/episode-templates.lua")[1], 1, "test").params.deferralSec, sc.cfg.deferralSec)
   check("play: a new alert starts the deferral over", sc.play(seqEp(1, 1, 2), waitAll).freezeAt, nil)

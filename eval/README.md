@@ -166,7 +166,11 @@ that decision.
   threshold chosen on dev (`tau`), and a wait with no probability (a chat
   verdict) is never honored. Candidates are scored on the `discriminate` prompt
   variant. As in run mode, a server error fails the run; so does an
-  `/apply-template` reply with no prompt.
+  `/apply-template` reply with no prompt. A flag the mode would not send is
+  refused: `--raw-names` and `--no-schema` always, `--variant` other than
+  `discriminate` with `--api systemone` (System One sends its own
+  instructions), and `--model` with `--api completion` (no request names
+  one).
 - A decisions file is one JSON row per decision point: `episode`, `t`,
   `action` (`freeze` or `wait`), `pWait` when the model gives one, and
   `snapshotHash`, the hash of the step's snapshot the row answered

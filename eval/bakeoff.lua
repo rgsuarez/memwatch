@@ -493,7 +493,9 @@ end
 --     [--api-key-env VAR] [--timeout 60] [--max-tokens 128] [--out rows.jsonl]
 --     [--retries 2] [--retry-wait 2]
 -- A server error fails the run, as in run mode, and so does an
--- /apply-template reply with no prompt.
+-- /apply-template reply with no prompt. A flag the mode would not send is
+-- refused: --raw-names and --no-schema always, --variant (other than
+-- discriminate) with --api systemone, and --model with --api completion.
 ------------------------------------------------------------------------------
 
 local function episodesMode(args)
@@ -510,6 +512,23 @@ local function episodesMode(args)
   -- Everything that can refuse does so before the output is claimed, so a
   -- refusal never leaves a reserved, empty file behind to block a retry.
   local retries, retryWait = retryArgs(args)
+  -- Every flag this mode takes is one it sends and records. Names are
+  -- redacted as production redacts them, and the chat path asks for the
+  -- schema, so --raw-names and --no-schema do not apply. System One sends its
+  -- own instructions (the discriminate clause), so --variant does not apply
+  -- to it. A completion request names no model (the server serves one), so
+  -- --model does not apply to it.
+  if args.raw_names or args.no_schema then
+    error("episodes mode redacts names as production does and asks for the schema:"
+      .. " --raw-names and --no-schema do not apply", 0)
+  end
+  if api == "systemone" and variant ~= "discriminate" then
+    error("--api systemone sends its own instructions (the discriminate clause): --variant "
+      .. variant .. " does not apply", 0)
+  end
+  if api == "completion" and args.model then
+    error("--api completion names no model (the server serves one): name the run with --label", 0)
+  end
   local files = listScenarios(dir)
   assert(#files > 0, "no episodes found in " .. dir)
   local systemPrompt = lfm.buildSystemPrompt({ variant = variant })

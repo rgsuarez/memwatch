@@ -1817,6 +1817,17 @@ printf '0.010 %s' "$status"
     okTpl == false and fTpl == false and saidTpl:find("gave no prompt", 1, true) ~= nil, true)
   local _, okRetryArg = run("chat", chat, "badretries", "--retries -1")
   check("runner: a negative --retries is refused", okRetryArg, false)
+  -- A flag the mode would not send is refused before any row.
+  local _, okRawN, _, fRawN = run("chat", chat, "rawn", "--raw-names")
+  check("runner: episodes mode refuses --raw-names, which it would not send", okRawN == false and fRawN == false, true)
+  local _, okNoS, _, fNoS = run("chat", chat, "nosch", "--no-schema")
+  check("runner: and --no-schema", okNoS == false and fNoS == false, true)
+  local _, okSv, _, fSv = run("systemone", chat, "s1var", "--variant baseline")
+  check("runner: System One refuses a --variant it would not send", okSv == false and fSv == false, true)
+  local rsd = run("systemone", chat, "s1disc", "--variant discriminate")
+  check("runner: and records discriminate, the instructions it sends", rsd.variant, "discriminate")
+  local _, okCm, _, fCm = run("completion", chat, "cmodel", "--model foo")
+  check("runner: a completion run refuses --model, which no request carries", okCm == false and fCm == false, true)
   check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)
   check("runner: and binds the input it answered, as the scorer hashes it",
     rc.snapshotHash ~= nil and rc.snapshotHash == sc.stepHash(ep.steps[1]), true)

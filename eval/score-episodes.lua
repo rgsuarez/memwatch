@@ -659,18 +659,25 @@ function M.fingerprint(ep)
                           ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
 end
 
--- Everything the scoring reads from an episode: each step's time, alert and
--- snapshot, the floor's ticks, the outcome labels, and the template the
--- bootstrap groups it by. Two episodes alike in all of it score alike,
--- whatever their ids; two that differ in any of it can score apart (the same
--- snapshots over different raw headroom, say), so a split may hold both.
+-- Everything the replay reads from an episode: each step's time and
+-- snapshot, whether it starts a new alert, the floor's ticks, and the outcome
+-- labels. Two episodes alike in all of it are the same trajectory, whatever
+-- their ids or the template they are filed under (a copy relabeled to another
+-- template would otherwise count as another bootstrap group); two that differ
+-- in any of it can score apart (the same snapshots over different raw
+-- headroom, say), so a split may hold both. The replay reads an alert only as
+-- a change from the step before (M.play), so the identity holds that change,
+-- not the alert's number: a copy with its alerts renumbered is the same
+-- episode.
 function M.replayPrint(ep)
   local L = ep.labels or {}
   local steps = {}
-  for i, st in ipairs(ep.steps or {}) do steps[i] = { t = st.t, alertSeq = st.alertSeq, snapshot = st.snapshot } end
+  for i, st in ipairs(ep.steps or {}) do
+    local prev = ep.steps[i - 1]
+    steps[i] = { t = st.t, newAlert = i > 1 and st.alertSeq ~= prev.alertSeq, snapshot = st.snapshot }
+  end
   return lfm.jsonEncode({ steps = lfm.jsonArray(steps), floorTicks = lfm.jsonArray(ep.floorTicks or {}),
-                          template = ep.template, class = L.class, runaway = L.runaway, ttxSec = L.ttxSec,
-                          resolvesBySec = L.resolvesBySec })
+                          class = L.class, runaway = L.runaway, ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
 end
 
 -- Every episode in a directory, each once: a copied file (the same episode
@@ -688,13 +695,19 @@ function M.loadDir(dir)
       local f = assert(io.open(dir .. "/" .. name, "r"))
       local ep = assert(lfm.jsonDecode(f:read("a")))
       f:close()
+      -- Every episode carries its id (the generator writes one): rows, keys
+      -- and the sort all read it.
+      if type(ep.id) ~= "string" or ep.id == "" then
+        p:close()
+        error(string.format("%s/%s carries no episode id", dir, name), 0)
+      end
       local fp = M.replayPrint(ep)
-      local first = (ep.id ~= nil and byId[ep.id]) or byPrint[fp]
+      local first = byId[ep.id] or byPrint[fp]
       if first then
         p:close()
         error(string.format("%s holds the same episode twice (%s and %s): score each episode once", dir, first, name), 0)
       end
-      if ep.id ~= nil then byId[ep.id] = name end
+      byId[ep.id] = name
       byPrint[fp] = name
       eps[#eps + 1] = ep
     end

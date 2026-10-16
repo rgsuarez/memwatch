@@ -1035,9 +1035,22 @@ do
     nf:write(lfm.jsonEncode(e), "\n")
     nf:close()
   end
+  local renum = tmpDir()
+  local copyR = lfm.jsonDecode(lfm.jsonEncode(one))
+  copyR.id = one.id .. "-renumbered"
+  for _, st in ipairs(copyR.steps) do st.alertSeq = (st.alertSeq or 0) + 10 end
+  for _, e in ipairs({ one, copyR }) do
+    local rf2 = assert(io.open(renum .. "/" .. e.id .. ".json", "w"))
+    rf2:write(lfm.jsonEncode(e), "\n")
+    rf2:close()
+  end
+  local okRenum, errRenum = pcall(sc.loadDir, renum)
+  check("cli: a copy with its alerts renumbered is the same episode, refused",
+    okRenum == false and tostring(errRenum):find("the same episode twice", 1, true) ~= nil, true)
+  os.execute("rm -rf '" .. renum .. "'")
   local okNoIds, errNoIds = pcall(sc.loadDir, noIds)
-  check("cli: two episodes with no id that score alike are refused too",
-    okNoIds == false and tostring(errNoIds):find("the same episode twice", 1, true) ~= nil, true)
+  check("cli: an episode with no id is refused, naming its file",
+    okNoIds == false and tostring(errNoIds):find("carries no episode id", 1, true) ~= nil, true)
   os.execute("rm -rf '" .. noIds .. "'")
   -- The same snapshots over different raw headroom, or under another alert,
   -- replay apart: both are kept.
@@ -1050,18 +1063,30 @@ do
   local twin2 = lfm.jsonDecode(lfm.jsonEncode(base1))
   twin2.id = one.id .. "-alert"
   twin2.steps[1].alertSeq = (twin2.steps[1].alertSeq or 1) + 1
-  local twin3 = lfm.jsonDecode(lfm.jsonEncode(base1))
-  twin3.id = one.id .. "-template"
-  twin3.template = tostring(one.template) .. "-other"
-  for _, e in ipairs({ base1, twin1, twin2, twin3 }) do
+  for _, e in ipairs({ base1, twin1, twin2 }) do
     local af = assert(io.open(apart .. "/" .. e.id .. ".json", "w"))
     af:write(lfm.jsonEncode(e), "\n")
     af:close()
   end
   local okApart, apartEps = pcall(sc.loadDir, apart)
-  check("cli: episodes alike but for their raw headroom, alert or template are all kept",
-    okApart == true and #apartEps == 4, true)
+  check("cli: episodes alike but for their raw headroom or alert are both kept",
+    okApart == true and #apartEps == 3, true)
   os.execute("rm -rf '" .. apart .. "'")
+  -- The same trajectory filed under another template is the same episode:
+  -- kept, it would count as another bootstrap group.
+  local relabelT = tmpDir()
+  local twin3 = lfm.jsonDecode(lfm.jsonEncode(base1))
+  twin3.id = one.id .. "-template"
+  twin3.template = tostring(one.template) .. "-other"
+  for _, e in ipairs({ base1, twin3 }) do
+    local tf3 = assert(io.open(relabelT .. "/" .. e.id .. ".json", "w"))
+    tf3:write(lfm.jsonEncode(e), "\n")
+    tf3:close()
+  end
+  local okRelabel, errRelabel = pcall(sc.loadDir, relabelT)
+  check("cli: a copy filed under another template is the same episode, refused",
+    okRelabel == false and tostring(errRelabel):find("the same episode twice", 1, true) ~= nil, true)
+  os.execute("rm -rf '" .. relabelT .. "'")
   -- As a script, the gate's exit status tells the outcomes apart: 2 for a
   -- set too small to decide, 3 for a refusal (never 1, a gate that failed),
   -- and 3 when the result file does not reach the disk.

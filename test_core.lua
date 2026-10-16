@@ -980,6 +980,21 @@ do
   local selfOnly = core.parseProbeRows(
     "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF)
   check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
+  -- The comm is the process's own claim, of any length: it is read in
+  -- linear time, whole, with only its trailing whitespace trimmed.
+  local ctl = "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n"
+  local function commOf(tail)
+    local r = core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026 " .. tail .. "\n", SELF)
+    return r and r[4242] and r[4242].comm
+  end
+  local t0 = os.clock()
+  local long = commOf("a" .. (" "):rep(40000) .. "b")
+  check("probe: a comm with a long whitespace run is read in linear time", os.clock() - t0 < 0.25, true)
+  check("probe: and kept whole", long, "a" .. (" "):rep(40000) .. "b")
+  check("probe: a comm's trailing whitespace is trimmed", commOf("node \t "), "node")
+  check("probe: its leading whitespace is the separator's", commOf("   node"), "node")
+  check("probe: a row that ends after the start time has an empty comm",
+    (core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026 \n", SELF) or {})[4242].comm, "")
 end
 
 -- ---- identity: a recorded process may be signaled only while it holds ----

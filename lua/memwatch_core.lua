@@ -425,11 +425,17 @@ function M.parseProbeRows(out, selfPid)
   local rows = {}
   for line in out:gmatch("[^\n]+") do
     if line:match("%S") then
-      local pid, uid, state, lstart, comm = line:match(
-        "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+(.-)%s*$")
+      -- The fixed fields, then where the comm starts. The comm is the
+      -- process's own claim, of any length, so its trailing whitespace is
+      -- trimmed by a backward byte scan: a pattern like (.-)%s*$ rescans a
+      -- long whitespace run inside it, in time quadratic in the run.
+      local pid, uid, state, lstart, at = line:match(
+        "^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%a+%s+%a+%s+%d+%s+%d+:%d+:%d+%s+%d+)%s+()")
       if not pid then return nil end
+      local e = #line
+      while e >= at and isSpace(line:byte(e)) do e = e - 1 end
       pid = tonumber(pid)
-      rows[pid] = { pid = pid, uid = tonumber(uid), state = state, lstart = lstart, comm = comm }
+      rows[pid] = { pid = pid, uid = tonumber(uid), state = state, lstart = lstart, comm = line:sub(at, e) }
     end
   end
   if selfPid == nil or rows[selfPid] == nil then return nil end

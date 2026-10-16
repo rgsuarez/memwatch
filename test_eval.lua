@@ -340,6 +340,20 @@ do
   check("labels: growth ending at a release past the bound starves the machine", slowExit(150, 150).class, "runaway")
   check("labels: as it does a second before it", slowExit(149, 150).class, "runaway")
   check("labels: one released at the end of growth within the bound resolves", slowExit(100, 100).class, "savable")
+  -- A release at the very instant growth would have exhausted the machine
+  -- cancels the exhaustion, so the runaway is a starving one: its deadline
+  -- is the deferral bound, not the release (138.24 s at 12 MB/s from 9.5%).
+  local function atLoss(rel)
+    return params({ avail0 = 9.5, graceRate = 0, phases = { { dur = 150, rate = 12 } },
+                    after = rel and "release" or "hold", releaseAt = rel })
+  end
+  local hold = atLoss(nil)
+  gen.prepare(hold)
+  local lostAtHold = gen.exhaustAt(hold, gen.cfg)
+  local cancelled = gen.simulate(atLoss(lostAtHold))
+  check("labels: an exhaustion a release cancels leaves the bound as the deadline",
+    cancelled.class == "runaway" and cancelled.lostAt == nil and cancelled.ttxSec == gen.cfg.deferralSec
+      and lostAtHold > gen.cfg.deferralSec, true)
 end
 
 -- ---- eligibility, state and footprint, from production's own logic ----

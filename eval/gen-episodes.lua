@@ -444,7 +444,10 @@ function M.simulate(p, cfg)
   local class
   if runaway then
     class = "runaway"
-    if ttx == nil then ttx = cfg.deferralSec end
+    -- The deadline: when the machine is lost, if it is; otherwise (a
+    -- starving plateau) the deferral bound. Never an exhaustion that a
+    -- release at that same instant cancelled.
+    ttx = lostAt or cfg.deferralSec
   elseif resolve <= cfg.deferralSec then
     class = "savable"
   else

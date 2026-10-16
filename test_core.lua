@@ -590,6 +590,21 @@ do
   check("shortName: Helper not after whitespace is kept", core.shortName("xHelper y"), "xHelper y")
   check("kill: a comm ending in a slash names no denied process",
     (core.killAllowed({ pid = 4243, uid = UID, comm = "/System/WindowServer/" }, UID, 999)), true)
+  -- And at the edges: empty, a lone slash, Helper first, whitespace other
+  -- than a space or tab, and bytes past ASCII.
+  check("friendlyName: an empty comm is unnamed", procs.friendlyName(""), "?")
+  check("friendlyName: a lone slash is kept whole", procs.friendlyName("/"), "/")
+  check("friendlyName: a multibyte basename is whole", procs.friendlyName("/opt/caf\xc3\xa9"), "caf\xc3\xa9")
+  check("shortName: a name that starts with Helper is kept", core.shortName("Helper"), "Helper")
+  check("shortName: whitespace then Helper at the start leaves nothing", core.shortName(" Helper"), "")
+  check("shortName: Helper after a newline is stripped", core.shortName("Slack\nHelper"), "Slack")
+  check("shortName: Helper after a vertical tab or form feed is stripped",
+    core.shortName("Slack\vHelper") .. "|" .. core.shortName("Zoom\f\rHelper (GPU)"), "Slack|Zoom")
+  check("shortName: a multibyte name keeps its bytes", core.shortName("Caf\xc3\xa9 Helper"), "Caf\xc3\xa9")
+  check("kill: an empty comm, a lone slash or no comm names no denied process",
+    (core.killAllowed({ pid = 4244, uid = UID, comm = "" }, UID, 999))
+      and (core.killAllowed({ pid = 4245, uid = UID, comm = "/" }, UID, 999))
+      and (core.killAllowed({ pid = 4246, uid = UID }, UID, 999)), true)
 end
 
 -- ---- LFM: JSON codec (trust-boundary parser; adversarial floor) ----

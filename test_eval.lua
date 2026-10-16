@@ -1070,7 +1070,7 @@ while [ $# -gt 0 ]; do
 done
 cat "$body" >> "$FAKE_BODY_LOG"; echo >> "$FAKE_BODY_LOG"
 printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"wait\",\"process_class\":\"hog\",\"confidence\":0.5,\"rationale\":\"x\"}"}}]}' > "$out"
-printf '0.010'
+printf '0.010 %s' "${FAKE_STATUS:-200}"
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -1111,6 +1111,14 @@ printf '0.010'
   local red, raw = resultAt(cwdRoot .. "/eval/results/t-taxonomy.json"), resultAt(cwdRoot .. "/eval/results/t-taxonomy-rawnames.json")
   check("runner: a redacted run writes its default file", red.redact_names, true)
   check("runner: a raw-names run writes its own beside it, naming its condition", raw.redact_names, false)
+  -- A server error fails the run, writing no results, rather than scoring
+  -- the error as the model's invalid reply.
+  local outErr = root .. "/run-err.json"
+  local okErr = os.execute(string.format("PATH='%s':\"$PATH\" FAKE_STATUS=503 FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run "
+    .. "--server http://stub --label t --scenarios '%s' --retries 0 --out '%s' >/dev/null 2>&1", stubDir, log, corpus, outErr))
+  local errFile = io.open(outErr, "r")
+  if errFile then errFile:close() end
+  check("runner: in run mode a server error fails the run, writing no results", okErr ~= true and errFile == nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 
@@ -1688,15 +1696,22 @@ if [ -n "${FAKE_BAD_FIRST:-}" ]; then
   n=$(cat "$FAKE_BAD_FIRST" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_BAD_FIRST"
   [ "$n" -eq 1 ] && FAKE_CHAT="not json"
 fi
+# FAKE_STATUS_SEQ: the HTTP status of each request in turn (the last one
+# repeats), counted in the file FAKE_SEQ_FILE names.
+status=200
+if [ -n "${FAKE_STATUS_SEQ:-}" ]; then
+  n=$(cat "$FAKE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_SEQ_FILE"
+  i=0; for s in $FAKE_STATUS_SEQ; do i=$((i + 1)); status=$s; [ "$i" -ge "$n" ] && break; done
+fi
 case "$url" in
   */v1/chat/completions) body="$FAKE_CHAT" ;;
   */v1/systemone) body='{"model":"d1","answers":{"action":{"type":"choice","choice":"freeze","probabilities":{"freeze":0.8,"wait":0.2},"confidence":0.4}}}' ;;
-  */apply-template) body='{"prompt":"PROMPT"}' ;;
+  */apply-template) body='{"prompt":"PROMPT"}'; [ -n "${FAKE_TEMPLATE:-}" ] && body="$FAKE_TEMPLATE" ;;
   */completion) body="$FAKE_COMPLETION" ;;
   *) exit 7 ;;
 esac
 printf '%s' "$body" > "$out"
-printf '0.010'
+printf '0.010 %s' "$status"
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -1720,17 +1735,21 @@ printf '0.010'
   local function sq(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
   local function run(api, chatBody, tag, extra, env, dir)
     local out = root .. "/rows-" .. tag .. ".jsonl"
+    local said = root .. "/said-" .. tag .. ".txt"
     local ok = os.execute(string.format("%s PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_COMPLETION=%s FAKE_BODY_LOG=%s lua eval/bakeoff.lua "
-      .. "episodes --server http://stub --label t --dir %s --api %s --out %s %s >/dev/null 2>&1",
+      .. "episodes --server http://stub --label t --dir %s --api %s --out %s %s >%s 2>&1",
       env or "", sq(stubDir), sq(chatBody), sq(completion), sq(root .. "/bodies-" .. tag .. ".log"), sq(dir or epDir),
-      api, sq(out), extra or ""))
+      api, sq(out), extra or "", sq(said)))
+    local sf = io.open(said, "r")
+    local saidText = sf and sf:read("a") or ""
+    if sf then sf:close() end
     local rows = {}
     local rf = io.open(out, "r")
     if rf then
       for line in rf:lines() do rows[#rows + 1] = lfm.jsonDecode(line) end
       rf:close()
     end
-    return rows[1] or {}, ok == true, #rows, rf ~= nil
+    return rows[1] or {}, ok == true, #rows, rf ~= nil, saidText
   end
   -- Two decision points (the episode twice, under two ids), for runs where
   -- one reply is garbage.
@@ -1772,6 +1791,32 @@ printf '0.010'
   check("runner: beside a valid reply, the run stands with both rows", okBad == true and nBad == 2, true)
   check("runner: a run with no valid reply fails, leaving no rows",
     okNone == false and nNone == 0 and fileNone == false, true)
+  -- A server error is no answer of the model's: the run fails, leaving no
+  -- rows. Rate limiting is tried again and the run stands; a refused key is
+  -- not tried again. (--retry-wait 0 keeps a retry immediate.)
+  local seqFile = root .. "/seq-count"
+  local function runSeq(tag, statuses, extra, api)
+    os.remove(seqFile)
+    return run(api or "chat", chat, tag, "--retry-wait 0 " .. (extra or ""),
+      "FAKE_STATUS_SEQ=" .. sq(statuses) .. " FAKE_SEQ_FILE=" .. sq(seqFile))
+  end
+  local _, ok500, n500, f500, said500 = runSeq("s500", "500")
+  check("runner: a server error fails the run, leaving no rows", ok500 == false and n500 == 0 and f500 == false, true)
+  check("runner: and says the server gave no reply", said500:find("gave no reply (HTTP 500", 1, true) ~= nil, true)
+  local r429, ok429, n429 = runSeq("s429", "429 200")
+  check("runner: rate limiting is tried again, and the run stands",
+    ok429 == true and n429 == #ep.steps and r429.valid == true, true)
+  local _, ok401, _, f401 = runSeq("s401", "401 200")
+  check("runner: a refused key is not tried again", ok401 == false and f401 == false, true)
+  local _, okNoRetry, _, fNoRetry = runSeq("s503", "503 200", "--retries 0")
+  check("runner: with no retries, a server error fails at once", okNoRetry == false and fNoRetry == false, true)
+  local _, okTplSrv, _, fTplSrv = runSeq("stpl", "500", nil, "completion")
+  check("runner: so does a server error on the template request", okTplSrv == false and fTplSrv == false, true)
+  local _, okTpl, _, fTpl, saidTpl = run("completion", chat, "tpl", nil, "FAKE_TEMPLATE=" .. sq("not json"))
+  check("runner: an /apply-template reply with no prompt fails the run",
+    okTpl == false and fTpl == false and saidTpl:find("gave no prompt", 1, true) ~= nil, true)
+  local _, okRetryArg = run("chat", chat, "badretries", "--retries -1")
+  check("runner: a negative --retries is refused", okRetryArg, false)
   check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)
   check("runner: and binds the input it answered, as the scorer hashes it",
     rc.snapshotHash ~= nil and rc.snapshotHash == sc.stepHash(ep.steps[1]), true)

@@ -36,8 +36,15 @@ scenario file carrying one.
 
 ```
 lua eval/bakeoff.lua run --server http://127.0.0.1:PORT --label 230M-Q4_K_M \
-  --variant taxonomy [--max-tokens 128] [--no-schema] [--server-pid N]
+  --variant taxonomy [--max-tokens 128] [--no-schema] [--server-pid N] \
+  [--raw-names] [--retries 2] [--retry-wait 2]
 ```
+
+A reply counts as the model's only when the server sent it. An HTTP status
+other than 2xx, or a request that failed, fails the run instead of scoring
+as an invalid reply. Rate limiting, a server error or a dropped connection
+is tried again `--retries` times, waiting `--retry-wait` seconds and then
+twice that.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count
@@ -158,7 +165,8 @@ that decision.
   yet): a wait counts only when the model's own P(wait) reaches the
   threshold chosen on dev (`tau`), and a wait with no probability (a chat
   verdict) is never honored. Candidates are scored on the `discriminate` prompt
-  variant.
+  variant. As in run mode, a server error fails the run; so does an
+  `/apply-template` reply with no prompt.
 - A decisions file is one JSON row per decision point: `episode`, `t`,
   `action` (`freeze` or `wait`), `pWait` when the model gives one, and
   `snapshotHash`, the hash of the step's snapshot the row answered

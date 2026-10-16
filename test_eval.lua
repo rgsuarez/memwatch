@@ -329,6 +329,19 @@ do
   gen.prepare(px)
   local xt = gen.track(px, gen.cfg, px.onsetAt - px.climbSec - gen.cfg.leadSec, 0)
   check("gate: a process that exits during the grace window never opens it", xt[0].gate, "closed")
+  -- The latch lapses at 60 while the machine stays critical: production keeps
+  -- the alert, with the process at its head as the hog fallback, and keeps
+  -- its grace, so when growth resumes and re-qualifies at 120 the gate opens
+  -- there at once and the floor catches the runaway before it exhausts.
+  local resume = { id = "T-resume", names = { "python3" }, avail0 = 10, w0 = 8000, age0 = 600, peak0 = 12000,
+                   compress = 3, graceRate = 0, phases = { { dur = 100, rate = 0 }, { dur = 80, rate = 250 } },
+                   after = "hold" }
+  local eres = gen.episode(resume, 1, "test")
+  local rts = {}
+  for _, st in ipairs(eres.steps) do rts[#rts + 1] = st.t end
+  check("alert: a lapse while critical keeps the alert and its grace", table.concat(rts, ","), "0,120")
+  check("alert: so waiting through it is not a miss",
+    sc.outcome(eres, sc.play(eres, function() return "wait" end)).missed, false)
   -- Decision points as production re-arms them, on synthetic ticks: grace
   -- expiry, then the first open tick a grace window or more after the last.
   local function ticksOpen(openAt)

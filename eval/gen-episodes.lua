@@ -75,6 +75,7 @@ M.cfg = {
   leadSec         = 60,     -- base-footprint history before the climb
   graceSec        = core.cfg.cool.autoKillGraceSec, -- the alert's unanswered window
   exposureStepMax = 15,     -- production's EXPOSURE_STEP_MAX: a stalled tick's most grace
+  settleSec       = 10,     -- below critical this long ends the alert, as in production
 }
 
 -- Deterministic PRNG (xorshift32), identical across Lua 5.4 and 5.5 so a
@@ -172,14 +173,18 @@ end
 -- Sampler ticks from first to last (multiples of tickSec), feeding the
 -- PRODUCTION tracker (memwatch_procs) one ps row per tick while the process
 -- exists, and the production pressure state machine (memwatch_core) the
--- same tick's signals. The alert's grace clock runs as production runs it:
--- the alert rises when the state goes critical with the offender at its
--- head, and grace accrues, interval by interval, while the offender heads
--- it as extreme (a stalled interval counts at most exposureStepMax). The
--- PRODUCTION unattended gate (core.unattendedGate) then says whether the
--- tick could act. Returns ticks[t] = { alive, w, avail, run (the tracker's
--- runaway row for the offender, or nil), state, kern, rates, exposureSec,
--- gate }, plus the first tick the alert's head was extreme (onset).
+-- same tick's signals. The alert runs as production runs it: it rises (its
+-- grace starting over) when the state goes critical with the process alive
+-- to head it, as a runaway or, once its latch lapses, as the hog fallback,
+-- and it ends only once the state has settled below critical for
+-- settleSec. Grace accrues, interval by interval and only while critical,
+-- while the offender heads the alert as extreme (a stalled interval counts
+-- at most exposureStepMax). The PRODUCTION unattended gate
+-- (core.unattendedGate), asked only while critical as production asks it,
+-- says whether the tick could act. Returns ticks[t] = { alive, w, avail,
+-- run (the tracker's runaway row for the offender, or nil), state, kern,
+-- rates, exposureSec, gate }, plus the first tick the alert's head was
+-- extreme (onset).
 local function pressureOf(avail, slopeMBmin)
   local pressure = (20 - avail) / 20
   if pressure < 0 then pressure = 0 end
@@ -197,7 +202,7 @@ function M.track(p, cfg, first, last)
   -- On the sampler's grid, from the later of the first tick and the birth.
   local t0 = math.floor(math.max(first, born) / cfg.tickSec) * cfg.tickSec
   if t0 < born then t0 = t0 + cfg.tickSec end
-  local exposureSec, headed, prevT, alertActive, onset = 0, false, nil, false, nil
+  local exposureSec, headed, prevT, alertActive, onset, belowSince = 0, false, nil, false, nil, nil
   for t = t0, last, cfg.tickSec do
     local alive = not (p.after == "exit" and p.releaseAt and t >= p.releaseAt)
     local w = M.weightAt(p, t)
@@ -214,22 +219,27 @@ function M.track(p, cfg, first, last)
     local kern, rates, pressure = pressureOf(avail, run and run.slopeMBmin or 0)
     local sig = core.signals({ availPct = avail }, rates, kern, run ~= nil and run.kind == "extreme")
     core.smStep(sm, sig, t)
-    -- The alert: up while the state is critical with the offender at its
-    -- head; it rises (grace starting over) on the tick it comes up.
-    local up = alive and run ~= nil and sm.state == "critical"
-    if up and not alertActive then exposureSec, headed = 0, false end
-    alertActive = up
-    if headed and prevT then
-      exposureSec = exposureSec + math.min(math.max(t - prevT, 0), cfg.exposureStepMax)
+    local critical = sm.state == "critical"
+    local gate = "closed"
+    if critical then
+      belowSince = nil
+      if not alertActive and alive then alertActive, exposureSec, prevT, headed = true, 0, nil, false end
+      if headed and prevT then
+        exposureSec = exposureSec + math.min(math.max(t - prevT, 0), cfg.exposureStepMax)
+      end
+      prevT = t
+      headed = alertActive and alive and run ~= nil and run.kind == "extreme"
+      if headed and onset == nil then onset = t end
+      gate = core.unattendedGate({
+        kind = run and run.kind or (alive and "hog") or nil, alertActive = alertActive, hudHold = false,
+        sameAsHud = alive, answered = false, interacted = false, final = false, bound = true,
+        exposureSec = exposureSec, graceSec = cfg.graceSec,
+      })
+    else
+      prevT, headed = nil, false
+      belowSince = belowSince or t
+      if alertActive and (t - belowSince) >= cfg.settleSec then alertActive = false end
     end
-    prevT = t
-    headed = alertActive and run.kind == "extreme"
-    if headed and onset == nil then onset = t end
-    local gate = core.unattendedGate({
-      kind = run and run.kind, alertActive = alertActive, hudHold = false, sameAsHud = run ~= nil,
-      answered = false, interacted = false, final = false, bound = true,
-      exposureSec = exposureSec, graceSec = cfg.graceSec,
-    })
     ticks[t] = { t = t, alive = alive, w = w, avail = avail, run = run, state = sm.state,
                  kern = kern, rates = rates, pressure = pressure, exposureSec = exposureSec, gate = gate }
   end

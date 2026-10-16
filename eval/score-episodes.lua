@@ -59,8 +59,6 @@ M.cfg = {
   confidence   = 0.95,
   bootstrap    = 2000,
   bootSeed     = 20261015,
-  flipExactMax = 16,     -- templates up to which the sign-flip test enumerates every flip
-  flipDraws    = 20000,  -- seeded random flips past that
   sizeDatasets = 400,    -- null datasets the controls' size check draws
   sizeShare    = 0.3,    -- the share of a null template's savables that differ
   noisyFlip    = 0.10,
@@ -267,15 +265,13 @@ end
 -- template's summed difference is as likely negative as positive, so the
 -- p-value is the share of sign flips (one sign per template, since jittered
 -- copies of one template are not independent) whose pooled sum is at least
--- the observed one. Exact by enumeration up to cfg.flipExactMax templates;
--- past that, cfg.flipDraws seeded random flips, the observed sum counted as
--- one of them. A template summing to zero changes no flip's sum and is left
--- out. With k templates the smallest p is 1/2^k, so four or fewer cannot
--- reach 0.05. Returns the p-value and k.
-function M.signFlipP(pairs, cfg)
-  cfg = cfg or M.cfg
+-- the observed one. The sums are whole numbers, so the flips' distribution
+-- is convolved exactly, at any template count. A template summing to zero
+-- changes no flip's sum and is left out. With k templates the smallest p is
+-- 1/2^k, so four or fewer cannot reach 0.05. Returns the p-value and k.
+function M.signFlipP(prs)
   local byTpl, tpls = {}, {}
-  for _, pr in ipairs(pairs) do
+  for _, pr in ipairs(prs) do
     if byTpl[pr.template] == nil then byTpl[pr.template] = 0; tpls[#tpls + 1] = pr.template end
     byTpl[pr.template] = byTpl[pr.template] + pr.d
   end
@@ -286,26 +282,26 @@ function M.signFlipP(pairs, cfg)
   end
   local k = #sums
   if k == 0 then return 1, 0 end
+  -- ways[v]: how many of the 2^j flips of the first j sums reach v, counted
+  -- in whole numbers while 2^k fits one exactly, else as shares.
+  local exact = k <= 60
+  local ways = { [0] = 1 }
+  for j = 1, k do
+    local sj = sums[j]
+    assert(math.type(sj) == "integer", "a paired difference that is not a whole number")
+    local nxt = {}
+    for v, w in pairs(ways) do
+      local add = exact and w or w / 2
+      nxt[v + sj] = (nxt[v + sj] or 0) + add
+      nxt[v - sj] = (nxt[v - sj] or 0) + add
+    end
+    ways = nxt
+  end
   local ge = 0
-  if k <= cfg.flipExactMax then
-    for mask = 0, (1 << k) - 1 do
-      local t = 0
-      for j = 1, k do
-        if (mask >> (j - 1)) & 1 == 1 then t = t - sums[j] else t = t + sums[j] end
-      end
-      if t >= obs then ge = ge + 1 end
-    end
-    return ge / (1 << k), k
+  for v, w in pairs(ways) do
+    if v >= obs then ge = ge + w end
   end
-  local r = rng(cfg.bootSeed)
-  for _ = 1, cfg.flipDraws do
-    local t = 0
-    for j = 1, k do
-      if r() < 0.5 then t = t - sums[j] else t = t + sums[j] end
-    end
-    if t >= obs then ge = ge + 1 end
-  end
-  return (1 + ge) / (1 + cfg.flipDraws), k
+  return exact and ge / (1 << k) or ge, k
 end
 
 ------------------------------------------------------------------------------
@@ -847,7 +843,7 @@ function M.compare(cand, base, cfg)
     end
   end
   local lower, point = M.pairedLowerBound(prs, cfg)
-  local p, k = M.signFlipP(prs, cfg)
+  local p, k = M.signFlipP(prs)
   return lower, point, p, k
 end
 
@@ -1017,7 +1013,7 @@ function M.nullSize(eps, cfg)
         prs[#prs + 1] = { template = t, d = (r() < cfg.sizeShare) and sign or 0 }
       end
     end
-    if M.signFlipP(prs, cfg) <= 1 - cfg.confidence then passes = passes + 1 end
+    if M.signFlipP(prs) <= 1 - cfg.confidence then passes = passes + 1 end
   end
   return passes, cfg.sizeDatasets, #tpls
 end

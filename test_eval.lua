@@ -207,15 +207,17 @@ do
   check("sign-flip: no difference at all is p 1", (sc.signFlipP(byTemplate({ 0, 0 }))), 1)
   check("sign-flip: one strong template among weak ones is no beat (3/8)",
     (sc.signFlipP(byTemplate({ 4, -1, 1 }))), 0.375)
-  -- Past the enumeration limit: seeded random flips, so reproducible, and
-  -- near the exact answer (14 templates of +1 and 3 of -1: the observed sum
-  -- 11 is reached when 14 or more of the 17 flips are +, 834 of 2^17).
+  -- Exact at any template count: 14 templates of +1 and 3 of -1 reach the
+  -- observed sum, 11, when 14 or more of the 17 flips are +: 834 of 2^17.
   local seventeen = {}
   for i = 1, 17 do seventeen[i] = i <= 14 and 1 or -1 end
   local p17, k17 = sc.signFlipP(byTemplate(seventeen))
-  check("sign-flip: past the enumeration limit, seeded random flips, reproducibly",
-    k17 == 17 and p17 == (sc.signFlipP(byTemplate(seventeen))), true)
-  check("sign-flip: and near the exact p", math.abs(p17 - 834 / 2 ^ 17) < 0.002, true)
+  check("sign-flip: exact past sixteen templates (834 / 2^17)", k17 == 17 and p17 == 834 / 2 ^ 17, true)
+  local forty = {}
+  for i = 1, 40 do forty[i] = 1 end
+  check("sign-flip: and at forty (2^-40)", (sc.signFlipP(byTemplate(forty))), 2 ^ -40)
+  check("sign-flip: a difference that is not a whole number is refused",
+    (pcall(sc.signFlipP, { { template = "T", d = 0.5 } })), false)
   check("sign-flip: three improving templates are no beat, though the bootstrap's bound is above zero",
     (sc.pairedLowerBound(byTemplate({ 1, 1, 1 }))) > 0 and (sc.signFlipP(byTemplate({ 1, 1, 1 }))) > 0.05, true)
   -- The size at the regenerated sets' shapes: candidates no better than the
@@ -228,7 +230,7 @@ do
     end
     return eps
   end
-  local quick = setmetatable({ sizeDatasets = 200, flipDraws = 4000 }, { __index = sc.cfg })
+  local quick = setmetatable({ sizeDatasets = 200 }, { __index = sc.cfg })
   local sp, sn, st = sc.nullSize(shape(17, 5), quick)
   check("sign-flip: its size at sealed's shape is at most 5%", st == 17 and sp / sn <= 0.05, true)
   local dp, dn, dt = sc.nullSize(shape(10, 10), quick)

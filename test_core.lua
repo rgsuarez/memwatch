@@ -3609,6 +3609,21 @@ do
     check("tokenprob parse: a sampled fused option leaves the untaken bare quote out",
       m ~= nil and m.action == "wait" and math.abs(m.pWait - 0.6) < 1e-9 and math.abs(m.pFreeze - 0.1) < 1e-9, true)
   end
+  -- Upstream arithmetic is float32: a near-certain wait's candidates can sum
+  -- a hair past 1, which is rounding, and must stay a wait the rail honors.
+  do
+    local function lp(tok, l) return { tok, math.exp(l) } end
+    local sure = lfm.parseTokenProbs(tpReply("wait", { lp("wait", 0), lp("wa", -19), lp("free", -21), lp("w", -22) }))
+    check("tokenprob parse: a near-certain wait reads at most 1", sure ~= nil and sure.pWait <= 1 and sure.mass <= 1, true)
+    check("tokenprob parse: and the rail honors it", sure ~= nil and lfm.waitHonored(sure, 0.9), true)
+    check("tokenprob parse: options past 1 beyond rounding are refused",
+      (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.7 }, { "wa", 0.5 } }))), nil)
+    local hair = lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray({
+      pos('{"', { { '{"', 1 } }), pos("action", { { "action", 1 } }), pos('":"', { { '":"', 1 } }),
+      { token = "wait", logprob = 0, top_logprobs = lfm.jsonArray({ { token = "wait", logprob = 1e-8 } }) } }) })
+    local h = lfm.parseTokenProbs(hair)
+    check("tokenprob parse: a logprob a hair over 0 reads as 1", h ~= nil and h.pWait, 1)
+  end
   -- Mass on other tokens counts against waiting: half the probability on an
   -- unrelated word leaves P(wait) at half, not certainty.
   check("tokenprob parse: unrecognized mass is not renormalized into a wait",

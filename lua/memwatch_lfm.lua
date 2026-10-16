@@ -825,6 +825,20 @@ end
 -- probability, and an option fused with the quote at that position counts
 -- too (below). Bounded by the decoder (64 KB, depth 8).
 -- Returns { action, pWait, pFreeze, pTerminate, mass } or nil, err.
+-- Probabilities come from float32 arithmetic upstream, so a token's can read
+-- a hair over 1 (a logprob of 1e-8), and a confident distribution's top
+-- candidates a hair over 1 together. Within PROB_SLACK that is rounding and
+-- reads as 1; beyond it the numbers are malformed. Returns the probability,
+-- nil when the candidate carries none, or false when it is out of range.
+local PROB_SLACK = 1e-6
+local function readProb(c)
+  local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
+    or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
+  if pr == nil then return nil end
+  if not (pr >= 0 and pr <= 1 + PROB_SLACK) then return false end
+  return math.min(pr, 1)
+end
+
 function M.parseTokenProbs(text)
   if type(text) ~= "string" or text == "" then return nil, "tokenprob: empty reply" end
   local doc, err = M.jsonDecode(text)
@@ -856,10 +870,9 @@ function M.parseTokenProbs(text)
   local p = { wait = 0, freeze = 0, terminate = 0 }
   for _, c in ipairs(cands) do
     local op = type(c) == "table" and optionOf(c.token, quoted) or nil
-    local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
-      or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
+    local pr = readProb(c)
     -- A probability outside [0, 1] (or not a number) is malformed.
-    if pr ~= nil and not (pr >= 0 and pr <= 1) then return nil, "tokenprob: a probability out of range" end
+    if pr == false then return nil, "tokenprob: a probability out of range" end
     if op and pr then p[op] = p[op] + pr end
   end
   -- The value's first token came after the quote as a token of its own.
@@ -875,18 +888,16 @@ function M.parseTokenProbs(text)
   -- is taken as written: the schema fixes it.
   if quotePos then
     local qc = quotePos.top_logprobs or quotePos.top_probs
-    local function probOf(c)
-      return type(c.prob) == "number" and c.prob or (type(c.logprob) == "number" and math.exp(c.logprob)) or nil
-    end
     -- The sampled quote's own probability, or else its entry among the
     -- candidates.
-    local q = probOf(quotePos)
+    local q = readProb(quotePos)
+    if q == false then return nil, "tokenprob: a probability out of range" end
     local fused, others = { wait = 0, freeze = 0, terminate = 0 }, 0
     if type(qc) == "table" then
       for _, c in ipairs(qc) do
-        local pr = type(c) == "table" and probOf(c) or nil
+        local pr = readProb(c)
+        if pr == false then return nil, "tokenprob: a probability out of range" end
         if type(c) == "table" and type(c.token) == "string" and pr then
-          if not (pr >= 0 and pr <= 1) then return nil, "tokenprob: a probability out of range" end
           if c.token == quotePos.token then
             if q == nil then q = pr end
           else
@@ -899,15 +910,22 @@ function M.parseTokenProbs(text)
       end
     end
     if q == nil then return nil, "tokenprob: no probability for the quote before the value" end
-    if not (q >= 0 and q <= 1) then return nil, "tokenprob: a probability out of range" end
     -- The sampled quote and the other candidates there are distinct tokens
     -- of one distribution: more than 1 among them is malformed.
-    if q + others > 1 + 1e-9 then
+    if q + others > 1 + PROB_SLACK then
       return nil, "tokenprob: the probabilities at the quote sum past 1"
     end
     for k in pairs(p) do p[k] = fused[k] + q * p[k] end
   end
   local mass = p.wait + p.freeze + p.terminate
+  -- More than 1 across the options is rounding within the slack, scaled
+  -- back to 1 (a near-certain wait must stay a wait the rail can honor),
+  -- and malformed beyond it.
+  if mass > 1 + PROB_SLACK then return nil, "tokenprob: the options' probabilities sum past 1" end
+  if mass > 1 then
+    for k in pairs(p) do p[k] = p[k] / mass end
+    mass = 1
+  end
   if mass < 0.5 then return nil, "tokenprob: the options carry too little probability" end
   local chosen = optionOf(at.token, quoted)
   if not chosen then return nil, "tokenprob: the chosen token is not an option" end

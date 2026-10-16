@@ -2441,10 +2441,13 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   do
     local localNames = { "http://127.0.0.2:9", "HTTP://LOCALHOST:80", "http://a.localhost", "http://localhost.:8080",
       "http://[::1]:11435", "http://[0:0:0:0:0:0:0:1]:11435", "http://[0000::0001]", "http://[::ffff:127.0.0.1]:9",
-      "http://0.0.0.0:8080", "http://[::]:8080" }
+      "http://0.0.0.0:8080", "http://[::]:8080", "127.0.0.1:11435", "localhost:8080", "http://127.1:11435",
+      "http://0x7f.1", "http://0177.0.0.1", "http://2130706433", "http://user@127.0.0.1:11435", "http://u:p@[::1]:9" }
     local farNames = { "http://stub", "https://api.example.com", "http://10.0.0.1", "http://127.0.0.256", "http://[::2]",
-      "http://[1::1]", "http://[::ffff:10.0.0.1]", "http://localhost.example.com", "http://user@127.0.0.1",
-      "http://[::1::1]", "http://[1:2:3:4:5:6:7:8:9]" }
+      "http://[1::1]", "http://[::ffff:10.0.0.1]", "http://localhost.example.com", "http://[::1::1]",
+      "http://[1:2:3:4:5:6:7:8:9]", "http://128.1", "http://evil.example#@127.0.0.1", "http://127.0.0.1:1@evil.example",
+      "ftp://127.0.0.1", "http://0x1000000007f000001", "http://02000000000017700000001", "http://08.0.0.1", "http://4294967296", "http://127..1", "stub",
+      "http://127.16777216", "http://127.256.0.1" }
     local wrongLocal, wrongFar = {}, {}
     for _, u in ipairs(localNames) do if not bk.hostIsLocal(u) then wrongLocal[#wrongLocal + 1] = u end end
     for _, u in ipairs(farNames) do if bk.hostIsLocal(u) then wrongFar[#wrongFar + 1] = u end end

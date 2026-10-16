@@ -164,31 +164,57 @@ local function ipv6Groups(s)
   return head
 end
 
--- Whether a server URL names this machine: localhost (and any name under
--- it), 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104 in any spelling, or an
--- unspecified address (0.0.0.0, ::), which a connection takes as this
--- machine. Anything else, a name that might resolve here included, is
--- taken as elsewhere.
+-- The 32-bit address an IPv4 literal names, in any form curl reads (as
+-- inet_aton does: 127.1, 0x7f.1, 0177.0.0.1, 2130706433), or nil when it
+-- is not one. Each part is decimal, octal (a leading 0) or hex (0x); the
+-- last part fills the bytes that remain.
+local function ipv4Address(s)
+  local parts = {}
+  for part in (s .. "."):gmatch("([^.]*)%.") do parts[#parts + 1] = part end
+  if #parts > 4 then return nil end
+  local vals = {}
+  for i, part in ipairs(parts) do
+    local v
+    if part:match("^0[x]%x?%x?%x?%x?%x?%x?%x?%x?$") then v = #part > 2 and tonumber(part:sub(3), 16) or 0
+    elseif part:match("^0[0-7]*$") and #part <= 12 then v = tonumber(part, 8)
+    elseif part:match("^[1-9]%d*$") and #part <= 10 then v = tonumber(part)
+    else return nil end
+    vals[i] = v
+  end
+  local n, addr = #vals, 0
+  for i = 1, n - 1 do
+    if vals[i] > 255 then return nil end
+    addr = addr | (vals[i] << (8 * (4 - i)))
+  end
+  if vals[n] >= (1 << (8 * (5 - n))) then return nil end
+  return addr | vals[n]
+end
+
+-- Whether a server URL names this machine, read as curl reads it (no
+-- scheme means http; userinfo is not the host): localhost (and any name
+-- under it), 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104, each in any
+-- spelling, or an unspecified address (0.0.0.0, ::), which a connection
+-- takes as this machine. Anything else, a name that might resolve here
+-- included, is taken as elsewhere.
 local function hostIsLocal(url)
-  local hostport = tostring(url):lower():match("^https?://([^/?#]+)")
-  if not hostport then return false end
-  local v6 = hostport:match("^%[([^%]]+)%]:?%d*$")
+  local u = tostring(url):lower()
+  local scheme, rest = u:match("^(%a[%w+.-]*)://(.*)$")
+  if scheme and scheme ~= "http" and scheme ~= "https" then return false end
+  local authority = (rest or u):match("^([^/?#]*)")
+  authority = authority:match("^.*@(.*)$") or authority
+  local v6 = authority:match("^%[([^%]]+)%]:?%d*$")
   if v6 then
     local g = ipv6Groups(v6)
     if not g then return false end
     local zero = g[1] == 0 and g[2] == 0 and g[3] == 0 and g[4] == 0 and g[5] == 0
     return zero and ((g[6] == 0 and g[7] == 0 and (g[8] == 1 or g[8] == 0)) or (g[6] == 0xffff and g[7] >> 8 == 127))
   end
-  local host = hostport:match("^([^:]+):?%d*$")
+  local host = authority:match("^([^:]+):?%d*$")
   if not host then return false end
   host = host:gsub("%.$", "")
-  if host == "localhost" or host:match("%.localhost$") or host == "0.0.0.0" then return true end
-  local a, b, c, d = host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
-  if not a then return false end
-  for _, x in ipairs({ a, b, c, d }) do
-    if #x > 3 or tonumber(x) > 255 then return false end
-  end
-  return tonumber(a) == 127
+  if host == "localhost" or host:match("%.localhost$") then return true end
+  local addr = ipv4Address(host)
+  return addr ~= nil and (addr >> 24 == 127 or addr == 0)
 end
 
 local function sampleServerMB(pid)

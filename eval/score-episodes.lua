@@ -859,6 +859,8 @@ end
 -- CLI
 ------------------------------------------------------------------------------
 
+local USAGE = "usage: score-episodes.lua gate|controls|tau --dir <episodes> [--fit-dir <dev>] [--candidate <name>]"
+local COMMANDS = { gate = true, controls = true, tau = true }
 local KNOWN_FLAGS = { ["--dir"] = true, ["--fit-dir"] = true, ["--candidate"] = true, ["--out"] = true,
                       ["--tree-depth"] = true, ["--decisions"] = true, ["--key"] = true, ["--tau"] = true,
                       ["--prevalence"] = true }
@@ -868,13 +870,12 @@ local function parse(argv)
   local i = 2
   while i <= #argv do
     local k, v = argv[i], argv[i + 1]
-    -- Every flag takes a value: one missing (the last argument, or another
-    -- flag in its place) is refused, never read as unset. A flag given twice
-    -- is refused too: which value was meant is not this script's to guess.
-    if type(k) == "string" and k:match("^%-%-") and (v == nil or v:match("^%-%-")) then
-      error(k .. " needs a value", 0)
-    end
+    -- An unknown flag is named as one first. Every flag takes a value: one
+    -- missing (the last argument, or another flag in its place) is refused,
+    -- never read as unset. A flag given twice is refused too: which value
+    -- was meant is not this script's to guess.
     if not KNOWN_FLAGS[k] then error("unknown argument " .. tostring(k), 0) end
+    if v == nil or v:match("^%-%-") then error(k .. " needs a value", 0) end
     if seen[k] then error(tostring(k) .. " given twice", 0) end
     seen[k] = true
     local function number(x) return assert(tonumber(x), k .. " must be a number, not " .. tostring(x)) end
@@ -1052,6 +1053,8 @@ end
 -- a verdict.
 function M.main(argv)
   local status = 0
+  -- The command first: an unknown one is a usage error, whatever follows it.
+  if not COMMANDS[argv[1]] then error(USAGE, 0) end
   local a = parse(argv)
   -- A gate's result file is this run's or nothing. One left at the path by an
   -- earlier run would read as this run's verdict if this one is refused or
@@ -1197,7 +1200,7 @@ function M.main(argv)
       if not powered and status == 0 then status = 2 end
     end
   else
-    error("usage: score-episodes.lua gate|controls|tau --dir <episodes> [--fit-dir <dev>] [--candidate <name>]")
+    error(USAGE, 0)
   end
   return status
 end

@@ -1213,6 +1213,28 @@ dofile("eval/score-episodes.lua")
   local okBogus, errBogus = pcall(sc.main, { "gate", "--dir", held, "--bogus", "1", "--bogus", "2" })
   check("cli: an unknown flag is called unknown, even given twice",
     okBogus == false and tostring(errBogus):find("unknown argument --bogus", 1, true) ~= nil, true)
+  -- The command and the flags are named before anything is read or cleared:
+  -- tau writes no result either, a lone unknown flag is unknown (not one
+  -- missing its value), and an unknown command is a usage error.
+  local gateDoc = '{"candidate":"x","pass":true}\n'
+  local gdf = assert(io.open(outFile, "w"))
+  gdf:write(gateDoc)
+  gdf:close()
+  local function outFileNow()
+    local f = io.open(outFile, "r")
+    local t = f and f:read("a")
+    if f then f:close() end
+    return t
+  end
+  local okTauOut, errTauOut = pcall(sc.main, { "tau", "--dir", held, "--out", outFile })
+  check("cli: and so is --out on tau, its path untouched", okTauOut == false
+    and tostring(errTauOut):find("--out applies to gate only", 1, true) ~= nil and outFileNow() == gateDoc, true)
+  local okLone, errLone = pcall(sc.main, { "gate", "--dir", held, "--bogus" })
+  check("cli: a lone unknown flag is called unknown, not one missing its value",
+    okLone == false and tostring(errLone):find("unknown argument --bogus", 1, true) ~= nil, true)
+  local okCmd, errCmd = pcall(sc.main, { "gaet", "--out", outFile })
+  check("cli: an unknown command is a usage error, its --out untouched",
+    okCmd == false and tostring(errCmd):find("usage:", 1, true) ~= nil and outFileNow() == gateDoc, true)
   check("cli: the harness's control, writing elsewhere, exits 2",
     exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
       .. " --candidate always-freeze --out " .. q(outFile)), 2)

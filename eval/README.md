@@ -180,7 +180,7 @@ that decision.
   place. Only a gate result is ever cleared: a path holding anything else
   (an episode, a script, a directory) refuses the run untouched, and so
   does a result that cannot be removed. A command line that does not
-  parse (an unknown flag, a flag given twice) touches nothing.
+  parse (an unknown command or flag, a flag given twice) touches nothing.
   `--out` applies to `gate` only. A split holds each episode once: a
   directory with the same episode twice (a copied file, or the episode
   under another id) is refused, since a copy would count twice toward the

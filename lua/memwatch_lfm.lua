@@ -72,12 +72,15 @@ M.cfg = {
   -- make the model episode-fatally inert.
   remoteCooldownSec = 15,     -- backoff after a remote timeout/error before retry
   redactNames = true,         -- send deterministic categories, not raw names (F4.1)
-  -- The wait rail's threshold: a model's wait at grace expiry defers the
-  -- deterministic freeze only when its own P(wait) reaches this. The
-  -- default is above 1, which no probability reaches, so no wait is honored
-  -- (the deterministic policy acts): the only safe value until a threshold
-  -- is chosen on dev data and frozen before held-out scoring. It is a
-  -- number so the operator's local config can set one.
+  -- The proposed wait rail's threshold (M.waitHonored): under it a model's
+  -- wait at grace expiry would defer the deterministic freeze only when its
+  -- own P(wait) reaches this. The rail is NOT wired into the live path yet:
+  -- today memwatch.lua defers on any model wait, through applyVerdict and
+  -- the deferral bound (maxDeferSec), and never reads this value. The
+  -- offline oracle scores candidates under the rail. The default is above
+  -- 1, which no probability reaches: honor nothing until a threshold is
+  -- chosen on dev data and frozen before held-out scoring. It is a number
+  -- so the operator's local config can set one once the rail is wired.
   tauWait = 2,
 }
 
@@ -967,9 +970,10 @@ end
 --                         gate as kill: same uid, denylist, protected pids)
 ------------------------------------------------------------------------------
 
--- The wait rail (grace expiry, an extreme offender, the freeze ceiling): a
--- model's wait defers the deterministic freeze only when the model is sure
--- of it, P(wait) >= tauWait, where P(wait) is the model's own distribution
+-- The proposed wait rail (grace expiry, an extreme offender, the freeze
+-- ceiling), not yet wired live (see cfg.tauWait): a model's wait would
+-- defer the deterministic freeze only when the model is sure of it,
+-- P(wait) >= tauWait, where P(wait) is the model's own distribution
 -- (decision-model option probabilities or token probabilities). A
 -- self-reported confidence is not a probability and never qualifies; nor
 -- does a wait without one, or an unset threshold. Pure.

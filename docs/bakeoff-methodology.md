@@ -85,7 +85,8 @@ candidate passes when the one-sided 95% upper bound on missed runaways is
 at most 5% and its wrongful-freeze rate beats the best deterministic
 baseline that meets the same bound (paired, one-sided 95% lower bound
 above zero, bootstrapped by template). Its wait counts only through the
-production wait rail, on its own probability. The held-out set is
+proposed wait rail, on its own probability: the contract it would be
+wired under (the live path does not consult the rail yet). The held-out set is
 generated from templates kept outside this repository and is scored once
 per candidate. Decision models (the d1 rows in the registry) answer the
 same question through a choice interface whose option probabilities feed

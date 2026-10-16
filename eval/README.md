@@ -130,10 +130,11 @@ that decision.
   or underpowered.
 - `bakeoff.lua episodes` records a model's decision at every decision point
   through the production builders (`--api chat|systemone|completion`), and
-  `score-episodes.lua` replays the rows through the production wait rail:
-  a wait counts only when the model's own P(wait) reaches the threshold
-  chosen on dev (`tau`), and a wait with no probability (a chat verdict) is
-  never honored. Candidates are scored on the `discriminate` prompt
+  `score-episodes.lua` replays the rows through the proposed wait rail, the
+  contract a model would be wired under (the live path does not consult it
+  yet): a wait counts only when the model's own P(wait) reaches the
+  threshold chosen on dev (`tau`), and a wait with no probability (a chat
+  verdict) is never honored. Candidates are scored on the `discriminate` prompt
   variant.
 
 ```

@@ -17,7 +17,7 @@
 -- is at most 5% AND the candidate's wrongful-freeze rate beats the best
 -- deterministic baseline that itself meets the miss bound: the one-sided
 -- 95% lower bound of the paired improvement, bootstrapped by template, must
--- be above zero. Calibration (G8) is reported as a diagnostic only.
+-- be above zero.
 --
 -- Usage (from the repo root):
 --   lua eval/score-episodes.lua gate --dir <episodes> --fit-dir <dev episodes> \
@@ -320,11 +320,15 @@ function M.noisyOracle(flip, seed)
   end
 end
 
--- Recorded model decisions replayed through the production wait rail:
--- decisions[episodeId][t] = { action, pWait }. A model's wait defers only
--- when lfm.waitHonored passes at tauWait, exactly as the live rail decides:
--- a wait recorded with no probability (a chat verdict, whose confidence is
--- self-reported) is never honored, at any threshold. A step with no
+-- Recorded model decisions replayed through the proposed wait rail
+-- (lfm.waitHonored), the contract a model would be wired under before it
+-- may defer anything live: decisions[episodeId][t] = { action, pWait }. A
+-- model's wait defers only when the rail passes at tauWait, and a wait
+-- recorded with no probability (a chat verdict, whose confidence is
+-- self-reported) is never honored, at any threshold. The live path does
+-- not consult the rail yet: it defers on any model wait, through
+-- applyVerdict and the deferral bound, so this replay scores the stricter,
+-- proposed contract. A step with no
 -- recorded decision gets the deterministic freeze. tauWait = 0 honors every
 -- wait that carries a probability. The score is 1 - P(wait) (with no
 -- probability, the recorded action: 0 for a wait, 1 for a freeze).

@@ -116,8 +116,9 @@ that decision.
   of an alert its state machine raised). Labels fall out of the trajectory
   exactly: runaway (it
   exhausts the machine at 5% available, or settles at or below the 8%
-  starvation line as the snapshot reports it), savable (it resolves within
-  the 120 s deferral bound) or late (excluded). The output must be absent
+  starvation line as the snapshot reports it and stays there past the
+  deferral bound: a hold, or a release or exit after the bound), savable (it
+  resolves within the 120 s deferral bound) or late (excluded). The output must be absent
   or empty, and a split is published whole or not at all: a template whose
   sample could not exist (one that would not fit the machine, say) refuses
   the run, naming the template and the seed.

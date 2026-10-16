@@ -1270,7 +1270,8 @@ do
   check("cat: a path-prefixed name uses its basename", lfm.categorize("/opt/homebrew/bin/rg"), "search-tool")
   check("cat: trailing slashes are dropped", lfm.categorize("/opt/homebrew/bin/rg/"), "search-tool")
   -- Names production really sees: top cuts them to 16 bytes, and some
-  -- processes retitle themselves. Each kept the family main gave it.
+  -- processes retitle themselves. Each reads as the family it belongs to
+  -- (main misfiled com.apple.Virtua, a VM, as system).
   do
     local seen = {
       { "com.apple.WebKit", "browser" }, { "Arc Helper", "browser" }, { "Arc Helper (Plugin)", "browser" },

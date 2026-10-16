@@ -81,28 +81,56 @@ SIGKILL after 7s if the target refuses to die, verifies death, and reports the
 memory actually reclaimed. Safety rails, enforced in pure logic
 (`core.killAllowed`): same-uid processes only, a curated denylist
 (WindowServer, loginwindow, Finder, Dock, Hammerspoon itself, and friends),
-never pid 1, never memwatch's own host. The target's identity is re-validated
-by comm before TERM and again before KILL, so a recycled pid can never be
-signaled. Every action and refusal is logged.
+never pid 1, never memwatch's own host. Every alert action acts on an
+identity, never a name: when an alert first shows a process it binds that
+process's start time, and the target is re-validated against it before TERM
+and again before KILL, so a recycled pid is refused rather than signaled.
+Every probe carries a positive control, so a probe that cannot run under
+pressure is never read as "the process exited": nothing is signaled, the
+frozen ledger keeps its entry, and the action stays retryable. If the
+binding fails, the HUD's first click binds it and asks for a second click
+("Identity verified. Click again to act."); unattended action waits for it
+too. A refusal on any surface (HUD, banner or menu) rebinds every surface.
+The menu's process rows bind when the menu opens and offer no Freeze or
+Force Quit for a row they cannot verify. Every action, refusal and answer
+is logged.
 
-A notification breadcrumb accompanies the HUD: one banner per critical
-episode, replaced in place if the named offender changes, never re-posted
-after a manual dismissal, and withdrawn on its own once the state settles
-below critical (its Force Quit action button renders reliably only when
-Hammerspoon notifications are set to the Alerts style; the HUD is the
-dependable surface).
+Each alert answers for one process, by what its action actually did. If a
+different process takes over as the offender while the HUD is up, the HUD
+switches to it as a new alert. The close button means "not now": the same
+process returns after the raise cooldown, as a new alert, or at once if it
+escalates (a quiet hog turning into a runaway). A process memwatch holds
+frozen, that is gone, or that is ignored (**Ignore 30m**, for 30 minutes) is
+no candidate for the HUD, the banner or the largest-process fallback; a
+process that survives a Freeze or Force Quit comes back after the
+cooldown, and a resumed one is alertable again. The full rules are in
+[docs/alert-lifecycle.md](docs/alert-lifecycle.md).
+
+A notification breadcrumb accompanies the HUD: one banner per offender per
+critical episode, never re-posted for the same offender within the episode
+(even after a manual dismissal), and withdrawn on its own once the state
+settles below critical. A generic banner (no offender identified yet) is
+replaced in place as soon as one is named. When the named offender changes,
+the stale banner is withdrawn at once and its replacement follows after a
+cooldown that damps offender flap. Its Force Quit action button appears only
+once the offender's start time is bound (the banner is upgraded in place when
+it binds), and renders reliably only when Hammerspoon notifications are set
+to the Alerts style; the HUD is the dependable surface.
 
 **Desktop alerts: on/off** in the menu mutes both surfaces at will
 (persisted as `"alerts": false` in `memwatch-local.json`; CLI:
 `hs -c "memwatch.setAlertsEnabled(false)"`). Muting hides the HUD and the
 banners only: the menu-bar state icon, logging, and the unattended engine
 stay live, and action receipts (an autonomous freeze/quit, frozen processes
-surviving a reload) still notify.
+surviving a reload, the adjudicator killed for exceeding its memory budget)
+still notify, as does the page that says per-process detection has gone
+stale while pressure is up (it stays up until detection recovers). Unmuting
+during an episode restores its HUD and banner.
 
 The dropdown menu shows the state and its cause, kernel level, live rates,
-headroom, top-5 processes by true weight (each with Force Quit / Ignore
-submenus), direct Force Quit / Ignore items for the current offender, and
-the desktop-alerts / LFM toggles.
+headroom, top-5 processes by true weight (each with Freeze / Force Quit /
+Ignore submenus), direct Force Quit / Ignore items for the current
+offender, and the desktop-alerts / LFM toggles.
 
 ### Freeze (reversible)
 
@@ -120,9 +148,16 @@ orphaned, and a "Frozen by memwatch" menu section resumes them.
 arms an unattended guard for the away-from-keyboard case: an extreme-growth
 runaway while critical, whose alert has gone unanswered for the grace window
 (muted desktop alerts still arm and count the same clock), is frozen or
-killed through the same policy-checked flow, loudly logged and notified. `freeze` is the recommended reversible default. The legacy
-`autoKill = true` still works and maps to `unattended = "kill"`. Leave it
-off until the detector has earned your trust.
+killed through the same policy-checked flow, loudly logged and notified.
+The grace is per process: the time that process has headed the alert as a
+runaway, so a newly named offender, a hog that turns into a runaway, or two
+runaways trading the top spot each get a full window. An operator action
+on that process from any surface stands it down; a click that did nothing
+does not. A freeze or terminate that fails on a process is not retried on
+it, and the receipt says what happened. `freeze` is the recommended
+reversible default. The legacy `autoKill = true` still works and maps to
+`unattended = "kill"`. Leave it off until the detector has earned your
+trust.
 
 ### LFM adjudication (opt-in, default OFF)
 
@@ -140,6 +175,109 @@ metric operationally defined:
 
 ![memwatch value report](docs/report-scoreboard.png)
 
+### Observation ledger (passive, default ON)
+
+Independently of adjudication, memwatch keeps a passive observation ledger,
+`memwatch-observe.jsonl` (local and gitignored). It writes a row at each
+grace-expiry decision point, and every 45 s while pressure is up and an
+offender is named. A decision point is a tick where the live unattended gate
+stands open, whatever the unattended mode: an extreme runaway, surfaced by
+the alert, unanswered for its grace window, and not frozen, gone or ignored.
+
+Each row holds:
+- the exact redacted, pid-free snapshot a model would have received (a row
+  that would exceed 60 KB drops it and carries `snapshotDropped`);
+- `wouldAct`, the action the deterministic policy fires under the live mode
+  (`none` while unattended is off, and on every 45 s row);
+- at decision points, `wouldActAtFreeze`, the freeze-ceiling counterfactual
+  a model would own at grace expiry.
+
+`offender.foreground` is a fork-free name match (`foregroundBasis: "name"`).
+The live policy also walks the process tree, so under kill mode `wouldAct`
+can read terminate where the live policy would freeze; such rows say so at
+top level (`wouldActBasis: "name"`). `offender.name` is a
+sanitized local basename kept only to re-derive categories: like the row's
+`pid`, it is never model input and is stripped from any dataset built from
+the ledger. Rows carry a `session` id. The sequence number restarts on every
+reload, so `(session, seq)` joins a row to its follow-ups.
+
+Follow-ups at 60, 120 and 180 s record what actually became of the process
+and the machine. Each observation keeps its own evidence, folded in as
+events arrive: every process sample, every signal memwatch sends and every
+operator action aimed at that same process (matched by its start time, so a
+process that later takes the pid is never mistaken for it), every operator
+action anywhere, and each change in whether memwatch's frozen ledger holds
+it. Every tick also logs the machine's available memory and state. A
+follow-up reads only these records, as of its horizon instant (the
+observation time plus 60, 120 or 180 s), so one whose timer ran late
+reports the horizon it names, not what happened after it: a freeze,
+resume, recovery or weight reading after the horizon stays out of it. A
+process table launched before the observation proves nothing about it and
+is ignored; launch order decides that, not the wall clock.
+
+The observed process's identity is the start window of its latest process
+sample; for a process only the streaming top has named (the process
+sampler stalled), the start time the alert bound to it, unless that time
+falls in the hour a daylight-saving fold repeats. Each row says which in
+`identityBasis` (`window`, `lstart`, or `none`, when it had neither, so its
+follow-ups can only read `unknown` or `exited`). A process table counts as
+whole, so that a process missing from it has exited, only when the sampler
+exited cleanly and the table lists memwatch's own process.
+
+The fate is one of:
+- `alive`: seen as the same process in a sample read within 15 s of the
+  horizon, or after it (freshness counts from when the table was read, not
+  when it arrived);
+- `exited`: proven gone by a sample delivered by the horizon (detail
+  `pid-reused` when another process holds the pid);
+- `frozen`: alive, and memwatch's frozen ledger held this same process at
+  the horizon;
+- `unknown`: details `stale-sample`, `incomplete-sample`,
+  `identity-uncertain`, `pre-observation-sample`, `frozen-uncertain` (alive,
+  but the frozen ledger's entry for its pid cannot be told apart from
+  another process), or `clock-step` (the wall clock stepped back after the
+  observation, so nothing in its record can be placed before or after a
+  horizon; such follow-ups carry no readings, and an exit proven before the
+  step still reads `exited`). The reason is the one known by the horizon.
+
+Each follow-up also carries:
+- the weight at the horizon (a reading delivered within 15 s of it), and
+  `peakSinceMB` through it (kept even if the process leaves the tracker);
+- `sampleAgeSec`, the horizon's distance from the freshest sighting
+  (negative when that sighting came after the horizon);
+- available memory and state as of the horizon, from the last tick at or
+  within 15 s before it (absent when ticks had stalled), and kernel jetsam
+  reports by file time;
+- `frozenLedger` as of the horizon (absent when it cannot be told);
+- `operatorActionsSince` (any menu, HUD or banner action) and
+  `operatorTouchesSince` (actions on this process), through the horizon;
+  `operatorTouchesUncertain` counts actions whose process could not be told
+  apart from a newcomer on the pid, and `operatorActionsDropped` says the
+  count is a lower bound (a record keeps at most 256 action times);
+- `memwatchSignalSince`, the last signal memwatch itself sent to this
+  process by the horizon: `freeze` (a STOP, including one sent again after a
+  quit could not be), `continue` (the CONT a quit sends a frozen process
+  before its TERM), `resume`, or `terminate` (`memwatchSignalCount` when
+  there was more than one), so its own actions never read as natural exits.
+
+A start time matches the observed process only when its start window could
+not also hold the pid's next process: for a process younger than that
+window (a young process, or a stalled sample) the match is uncertain.
+
+Pending follow-ups do not survive a reload. A record whose follow-up
+timers never run (a stalled run loop) stops collecting ten minutes after its
+last horizon; it keeps each horizon's machine reading, so a follow-up that
+runs later still reports it. A rotation that cannot finish is counted as an error, and past
+twice the 4 MB cap rows are refused rather than written.
+
+It never forks, never acts and never leaves the machine. It exists so that
+adjudicators can be judged against real outcomes rather than synthetic
+scenarios alone. The rules it holds to (each observation's lifecycle, the
+as-of-horizon reads, the clock and identity models, its bounds) are in
+`docs/observation-ledger.md`. Set `"observe": false` in the local config to turn it off.
+`hs -c "memwatch.testObserve()"` writes one synthetic-tagged row to prove the
+path end to end, and says so if the row could not be written.
+
 ## Layout
 
 ```
@@ -148,12 +286,17 @@ metric operationally defined:
   lua/memwatch_procs.lua  pure: ps/top parsers, growth rings, runaway detection, ranking
   lua/memwatch_lfm.lua    pure: LFM JSON codec, prompt, serializer, validator, rails (opt-in)
   lua/memwatch_report.lua pure: the value report renderer (opt-in)
+  lua/memwatch_observe.lua pure: observation-ledger rows, per-observation evidence and fates
   lua/memwatch.lua        Hammerspoon glue: timers, async sampling, HUD, menu, kill/freeze, LFM lifecycle, log
   test_core.lua           unit tests for the pure modules (lua test_core.lua)
   test_report.lua         unit tests for the report renderer (lua test_report.lua)
+  test_glue.lua           behavioral tests of the alert glue in a fake Hammerspoon (lua test_glue.lua)
+  test/hsfake.lua         that fake: virtual clock, timers, process table, HUD, banners, menu
+  docs/alert-lifecycle.md the alert rules: identity, answers, grace, banners, episode boundaries
   eval/                   the model bake-off: corpus, runner, gates, methodology
   install.sh              idempotent wiring into ~/.hammerspoon/init.lua (with backup); --with-lfm adds adjudication
   memwatch.log            state transitions, runaways, kills, errors; rotates at 1 MB
+  memwatch-observe.jsonl  passive observation ledger; rotates at 4 MB, three generations kept
 ```
 
 The verdict is fork-free: signals and the state machine run every 5s tick
@@ -183,20 +326,32 @@ Appends a `BEGIN memwatch / END memwatch` block to `~/.hammerspoon/init.lua`
 
 ## Test
 
-Pure-logic unit tests (state machine, detector, kill policy, parsers):
+Pure-logic unit tests (state machine, detector, kill policy, parsers), and
+behavioral tests that run the real Hammerspoon glue against a fake
+Hammerspoon with a virtual clock (alert episodes, identity binding, failed
+probes, answers and grace, banners, restarts, diagnostics):
 
 ```sh
-cd ~/projects/memwatch && lua test_core.lua
+cd ~/projects/memwatch && lua test_core.lua && lua test_glue.lua
 ```
 
+The fake writes into a scratch home under the system temp dir; set
+`HSFAKE_ROOT` (or run where `$PWD` is writable) when that is not allowed.
+
+The public-tree firewall refuses to scan without the maintainer's local term
+list, so a public clone runs it as
+`MEMWATCH_PUBLIC_CLONE=1 bash eval/checks/no-internal-refs.sh`.
+
 Visual self-test and full-surface simulation (no real process involved; the
-fake offender probes as already exited, so clicking Force Quit is safe):
+fake offender is synthetic, so its buttons never signal anything, whatever
+process may really hold its pid):
 
 ```sh
 hs -c "memwatch.test('elevated')"    # amber title for 12s
 hs -c "memwatch.test('critical')"    # red title + notification + HUD
 hs -c "memwatch.simulate()"          # runaway-alert demo for 20s
 hs -c "memwatch.status()"            # one-line current reading
+hs -c "memwatch.testObserve()"       # one synthetic observation row, follow-ups at 2-6 s
 ```
 
 Live end-to-end drill with a real (bounded, safe) leaker: allocate ~190 MB/s

@@ -211,6 +211,91 @@ check("ps comm keeps spaces", procs.friendlyName(psList[1].comm), "Google Chrome
 check("ps uid parsed", psList[3].uid, 88)
 check("friendlyName bare", procs.friendlyName("claude"), "claude")
 
+-- ---- procs: etime and process age (the sampler's ps carries etime) ----
+check("etime mm:ss", procs.parseEtime("00:07"), 7)
+check("etime hh:mm:ss", procs.parseEtime("01:02:03"), 3723)
+check("etime dd-hh:mm:ss", procs.parseEtime("2-03:04:05"), 2 * 86400 + 3 * 3600 + 4 * 60 + 5)
+check("etime garbage is unknown, never fabricated", procs.parseEtime("Tue"), nil)
+local psEtBlob = [[
+1
+total = 9216.00M  used = 7987.06M  free = 1228.94M  (encrypted)
+  PID   UID    RSS     ELAPSED COMM
+  771   502 509728    01:23:45 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)
+  118   502 489904       00:40 claude
+    1     0  18656 01-15:24:11 /sbin/launchd
+]]
+local psEt = procs.parsePsList(psEtBlob)
+check("etime rows parsed", #psEt, 3)
+check("etime age parsed", psEt[2].etimeSec, 40)
+check("etime hour form parsed, not swallowed into comm", psEt[1].etimeSec, 3600 + 23 * 60 + 45)
+check("etime hour-form comm is the path", psEt[1].comm:sub(1, 14), "/Applications/")
+check("etime day form", psEt[3].etimeSec, 86400 + 15 * 3600 + 24 * 60 + 11)
+check("etime comm keeps spaces", procs.friendlyName(psEt[1].comm), "Google Chrome Helper (Renderer)")
+check("legacy four-column rows parse with unknown age", psList[1].etimeSec, nil)
+do
+  -- An elapsed token that does not parse leaves the age unknown; it never
+  -- becomes part of the command name.
+  local bad = procs.parsePsList("  555   502  4096   1-2-3 /usr/local/bin/tool\n")
+  check("etime: an unparseable token keeps the row's shape", bad[1] and bad[1].comm, "/usr/local/bin/tool")
+  check("etime: and leaves the age unknown", bad[1] and bad[1].etimeSec, nil)
+end
+do
+  -- A young allocator climbing 1 GB per 5 s tick: the runaway carries its
+  -- live age, so the snapshot finally says "40 s old", not nothing.
+  local tr = procs.newTracker()
+  for i = 0, 6 do
+    procs.update(tr, { { pid = 4242, uid = 502, rssMB = 1000 + i * 1000,
+                         etimeSec = 40 + i * 5, comm = "python3" } }, 1000 + i * 5, nil)
+  end
+  local runs = procs.runaways(tr, 1030, "elevated", 36 * 1024)
+  check("runaway is extreme", runs[1] and runs[1].kind, "extreme")
+  check("runaway carries live age", runs[1] and runs[1].ageSec, 70)
+  -- A 60 s delivery stall: the true start lies anywhere in the sampler's
+  -- window, so the age is centered in it rather than under-reported by the
+  -- whole stall (the callback-time estimate would still say 70 s).
+  local trLate = procs.newTracker()
+  for i = 0, 6 do
+    local at = 1000 + i * 5
+    procs.update(trLate, { { pid = 4243, uid = 502, rssMB = 1000 + i * 1000,
+                             etimeSec = 40 + i * 5, comm = "python3" } }, at, nil, at - 60)
+  end
+  local runsLate = procs.runaways(trLate, 1030, "elevated", 36 * 1024)
+  check("runaway age is centered in a stalled sample's window", runsLate[1] and runsLate[1].ageSec, 100)
+  -- Inside a callback holding a 30 s step back, the raw clock is 30 s behind
+  -- memwatch's: the age reads on the raw clock its start window is on, as it
+  -- will once the step is taken out, never 30 s older for the frame's rest.
+  local runsHeld = procs.runaways(trLate, 1030, "elevated", 36 * 1024, 1000)
+  check("a runaway's age reads on the raw clock (30 s held back: 70, not 100)", runsHeld[1] and runsHeld[1].ageSec, 70)
+  local ranked = procs.rankByWeight({ { pid = 7, uid = 502, rssMB = 9000,
+                                        etimeSec = 86400, comm = "VirtualMachine" } }, nil, 5)
+  local off = procs.pickOffender({}, ranked, "critical", nil)
+  check("hog fallback carries age", off and off.ageSec, 86400)
+  local trNoAge = procs.newTracker()
+  procs.update(trNoAge, { { pid = 9, uid = 502, rssMB = 100, comm = "x" } }, 1000, nil)
+  check("no etime means no age", trNoAge.procs[9].startedAt, nil)
+  -- A delivery inside a callback still holding a step back reads memwatch's
+  -- clock 30 s ahead of the raw wall clock ps's etime runs on: the window is
+  -- placed with the raw reading (wallAt), so it stays on the kernel's start.
+  local trStep = procs.newTracker()
+  procs.update(trStep, { { pid = 11, uid = 502, rssMB = 100, etimeSec = 100, comm = "x" } }, 2000, nil, 1968, 1970)
+  local wide = procs.startWindow(105, 1000, 906, 100)
+  check("a window widens by a step taken between launch and delivery (ps read at 1005, before it)",
+    wide.lo <= 900 and wide.hi >= 900, true)
+  local narrow = procs.startWindow(105, 1000, 906, 0)
+  check("without the widening that start falls outside (control)", narrow.hi < 900, true)
+  -- (round 11) The lower bound widens too. Launched at 1000, a 6 s step back
+  -- at 1000.5, ps read at 1001 (the clock reads 995, so etime is 100 for a
+  -- start at 895) and delivered at 1004 on the new clock: the start sits
+  -- below the unwidened window.
+  local wideLo = procs.startWindow(100, 1000, 1004, 6)
+  check("the lower bound widens by the step too (ps read after it)", wideLo.lo <= 895 and wideLo.hi >= 895, true)
+  check("without the widening that start falls below the window (control)",
+    procs.startWindow(100, 1000, 1004, 0).lo > 895, true)
+  check("a window is placed with the raw wall reading, not the callback's basis",
+    trStep.procs[11].startLo == 1867 and trStep.procs[11].startHi == 1870, true)
+  check("and the sighting keeps memwatch's basis", trStep.procs[11].lastSeen, 2000)
+end
+
 local topBlob = [[
 PhysMem: 34G used (11G wired, 9279M compressor), 671M unused.
 PID    COMMAND          MEM   CMPRS
@@ -293,6 +378,32 @@ check("absolute silent at ok", #procs.runaways(trBig, 25, "ok", 36864), 0)
 local runsBig = procs.runaways(trBig, 25, "critical", 36864)
 check("absolute fires at critical", #runsBig, 1)
 check("absolute kind", runsBig[1].kind, "absolute")
+
+-- risingSince: a run of rises after a mark (a freeze, a verified exit)
+-- means the pid holds a running process; a held or compressing one never
+-- makes a run. Three cases plus the empty one.
+do
+  local function series(values, comm)
+    local sr = {}
+    for i, v in ipairs(values) do sr[#sr + 1] = { t = (i - 1) * 5, list = { row(60, v, comm or "node") } } end
+    return feed(sr)
+  end
+  -- Frozen at t=12: big and flat before it, a newcomer growing after it.
+  local trNew = series({ 9000, 9000, 9000, 2000, 2300, 2600, 2900, 3200 })
+  check("risingSince: a grower after the mark is a run", procs.risingSince(trNew, 60, 12) >= 3, true)
+  check("risingSince: the mark bounds the count (rises before it do not count)",
+    procs.risingSince(series({ 1000, 1400, 1800, 2200, 2200, 2200 }), 60, 12), 0)
+  -- A held process whose pages compress: each drop is caught up by one rise.
+  local trHeld = series({ 9000, 9000, 8000, 8300, 7500, 7800, 7000, 7300 })
+  check("risingSince: a compressing held process never makes a run", procs.risingSince(trHeld, 60, 0) < 3, true)
+  -- (round 5) A held process whose figure catches up on alternate samples:
+  -- rise, flat, rise, flat, rise is no run (growth()'s one-flat grace does
+  -- not apply here).
+  local trAlt = series({ 9000, 9100, 9100, 9200, 9200, 9300 })
+  check("risingSince: alternate catch-ups are not a run", procs.risingSince(trAlt, 60, 0), 1)
+  check("risingSince: no samples after the mark", procs.risingSince(trNew, 60, 999), 0)
+  check("risingSince: an untracked pid", procs.risingSince(trNew, 61, 0), 0)
+end
 
 -- weight rings: cmprs from top joins rss and sticks between top refreshes,
 -- so a runaway whose pages are compressed away in real time stays visible.
@@ -826,34 +937,210 @@ local function earlyRefs(path)
   return bad
 end
 
+-- ---- tri-state process probe: a failed probe is never an exit ----
+-- memwatch's own pid rides in every probe as the positive control, so a
+-- missing row means "gone" only when the control row came back.
+do
+  local SELF = 777
+  local out = table.concat({
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon",
+    " 4242   501 T    Mon Oct  5 10:00:01 2026 /usr/local/bin/node",
+    " 5151   501 R+   Tue Oct 13 11:22:33 2026 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)",
+  }, "\n") .. "\n"
+  local rows = core.parseProbeRows(out, SELF)
+  check("probe: the reply parses", rows ~= nil, true)
+  local st, p = core.probeResult(rows, 4242)
+  check("probe: a listed pid is present", st, "present")
+  check("probe: its start time is kept", p and p.lstart, "Mon Oct  5 10:00:01 2026")
+  check("probe: its state is kept", p and p.state, "T")
+  check("probe: a T state is stopped", core.isStopped(p), true)
+  local _, chrome = core.probeResult(rows, 5151)
+  check("probe: a comm with spaces is kept whole", chrome and chrome.comm,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper (Renderer)")
+  check("probe: R+ is not stopped", core.isStopped(chrome), false)
+  check("probe: a missing pid with the control row present is absent", (core.probeResult(rows, 9999)), "absent")
+  check("probe: an empty reply is unknown, not absent",
+    (core.probeResult(core.parseProbeRows("", SELF), 4242)), "unknown")
+  check("probe: a reply without the control row is unknown",
+    (core.probeResult(core.parseProbeRows(" 4242   501 S    Mon Oct  5 10:00:01 2026 /usr/local/bin/node\n", SELF), 4242)),
+    "unknown")
+  check("probe: a nil reply (the fork raised) is unknown", (core.probeResult(core.parseProbeRows(nil, SELF), 4242)), "unknown")
+  check("probe: garbage is unknown", (core.probeResult(core.parseProbeRows("ps: illegal option\n", SELF), 4242)), "unknown")
+  check("probe: the control row beside a cut-off line is unknown, not absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n 4242   50", SELF), 4242)),
+    "unknown")
+  check("probe: a complete reply that omits the pid is absent",
+    (core.probeResult(core.parseProbeRows(
+      "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF), 4242)),
+    "absent")
+  local selfOnly = core.parseProbeRows(
+    "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF)
+  check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
+end
+
+-- ---- identity: a recorded process may be signaled only while it holds ----
+do
+  local ident = { pid = 4100, lstart = "Mon Oct 12 10:00:01 2026", name = "llama-server" }
+  check("holds: the recorded process, probed present", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "llama-server"), true)
+  check("holds: another start time on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:09:09 2026", "llama-server"), false)
+  check("holds: a probe that could not tell is refused", core.identityHolds(ident, "unknown", nil, nil), false)
+  check("holds: an exited process is refused", core.identityHolds(ident, "absent", nil, nil), false)
+  check("holds: a record without a start time never signals",
+    core.identityHolds({ pid = 4100, name = "llama-server" }, "present", "Mon Oct 12 10:00:01 2026", "llama-server"), false)
+  check("holds: another name on the pid is refused", core.identityHolds(ident, "present",
+    "Mon Oct 12 10:00:01 2026", "python3"), false)
+  check("holds: a record without a name compares start time alone",
+    core.identityHolds({ pid = 4100, lstart = "L" }, "present", "L", "anything"), true)
+end
+
+-- ---- identity: exact identity, and records that never transfer ----
+do
+  local A  = { pid = 7, name = "node", lstart = "L1" }
+  local A2 = { pid = 7, name = "node", lstart = "L1" }
+  local B  = { pid = 7, name = "node", lstart = "L2" }
+  local U  = { pid = 7, name = "node" }
+  check("exact: the same bound process", core.sameIdentity(A, A2), true)
+  check("exact: another start time on the pid is not it", core.sameIdentity(A, B), false)
+  check("exact: an unbound side never matches", core.sameIdentity(A, U), false)
+  check("exact: two unbound readings do not match either", core.sameIdentity(U, { pid = 7, name = "node" }), false)
+  check("exact: a truncated name of the same bound process matches",
+    core.sameIdentity({ pid = 7, name = "Google Chrome He", lstart = "L1" },
+                      { pid = 7, name = "Google Chrome Helper (Renderer)", lstart = "L1" }), true)
+  check("exact: nil is never a match", core.sameIdentity(nil, A), false)
+  check("record: made for this bound process", core.recordDescribes({ name = "node", lstart = "L1" }, A), true)
+  check("record: made while unbound does not transfer once it binds",
+    core.recordDescribes({ name = "node" }, A), false)
+  check("record: made for a bound process does not serve an unbound reading",
+    core.recordDescribes({ name = "node", lstart = "L1" }, U), false)
+  check("record: made while unbound serves the unbound reading", core.recordDescribes({ name = "node" }, U), true)
+  check("record: another process's record does not", core.recordDescribes({ name = "node", lstart = "L1" }, B), false)
+  check("record: two names sharing 15 characters are different processes",
+    core.recordDescribes({ name = "Chrome Helper (GPU)" }, { pid = 7, name = "Chrome Helper (Renderer)" }), false)
+end
+
+-- ---- identity: continuity versus memory ----
+do
+  local full = "Google Chrome Helper (Renderer)"
+  check("name: a top-truncated name matches its full name",
+    core.sameName("Google Chrome He", full), true)
+  check("name: either way round", core.sameName(full, "Google Chrome He"), true)
+  check("name: short names must match exactly", core.sameName("node", "node2"), false)
+  check("name: a short prefix is not enough", core.sameName("Google", full), false)
+  check("name: a 15-character prefix matches a 20-character name",
+    core.sameName("Chrome Helper (", "Chrome Helper (GPU)1"), true)
+  check("name: two long names that differ inside the prefix do not",
+    core.sameName("Chrome Helper (Renderer)", "Chrome Helpers (GPU)"), false)
+  check("continuity: a truncated name is the same offender",
+    core.sameOffender({ pid = 7, name = "Google Chrome He" }, { pid = 7, name = full, lstart = "L1" }), true)
+  local bound, other = { pid = 7, name = "node", lstart = "L1" }, { pid = 7, name = "node", lstart = "L2" }
+  local unbound = { pid = 7, name = "node" }
+  check("continuity: an unbound side matches while identity is being established",
+    core.sameOffender(unbound, bound), true)
+  check("memory: a bound record matches the same start time", core.sameRecord(bound, { pid = 7, name = "node", lstart = "L1" }), true)
+  check("memory: a different start time is a different process", core.sameRecord(bound, other), false)
+  check("memory: an unbound record never vouches for a bound process", core.sameRecord(unbound, bound), false)
+  check("memory: an unbound candidate compares by pid and name", core.sameRecord(bound, unbound), true)
+  check("memory: two unbound records compare by pid and name", core.sameRecord(unbound, { pid = 7, name = "node" }), true)
+  check("memory: another pid never matches", core.sameRecord(bound, { pid = 8, name = "node", lstart = "L1" }), false)
+end
+
+-- ---- held pollers: a give-up is never a success ----
+do
+  local st = {}
+  check("until: a poll that reports done is done", core.untilStep(st, true, true, 0, 120), "done")
+  check("until: a poll that runs but is not done polls again", core.untilStep(st, true, false, 1, 120), "poll")
+  check("until: an error polls again (escalations live in predicates)", core.untilStep(st, false, "boom", 10, 120), "poll")
+  check("until: still polling just under the budget", core.untilStep(st, false, "boom", 129, 120), "poll")
+  check("until: a continuous error run gives up at the budget", core.untilStep(st, false, "boom", 130, 120), "giveup")
+  local st2 = {}
+  core.untilStep(st2, false, "boom", 0, 120)
+  core.untilStep(st2, true, false, 100, 120)
+  check("until: a poll that runs ends the error run", core.untilStep(st2, false, "boom", 150, 120), "poll")
+end
+
+-- ---- an action's outcome is the alert's answer ----
+do
+  check("answer: frozen is done",            core.answerFor("frozen"), "done")
+  check("answer: terminated is done",        core.answerFor("terminated"), "done")
+  check("answer: exited is done",            core.answerFor("exited"), "done")
+  check("answer: a reused pid rebinds",      core.answerFor("stale"), "rebind")
+  check("answer: a policy refusal snoozes",  core.answerFor("refused"), "snooze")
+  check("answer: a survivor snoozes",        core.answerFor("failed"), "snooze")
+  check("answer: unverified stands",         core.answerFor("unverified"), "stand")
+  check("answer: unconfirmed stands",        core.answerFor("unconfirmed"), "stand")
+  check("answer: no outcome stands",         core.answerFor(nil), "stand")
+  check("answer: an unknown outcome stands", core.answerFor("bogus"), "stand")
+end
+
 -- ---- frozen-ledger prune (calm-state liveness sweep, 2026-07-09 field fix) ----
 -- Three-case floor: exited / identity-changed / healthy-kept, plus the
--- resumed-externally drop and the empty no-op.
+-- resumed-externally drop, the unknown keep and the empty no-op.
 do
   local entries = {
     [100] = { pid = 100, name = "vm-host", lstart = "Tue Jul  7 07:24:43 2026" },
     [200] = { pid = 200, name = "leaky",   lstart = "Wed Jul  8 10:00:00 2026" },
     [300] = { pid = 300, name = "runner",  lstart = "Wed Jul  8 11:00:00 2026" },
     [400] = { pid = 400, name = "steady",  lstart = "Wed Jul  8 12:00:00 2026" },
+    [500] = { pid = 500, name = "held",    lstart = "Wed Jul  8 13:00:00 2026" },
   }
   local probes = {
-    -- [100] absent: exited
-    [200] = { lstart = "Thu Jul  9 09:00:00 2026", state = "T" }, -- pid recycled
-    [300] = { lstart = "Wed Jul  8 11:00:00 2026", state = "R" }, -- resumed externally
-    [400] = { lstart = "Wed Jul  8 12:00:00 2026", state = "T" }, -- still frozen
+    [100] = { "absent" },                                                        -- exited
+    [200] = { "present", { lstart = "Thu Jul  9 09:00:00 2026", state = "T" } },  -- pid recycled
+    [300] = { "present", { lstart = "Wed Jul  8 11:00:00 2026", state = "R" } },  -- resumed externally
+    [400] = { "present", { lstart = "Wed Jul  8 12:00:00 2026", state = "T" } },  -- still frozen
+    [500] = { "unknown" },                                                       -- probe could not run
   }
-  local kept, dropped = core.pruneFrozen(entries, function(pid) return probes[pid] end)
+  local kept, dropped = core.pruneFrozen(entries, function(pid) return table.unpack(probes[pid]) end)
   check("prune: exited dropped",       kept[100], nil)
   check("prune: recycled dropped",     kept[200], nil)
   check("prune: resumed dropped",      kept[300], nil)
   check("prune: live frozen kept",     kept[400] ~= nil, true)
+  check("prune: an unknown probe keeps the entry", kept[500] ~= nil, true)
   local whys = {}
   for _, d in ipairs(dropped) do whys[d.entry.pid] = d.why end
   check("prune: exited reason",        whys[100], "exited")
   check("prune: recycled reason",      whys[200], "pid-recycled")
   check("prune: resumed reason",       whys[300], "resumed-externally")
-  local k2, d2 = core.pruneFrozen({}, function() return nil end)
+  check("prune: nothing dropped for the unknown one", whys[500], nil)
+  local pend = { [600] = { pid = 600, name = "settling", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
+  local probed = false
+  local k3 = core.pruneFrozen(pend, function() probed = true; return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1010)
+  check("prune: a freeze still being verified is kept", k3[600] ~= nil, true)
+  check("prune: and not even probed", probed, false)
+  local k4 = core.pruneFrozen(pend, function() return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "R" } end, 1040)
+  check("prune: once its verify window passes it is checked like any other", k4[600], nil)
+  local k2, d2 = core.pruneFrozen({}, function() return "unknown" end)
   check("prune: empty entries no-op",  next(k2) == nil and #d2 == 0, true)
+  -- Pure: a freeze its own verifier could not confirm stays as it was once
+  -- its window passes (no longer pending only because the window ended),
+  -- and the reducer returns no third value.
+  local unconf = { [700] = { pid = 700, name = "unconfirmed", lstart = "Wed Jul  8 14:00:00 2026", pendingUntil = 1030 } }
+  local k5, d5, extra = core.pruneFrozen(unconf, function()
+    return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
+  check("prune: a stopped entry past its window is kept", k5[700] ~= nil and #d5 == 0, true)
+  check("prune: and the entry is not changed (pure)", unconf[700].pendingUntil, 1030)
+  check("prune: no third return", extra, nil)
+  -- An entry whose STOP never went out is no freeze of memwatch's, whatever
+  -- the process's state: dropped without a probe, inside its window or not.
+  for _, case in ipairs({ { at = 1010, label = "inside its window" }, { at = 1040, label = "past its window" } }) do
+    local unsent = { [800] = { pid = 800, name = "unsent", lstart = "Wed Jul  8 14:00:00 2026",
+                               pendingUntil = 1030, stopSent = false } }
+    local asked = false
+    local k7, d7 = core.pruneFrozen(unsent, function()
+      asked = true
+      return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, case.at)
+    check("prune: an unsent STOP's entry is dropped " .. case.label, k7[800], nil)
+    check("prune: as stop-never-sent " .. case.label, d7[1] and d7[1].why, "stop-never-sent")
+    check("prune: with no probe " .. case.label, asked, false)
+  end
+  -- Control: the same stopped process with its STOP sent stays.
+  local sent = { [801] = { pid = 801, name = "sent", lstart = "Wed Jul  8 14:00:00 2026", stopSent = true } }
+  local k8 = core.pruneFrozen(sent, function()
+    return "present", { lstart = "Wed Jul  8 14:00:00 2026", state = "T" } end, 1040)
+  check("prune: a sent STOP's stopped process is kept (control)", k8[801] ~= nil, true)
 end
 
 -- ---- plateaued-runaway evidence: peak slope (2026-07-13 live-drill finding) ----
@@ -1008,7 +1295,7 @@ do
   check("plain: name field kept",     plain:find('"name"', 1, true) ~= nil, true)
 end
 
-for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua", "lua/memwatch_report.lua" }) do
+for _, path in ipairs({ "lua/memwatch.lua", "lua/memwatch_core.lua", "lua/memwatch_procs.lua", "lua/memwatch_lfm.lua", "lua/memwatch_report.lua", "lua/memwatch_observe.lua" }) do
   local bad = earlyRefs(path)
   for _, b in ipairs(bad) do print("FAIL  split-scope: " .. b) end
   check("split-scope clean: " .. path, #bad, 0)
@@ -1022,13 +1309,1888 @@ end
 -- timeout). Transient timers must go through the held helpers; exactly one
 -- bare constructor of each kind may exist, inside the helper itself.
 do
+  -- Count constructors in CODE only: a comment quoting one (the incident
+  -- narratives here do) must neither trip nor satisfy the pin.
+  local function stripComments(text)
+    text = text:gsub("%-%-%[(=*)%[.-%]%1%]", "")   -- block comments
+    return (text:gsub("%-%-[^\n]*", ""))           -- line comments
+  end
+  local function count(text, pat)
+    local _, n = stripComments(text):gsub(pat, "")
+    return n
+  end
   local f = assert(io.open("lua/memwatch.lua", "r"))
   local src = f:read("a")
   f:close()
-  local _, afterCount = src:gsub("hs%.timer%.doAfter%(", "")
-  local _, untilCount = src:gsub("hs%.timer%.doUntil%(", "")
-  check("held-timer: doAfter only inside afterHeld", afterCount, 1)
-  check("held-timer: doUntil only inside untilHeld", untilCount, 1)
+  check("held-timer: doAfter only inside afterHeld", count(src, "hs%.timer%.doAfter%("), 1)
+  check("held-timer: doUntil only inside untilHeld", count(src, "hs%.timer%.doUntil%("), 1)
+  check("held-timer: a commented constructor is not counted (control)",
+    count("-- hs.timer.doAfter(5, f)\n--[[ hs.timer.doUntil(p) ]]\n", "hs%.timer%.do%a+%("), 0)
+  check("held-timer: a real constructor is counted (control)",
+    count("local t = hs.timer.doAfter(5, f) -- note\n", "hs%.timer%.doAfter%("), 1)
+end
+
+-- ---- alert surfaces: offender identity, banner steps, HUD raises ----
+do
+  local A  = { pid = 10, name = "node", lstart = "Mon Oct 12 10:00:00 2026" }
+  local A2 = { pid = 10, name = "node" }                                  -- same, unbound
+  local Ar = { pid = 10, name = "node", lstart = "Mon Oct 12 11:30:00 2026" } -- pid reused
+  local B  = { pid = 11, name = "python3" }
+  check("offender: same process, both bound", core.sameOffender(A, { pid = 10, name = "node", lstart = A.lstart }), true)
+  check("offender: an unbound start time never forces a mismatch", core.sameOffender(A, A2), true)
+  check("offender: a reused pid with a new start time differs", core.sameOffender(A, Ar), false)
+  check("offender: a renamed pid differs", core.sameOffender(A, { pid = 10, name = "rg" }), false)
+  check("offender: a different pid differs", core.sameOffender(A, B), false)
+  check("offender: none equals none", core.sameOffender(nil, nil), true)
+  check("offender: none differs from one", core.sameOffender(nil, A), false)
+
+  check("kind: severity rises from hog to extreme",
+    core.kindRank("hog") < core.kindRank("absolute") and core.kindRank("absolute") < core.kindRank("sustained")
+      and core.kindRank("sustained") < core.kindRank("extreme"), true)
+  check("kind: an unknown kind ranks lowest", core.kindRank(nil), 0)
+
+  -- W = withdraw, P = post (after the cooldown), R = replace in place now.
+  local function step(a)
+    local s = core.bannerStep(a)
+    return (s.withdraw and "W" or "-") .. (s.post and "P" or "-") .. (s.replace and "R" or "-")
+  end
+  local Ab = { pid = 10, name = "node", lstart = A.lstart, kind = "extreme", canAct = true }
+  local Au = { pid = 10, name = "node", kind = "extreme", canAct = false }   -- posted unbound
+  local Ah = { pid = 10, name = "node", lstart = A.lstart, kind = "hog", canAct = true }
+  local base = { sinceLastPostSec = 1e9, cooldownSec = 180 }
+  local function with(over)
+    local t = {}
+    for k, v in pairs(base) do t[k] = v end
+    for k, v in pairs(over) do t[k] = v end
+    return t
+  end
+  -- Happy: the first post; the live banner for the same offender stays.
+  check("banner: first post of an episode", step(with({ hasBanner = false, offender = A })), "-P-")
+  check("banner: the current offender's banner stays",
+    step(with({ hasBanner = true, banner = Ab, offender = A2, canAct = true })), "---")
+  -- Upgrades in place, without the cooldown: identity bound, kind escalated,
+  -- a generic banner gaining a name.
+  check("banner: an unbound banner upgrades once identity binds",
+    step(with({ hasBanner = true, banner = Au, offender = A, canAct = true, sinceLastPostSec = 5 })), "--R")
+  check("banner: a hog banner upgrades when it escalates",
+    step(with({ hasBanner = true, banner = Ah, offender = { pid = 10, name = "node", kind = "extreme" },
+               canAct = true, sinceLastPostSec = 5 })), "--R")
+  check("banner: a generic banner gains the offender's name at once",
+    step(with({ hasBanner = true, banner = nil, offender = A, canAct = true, sinceLastPostSec = 5 })), "--R")
+  -- Changed: a stale banner goes at once; its replacement waits the cooldown.
+  check("banner: a new offender withdraws the stale banner at once",
+    step(with({ hasBanner = true, banner = Ab, offender = B, sinceLastPostSec = 30 })), "W--")
+  check("banner: the replacement posts once the cooldown allows",
+    step(with({ hasBanner = false, offender = B, sinceLastPostSec = 181 })), "-P-")
+  check("banner: a reused pid is a different offender",
+    step(with({ hasBanner = true, banner = Ab, offender = Ar, sinceLastPostSec = 30 })), "W--")
+  -- History: an offender already announced this episode stays quiet.
+  check("banner: a returning offender already announced stays quiet",
+    step(with({ hasBanner = false, offender = A, notified = true })), "---")
+  check("banner: and a stale banner still goes when it returns",
+    step(with({ hasBanner = true, banner = { pid = 11, name = "python3" }, offender = A, notified = true })), "W--")
+  -- A banner naming a process since answered (frozen, gone, ignored) goes,
+  -- whoever heads the episode now (an answered process is no candidate).
+  check("banner: an answered process's banner goes when another heads the episode",
+    step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = B, sinceLastPostSec = 200 })), "WP-")
+  check("banner: even once no offender is named",
+    step(with({ hasBanner = true, banner = Ab, bannerHandled = true, offender = nil, notified = true })), "W--")
+  -- Degraded: the offender vanishes mid-episode; the banner stays (no churn).
+  check("banner: a vanished offender keeps its banner",
+    step(with({ hasBanner = true, banner = Ab, offender = nil })), "---")
+  check("banner: a generic banner stays while no offender is named",
+    step(with({ hasBanner = true, banner = nil, offender = nil })), "---")
+  check("banner: a generic banner posts once per episode",
+    step(with({ hasBanner = false, offender = nil, notified = true })), "---")
+
+  local function raise(a) return core.hudRaiseDue(a) end
+  local snoozed = { off = A, kind = "extreme", untilAt = 1060 }
+  check("hud: never re-raises an episode already up",
+    raise({ visible = true, offender = B, episode = A, sinceRaiseSec = 1e9, raiseSec = 60 }), false)
+  check("hud: an episode's first offender raises at once",
+    raise({ visible = false, offender = A, episode = nil, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: a snoozed offender stays down until the snooze ends",
+    raise({ visible = false, offender = A2, episode = A, snooze = snoozed, now = 1030, sinceRaiseSec = 999, raiseSec = 60 }), false)
+  check("hud: and returns when it ends",
+    raise({ visible = false, offender = A2, episode = A, snooze = snoozed, now = 1061, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: an escalation preempts the snooze",
+    raise({ visible = false, offender = { pid = 10, name = "node", kind = "extreme" }, episode = A,
+            snooze = { off = A, kind = "hog", untilAt = 2000 }, now = 1010, sinceRaiseSec = 0, raiseSec = 60 }), true)
+  check("hud: a new offender preempts the cooldown",
+    raise({ visible = false, offender = B, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), true)
+  check("hud: the same offender again waits the cooldown",
+    raise({ visible = false, offender = A2, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), false)
+  check("hud: no named offender stays cooldown-gated",
+    raise({ visible = false, offender = nil, episode = A, sinceRaiseSec = 5, raiseSec = 60 }), false)
+end
+
+-- ---- alert-surface glue: identity binding and lifecycle ----
+-- Source pins (the behavioral harness, test_glue.lua, drives the glue;
+-- these pin shapes it cannot reach or that must never come back). A
+-- forbidden shape is checked with a real control: the same extractor run
+-- over a pre-fix body must find it, so neither a vacuous extraction nor a
+-- scan that cannot see the shape passes.
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local function bodyIn(text, startPat, endPat)
+    local s = text:find(startPat, 1, true)
+    local e = s and text:find(endPat or "\nend\n", s, true)
+    return (s and e) and text:sub(s, e) or ""
+  end
+  local function body(startPat, endPat) return bodyIn(src, startPat, endPat) end
+  -- The live body has no `bad`; a pre-fix body, extracted the same way, has it.
+  local function forbids(startPat, bad, preFix, endPat)
+    local live, old = bodyIn(src, startPat, endPat), bodyIn(preFix, startPat, endPat)
+    return #live > 0 and live:find(bad, 1, true) == nil and old:find(bad, 1, true) ~= nil
+  end
+  check("source pins: the control rejects a live body that still has the shape",
+    (function()
+      local saved = src
+      src = "local function probe()\n  bad()\nend\n"
+      local verdict = forbids("local function probe()", "bad()", src)
+      src = saved
+      return verdict
+    end)(), false)
+  local notify = body("local function notifyCrit(m)")
+  check("banner glue: notifyCrit located", #notify > 400, true)
+  check("banner glue: steps through core.bannerStep", notify:find("core.bannerStep(", 1, true) ~= nil, true)
+  check("banner glue: Force Quit passes the bound start time",
+    notify:find("local target = { pid = off.pid, name = off.name, lstart = lstart }", 1, true) ~= nil
+      and notify:find("surfaceUpdate(target, click), { expectedLstart = lstart })", 1, true) ~= nil, true)
+  check("banner glue: the button exists only when identity is bound",
+    notify:find("hasActionButton   = canAct,", 1, true) ~= nil, true)
+  check("banner glue: no unbound kill remains",
+    forbids("local function notifyCrit(m)", "M.killPid(off.pid, off.name)\n",
+      "local function notifyCrit(m)\n  critNotif = hs.notify.new(function()\n    M.killPid(off.pid, off.name)\n  end)\nend\n"), true)
+  -- (round 5) An outcome from the menu or a banner answers only a HUD bound
+  -- to its very process; a refusal with no start time withdraws only an
+  -- unbound banner.
+  local SURF = "local function surfaceUpdate(target, click)"
+  check("surface glue: an outcome answers only a HUD bound to its very process",
+    body(SURF):find("core.sameIdentity(hudOffender, target)", 1, true) ~= nil
+      and forbids(SURF, "core.sameOffender(hudOffender, target)",
+        SURF .. "\n    if hudOffender and core.sameOffender(hudOffender, target) then end\nend\n"), true)
+  local REFUSED = "local function identityRefused(target)"
+  check("refusal glue: an unbound refusal never withdraws a bound banner",
+    body(REFUSED):find("(critNotifOff.lstart == nil or (target.lstart ~= nil and critNotifOff.lstart == target.lstart))", 1, true) ~= nil
+      and forbids(REFUSED, "target.lstart == nil or critNotifOff.lstart == nil",
+        REFUSED .. "\n     and (target.lstart == nil or critNotifOff.lstart == nil or critNotifOff.lstart == target.lstart) then\nend\n"), true)
+  local surfaces = body("local function alertSurfaces(state, now)")
+  check("hud glue: alertSurfaces located", #surfaces > 400, true)
+  check("hud glue: raises through core.hudRaiseDue", surfaces:find("core.hudRaiseDue(", 1, true) ~= nil, true)
+  check("hud glue: a refresh inherits the bound identity",
+    surfaces:find("bindOffender(offender, hudOffender, now, false)", 1, true) ~= nil, true)
+  check("hud glue: a retarget binds anew",
+    surfaces:find("if not core.sameOffender(hudOffender, offender) then", 1, true) ~= nil
+      and surfaces:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
+  check("hud glue: the grace is per process (the single shared clock is gone)",
+    forbids("local function unattendedStep(offender, now)", "hudShownAt",
+      "local function unattendedStep(offender, now)\n  if (now - hudShownAt) < core.cfg.cool.autoKillGraceSec then return end\nend\n")
+      and src:find("hudShownAt", 1, true) == nil
+      and surfaces:find("exposureHead.sec = (exposureHead.sec or 0)", 1, true) ~= nil, true)
+  check("hud glue: the refresh never drops the bound table",
+    forbids("local function alertSurfaces(state, now)", "hudOffender = offender or hudOffender",
+      "local function alertSurfaces(state, now)\n      hudOffender = offender or hudOffender\nend\n"), true)
+  local reset = body("local function resetEpisode()")
+  check("episode glue: resetEpisode located", #reset > 100, true)
+  check("episode glue: the episode's end forgets its HUD memory",
+    reset:find("hudEpisodeOff, hudSnooze, hudStalePid = nil, nil, nil", 1, true) ~= nil
+      and reset:find("exposure, interacted, exposureTickAt, exposureHead = {}, {}, nil, nil", 1, true) ~= nil, true)
+  check("episode glue: the episode ends at settle",
+    surfaces:find("if settled and not hudHold then resetEpisode() end", 1, true) ~= nil, true)
+  check("episode glue: and with the run", body("function M.stop()"):find("resetEpisode()", 1, true) ~= nil, true)
+  check("episode glue: stop drops a pending model request",
+    body("function M.stop()"):find("lfmInFlight = nil", 1, true) ~= nil, true)
+  local closeAt = src:find('elseif id == "close" then', 1, true)
+  local closeBody = closeAt and src:sub(closeAt, closeAt + 260) or ""
+  check("hud glue: a close is a snooze", closeBody:find('dismissHud("snooze")', 1, true) ~= nil, true)
+  local clicks = body('hud:mouseCallback(guard("hud-click"', "\n  end))")
+  check("hud glue: no click handler hides the HUD without answering it",
+    #clicks > 0 and forbids('hud:mouseCallback(guard("hud-click"', "M.hideHud()",
+      'hud:mouseCallback(guard("hud-click", function(_, evt, id)\n    if id == "close" then M.hideHud() end\n  end))',
+      "\n  end))"), true)
+  check("hud glue: a click acts only on a bound identity",
+    clicks:find("if not target.lstart then", 1, true) ~= nil, true)
+  local poll = body("local function untilHeld(pred, action, interval, onGiveUp)")
+  check("poller glue: untilHeld located", #poll > 200, true)
+  check("poller glue: a give-up calls the owner's handler, never the success action",
+    poll:find('if step == "giveup" then', 1, true) ~= nil and poll:find("pcall(onGiveUp)", 1, true) ~= nil, true)
+  check("poller glue: an error no longer ends the poller",
+    forbids("local function untilHeld(pred, action, interval, onGiveUp)", "or not ok",
+      "local function untilHeld(pred, action, interval, onGiveUp)\n    done = done == true or not ok\nend\n"), true)
+  check("poller glue: a continuous error run gives up", poll:find("UNTIL_GIVEUP_SEC", 1, true) ~= nil, true)
+  local retire = body("local function retireLfmServer(reason)")
+  local RETIRE = "local function retireLfmServer(reason)"
+  check("lfm glue: the retire TERM and KILL both check the recorded server identity",
+    retire:find('local sent = tracked == "ours" and send(sig, pid)', 1, true) ~= nil
+      and retire:find('if owner and not (owner == pid and (sent or tracked == "other")) and listenerIsOurs(owner) then', 1, true) ~= nil
+      and retire:find("core.identityHolds(ident, st,", 1, true) ~= nil
+      and forbids(RETIRE, 'sig == "TERM" or',
+        RETIRE .. '\n    if pid and (sig == "TERM" or trackedIsOurs()) then\nend\n'), true)
+  check("lfm glue: a listener on the tracked pid gets no shortcut",
+    forbids(RETIRE, "if owner == pid then return true end",
+      RETIRE .. "\n    if owner == pid then return true end\nend\n"), true)
+  check("lfm glue: the identity is the one recorded at start, not probed at retire",
+    forbids(RETIRE, "local ident = probePid(pid)", RETIRE .. "\n  local ident = probePid(pid)\nend\n")
+      and src:find("recordLfmServer(owner)", 1, true) ~= nil, true)
+  local start = body("function M.start()")
+  check("lfm glue: a later probe that cannot answer keeps the recorded start time",
+    body("local function recordLfmServer(pid)"):find(
+      "lstart = probed and probed.lstart or (prev and prev.lstart) or nil", 1, true) ~= nil, true)
+  check("ledger glue: an entry with no start time is owned by no writer",
+    src:find("return cur == nil or (cur.lstart ~= nil and cur.lstart == lstart)", 1, true) ~= nil, true)
+  local rls = body("local function recordLfmServer(pid)")
+  check("lfm glue: only the start time carries over a failed probe, never the name",
+    rls:find("name = probed and procs.friendlyName(probed.comm) or nil", 1, true) ~= nil
+      and rls:find("prev and prev.name", 1, true) == nil, true)
+  check("lfm glue: no pidfile is written without a start time",
+    rls:find("local rec = lfmServerIdent.lstart and lfm.jsonEncode(", 1, true) ~= nil, true)
+  check("lfm glue: the orphan sweep requires the recorded start time",
+    start:find("core.identityHolds({ pid = rec.pid, lstart = rec.lstart }", 1, true) ~= nil
+      and forbids("function M.start()", "not rec.lstart or",
+        "function M.start()\n           and (not rec.lstart or info:find(rec.lstart, 1, true)) then\nend\n"), true)
+  check("lfm glue: the health poll's give-up retires the server",
+    src:find('retireLfmServer("health-giveup")', 1, true) ~= nil, true)
+  check("poller glue: the retire probe cannot skip the KILL deadline",
+    src:find("local okGone, gone = pcall(function()", 1, true) ~= nil, true)
+  local police = src:find('"memwatch: adjudicator over budget"', 1, true)
+  check("receipt glue: the over-budget notice ignores the mute",
+    police ~= nil and not src:sub(police - 200, police):find("if alertsEnabled then", 1, true), true)
+  check("banner glue: the episode history gates every post",
+    notify:find("canAct = canAct, notified = notified,", 1, true) ~= nil, true)
+  check("banner glue: every post joins the episode history",
+    notify:find("critNotified[#critNotified + 1] = critNotifOff or { none = true }", 1, true) ~= nil, true)
+  check("banner glue: the episode's end clears the history", reset:find("critNotified = {}", 1, true) ~= nil, true)
+  local raiseBody = body("local function raiseHud(offender, titleText)")
+  check("hud glue: a fresh raise binds identity anew",
+    raiseBody:find("bindOffender(offender, nil, now, true)", 1, true) ~= nil, true)
+  check("hud glue: a raise no longer inherits across the episode",
+    forbids("local function raiseHud(offender, titleText)", "bindOffender(offender, hudEpisodeOff)",
+      "local function raiseHud(offender, titleText)\n  bindOffender(offender, hudEpisodeOff)\nend\n"), true)
+  local test = body("function M.test(level, seconds)")
+  local clearAt = test:find("resetEpisode()", 1, true)
+  local postAt = test:find("notifyCrit(lastMetrics)", 1, true)
+  check("self-test glue: a fresh run clears the previous banner first",
+    clearAt ~= nil and postAt ~= nil and clearAt < postAt, true)
+  check("self-test glue: a stale resume is a no-op", test:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
+  local sim = body("function M.simulate(seconds)")
+  check("simulate glue: a stale resume is a no-op", sim:find("if gen ~= runGen then return end", 1, true) ~= nil, true)
+  local stop = body("function M.stop()")
+  check("lifecycle glue: stop orphans pending resumes", stop:find("runGen = runGen + 1", 1, true) ~= nil, true)
+  -- The LFM pollers (not reachable from the behavioral harness).
+  check("lfm glue: a health poller ends when its server is no longer current",
+    src:find("if not myTask or lfmServerTask ~= myTask then return true end", 1, true) ~= nil, true)
+  check("lfm glue: the retire KILL survives a failing listener lookup",
+    src:find('local okKill, kerr = pcall(signalTargets, "KILL")', 1, true) ~= nil, true)
+  check("config glue: an undecodable local config is never rewritten",
+    src:find('logError("local-config-save"', 1, true) ~= nil, true)
+  local mute = body("function M.setAlertsEnabled(on)")
+  check("mute glue: unmuting lets the banner return with the HUD", mute:find("lastNotifyAt = 0", 1, true) ~= nil, true)
+  check("mute glue: muting forgets the episode history so unmute restores the banner",
+    mute:find("critNotified = {}", 1, true) ~= nil, true)
+  check("self-test glue: a fresh run clears the episode history", test:find("resetEpisode()", 1, true) ~= nil, true)
+  check("simulate glue: a simulation starts a fresh episode too",
+    body("function M.simulate(seconds)"):find("resetEpisode()", 1, true) ~= nil, true)
+end
+
+-- ---- episode banner: the cooldown ends with the episode ----
+-- A cooldown carried past recovery silenced the next episode's banner when
+-- it began within notifyCooldownSec of the last one. The settle branch must
+-- reset it whether or not a banner is still up.
+do
+  -- True when the settle branch resets the cooldown under the settle gate
+  -- itself, not under a live-banner condition that skips it.
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local rs = src:find("local function resetEpisode()", 1, true)
+  local re = rs and src:find("\nend\n", rs, true)
+  local resetBody = (rs and re) and src:sub(rs, re) or ""
+  local function resetsOnSettle(body)
+    local gate = body:find("if settled then", 1, true) or body:find("if settled and not hudHold then", 1, true)
+    local reset = body:find("lastNotifyAt = 0", 1, true)
+    local viaEpisode = body:find("resetEpisode()", 1, true)
+    if gate and viaEpisode and gate < viaEpisode then
+      return resetBody:find("lastNotifyAt = 0", 1, true) ~= nil
+    end
+    return gate ~= nil and reset ~= nil and gate < reset
+  end
+  local s = src:find("local settled = (now - hudBelowCritSince) >= 10", 1, true)
+  local e = s and src:find("\nend\n", s, true)
+  local body = (s and e) and src:sub(s, e) or ""
+  check("episode banner: settle branch located", #body > 100, true)
+  check("episode banner: settle resets the cooldown", resetsOnSettle(body), true)
+  -- Positive control: the same scan rejects the pre-fix shape, where the
+  -- banner was withdrawn and the cooldown kept.
+  local preFix = table.concat({
+    "local settled = (now - hudBelowCritSince) >= 10",
+    "if critNotif and settled then",
+    "  pcall(function() critNotif:withdraw() end)",
+    "  critNotif, critNotifPid = nil, nil",
+    "end" }, "\n")
+  check("episode banner: scan rejects the pre-fix shape (positive control)",
+    resetsOnSettle(preFix), false)
+end
+
+-- ---- decision-point predicates: kind-bound verdicts, time-bound deferral ----
+-- A verdict computed for kind=hog must never drive a decision about the same
+-- pid once the detector says kind=extreme (2026-10-14 ledger audit: every
+-- acting-path wait in the remote model's tenure was this race).
+do
+  local v = { action = "wait", process_class = "hog", confidence = 0.8, rationale = "" }
+  local now = 5000
+  local entry = { verdict = v, at = now - 30, kind = "extreme" }
+  check("verdict usable: same kind, fresh", (lfm.verdictUsable(entry, { kind = "extreme" }, now, 90)), true)
+  local ok, why = lfm.verdictUsable({ verdict = v, at = now - 30, kind = "hog" }, { kind = "extreme" }, now, 90)
+  check("verdict refused: kind changed since dispatch", ok, false)
+  check("verdict refused reason: kind-changed", why, "kind-changed")
+  local ok2, why2 = lfm.verdictUsable({ verdict = v, at = now - 30 }, { kind = "extreme" }, now, 90)
+  check("verdict refused: legacy entry without kind", ok2, false)
+  check("verdict refused reason: no-kind", why2, "no-kind")
+  check("verdict refused: stale", (lfm.verdictUsable({ verdict = v, at = now - 91, kind = "extreme" }, { kind = "extreme" }, now, 90)), false)
+  check("verdict refused: no entry", (lfm.verdictUsable(nil, { kind = "extreme" }, now, 90)), false)
+  check("deferral: first wait not exhausted", lfm.deferralExhausted(now, now, 120), false)
+  check("deferral: one window later not exhausted", lfm.deferralExhausted(now - 60, now, 120), false)
+  check("deferral: exhausted at the bound", lfm.deferralExhausted(now - 120, now, 120), true)
+  check("deferral: no first wait is not exhausted", lfm.deferralExhausted(nil, now, 120), false)
+  -- A clock stepped back after the stamp (wake-time NTP, a VM resume) makes
+  -- the age negative: the verdict is stale and the deferral is over, or a
+  -- step of minutes would hold the deterministic policy off for minutes.
+  check("verdict refused: stamped after now (clock stepped back)",
+    select(2, lfm.verdictUsable({ verdict = v, at = now + 600, kind = "extreme" }, { kind = "extreme" }, now, 90)),
+    "stale")
+  check("verdict usable: stamped this instant (age 0, control)",
+    (lfm.verdictUsable({ verdict = v, at = now, kind = "extreme" }, { kind = "extreme" }, now, 90)), true)
+  check("deferral: a first wait stamped after now is exhausted", lfm.deferralExhausted(now + 600, now, 120), true)
+  check("deferral step: a step back mid-deferral exhausts the next wait",
+    select(2, lfm.deferralStep({ firstAt = now + 600, count = 1 }, now, 120)), true)
+  check("deferral bound spans at least two grace windows",
+    lfm.cfg.maxDeferSec >= 2 * core.cfg.cool.autoKillGraceSec, true)
+  -- The deferral step folds each wait into { firstAt, count } on the
+  -- decision tick's clock: tick-aligned waits at 0, 60 and 120 s (grace
+  -- 60, bound 120) exhaust exactly on the third.
+  local now0 = 7000
+  local st1, ex1 = lfm.deferralStep(nil, now0, 120)
+  check("deferral step: the first wait starts the clock", st1.firstAt, now0)
+  check("deferral step: the first wait is not exhausted", ex1, false)
+  local st2, ex2 = lfm.deferralStep(st1, now0 + 60, 120)
+  check("deferral step: the second wait keeps the first stamp", st2.firstAt, now0)
+  check("deferral step: the second wait is not exhausted", ex2, false)
+  local st3, ex3 = lfm.deferralStep(st2, now0 + 120, 120)
+  check("deferral step: the third tick-aligned wait exhausts exactly", ex3, true)
+  check("deferral step: waits are counted", st3.count, 3)
+  check("deferral step: the input state is not mutated", st1.count, 1)
+  check("deferral step: a first stamp read late behind a fork would miss the third wait",
+    lfm.deferralExhausted(now0 + 0.4, now0 + 120, 120), false)
+  local reset, exReset = lfm.deferralStep(nil, now0 + 500, 120)
+  check("deferral step: a reset state starts fresh", reset.firstAt .. "/" .. reset.count, (now0 + 500) .. "/1")
+  check("deferral step: a reset state is not exhausted", exReset, false)
+  check("deferral step: a malformed state starts fresh", (lfm.deferralStep({ firstAt = "x" }, now0, 120)).firstAt, now0)
+  local _, exDefault = lfm.deferralStep({ firstAt = now0, count = 1 }, now0 + lfm.cfg.maxDeferSec, nil)
+  check("deferral step: a nil bound falls back to the cfg default", exDefault, true)
+  local _, exEarly = lfm.deferralStep({ firstAt = now0, count = 1 }, now0 + lfm.cfg.maxDeferSec - 1, nil)
+  check("deferral step: the default bound is not exhausted early", exEarly, false)
+end
+
+-- ---- passive observation ledger (pure half) ----
+do
+  local observe = require("memwatch_observe")
+  -- Row shape: the snapshot is the serialized model input (pid-free by
+  -- construction); the top-level pid is only a local join key.
+  local runs = {}
+  for i = 1, 5 do
+    runs[i] = { pid = 1000 + i, name = "proc" .. i, kind = "extreme", weightMB = 4000, slopeMBmin = 9000 }
+  end
+  local snap = { state = "critical", availPct = 7, kern = 2,
+    offender = { pid = 4242, name = "leak.py", kind = "extreme", weightMB = 9000.7,
+                 slopeMBmin = 11000.2, peakSlopeMBmin = 12000, ageSec = 40 },
+    runaways = runs }
+  local user = lfm.serializeSnapshot(snap, { redactNames = true })
+  -- A decision row with unattended off: the deterministic policy fires
+  -- nothing, and the freeze-ceiling counterfactual rides beside it.
+  local row = observe.row({ at = "2026-10-14T00:00:00Z", seq = 7, point = "decision",
+    state = "critical", kern = 2, availPct = 7.6, swapGB = 15.55, compressorGB = 52.04,
+    swapoutRate = 4000.9, compRate = 90000.2, runawayCount = 5, mode = "off", lfmEnabled = false,
+    wouldAct = "none", wouldActAtFreeze = "freeze", graceElapsedSec = 61.4, category = "unknown",
+    offender = snap.offender, snapshot = user, snapshotHash = lfm.snapshotHash(user) })
+  check("observe: row point", row.point, "decision")
+  check("observe: row pid is the local join key", row.pid, 4242)
+  check("observe: row numbers floored", row.availPct, 7)
+  check("observe: offender weight floored", row.offender.weightMB, 9000)
+  check("observe: offender age carried", row.offender.ageSec, 40)
+  check("observe: wouldAct carried", row.wouldAct, "none")
+  check("observe: freeze-ceiling counterfactual carried", row.wouldActAtFreeze, "freeze")
+  check("observe: snapshot is pid-free", row.snapshot:find('"pid"', 1, true), nil)
+  check("observe: snapshot is redacted", row.snapshot:find("leak.py", 1, true), nil)
+  local line = lfm.ledgerLine(row)
+  check("observe: row encodes", line ~= nil, true)
+  check("observe: row well under the 64 KB decoder cap", #line < 16000, true)
+  check("observe: row decodes back", (lfm.jsonDecode(line:sub(1, -2)) or {}).seq, 7)
+  check("observe: counterfactual survives the round trip",
+    (lfm.jsonDecode(line:sub(1, -2)) or {}).wouldActAtFreeze, "freeze")
+  local adv = observe.row({ point = "advisory", wouldAct = "none", offender = {} })
+  check("observe: advisory rows carry no counterfactual", adv.wouldActAtFreeze, nil)
+  check("observe: advisory line omits the counterfactual",
+    lfm.ledgerLine(adv):find("wouldActAtFreeze", 1, true), nil)
+  check("observe: synthetic flag only when set", row.synthetic, nil)
+  check("observe: synthetic flag carried",
+    observe.row({ synthetic = true, offender = {} }).synthetic, true)
+
+  -- Names: attacker-controlled, stored sanitized, never model input.
+  check("name: a normal name is kept", observe.sanitizeName("clang++ -O2 v1.2_x"), "clang++ -O2 v1.2_x")
+  check("name: control bytes are replaced", observe.sanitizeName("evil\nname\t\1x"), "evil?name??x")
+  check("name: invalid UTF-8 is replaced", observe.sanitizeName("bad\xFF\xFEname"), "bad??name")
+  check("name: every non-ASCII byte is replaced", observe.sanitizeName("caf\xC3\xA9"), "caf??")
+  check("name: capped at 64 bytes", #observe.sanitizeName(string.rep("a", 100)), 64)
+  check("name: non-strings are nil", observe.sanitizeName(42), nil)
+  local hostile = "x\1\n\xFF\xFE" .. string.rep("y", 100)
+  local hrow = observe.row({ point = "decision", offender = { pid = 9, name = hostile } })
+  check("name: the row stores the sanitized name", hrow.offender.name, observe.sanitizeName(hostile))
+  local hline = lfm.ledgerLine(hrow)
+  check("name: a hostile name still yields a decodable line",
+    ((lfm.jsonDecode(hline:sub(1, -2)) or {}).offender or {}).name, "x????" .. string.rep("y", 59))
+
+  -- boundLine: an oversize row drops its snapshot, never the row.
+  local encCalls = 0
+  local function fakeEncode(r)
+    encCalls = encCalls + 1
+    return string.rep("x", (r.snapshot and #r.snapshot or 0) + 10) .. "\n"
+  end
+  local small = { snapshot = "abc" }
+  local l1 = observe.boundLine(small, fakeEncode, 100)
+  check("boundLine: under the cap keeps the snapshot", small.snapshot, "abc")
+  check("boundLine: under the cap encodes once", encCalls, 1)
+  check("boundLine: under the cap sets no drop flag", small.snapshotDropped, nil)
+  check("boundLine: under the cap returns the line", #l1, 14)
+  encCalls = 0
+  local big = { snapshot = string.rep("s", 500), snapshotHash = "h" }
+  local l2 = observe.boundLine(big, fakeEncode, 100)
+  check("boundLine: over the cap drops the snapshot", big.snapshot, nil)
+  check("boundLine: over the cap flags the drop", big.snapshotDropped, true)
+  check("boundLine: the hash survives the drop", big.snapshotHash, "h")
+  check("boundLine: over the cap re-encodes", encCalls, 2)
+  check("boundLine: the re-encoded line fits", #l2 <= 100, true)
+  local bare = {}
+  local l3 = observe.boundLine(bare, function() return string.rep("x", 200) end, 100)
+  check("boundLine: over the cap without a snapshot is left as encoded", #l3, 200)
+  check("boundLine: no snapshot, no drop flag", bare.snapshotDropped, nil)
+  local huge = observe.row({ point = "decision", offender = {}, snapshot = string.rep("z", 70000) })
+  local hl = observe.boundLine(huge, lfm.ledgerLine, observe.cfg.maxLineBytes)
+  check("boundLine: a real oversize row decodes after the drop",
+    (lfm.jsonDecode(hl:sub(1, -2)) or {}).snapshotDropped, true)
+
+  -- Start windows: ps read the table between launch and delivery.
+  local sw = procs.startWindow(100, 5000, 5004)
+  check("window: lower bound is launch - etime - 1", sw.lo, 4899)
+  check("window: upper bound is delivery - etime", sw.hi, 4904)
+  check("window: carries the etime", sw.etimeSec, 100)
+  check("window: no etime, no window", procs.startWindow(nil, 5000, 5004), nil)
+  check("window: unknown launch leaves it unbounded below",
+    procs.startWindow(100, nil, 5004).lo, -math.huge)
+  check("window: a launch after delivery clamps to delivery",
+    procs.startWindow(100, 6000, 5004).lo, 4903)
+  local trWin = procs.newTracker()
+  procs.update(trWin, { { pid = 77, uid = 501, rssMB = 10, etimeSec = 300, comm = "/bin/x" } }, 2000, nil, 1990)
+  check("tracker: start window from the sampler's launch", trWin.procs[77].startLo, 1689)
+  check("tracker: start window to the sampler's delivery", trWin.procs[77].startHi, 1700)
+  check("tracker: start window carries the etime", trWin.procs[77].etimeSec, 300)
+  check("tracker: start estimate is the window midpoint", trWin.procs[77].startedAt, 1694.5)
+  local trNoLaunch = procs.newTracker()
+  procs.update(trNoLaunch, { { pid = 78, uid = 501, rssMB = 10, etimeSec = 300, comm = "/bin/x" } }, 2000, nil)
+  check("tracker: no launch time keeps the callback-time estimate", trNoLaunch.procs[78].startedAt, 1700)
+
+  -- Identity: windows, never point estimates.
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  check("identity: same process, tight windows", observe.identity(old0, { lo = 999, hi = 1001 }), "same")
+  check("identity: disjoint windows prove a different process",
+    observe.identity(old0, { lo = 1500, hi = 1502 }), "reused")
+  -- The stall case: the follow-up sample was delivered 60 s late, so a
+  -- point estimate would sit 60 s after the original start and read as a
+  -- new process. The window widens instead and still overlaps.
+  check("identity: a 60 s delivery stall is not a reuse",
+    observe.identity(old0, { lo = 999, hi = 1060 }), "same")
+  check("identity: a young process under wide windows is undecidable",
+    observe.identity({ lo = 999, hi = 1003, etimeSec = 20 }, { lo = 999, hi = 1060 }), "unknown")
+  check("identity: missing windows are undecidable", observe.identity(nil, { lo = 1, hi = 2 }), "unknown")
+
+  -- Evidence: each observation folds the samples, signals and touches that
+  -- arrive after it; a follow-up reads only that record.
+  local function ev0() return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0,
+                                                    obsAt = 1000, weightMB = 100 }) end
+  local same = { lo = 999, hi = 1001 }
+  local e = ev0()
+  check("evidence: nothing seen yet is unknown", (observe.fateAt(e, 1060)), "unknown")
+  check("evidence: and says the sample is stale", select(2, observe.fateAt(e, 1060)), "stale-sample")
+  observe.foldSample(e, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                          weightMB = 140, launchedAt = 1050, deliveredAt = 1052 })
+  check("evidence: seen as the same process near the horizon is alive", (observe.fateAt(e, 1060)), "alive")
+  check("evidence: freshness counts from acquisition, not delivery", (observe.fateAt(e, 1066)), "unknown")
+  observe.foldFrozen(e, 1055, true)
+  check("evidence: the frozen ledger's process is frozen", (observe.fateAt(e, 1060)), "frozen")
+  check("evidence: but not before the ledger held it", (observe.fateAt(e, 1054)), "alive")
+  check("evidence: weight is the latest sighting", e.lastWeightMB, 140)
+  check("evidence: peak is folded as samples arrive", e.peakMB, 140)
+  -- A late delivery: the table was read at launch, long before it landed.
+  local late = ev0()
+  observe.foldSample(late, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = { lo = 999, hi = 1040 },
+                             weightMB = 120, launchedAt = 1015, deliveredAt = 1055 })
+  check("evidence: a table delivered late is as old as its launch", (observe.fateAt(late, 1060)), "unknown")
+  -- Peaks survive the process leaving the tracker.
+  local pk = ev0()
+  observe.foldSample(pk, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 24000, launchedAt = 1010, deliveredAt = 1011 })
+  observe.foldSample(pk, { complete = true, row = nil, launchedAt = 1020, deliveredAt = 1021 })
+  check("evidence: absent from a complete table is exited", (observe.fateAt(pk, 1060)), "exited")
+  check("evidence: the peak it reached before exiting is kept", pk.peakMB, 24000)
+  observe.foldSample(pk, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 30000, launchedAt = 1030, deliveredAt = 1031 })
+  check("evidence: once gone, later samples change nothing", pk.peakMB, 24000)
+  local partial = ev0()
+  observe.foldSample(partial, { complete = false, row = nil, launchedAt = 1050, deliveredAt = 1051 })
+  local fp, dp = observe.fateAt(partial, 1060)
+  check("evidence: absence from a partial table proves nothing", fp, "unknown")
+  check("evidence: and says so", dp, "incomplete-sample")
+  local reused = ev0()
+  observe.foldSample(reused, { complete = false, row = { pid = 1, comm = "/bin/x" }, start1 = { lo = 1500, hi = 1502 },
+                               launchedAt = 1050, deliveredAt = 1051 })
+  local fr, dr = observe.fateAt(reused, 1060)
+  check("evidence: disjoint start windows prove the pid was reused", fr, "exited")
+  check("evidence: reuse detail", dr, "pid-reused")
+  local other = ev0()
+  observe.foldSample(other, { complete = true, row = { pid = 1, comm = "/usr/bin/other" }, launchedAt = 1050, deliveredAt = 1051 })
+  check("evidence: a changed comm is a reuse", select(2, observe.fateAt(other, 1060)), "pid-reused")
+  local undec = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = { lo = 999, hi = 1003, etimeSec = 20 },
+                                     obsAt = 1000, weightMB = 1 })
+  observe.foldSample(undec, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = { lo = 999, hi = 1060 },
+                              launchedAt = 1050, deliveredAt = 1051 })
+  check("evidence: an undecidable identity is unknown", select(2, observe.fateAt(undec, 1060)), "identity-uncertain")
+  -- Signals and touches count only for the observed process.
+  local sg = ev0()
+  local atStart = os.time({ year = 2026, month = 10, day = 12, hour = 10, min = 0, sec = 1 })
+  local sgEv = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = { lo = atStart - 1, hi = atStart + 1, etimeSec = 900 },
+                                     obsAt = atStart + 900, weightMB = 1 })
+  observe.foldSignal(sgEv, { action = "terminate", at = atStart + 950, comm = "/bin/x",
+                             startEpoch = observe.lstartEpoch("Mon Oct 12 10:00:01 2026") })
+  check("signal: one sent to the observed process counts", sgEv.signals[1] and sgEv.signals[1].action, "terminate")
+  check("signal: and is certain", sgEv.signals[1] and sgEv.signals[1].uncertain, nil)
+  observe.foldSignal(sgEv, { action = "freeze", at = atStart + 960, comm = "/bin/x",
+                             startEpoch = atStart + 600 })
+  check("signal: one sent to a newer process under the pid does not", #sgEv.signals, 1)
+  observe.foldSignal(sg, { action = "freeze", at = 1050, comm = "/bin/x", startEpoch = nil })
+  check("signal: an unbound one is kept, marked uncertain", sg.signals[1] and sg.signals[1].uncertain, true)
+  observe.foldTouch(sgEv, { startEpoch = atStart })
+  observe.foldTouch(sgEv, { startEpoch = atStart + 600 })
+  check("touch: only touches on the observed process count", sgEv.touches, 1)
+  check("lstartEpoch: ps's start time parses", observe.lstartEpoch("Mon Oct 12 10:00:01 2026"), atStart)
+  check("lstartEpoch: a space-padded day parses",
+    observe.lstartEpoch("Mon Oct  5 10:00:01 2026") ~= nil, true)
+  check("lstartEpoch: garbage is nil", observe.lstartEpoch("not a time"), nil)
+  check("frozen: the ledger entry of the observed process matches",
+    observe.frozenMatches({ lstart = "Mon Oct 12 10:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1, etimeSec = 900 }), true)
+  check("frozen: a stale entry of an earlier process does not",
+    observe.frozenMatches({ lstart = "Mon Oct 12 09:00:01 2026" }, { lo = atStart - 1, hi = atStart + 1, etimeSec = 900 }), false)
+  check("frozen: a young process's window cannot tell a successor apart",
+    observe.frozenMatches({ lstart = "Mon Oct 12 10:00:01 2026" }, { lo = atStart - 30, hi = atStart + 10, etimeSec = 20 }), nil)
+
+  -- (round 3) A start epoch inside a window wider than the process's age
+  -- could be the pid's next process: unknown, not same.
+  local youngW = { lo = 1000, hi = 1035, etimeSec = 20 }
+  check("matchStart: inside an old process's window is the same process",
+    observe.matchStart({ lo = 1000, hi = 1002, etimeSec = 900 }, "/bin/x", 1001, "/bin/x"), "same")
+  check("matchStart: inside a young process's wide window is unknown",
+    observe.matchStart(youngW, "/bin/x", 1020, "/bin/x"), "unknown")
+  check("matchStart: outside the window is a different process",
+    observe.matchStart(youngW, "/bin/x", 1100, "/bin/x"), "different")
+  check("matchStart: another comm is a different process",
+    observe.matchStart(youngW, "/bin/x", 1020, "/bin/y"), "different")
+  -- So a signal to a successor that started inside such a window is kept as
+  -- uncertain, and a touch on it counts apart.
+  local yev = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = youngW, obsAt = 1040, weightMB = 1 })
+  observe.foldSignal(yev, { action = "terminate", at = 1050, comm = "/bin/x", startEpoch = 1030 })
+  check("matchStart: a signal to a possible successor is uncertain", yev.signals[1] and yev.signals[1].uncertain, true)
+  observe.foldTouch(yev, { at = 1051, startEpoch = 1030 })
+  check("touch: an undecidable touch does not count as certain", yev.touches, 0)
+  check("touch: it counts apart, as uncertain", yev.touchesUncertain, 1)
+  observe.foldTouch(yev, { at = 1052 })
+  check("touch: a touch with no start time is uncertain too", yev.touchesUncertain, 2)
+
+  -- (round 3) A sample launched before the observation proves nothing
+  -- about what followed it: not an exit, a reuse, a sighting or a weight.
+  local pre = ev0()
+  observe.foldSample(pre, { complete = true, row = nil, launchedAt = 995, deliveredAt = 1030 })
+  local fpre, dpre = observe.fateAt(pre, 1060)
+  check("pre-observation: absent from an earlier complete table is not an exit", fpre, "unknown")
+  check("pre-observation: and says why", dpre, "pre-observation-sample")
+  local preR = ev0()
+  observe.foldSample(preR, { complete = true, row = { pid = 1, comm = "/usr/bin/other" }, launchedAt = 990, deliveredAt = 1030 })
+  check("pre-observation: an earlier table's other process is not a reuse", (observe.fateAt(preR, 1060)), "unknown")
+  local preP = ev0()
+  observe.foldSample(preP, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = 900, launchedAt = 998, deliveredAt = 1030 })
+  check("pre-observation: an earlier sighting is not a sighting", preP.seenAcq, nil)
+  check("pre-observation: nor a peak", preP.peakMB, 100)
+  local noLaunch = ev0()
+  observe.foldSample(noLaunch, { complete = true, row = nil, launchedAt = nil, deliveredAt = 1030 })
+  check("pre-observation: a table with no known launch proves nothing", (observe.fateAt(noLaunch, 1060)), "unknown")
+
+  -- (round 3) A follow-up reads its horizon, not the moment its timer ran.
+  local hz = ev0()
+  observe.foldSample(hz, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 200, launchedAt = 1055, deliveredAt = 1056 })
+  observe.foldSample(hz, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                           weightMB = 500, launchedAt = 1065, deliveredAt = 1066 })
+  observe.foldSample(hz, { complete = true, row = nil, launchedAt = 1075, deliveredAt = 1080 })
+  check("horizon: alive at +60 though it exited before a late timer ran", (observe.fateAt(hz, 1060)), "alive")
+  check("horizon: exited once the proving table was delivered", (observe.fateAt(hz, 1080)), "exited")
+  check("horizon: not before it was delivered", (observe.fateAt(hz, 1078)), "alive")
+  local a60 = observe.asOf(hz, 1060)
+  check("horizon: the weight is the last sighting by the horizon", a60.weightMB, 200)
+  check("horizon: the peak runs through the horizon only", a60.peakMB, 200)
+  check("horizon: a later horizon sees the later peak", observe.asOf(hz, 1070).peakMB, 500)
+  observe.foldSignal(hz, { action = "freeze", at = 1050, comm = "/bin/x", startEpoch = nil })
+  observe.foldSignal(hz, { action = "terminate", at = 1070, comm = "/bin/x", startEpoch = nil })
+  check("horizon: the last signal by the horizon", observe.asOf(hz, 1060).signal.action, "freeze")
+  check("horizon: a later horizon reports the later signal", observe.asOf(hz, 1100).signal.action, "terminate")
+  check("horizon: and counts both", observe.asOf(hz, 1100).signalCount, 2)
+  check("horizon: no sightings, no weight, the observation's own peak", observe.asOf(ev0(), 1060).peakMB, 100)
+  -- The freshness boundary: a sighting read exactly 15 s before the
+  -- horizon still counts; one a moment earlier does not.
+  local edge = ev0()
+  observe.foldSample(edge, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = 1, launchedAt = 1045, deliveredAt = 1046 })
+  check("freshness: read exactly 15 s before the horizon is alive", (observe.fateAt(edge, 1060)), "alive")
+  check("freshness: a moment more is unknown", (observe.fateAt(edge, 1060.5)), "unknown")
+  check("frozen: no entry is false", observe.frozenMatches(nil, old0), false)
+  check("frozen: an entry without a start time cannot tell", observe.frozenMatches({ name = "x" }, old0), nil)
+
+  -- Follow-ups read the tracker entry only when it is provably the observed
+  -- process: the same comm, and start windows identity() calls same.
+  check("startOf: the entry's window", observe.startOf({ startLo = 1, startHi = 3, etimeSec = 9 }).hi, 3)
+  check("startOf: no window, nil", observe.startOf({ comm = "/bin/x" }), nil)
+  check("startOf: no entry, nil", observe.startOf(nil), nil)
+  local live = { comm = "/bin/x", startLo = 999, startHi = 1001, etimeSec = 9060, weightMB = 5 }
+
+  -- A decision stamp holds only for the process it was taken from.
+  local stamp = { at = 100, comm = "/bin/x", start = old0 }
+  check("liveStamp: the same process keeps its stamp", observe.liveStamp(stamp, live), stamp)
+  check("liveStamp: a different comm drops it",
+    observe.liveStamp(stamp, { comm = "/bin/y", startLo = 999, startHi = 1001, etimeSec = 9060 }), nil)
+  check("liveStamp: a same-comm pid reuse drops it",
+    observe.liveStamp(stamp, { comm = "/bin/x", startLo = 1500, startHi = 1502, etimeSec = 60 }), nil)
+  local youngStamp = { at = 100, comm = "/bin/x", start = { lo = 999, hi = 1003, etimeSec = 1 } }
+  check("liveStamp: an undecidable identity keeps it", observe.liveStamp(youngStamp, live), youngStamp)
+  check("liveStamp: no tracker entry keeps it", observe.liveStamp(stamp, nil), stamp)
+  check("liveStamp: no stamp is nil", observe.liveStamp(nil, live), nil)
+
+  -- The unattended gate, shared by the live step and the decision rows.
+  local gate = { kind = "extreme", alertActive = true, hudHold = false, sameAsHud = true,
+                 answered = false, interacted = false, bound = true, exposureSec = 61, graceSec = 60 }
+  local function gateWith(over)
+    local a = {}
+    for k, v in pairs(gate) do a[k] = v end
+    for k, v in pairs(over) do a[k] = v end
+    return core.unattendedGate(a)
+  end
+  check("gate: an unanswered extreme alert past its grace is open", gateWith({}), "open")
+  check("gate: exactly at grace is open", gateWith({ exposureSec = 60 }), "open")
+  check("gate: before grace is closed", gateWith({ exposureSec = 59 }), "closed")
+  check("gate: an operator action closes it", gateWith({ interacted = true }), "closed")
+  check("gate: an answered process (frozen, gone, ignored) closes it", gateWith({ answered = true }), "closed")
+  check("gate: a failed action's final latch closes it", gateWith({ final = true }), "closed")
+  check("gate: an offender the alert did not surface closes it", gateWith({ sameAsHud = false }), "closed")
+  check("gate: a held narrative closes it", gateWith({ hudHold = true }), "closed")
+  check("gate: a hog is never acted on", gateWith({ kind = "hog" }), "closed")
+  check("gate: no live alert closes it", gateWith({ alertActive = false }), "closed")
+  check("gate: open but unbound says so", gateWith({ bound = false }), "unbound")
+  check("gate: an empty table is closed", core.unattendedGate({}), "closed")
+  check("gate: no input is closed", core.unattendedGate(nil), "closed")
+  -- The decision row: the gate open, once per process per grace window.
+  local due = { enabled = true, gate = "open", graceSec = 60 }
+  local function dueWith(over)
+    local a = {}
+    for k, v in pairs(due) do a[k] = v end
+    for k, v in pairs(over) do a[k] = v end
+    return observe.decisionDue(a)
+  end
+  check("decisionDue: an open gate is due", dueWith({}), true)
+  check("decisionDue: a closed gate is not", dueWith({ gate = "closed" }), false)
+  check("decisionDue: an unbound gate is not (the live step would not act)", dueWith({ gate = "unbound" }), false)
+  check("decisionDue: the ledger off is not due", dueWith({ enabled = false }), false)
+  check("decisionDue: a stamp after now (the clock stepped back) counts as elapsed",
+    dueWith({ sinceLastSec = -30 }), true)
+  check("decisionDue: inside the window is not due (control)", dueWith({ sinceLastSec = 30 }), false)
+  check("decisionDue: a row within the grace window suppresses", dueWith({ sinceLastSec = 30 }), false)
+  check("decisionDue: a row a full window ago does not", dueWith({ sinceLastSec = 60 }), true)
+  check("decisionDue: no grace window is not due", dueWith({ graceSec = false }), false)
+  check("decisionDue: an empty table is not due", observe.decisionDue({}), false)
+  check("decisionDue: no input is not due", observe.decisionDue(nil), false)
+  -- There is no mode input: the same facts decide under every mode.
+  local dueModes = 0
+  for _, m in ipairs({ "off", "freeze", "kill" }) do
+    if dueWith({ mode = m }) then dueModes = dueModes + 1 end
+  end
+  check("decisionDue: due under every mode", dueModes, 3)
+
+  -- Jetsam reports are counted by their files' modification epochs.
+  local times = { 1000, 1100, 1300 }
+  check("jetsam: window count", observe.countSince(times, 999, 1101), 2)
+  check("jetsam: empty window", observe.countSince(times, 1110, 1200), 0)
+  -- Names keep the parentheses and brackets their categories depend on.
+  check("name: helper parentheses are kept", observe.sanitizeName("Code Helper (GPU)"), "Code Helper (GPU)")
+  check("name: brackets are kept", observe.sanitizeName("worker [3]"), "worker [3]")
+  -- A row still over the cap without its snapshot is reduced, never lost.
+  local enc = function(r) local n = 0; for _ in pairs(r) do n = n + 1 end
+    return string.rep("x", (r.encodingDropped and 10) or 200) end
+  local small = observe.boundLine({ seq = 7, at = "t", pid = 1, point = "decision", big = true }, enc, 100)
+  check("boundLine: a row over the cap without a snapshot is reduced to its keys", #small, 10)
+
+  local plan = observe.rotationPlan("/tmp/x.jsonl", 3)
+  check("rotation: oldest moves first", plan[1][1] .. ">" .. plan[1][2], "/tmp/x.jsonl.2>/tmp/x.jsonl.3")
+  check("rotation: live file moves last", plan[#plan][1] .. ">" .. plan[#plan][2], "/tmp/x.jsonl>/tmp/x.jsonl.1")
+  check("rotation: step count", #plan, 3)
+end
+
+  -- (round 3) A rename that fails stops the rotation: the live file must
+  -- not be moved onto a generation that could not move on.
+do
+  local observe = require("memwatch_observe")
+  local plan = observe.rotationPlan("/tmp/x.jsonl", 3)
+  local function runRotate(failOn, present)
+    local done = {}
+    local ok, err = observe.rotate(plan,
+      function(p) return present[p] == true end,
+      function(from, to)
+        if from == failOn then return nil, "denied" end
+        done[#done + 1] = from .. ">" .. to
+        return true
+      end)
+    return ok, err, table.concat(done, ",")
+  end
+  local all = { ["/tmp/x.jsonl"] = true, ["/tmp/x.jsonl.1"] = true, ["/tmp/x.jsonl.2"] = true }
+  local ok1, _, done1 = runRotate(nil, all)
+  check("rotate: every step runs when every rename succeeds", ok1 and done1,
+    "/tmp/x.jsonl.2>/tmp/x.jsonl.3,/tmp/x.jsonl.1>/tmp/x.jsonl.2,/tmp/x.jsonl>/tmp/x.jsonl.1")
+  local ok2, err2, done2 = runRotate("/tmp/x.jsonl.1", all)
+  check("rotate: a failed rename stops the rotation", ok2, false)
+  check("rotate: and says why", err2, "denied")
+  check("rotate: the live file is not moved onto the generation that stayed", done2, "/tmp/x.jsonl.2>/tmp/x.jsonl.3")
+  local _, _, done3 = runRotate(nil, { ["/tmp/x.jsonl"] = true })
+  check("rotate: generations that do not exist yet are skipped", done3, "/tmp/x.jsonl>/tmp/x.jsonl.1")
+
+  -- (round 3) Under kill mode wouldAct rests on the name match: said at top level.
+  local killRow = observe.row({ mode = "kill", wouldAct = "terminate", offender = { pid = 1 } })
+  check("row: a kill-mode action says its foreground basis", killRow.wouldActBasis, "name")
+  check("row: an advisory row has no action basis",
+    observe.row({ mode = "kill", wouldAct = "none", offender = { pid = 1 } }).wouldActBasis, nil)
+  check("row: freeze mode has no name-match caveat",
+    observe.row({ mode = "freeze", wouldAct = "freeze", offender = { pid = 1 } }).wouldActBasis, nil)
+end
+
+-- ---- (round 4) evidence as of the horizon, whenever the timer runs ----
+-- Each follow-up reads what held at its horizon instant: a weight read
+-- after it, a freeze or resume after it, an operator action after it, or a
+-- clock stepped back after the observation must not leak into it.
+do
+  local observe = require("memwatch_observe")
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  local same = { lo = 999, hi = 1001 }
+  local function ev0(minSeq)
+    return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000,
+                                 weightMB = 100, minSeq = minSeq })
+  end
+  local function sight(ev, w, launched, delivered, seq)
+    observe.foldSample(ev, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = w, launchedAt = launched, deliveredAt = delivered, seq = seq })
+  end
+
+  -- A weight counts from its delivery: a table launched before the
+  -- horizon but read and delivered after it is not the weight at it.
+  local cross = ev0()
+  sight(cross, 100, 1050, 1051)
+  sight(cross, 900, 1055, 1066)
+  check("as-of weight: a reading delivered after the horizon is excluded", observe.asOf(cross, 1060).weightMB, 100)
+  check("as-of weight: and is not the peak at it", observe.asOf(cross, 1060).peakMB, 100)
+  check("as-of weight: presence still counts from the launch", (observe.fateAt(cross, 1060)), "alive")
+  check("as-of weight: a later horizon has it", observe.asOf(cross, 1070).weightMB, 900)
+
+  -- The frozen ledger as of the horizon: frozen after it, or resumed after
+  -- it, does not change what held at it.
+  local fz = ev0()
+  observe.foldFrozen(fz, 1000, false)
+  sight(fz, 100, 1050, 1051)
+  sight(fz, 100, 1095, 1096)
+  observe.foldFrozen(fz, 1070, true)
+  observe.foldFrozen(fz, 1090, false)
+  check("frozen as of: running at +60 though frozen at +70", (observe.fateAt(fz, 1060)), "alive")
+  check("frozen as of: the ledger held it at +80", observe.frozenAt(fz, 1080), true)
+  check("frozen as of: and not once resumed", observe.frozenAt(fz, 1095), false)
+  check("frozen as of: an unchanged state is not logged twice",
+    (function() local n = #fz.frozenLog; observe.foldFrozen(fz, 1100, false); return #fz.frozenLog - n end)(), 0)
+  local fzu = ev0()
+  sight(fzu, 100, 1050, 1051)
+  observe.foldFrozen(fzu, 1040, nil)
+  local fu1, fu2 = observe.fateAt(fzu, 1060)
+  check("frozen as of: an entry that cannot be told apart is not alive", fu1, "unknown")
+  check("frozen as of: and says why", fu2, "frozen-uncertain")
+  check("frozen as of: nothing logged is not frozen", observe.frozenAt(ev0(), 1060), false)
+
+  -- Operator actions per observation, through the horizon only.
+  local ac = ev0()
+  observe.foldAction(ac, 1050)
+  observe.foldAction(ac, 1070)
+  check("actions as of: one by +60", observe.asOf(ac, 1060).actions, 1)
+  check("actions as of: both by +100", observe.asOf(ac, 1100).actions, 2)
+  check("actions as of: none for a fresh record", observe.asOf(ev0(), 1060).actions, 0)
+
+  -- An event with no time is never placed before a horizon.
+  local nt = ev0()
+  observe.foldSignal(nt, { action = "freeze", comm = "/bin/x", startEpoch = nil })
+  observe.foldTouch(nt, { comm = "/bin/x" })
+  check("undated: a signal with no time is not counted", observe.asOf(nt, 1e9).signalCount, 0)
+  check("undated: nor a touch", observe.asOf(nt, 1e9).touchesUncertain, 0)
+  local ng = ev0()
+  ng.gone = { how = "exited", at = nil }
+  check("undated: a proof of exit with no time is not an exit", (observe.fateAt(ng, 1e9)), "unknown")
+
+  -- Launch order, not the wall clock, decides what came after the
+  -- observation; a later launch whose wall time reads before it proves
+  -- the clock stepped back, and then nothing can be placed.
+  local sq = ev0(5)
+  sight(sq, 100, 2000, 2001, 4)
+  check("launch order: an earlier sampler is ignored whatever its wall time", sq.seenAcq, nil)
+  check("launch order: and says so, once that table had come in", select(2, observe.fateAt(sq, 2001)), "pre-observation-sample")
+  check("launch order: a reason is read as of the horizon, not before it was known",
+    select(2, observe.fateAt(sq, 1060)), "stale-sample")
+  sight(sq, 100, 1001, 1002, 5)
+  check("launch order: the first sampler after the observation counts", sq.seenAcq, 1001)
+  local st = ev0(5)
+  sight(st, 100, 880, 881, 6)
+  check("clock step: a later launch that reads before the observation flags it", st.clockStep, true)
+  local f1, d1 = observe.fateAt(st, 1060)
+  check("clock step: the fate is unknown", f1, "unknown")
+  check("clock step: and says why", d1, "clock-step")
+  check("clock step: nothing is reported as of a horizon", observe.asOf(st, 1060), nil)
+  check("clock step: a one-second jitter is not a step (control)",
+    (function() local j = ev0(5); sight(j, 100, 999.5, 1000.5, 5); return j.clockStep end)(), nil)
+  local wall = ev0()
+  sight(wall, 100, 999, 1001)
+  check("launch order: without sequences the launch time decides (fallback)", wall.seenAcq, nil)
+
+  -- A pre-observation sample never hides a later, better reason.
+  local lm = ev0(5)
+  observe.foldSample(lm, { complete = false, row = nil, launchedAt = 1050, deliveredAt = 1051, seq = 5 })
+  sight(lm, 100, 1060, 1061, 4)
+  check("lastMiss: a pre-observation sample does not overwrite a real miss",
+    select(2, observe.fateAt(lm, 1060)), "incomplete-sample")
+  local lm2 = ev0(5)
+  sight(lm2, 100, 1001, 1002, 5)
+  sight(lm2, 100, 1060, 1061, 4)
+  check("lastMiss: nor mark a record that has a sighting", lm2.lastMiss, nil)
+
+  -- The machine's reading as of the horizon, from the tick log.
+  local log = { { at = 1000, availPct = 5, state = "critical" }, { at = 1055, availPct = 6, state = "critical" },
+                { at = 1090, availPct = 44, state = "ok" } }
+  check("metricAt: the last reading at or before the horizon", observe.metricAt(log, 1060).availPct, 6)
+  check("metricAt: not the recovery after it", observe.metricAt(log, 1060).state, "critical")
+  check("metricAt: a reading older than the freshness window is no reading", observe.metricAt(log, 1080), nil)
+  check("metricAt: nothing before the horizon", observe.metricAt(log, 999), nil)
+  check("metricAt: an empty log", observe.metricAt({}, 1060), nil)
+
+  -- A bound start time seeds a start window when no ps sighting gave one,
+  -- unless it falls in the hour a daylight-saving fold repeats.
+  local stamp = os.date("%a %b %e %H:%M:%S %Y", 1760000000)
+  check("lstart strict: an ordinary time reads as lstartEpoch does",
+    observe.lstartEpochUnambiguous(stamp), observe.lstartEpoch(stamp))
+  check("lstart strict: garbage is nil", observe.lstartEpochUnambiguous("not a time"), nil)
+  local w = observe.startFromLstart(stamp, 1760000600)
+  check("startFromLstart: the whole second the start time names", w and (w.lo .. "-" .. w.hi), "1760000000-1760000001")
+  check("startFromLstart: with the process's age", w and w.etimeSec, 600)
+  check("startFromLstart: a start after now is refused", observe.startFromLstart(stamp, 1759999999), nil)
+  check("startFromLstart: a bound process seen by ps later is the same process",
+    observe.identity(w, { lo = 1760000000, hi = 1760000003 }), "same")
+  -- The fold, found from this zone's own transitions (hourly scan of 2026):
+  -- the half hour after daylight time ends occurs twice.
+  local fallBack
+  local t0 = os.time({ year = 2026, month = 1, day = 1, hour = 12 })
+  for i = 0, 365 * 24 do
+    local a, b = os.date("*t", t0 + i * 3600), os.date("*t", t0 + (i + 1) * 3600)
+    if a.isdst and not b.isdst then fallBack = t0 + (i + 1) * 3600; break end
+  end
+  if fallBack then
+    local twice = os.date("%a %b %e %H:%M:%S %Y", fallBack - (fallBack % 3600) + 1800)
+    check("lstart strict: a time the fold repeats is refused", observe.lstartEpochUnambiguous(twice), nil)
+    check("lstart strict: so no window is seeded from it", observe.startFromLstart(twice, fallBack + 7200), nil)
+    check("lstart strict: two hours later is ordinary again (control)",
+      observe.lstartEpochUnambiguous(os.date("%a %b %e %H:%M:%S %Y", fallBack + 7200)) ~= nil, true)
+  else
+    print("note  lstart strict: this zone keeps no daylight time; the fold case is not exercised")
+  end
+
+  -- Dispatch: the probed process must be the one the snapshot's data came from.
+  local tStart = os.time({ year = 2026, month = 10, day = 12, hour = 10, min = 0, sec = 1 })
+  local entry = { comm = "/bin/x", startLo = tStart - 1, startHi = tStart + 1, etimeSec = 900 }
+  local stampA = os.date("%a %b %e %H:%M:%S %Y", tStart)
+  local stampB = os.date("%a %b %e %H:%M:%S %Y", tStart + 600)
+  check("sameSource: the tracker's process is the probed one",
+    observe.sameSource(entry, { comm = "/bin/x", lstart = stampA }), "same")
+  check("sameSource: a pid taken over since the sample is not",
+    observe.sameSource(entry, { comm = "/bin/x", lstart = stampB }), "different")
+  check("sameSource: another program under the pid is not",
+    observe.sameSource(entry, { comm = "/bin/y", lstart = stampA }), "different")
+  check("sameSource: a young process's wide window cannot tell",
+    observe.sameSource({ comm = "/bin/x", startLo = tStart - 30, startHi = tStart + 30, etimeSec = 40 },
+      { comm = "/bin/x", lstart = stampA }), "unknown")
+  check("sameSource: without a window, the alert's bound start time decides",
+    observe.sameSource({ comm = nil }, { comm = "/bin/x", lstart = stampA }, stampA), "same")
+  check("sameSource: and refuses another start time",
+    observe.sameSource({ comm = nil }, { comm = "/bin/x", lstart = stampB }, stampA), "different")
+  check("sameSource: with neither, nothing can be told",
+    observe.sameSource(nil, { comm = "/bin/x", lstart = stampA }, nil), "unknown")
+  check("sameSource: no probe, nothing", observe.sameSource(entry, nil), "unknown")
+
+  local rowB = observe.row({ offender = { pid = 1 }, identityBasis = "lstart" })
+  check("row: the identity basis is recorded", rowB.identityBasis, "lstart")
+end
+
+-- ---- (round 5) records keep their horizons; a step closes any record ----
+do
+  local observe = require("memwatch_observe")
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  local same = { lo = 999, hi = 1001 }
+  local function ev0(horizons)
+    return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000,
+                                 weightMB = 100, horizons = horizons or { 60, 120 } })
+  end
+  -- Horizon readings are kept in the record once each horizon passes.
+  local log = { { at = 1000, availPct = 5, state = "critical" }, { at = 1058, availPct = 6, state = "critical" },
+                { at = 1118, availPct = 30, state = "elevated" } }
+  local hz = ev0()
+  observe.snapshotHorizons(hz, log, 1061)
+  check("snapshot: a passed horizon's reading is kept", hz.metricsAt[60] and hz.metricsAt[60].availPct, 6)
+  check("snapshot: a horizon not reached yet is not", hz.metricsAt[120], nil)
+  observe.snapshotHorizons(hz, { { at = 1200, availPct = 50, state = "ok" } }, 1200)
+  check("snapshot: a kept reading is never replaced", hz.metricsAt[60].availPct, 6)
+  check("snapshot: a horizon with no fresh reading is kept as none", hz.metricsAt[120], false)
+  local st = ev0()
+  observe.noteClockStep(st)
+  observe.snapshotHorizons(st, log, 1200)
+  check("snapshot: none after a clock step", st.metricsAt[60], nil)
+
+  -- A step closes a record whose exit was already proven: the exit stands,
+  -- nothing after the step is folded, and nothing is read as of a horizon.
+  local gone = ev0()
+  observe.foldSample(gone, { complete = true, row = nil, launchedAt = 1010, deliveredAt = 1020, seq = 2 })
+  observe.noteClockStep(gone)
+  observe.foldAction(gone, 960)
+  observe.foldSignal(gone, { action = "freeze", at = 950, comm = "/bin/x", startEpoch = nil })
+  check("gone then step: the exit proven before the step stands", (observe.fateAt(gone, 1060)), "exited")
+  check("gone then step: an action after the step is not folded", #gone.actions, 0)
+  check("gone then step: nor a signal", #gone.signals, 0)
+  check("gone then step: nothing is read as of a horizon", observe.asOf(gone, 1060), nil)
+  local live = ev0()
+  observe.noteClockStep(live)
+  check("step: a record not proven gone is unknown", select(2, observe.fateAt(live, 1060)), "clock-step")
+
+  -- The weight at a horizon is a reading delivered within the freshness
+  -- window; the peak still counts older ones.
+  local w = ev0()
+  observe.foldSample(w, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                          weightMB = 500, launchedAt = 1000, deliveredAt = 1001, seq = 2 })
+  check("stale weight: a reading from long before the horizon is no weight at it", observe.asOf(w, 1060).weightMB, nil)
+  check("stale weight: but it is in the peak", observe.asOf(w, 1060).peakMB, 500)
+  check("stale weight: a fresh one is the weight (control)", observe.asOf(w, 1010).weightMB, 500)
+
+  -- Operator action times are bounded per record; the rest are counted.
+  local many = ev0()
+  for i = 1, observe.cfg.maxActions + 44 do observe.foldAction(many, 1000 + i * 0.01) end
+  check("actions: at most maxActions times are kept", #many.actions, observe.cfg.maxActions)
+  check("actions: the rest are counted", observe.asOf(many, 2000).actionsDropped, 44)
+  check("actions: a record under the cap drops none (control)", observe.asOf(ev0(), 2000).actionsDropped, nil)
+
+  -- The daylight-saving fold, in a zone that has one whatever this
+  -- machine's: a child Lua with TZ fixed runs the fold cases and prints them.
+  -- The interpreter is the lowest arg index (options sit between it and
+  -- the script).
+  local lua = "lua"
+  if arg then
+    local i = -1
+    while arg[i - 1] ~= nil do i = i - 1 end
+    lua = arg[i] or lua
+  end
+  local child = [[
+package.path = "lua/?.lua;" .. package.path
+local o = require("memwatch_observe")
+local t0 = os.time({ year = 2026, month = 1, day = 1, hour = 12 })
+local fb
+for i = 0, 365 * 24 do
+  local a, b = os.date("*t", t0 + i * 3600), os.date("*t", t0 + (i + 1) * 3600)
+  if a.isdst and not b.isdst then fb = t0 + (i + 1) * 3600; break end
+end
+if not fb then print("NOFOLD"); return end
+local twice = os.date("%a %b %e %H:%M:%S %Y", fb - (fb % 3600) + 1800)
+local ok = os.date("%a %b %e %H:%M:%S %Y", fb + 7200)
+local e1 = o.lstartEpoch(twice)
+local win = { lo = e1 - 1, hi = e1 + 1, etimeSec = 9000 }
+print("strict", o.lstartEpochUnambiguous(twice) == nil, o.lstartEpochUnambiguous(ok) ~= nil)
+print("seed", o.startFromLstart(twice, fb + 7200) == nil)
+print("frozen", tostring(o.frozenMatches({ lstart = twice }, win)))
+print("source", o.sameSource({ comm = "/bin/x", startLo = win.lo, startHi = win.hi, etimeSec = 9000 },
+  { comm = "/bin/x", lstart = twice }))
+]]
+  -- Passed with -e, so the check needs no temp file.
+  local quoted = "'" .. (child:gsub("'", "'\\''")) .. "'"
+  local p = io.popen("TZ=America/New_York " .. lua .. " -e " .. quoted .. " 2>&1")
+  local out = p and p:read("a") or ""
+  if p then p:close() end
+  check("fold (TZ=America/New_York): the zone has a fold to test", out:find("NOFOLD", 1, true), nil)
+  check("fold: a repeated time is refused, an ordinary one read", out:find("strict\ttrue\ttrue", 1, true) ~= nil, true)
+  check("fold: no window is seeded from it", out:find("seed\ttrue", 1, true) ~= nil, true)
+  check("fold: a frozen entry started then cannot be told (nil), never a confident false",
+    out:find("frozen\tnil", 1, true) ~= nil, true)
+  check("fold: a probe started then is unknown at dispatch, not a takeover",
+    out:find("source\tunknown", 1, true) ~= nil, true)
+end
+
+-- ---- observation glue: fork-free, error-bounded, mode-independent ----
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  -- A top-level function's text, from its header to its closing column-0 end.
+  local function fnBody(header)
+    local a = src:find(header, 1, true)
+    local z = a and src:find("\nend\n", a, true)
+    return (a and z) and src:sub(a, z) or ""
+  end
+  local body = fnBody("writeObservation = function(")
+  -- The whole observation path is fork-free: the writer and its follow-ups,
+  -- every glue helper it calls, and the decision trigger in alertSurfaces.
+  local alertBody = fnBody("local function alertSurfaces(state, now)")
+  -- The decision trigger is the observation block just before the
+  -- unattended step: only comments and the observation block live there.
+  local _, da = alertBody:find("and recordFor(exposure, hudOffender, true) or nil", 1, true)
+  local dz = alertBody:find("unattendedStep(offender, now)", 1, true)
+  local observePath = {
+    { "writeObservation", body },
+    { "jetsamSince", fnBody("function obs.jetsamSince(since, untilT)") },
+    { "appendObserve", fnBody("function obs.appendObserve(line)") },
+    { "buildLfmSnapshot", fnBody("local function buildLfmSnapshot(offender)") },
+    { "the decision trigger", (da and dz and da < dz) and alertBody:sub(da + 1, dz - 1) or "" },
+  }
+  -- Frontier patterns: a bare sh( call, not the tail of snapshotHash(.
+  local forkers = { "%f[%w_]sh%(", "pidAlive%(", "pidState%(", "probePid%(",
+                    "hs%.execute", "io%.popen", "hs%.task" }
+  check("observe glue: fork scan sees a real sh( call (positive control)",
+    ("local out = sh(cmd)"):find(forkers[1]) ~= nil, true)
+  check("observe glue: fork scan ignores snapshotHash( (negative control)",
+    ("lfm.snapshotHash(user)"):find(forkers[1]), nil)
+  for _, part in ipairs(observePath) do
+    check("observe glue: " .. part[1] .. " located", #part[2] > 150, true)
+    for _, forker in ipairs(forkers) do
+      check("observe glue: no fork in " .. part[1] .. " via " .. forker, part[2]:find(forker), nil)
+    end
+  end
+  check("observe glue: follow-ups use held timers", body:find("afterHeld(h,", 1, true) ~= nil, true)
+  -- The decision trigger is the pure predicate, evaluated ahead of and
+  -- independently of the unattended mode.
+  local dd = alertBody:find("observe.decisionDue({", 1, true)
+  local ru = alertBody:find("unattendedStep(offender, now)", 1, true)
+  check("observe glue: alertSurfaces decides through observe.decisionDue", dd ~= nil, true)
+  check("observe glue: the decision trigger precedes the unattended step (which looks up the mode)",
+    dd ~= nil and ru ~= nil and dd < ru, true)
+  local function triggerTakesNoMode(text)
+    local a = text:find("observe.decisionDue({", 1, true)
+    local z = a and text:find("})", a, true)
+    local args = (a and z) and text:sub(a, z) or nil
+    return args ~= nil and args:find("resolveUnattended", 1, true) == nil
+      and args:find("%f[%w_]mode%f[^%w_]") == nil
+  end
+  check("observe glue: the mode scan sees a mode input (positive control)",
+    triggerTakesNoMode("observe.decisionDue({ enabled = x, mode = core.resolveUnattended(core.cfg) })"), false)
+  check("observe glue: the decision trigger takes no mode", triggerTakesNoMode(alertBody), true)
+  check("observe glue: an existing stamp counts only for the same process",
+    alertBody:find("observe.liveStamp(obs.decisionAt[offender.pid], decEntry)", 1, true) ~= nil, true)
+  local stampAt = alertBody:find("obs.decisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,", 1, true)
+  local writeAt = alertBody:find('pcall(obs.writeObservation, "decision"', 1, true)
+  check("observe glue: the stamp carries the process identity", stampAt ~= nil, true)
+  check("observe glue: the stamp is set before the write", stampAt ~= nil and writeAt ~= nil and stampAt < writeAt, true)
+  -- wouldAct is what fires under the live mode; the freeze ceiling is a
+  -- separate counterfactual, and every row is bounded before it is written.
+  check("observe glue: wouldAct follows the live mode",
+    body:find('wouldAct = (mode == "off") and "none" or deterministicAction(mode, foreground)', 1, true) ~= nil, true)
+  check("observe glue: the freeze ceiling has its own field",
+    body:find('wouldActAtFreeze = deterministicAction("freeze", foreground)', 1, true) ~= nil, true)
+  check("observe glue: wouldAct is no longer the freeze-ceiling decision",
+    body:find('and deterministicAction("freeze", foreground) or "wait"', 1, true), nil)
+  check("observe glue: the row is bounded before it is appended",
+    body:find("observe.boundLine(row, lfm.ledgerLine, observe.cfg.maxLineBytes)", 1, true) ~= nil, true)
+  local dbody = fnBody("writeDecisionOutcome = function(")
+  check("decision ledger glue: writeDecisionOutcome located", #dbody > 200, true)
+  check("decision ledger glue: the stored name is sanitized",
+    dbody:find("name = observe.sanitizeName(offender.name)", 1, true) ~= nil, true)
+  check("decision ledger glue: no raw name is stored", dbody:find("name = offender.name", 1, true), nil)
+  check("observe glue: decision point is error-bounded",
+    src:find('pcall(obs.writeObservation, "decision"', 1, true) ~= nil, true)
+  check("observe glue: advisory cadence is error-bounded",
+    src:find('pcall(obs.writeObservation, "advisory"', 1, true) ~= nil, true)
+  -- Fates come only from the observation's own evidence: every sample folds
+  -- in with its completeness and its start window, and the operator signal
+  -- is the monotonic counter, not the resettable HUD flag.
+  local sampleBody = fnBody("local function onSample(blob, exitCode, launchedAt, seq)")
+  check("observe glue: onSample located", #sampleBody > 300, true)
+  check("observe glue: each sample folds in with its completeness",
+    sampleBody:find("complete = sampler.complete, row = row,", 1, true) ~= nil, true)
+  check("observe glue: and its start window, bounded by launch and the raw delivery reading (none from a clamped etime)",
+    sampleBody:find("and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil", 1, true) ~= nil
+      and sampleBody:find("local rawDeliveredAt = clock.wallAt", 1, true) ~= nil
+      and sampleBody:find("local placeable = row and type(row.etimeSec) == \"number\" and row.etimeSec > 0", 1, true) ~= nil, true)
+  check("observe glue: an older sampler's late table never replaces a newer one",
+    sampleBody:find("if seq and seq < sampler.seq then return end", 1, true) ~= nil
+      and sampleBody:find("launchedAt < sampler.launchedAt", 1, true) == nil, true)
+  check("observe glue: no point-estimate start compare remains",
+    body:find("psStartedAt", 1, true), nil)
+  check("observe glue: operator actions counted from the observation through the horizon",
+    body:find("operatorActionsSince = at.actions,", 1, true) ~= nil
+      and src:find("obs.actionTimes", 1, true) == nil, true)
+  check("observe glue: a follow-up reads its horizon instant, not its timer's",
+    body:find("local tH = now + h", 1, true) ~= nil
+      and body:find("local fate, detail = observe.fateAt(ev, tH)", 1, true) ~= nil
+      and body:find("local at = observe.asOf(ev, tH) or {}", 1, true) ~= nil
+      and body:find("observe.metricAt(obs.ticks, tH)", 1, true) ~= nil
+      and body:find("observe.fateAt(ev, t,", 1, true) == nil, true)
+  -- The follow-up callback itself (the row above it reads live state at
+  -- the observation, as it should).
+  local fuAt = body:find('afterHeld(h, guard("observe-followup"', 1, true)
+  local fuBody = fuAt and body:sub(fuAt) or ""
+  check("observe glue: machine metrics come from the tick log, never live",
+    fuBody:find("availPct = mt and math.floor(mt.availPct) or nil", 1, true) ~= nil
+      and fuBody:find("state = mt and mt.state or nil", 1, true) ~= nil
+      and fuBody:find("lastMetrics", 1, true) == nil
+      and fuBody:find("smState", 1, true) == nil
+      and fuBody:find("frozen[", 1, true) == nil, true)
+  check("observe glue: the resettable HUD flag is not the operator signal",
+    body:find("hudInteracted", 1, true), nil)
+  check("observe glue: the frozen ledger counts only for the observed process, as of the horizon",
+    body:find("observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))", 1, true) ~= nil
+      and body:find("frozenNow = observe.frozenAt(ev, tH)", 1, true) ~= nil
+      and body:find("frozenLedger = frozenNow,", 1, true) ~= nil
+      and body:find("frozen[pid], ev.start0", 1, true) == nil, true)
+  -- Weight and peak come only from the folded evidence: the follow-up never
+  -- reads the tracker (an entry can expire, or belong to a newer process).
+  local _, trackerReads = body:gsub("tracker%.procs%[pid%]", "")
+  check("observe glue: the tracker is read once, at observation", trackerReads, 1)
+  check("observe glue: weight needs presence, as of the horizon",
+    body:find("local weightNow = present and at.weightMB or nil", 1, true) ~= nil, true)
+  check("observe glue: the peak runs through the horizon",
+    body:find("peakSinceMB = at.peakMB and math.floor(at.peakMB) or nil", 1, true) ~= nil, true)
+  check("observe glue: the 60 s window peak is gone", body:find("windowPeakMB", 1, true), nil)
+  -- memwatch's own signals: recorded where each signal is sent, after the
+  -- identity and policy gates, and compared with the observation time.
+  local function recordedAtSend(text, send, record)
+    local gate = text:find("core.killAllowed(", 1, true)
+    local s0, s1 = text:find(send, 1, true)
+    local r0 = text:find(record, 1, true)
+    local _, n = text:gsub(record:gsub("%p", "%%%0"), "")
+    return gate ~= nil and s0 ~= nil and r0 ~= nil and s0 > gate and r0 > s1 and n == 1
+      and text:sub(s1 + 1, r0 - 1):match("^%s*$") ~= nil
+  end
+  check("signals glue: the order check accepts a record right after a gated send (control)",
+    recordedAtSend("core.killAllowed(p)\nSEND()\n  RECORD()\n", "SEND()", "RECORD()"), true)
+  check("signals glue: the order check refuses a record before the gate (positive control)",
+    recordedAtSend("RECORD()\ncore.killAllowed(p)\nSEND()\n", "SEND()", "RECORD()"), false)
+  check("signals glue: the order check refuses a record apart from its send (positive control)",
+    recordedAtSend("core.killAllowed(p)\nSEND()\nother()\nRECORD()\n", "SEND()", "RECORD()"), false)
+  local killBody, freezeBody = fnBody("function M.killPid("), fnBody("function M.freezePid(")
+  check("signals glue: killPid located", #killBody > 500, true)
+  check("signals glue: freezePid located", #freezeBody > 500, true)
+  -- Recorded only once the signal went out: a TERM send that failed returns
+  -- before the record, and a STOP is recorded only when it was sent.
+  check("signals glue: a terminate is recorded after a TERM that went out, after the gates",
+    recordedAtSend(killBody, 'weightMB = frozenEntry and frozenEntry.weightMB })\n'
+      .. '    return\n  end\n  -- The TERM is the signal of record: a KILL escalation below carries out\n'
+      .. '  -- the same decision.',
+      'obs.noteSignal(pid, "terminate", proc)'), true)
+  check("signals glue: a freeze is recorded only when its STOP was sent, after the gates",
+    recordedAtSend(freezeBody, 'local stopSent = send("STOP", pid)\n  if stopSent then',
+      'obs.noteSignal(pid, "freeze", proc)'), true)
+  -- Bookkeeping never interrupts an action or the tick: every fold an
+  -- action or the tick calls runs under pcall.
+  for _, name in ipairs({ "function obs.noteSignal(", "function obs.noteTouch(",
+                          "function obs.noteAction(", "function obs.noteFrozen(" }) do
+    local b = fnBody(name)
+    check("observe glue: " .. name:sub(10) .. " is error-bounded",
+      #b > 50 and b:find("pcall(function()", 1, true) ~= nil, true)
+  end
+  check("observe glue: the tick's log call is error-bounded",
+    src:find("local okTick, errTick = pcall(obs.noteTick, now, m.availPct, state)", 1, true) ~= nil, true)
+  local _, recordSites = src:gsub('noteSignal%(pid, "', "")
+  -- (A quit whose TERM cannot be sent re-freezes through M.freezePid, so
+  -- that STOP is recorded at the freeze site.)
+  check("signals glue: the four signal sites record (freeze, continue, terminate, resume)",
+    recordSites, 4)
+  for _, site in ipairs({ 'if contSent then obs.noteSignal(pid, "continue", proc) end',
+                          'obs.noteSignal(pid, "resume", proc)' }) do
+    check("signals glue: recorded after a successful send: " .. site:sub(1, 48),
+      src:find(site, 1, true) ~= nil, true)
+  end
+  check("signals glue: no pid-keyed signal record remains", src:find("memwatchSignals", 1, true), nil)
+  check("observe glue: follow-ups report the last signal to the observed process by the horizon",
+    body:find("local sig = at.signal", 1, true) ~= nil
+      and body:find("memwatchSignalSince = sig and sig.action or nil", 1, true) ~= nil
+      and body:find("memwatchSignalCount = (at.signalCount or 0) > 1 and at.signalCount or nil", 1, true) ~= nil, true)
+  local gcBody = fnBody("gcUnattendedState = function(")
+  check("signals glue: gcUnattendedState located", #gcBody > 200, true)
+  check("signals glue: the tick hands the GC its clock", src:find("gcUnattendedState(now)", 1, true) ~= nil, true)
+  -- Counters count rows that reached the file: appendObserve reports
+  -- success, and every increment is guarded by it.
+  local appendBody = fnBody("function obs.appendObserve(line)")
+  check("observe glue: appendObserve located", #appendBody > 200, true)
+  check("observe glue: a nil line counts as an error",
+    appendBody:find("if not line then obs.stats.errors = obs.stats.errors + 1; return false end", 1, true) ~= nil, true)
+  local _, falseReturns = appendBody:gsub("return false", "")
+  check("observe glue: nil line, both opens, a refused row past the cap and the write each report failure",
+    falseReturns, 5)
+  check("observe glue: write and close are both checked",
+    appendBody:find("if not (wrote and closed) then", 1, true) ~= nil, true)
+  local _, trueReturns = appendBody:gsub("return true", "")
+  check("observe glue: only a written line reports success",
+    trueReturns == 1 and appendBody:find("return true\n$") ~= nil, true)
+  check("observe glue: rotation runs through observe.rotate, and a failure is counted and logged",
+    appendBody:find("local rotated, rerr = observe.rotate(observe.rotationPlan(obs.path, observe.cfg.keep),", 1, true) ~= nil
+      and appendBody:find('logError("observe-rotate", rerr)', 1, true) ~= nil
+      and appendBody:find("function(path) return hs.fs.attributes(path) ~= nil end", 1, true) ~= nil, true)
+  check("observe glue: a write that fails at close logs the close's error",
+    appendBody:find('logError("observe-write", werr or cerr)', 1, true) ~= nil, true)
+  local function guardedIncrements(text, counter)
+    local inc = "obs.stats." .. counter .. " = obs.stats." .. counter .. " + 1"
+    local n, guarded, i = 0, 0, 1
+    while true do
+      local a = text:find(inc, i, true)
+      if not a then return n, guarded end
+      n = n + 1
+      local before = text:sub(math.max(1, a - 120), a - 1)
+      if before:find("if obs.appendObserve(", 1, true)
+         or before:find("if not obs.appendObserve(line) then return nil end", 1, true) then
+        guarded = guarded + 1
+      end
+      i = a + #inc
+    end
+  end
+  local cn, cg = guardedIncrements("obs.appendObserve(line)\nobs.stats.rows = obs.stats.rows + 1\n", "rows")
+  check("observe glue: the guard scan sees an unguarded increment (positive control)", cn - cg, 1)
+  local rn, rg = guardedIncrements(src, "rows")
+  local fn, fg = guardedIncrements(src, "followups")
+  check("observe glue: one row increment, guarded by a written line", rn .. "/" .. rg, "1/1")
+  check("observe glue: one follow-up increment, guarded by a written line", fn .. "/" .. fg, "1/1")
+  -- The decision ledger: room for snapshot rows, and loud when unwritable.
+  check("decision ledger glue: sized for rows that carry their snapshot",
+    src:find("local LFM_LEDGER_MAX_BYTES = 8e6", 1, true) ~= nil, true)
+  local ledgerBody = fnBody("local function appendLedger(line)")
+  check("decision ledger glue: appendLedger located", #ledgerBody > 100, true)
+  local _, openLogs = ledgerBody:gsub('if not f then logError%("lfm%-ledger%-open", err%); return end', "")
+  check("decision ledger glue: both opens log a failure", openLogs, 2)
+  check("decision ledger glue: no silent open failure remains", ledgerBody:find("if not f then return end", 1, true), nil)
+  check("decision ledger glue: logError limits each label to one line a minute",
+    src:find("if lastErrorMono[label] and (now - lastErrorMono[label]) < 60 then return end", 1, true) ~= nil, true)
+  -- The sampler tells its consumer how it ended and when it was launched.
+  check("sampler glue: callback forwards exit code, launch time and launch order",
+    src:find("onDone(table.concat(acc), exitCode, launchedAt, seq)", 1, true) ~= nil, true)
+  check("sampler glue: completeness comes from the exit code",
+    src:find("sampler.complete = (exitCode == 0)", 1, true) ~= nil, true)
+  check("sampler glue: the tracker gets the launch time, and the raw delivery reading for its windows",
+    src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, widenSec)", 1, true) ~= nil, true)
+  -- (round 11) A table whose launch record is gone widens the tracker's
+  -- windows by every step back so far: a bound on the steps since its launch.
+  check("sampler glue: a table without its launch record widens by every step back so far",
+    src:find("local widenSec = steppedSec or -(clock.stepTotal + clock.pending)", 1, true) ~= nil, true)
+  -- (round 11) Ages read the raw clock, at the runaways and from lstart.
+  check("ages glue: runaways' ages read the raw clock",
+    src:find("local rawAt = now + clock.pending", 1, true) ~= nil
+      and src:find("totalMB > 0 and totalMB or nil, rawAt)", 1, true) ~= nil, true)
+  check("ages glue: an lstart-derived start reads the raw clock",
+    src:find("observe.startFromLstart(extra.lstart, now + clock.pending)", 1, true) ~= nil, true)
+  -- (round 11) A record born after a step was seen, in the same held frame,
+  -- is closed when the frame ends, by the shift (and by the fold's own step
+  -- check after it, which is why no scenario tells the two apart): both the
+  -- shift and clock.onHeld close every collecting record.
+  do
+    local n = 0
+    for _ in src:gmatch("for _, ev in pairs%(obs%.pending%) do observe%.noteClockStep%(ev%) end") do n = n + 1 end
+    check("clock glue: the shift and the held-step hook both close every collecting record", n, 2)
+  end
+  -- (round 11) An alert is contained whole: the hs.alert lookup and its text
+  -- too, not only the display call.
+  check("alert glue: the alert call is contained whole",
+    src:find('pcall(function() hs.alert.show("memwatch: " .. tostring(text), sec or 2.5) end)', 1, true) ~= nil, true)
+  -- The fake cannot build an unbound offender table beside a bound alert,
+  -- so the recorded binding's fallback to the alert's is pinned by text.
+  check("re-ask: a verdict records the alert's binding when its offender table is unbound",
+    src:find("boundLstart = offender.lstart or bound", 1, true) ~= nil, true)
+  -- The fold's ordering and its own step check compare the launch with the
+  -- observation's time: they read the shifted launch record (memwatch's
+  -- basis), the raw reading being for windows only. Pinned by text: records
+  -- open across a step are closed when it is seen, so no scenario can tell
+  -- the two bases apart today.
+  check("observe glue: the fold orders on the shifted launch record, not the raw reading",
+    src:find("seq = seq, launchedAt = sampler.launchedAt or launchedAt, deliveredAt = now })", 1, true) ~= nil, true)
+  check("sampler glue: the launch time for windows is the raw reading, not the callback's basis",
+    src:find("local launchedAt = clock.wallAt", 1, true) ~= nil, true)
+end
+
+-- ---- operator actions: every UI path that touches a process counts ----
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  -- An unwrapped menu action: fn = function() calling a process action or
+  -- opening Activity Monitor directly, without byOperator around it.
+  local unwrapped = "fn = function%(%)%s*([%w_.:]+)%("
+  local acts = { killPid = true, freezePid = true, ignore = true, resumePid = true,
+                 resumeAll = true, launchOrFocus = true }
+  local function countUnwrapped(text)
+    local n = 0
+    for callee in text:gmatch(unwrapped) do
+      if acts[callee:match("([%w_]+)$")] then n = n + 1 end
+    end
+    return n
+  end
+  check("operator actions: scan sees an unwrapped menu kill (positive control)",
+    countUnwrapped('{ title = "x", fn = function() M.killPid(pid, name) end }'), 1)
+  check("operator actions: scan ignores a wrapped one (negative control)",
+    countUnwrapped('{ title = "x", fn = obs.byOperator(function() M.killPid(pid, name) end) }'), 0)
+  check("operator actions: every menu process action is wrapped", countUnwrapped(src), 0)
+  local _, wrapped = src:gsub("fn = obs%.byOperator%(function%(%)", "")
+  check("operator actions: all fourteen menu actions are wrapped", wrapped, 14)
+  local m0 = src:find("local function buildMenu(", 1, true)
+  local m1 = m0 and src:find("\nend\n", m0, true)
+  local menuBody = (m0 and m1) and src:sub(m0, m1) or ""
+  check("operator actions: no menu action calls its handler directly",
+    #menuBody > 500 and menuBody:find("fn = function()", 1, true) == nil, true)
+  local hs0 = src:find('if evt ~= "mouseUp" then return end', 1, true)
+  check("operator actions: HUD clicks count",
+    hs0 ~= nil and src:sub(hs0, hs0 + 80):find("obs.noteAction()", 1, true) ~= nil, true)
+  local nb = src:find("actionButtonClicked then", 1, true)
+  check("operator actions: the banner's Force Quit counts",
+    nb ~= nil and src:sub(nb, nb + 80):find("obs.noteAction()", 1, true) ~= nil, true)
+  check("operator actions: one place folds them into the pending records",
+    select(2, src:gsub("observe%.foldAction%(", "")), 1)
+end
+
+-- ---- glue pins: the live path must use the predicates above ----
+-- Positive pins are exact occurrence counts, not mere presence: they pin
+-- every call site, so the zero-count negative pins beside them can never
+-- pass vacuously.
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local function count(text, needle)
+    local n, i = 0, 1
+    while true do
+      local a, z = text:find(needle, i, true)
+      if not a then return n end
+      n, i = n + 1, z + 1
+    end
+  end
+  check("glue: the counter sees every occurrence (positive control)", count("ab x ab", "ab"), 2)
+  check("glue: consumeVerdict uses verdictUsable", count(src, "if not lfm.verdictUsable(e, offender,"), 1)
+  check("glue: dispatch freshness uses verdictUsable",
+    count(src, "local usable = lfm.verdictUsable(cached, lastOffender,"), 1)
+  check("glue: verdictUsable has exactly those two call sites", count(src, "lfm.verdictUsable("), 2)
+  check("glue: wait deferral is time-bound",
+    count(src, "lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)"), 1)
+  check("glue: the deferral step is the only deferral call", count(src, "lfm.deferral"), 1)
+  check("glue: no wait counter bound remains", count(src, "streak >= 3"), 0)
+  -- The deferral clock is the decision tick's: passed in, never re-read
+  -- after the probe forks inside the decision.
+  local function fnBody(header)
+    local a = src:find(header, 1, true)
+    local z = a and src:find("\nend\n", a, true)
+    return (a and z) and src:sub(a, z) or ""
+  end
+  local resolveBody = fnBody("resolveUnattendedAction = function(mode, offender, now)")
+  check("glue: resolveUnattendedAction takes the tick's clock", #resolveBody > 500, true)
+  check("glue: the decision passes the tick's clock", count(src, "resolveUnattendedAction(mode, offender, now)"), 1)
+  check("glue: that decision is the only caller", count(src, "resolveUnattendedAction("), 1)
+  check("glue: the decision never re-reads the clock", count(resolveBody, "secondsSinceEpoch"), 0)
+  -- Absent pids are pruned only on a complete table taken after the pid
+  -- was last seen alive (the stale-table behavior itself is driven in
+  -- test_glue: "a stalled ps table does not prune a top-fed offender").
+  local GUARD = "if not sampler.complete or not sampler.launchedAt then return end"
+  local SWEEP = "for _, p in ipairs(lastPsList) do alive[p.pid] = true end"
+  local LATER = "return not (e and e.lastSeen and e.lastSeen > sampler.launchedAt)"
+  local function prunesOnlyOnProof(text)
+    local guard, sweep = text:find(GUARD, 1, true), text:find(SWEEP, 1, true)
+    return guard ~= nil and sweep ~= nil and guard < sweep and text:find(LATER, 1, true) ~= nil
+      and text:find("lastRuns", 1, true) == nil
+  end
+  check("glue: the prune scan refuses a guard after the sweep (positive control)",
+    prunesOnlyOnProof(SWEEP .. "\n" .. GUARD .. "\n" .. LATER .. "\n"), false)
+  check("glue: the prune scan refuses pruning by the runaway list (positive control)",
+    prunesOnlyOnProof(GUARD .. "\n" .. SWEEP .. "\n" .. LATER .. "\nfor _, r in ipairs(lastRuns) do end\n"), false)
+  check("glue: the prune scan refuses absence alone, with no later evidence check (positive control)",
+    prunesOnlyOnProof(GUARD .. "\n" .. SWEEP .. "\n"), false)
+  check("glue: a pid's records go only on a complete table taken after it was last seen",
+    prunesOnlyOnProof(fnBody("gcUnattendedState = function(now)")), true)
+  local resetBody = fnBody("local function resetEpisode()")
+  check("glue: the episode's end resets streaks and decision stamps, and keeps final latches",
+    resetBody:find("if f.final then finals[pid] = { final = true, lstart = f.lstart, at = f.at } end", 1, true) ~= nil
+      and resetBody:find("unattendedWaitStreak, unattendedFiredFor, obs.decisionAt = {}, finals, {}", 1, true) ~= nil, true)
+  check("glue: cache entries record the dispatch kind", count(src, "kind = offender.kind, snapshot = user,"), 1)
+  check("glue: names redacted on every serialize call",
+    count(src, "lfm.serializeSnapshot(snap, { redactNames = lfm.cfg.redactNames })"), 3)
+  check("glue: every serialize call is the redacted form", count(src, "lfm.serializeSnapshot("), 3)
+  check("glue: no remote-only redaction remains", count(src, "redactNames = remote and"), 0)
+  check("glue: the in-flight record is exactly { nonce, pid, hash, at }",
+    count(src, "lfmInFlight = { nonce = nonce, pid = pid, hash = hash, at = sentAt }"), 1)
+  check("glue: the in-flight record is built in one place", count(src, "lfmInFlight = {"), 1)
+  check("lfm: names are redacted by default", lfm.cfg.redactNames, true)
+end
+
+-- ---- glue: room under Lua's 200-local cap ----
+-- Lua caps a chunk's locals at 200, and memwatch.lua's main chunk is near
+-- the cap. Past it the file does not load at all; this pin trips first.
+do
+  local f = assert(io.open("lua/memwatch.lua", "r"))
+  local src = f:read("a")
+  f:close()
+  local function topLocals(text)
+    local n = 0
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+      if line:match("^local%s+function%s") then
+        n = n + 1
+      else
+        local names = line:match("^local%s+([%w_,%s]+)")
+        if names then for _ in names:gmatch("[%a_][%w_]*") do n = n + 1 end end
+      end
+    end
+    return n
+  end
+  check("locals: the count sees lists, functions, and skips nested locals (control)",
+    topLocals("local a, b, c = 1\nlocal function d() end\n  local e = 1\nlocal g\n"), 5)
+  local n = topLocals(src)
+  check(string.format("locals: memwatch.lua keeps headroom under the 200 cap (%d used)", n), n <= 190, true)
+end
+
+-- ---- start times as ps prints them (lstartEpoch) ----
+-- Dating an old frozen entry rests on this parse, so it is pinned against
+-- hand-written fields, and it must fail closed (nil) on anything that does
+-- not name exactly one instant.
+do
+  local names = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+  local allMonths = true
+  for m, mon in ipairs(names) do
+    -- Noon is never inside a daylight saving change, in any zone.
+    for _, day in ipairs({ 5, 15 }) do
+      local text = string.format("Mon %s %2d 12:00:00 2026", mon, day)
+      local want = os.time({ year = 2026, month = m, day = day, hour = 12, min = 0, sec = 0 })
+      if core.lstartEpoch(text) ~= want then
+        allMonths = false
+        print("  lstartEpoch mismatch: " .. text)
+      end
+    end
+  end
+  check("lstartEpoch: all twelve months, one- and two-digit days, match hand-written fields", allMonths, true)
+  check("lstartEpoch: one second apart reads one second apart",
+    (core.lstartEpoch("Mon Oct  5 10:00:02 2026") or 0) - (core.lstartEpoch("Mon Oct  5 10:00:01 2026") or 0), 1)
+  local bad = {
+    { "nil", nil }, { "a number", 1791212401 }, { "an unknown month", "Mon Foo  5 10:00:01 2026" },
+    { "missing seconds", "Mon Oct  5 10:00 2026" }, { "trailing junk", "Mon Oct  5 10:00:01 2026 x" },
+    { "a date that does not exist", "Mon Feb 30 10:00:00 2026" }, { "hour 25", "Mon Oct  5 25:00:00 2026" },
+    { "empty", "" },
+  }
+  for _, c in ipairs(bad) do
+    check("lstartEpoch: " .. c[1] .. " is nil", core.lstartEpoch(c[2]), nil)
+  end
+  -- The daylight saving fold and gap, in a child with a fixed zone (this
+  -- process cannot change its own). A child that does not answer fails the
+  -- checks: a silent child is never read as a pass.
+  -- The interpreter is the lowest arg index (options sit between it and
+  -- the script).
+  local lua = "lua"
+  if arg then
+    local i = -1
+    while arg[i - 1] ~= nil do i = i - 1 end
+    lua = arg[i] or lua
+  end
+  local code = 'package.path = "lua/?.lua;" .. package.path; local c = require("memwatch_core"); '
+    .. 'local function s(v) return v == nil and "nil" or "num" end; '
+    .. 'print("ctl " .. s(c.lstartEpoch("Sun Nov  1 03:00:00 2026")) .. " fold " .. s(c.lstartEpoch("Sun Nov  1 01:30:00 2026")) '
+    .. '.. " gap " .. s(c.lstartEpoch("Sun Mar  8 02:30:00 2026")))'
+  local function child(tz)
+    local h = io.popen(string.format("TZ=%s %s -e '%s' 2>&1", tz, lua, code))
+    local out = h and h:read("a") or ""
+    if h then h:close() end
+    return out
+  end
+  local chicago = child("America/Chicago")
+  check("lstartEpoch: the child answered (positive control)", chicago:match("^ctl num") ~= nil, true)
+  check("lstartEpoch: the hour repeated when daylight saving ends is nil", chicago:match(" fold (%a+)"), "nil")
+  check("lstartEpoch: the hour skipped when it starts is nil", chicago:match(" gap (%a+)"), "nil")
+  local utc = child("UTC")
+  check("lstartEpoch: the same times parse where no clock changes (control)",
+    utc:match("^ctl num fold num gap num") ~= nil, true)
+end
+
+-- ---- (round 6) the ledger's counts and reasons, as of each horizon ----
+do
+  local observe = require("memwatch_observe")
+  local old0 = { lo = 999, hi = 1003, etimeSec = 9000 }
+  local function ev0()
+    return observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000, weightMB = 100 })
+  end
+  -- Dropped operator actions are dated against the horizons: a drop after a
+  -- horizon never shows in that horizon's count.
+  local d = ev0()
+  for i = 1, observe.cfg.maxActions do observe.foldAction(d, 1000 + i * 0.01) end
+  observe.foldAction(d, 1061)        -- dropped after +60
+  observe.foldAction(d, 1121)        -- dropped after +120
+  check("dropped: none by +60 (the drops came after it)", observe.asOf(d, 1060).actionsDropped, nil)
+  check("dropped: one by +120", observe.asOf(d, 1120).actionsDropped, 1)
+  check("dropped: two by +180", observe.asOf(d, 1180).actionsDropped, 2)
+  check("dropped: the kept count is exact at +60", observe.asOf(d, 1060).actions, observe.cfg.maxActions)
+  local under = ev0()
+  observe.foldAction(under, 1001)
+  check("dropped: a record under the cap drops none (control)", observe.asOf(under, 1180).actionsDropped, nil)
+  -- (round 7) A drop exactly at a horizon's instant counts by that horizon,
+  -- as a kept action does; a record with horizons of its own (the
+  -- synthetic probe's 2, 4 and 6 s) is dated by them.
+  local edge = ev0()
+  for i = 1, observe.cfg.maxActions do observe.foldAction(edge, 1000 + i * 0.01) end
+  observe.foldAction(edge, 1060)     -- dropped at the +60 instant
+  check("dropped: a drop at the horizon's instant counts by it", observe.asOf(edge, 1060).actionsDropped, 1)
+  local custom = observe.newEvidence({ pid = 1, comm0 = "/bin/x", start0 = old0, obsAt = 1000, weightMB = 100,
+    horizons = { 2, 4, 6 } })
+  for i = 1, observe.cfg.maxActions do observe.foldAction(custom, 1000 + i * 0.001) end
+  observe.foldAction(custom, 1003)   -- after +2, by +4
+  check("dropped: custom horizons date their own drops (none by +2)", observe.asOf(custom, 1002).actionsDropped, nil)
+  check("dropped: custom horizons date their own drops (one by +4)", observe.asOf(custom, 1004).actionsDropped, 1)
+  -- A miss that a later sighting resolved is not the reason a later horizon
+  -- has no fresh sighting.
+  local same = { lo = 999, hi = 1001 }
+  local function sight(ev, launchedAt, deliveredAt)
+    observe.foldSample(ev, { complete = true, row = { pid = 1, comm = "/bin/x" }, start1 = same,
+                             weightMB = 100, launchedAt = launchedAt, deliveredAt = deliveredAt })
+  end
+  local function miss(ev, launchedAt, deliveredAt)
+    observe.foldSample(ev, { complete = false, row = nil, launchedAt = launchedAt, deliveredAt = deliveredAt })
+  end
+  local r1 = ev0()
+  miss(r1, 1005, 1006)
+  sight(r1, 1020, 1021)
+  check("reason: a miss, a sighting, then a stall reads stale",
+    select(2, observe.fateAt(r1, 1060)), "stale-sample")
+  local r2 = ev0()
+  sight(r2, 1020, 1021)
+  miss(r2, 1029, 1030)
+  check("reason: a miss after the last sighting keeps its reason",
+    select(2, observe.fateAt(r2, 1060)), "incomplete-sample")
+  local r3 = ev0()
+  miss(r3, 1005, 1006)
+  check("reason: a miss with no sighting keeps its reason (control)",
+    select(2, observe.fateAt(r3, 1060)), "incomplete-sample")
+end
+
+-- ---- rule 8: clock.shift covers every wall stamp memwatch keeps ----
+-- A stamp the shift misses keeps the old basis after a step back, so its
+-- wait runs long by the step. Every top-level local and every field named
+-- as a time (...At, ...Since, ...Until, ...Seen), in the glue and in the
+-- tracker, must be named in clock.shift, unless it is listed here with the
+-- reason it is not a wall stamp.
+do
+  local notWall = {
+    erroringSince = "an error run is a duration, timed on the monotonic clock",
+    obsAt = "a ledger record is closed on a step, never shifted",
+    metricsAt = "a ledger record's map of horizon readings, not a stamp",
+    wallAt = "the detector's own last reading",
+    monoAt = "the detector's own last reading (monotonic)",
+  }
+  local function read(path)
+    local f = assert(io.open(path, "r")); local t = f:read("a"); f:close(); return t
+  end
+  local src, psrc = read("lua/memwatch.lua"), read("lua/memwatch_procs.lua")
+  local a = src:find("function clock.shift(delta)", 1, true)
+  local z = a and src:find("\nend\n", a, true)
+  local body = (a and z) and src:sub(a, z) or ""
+  check("clock.shift: located", #body > 200, true)
+  local function timeName(n)
+    return (n:match("At$") or n:match("Since$") or n:match("Until$") or n:match("Seen$")) and not notWall[n]
+  end
+  local function unshifted(text, shiftBody)
+    local miss, seen, calls = {}, {}, {}
+    for n in text:gmatch("%.([%a_][%w_]*)%s*%(") do calls[n] = true end   -- functions, not stamps
+    for line in text:gmatch("[^\n]+") do
+      if not line:match("^local%s+function") then
+        local names = line:match("^local%s+([%w_,%s]-)%s*=") or line:match("^local%s+([%w_]+)%s*$")
+        for n in (names or ""):gmatch("[%w_]+") do
+          if timeName(n) and not seen[n] then
+            seen[n] = true
+            if not shiftBody:find("%f[%w_]" .. n .. "%f[^%w_]") then miss[#miss + 1] = n end
+          end
+        end
+      end
+    end
+    for n in text:gmatch("%.([%a_][%w_]*)") do
+      if timeName(n) and not calls[n] and not seen[n] then
+        seen[n] = true
+        if not shiftBody:find("%f[%w_]" .. n .. "%f[^%w_]") then miss[#miss + 1] = n end
+      end
+    end
+    return miss
+  end
+  local m1, m2 = unshifted(src, body), unshifted(psrc, body)
+  -- The tracker's fields are shifted on its entries (e.<field>), not merely
+  -- named somewhere in the shift: a same-named field of another table (the
+  -- sampler's startedAt) would hide a missing one.
+  -- A start window, and its midpoint, are anchored to the kernel's start
+  -- record (ps's etime runs on the wall clock), which a step does not move.
+  local anchored = { startedAt = true }
+  local m3, seenT = {}, {}
+  for field in psrc:gmatch("e%.([%a_][%w_]*)%s*[,=]") do
+    if not seenT[field] and timeName(field) and not anchored[field] then
+      seenT[field] = true
+      if not body:find("e." .. field .. " = sh(", 1, true) and not body:find("e." .. field .. ",", 1, true) then
+        m3[#m3 + 1] = field
+      end
+    end
+  end
+  check("clock.shift: every wall field on a tracker entry is shifted on the entry (" .. table.concat(m3, ",") .. ")", #m3, 0)
+  check("clock.shift: every time-named stamp in the glue is shifted (" .. table.concat(m1, ",") .. ")", #m1, 0)
+  check("clock.shift: every time-named stamp the tracker keeps is shifted (" .. table.concat(m2, ",") .. ")", #m2, 0)
+  check("clock.shift: the tracker's ring times are shifted", body:find("smp.t = sh(smp.t)", 1, true) ~= nil, true)
+  check("clock.shift: the scan sees a missing local (positive control)",
+    #unshifted("local fooAt = 0\n", body), 1)
+  check("clock.shift: the scan sees a missing field (positive control)",
+    #unshifted("e.fooUntil = now + 1\n", body), 1)
+  check("clock.shift: a function call is not a stamp (control)",
+    #unshifted("x = procs.fooSince(t)\n", body), 0)
+  -- Fields named plainly at, since or t are stamps too. Each holder that
+  -- writes one is listed with the shift step that covers it, or the scan
+  -- fails: a new holder is a reviewed decision.
+  local lowerHolders = {
+    topCache = "sampler", goneUntil = "gone", fired = "unattended (an unattendedFiredFor record)",
+    unattendedFiredFor = "unattended", lfmInFlight = "adjudicator", verdictCache = "verdicts",
+    smState = "state", ring = "tracker (its samples)",
+    sampler = "sampler (its last delivery and its launch)", log = "observation (the tick log, obs.ticks)",
+    decisionAt = "observation (obs.decisionAt)", finals = "not held: the GC's own snapshot of final latches, in one call",
+    sig = "not held: an action signal, folded at once into the pending records (which a step closes)",
+    t = "not held: a touch, folded at once into the pending records (which a step closes)",
+    times = "not held: report files' modification times, counted in one call",
+    launches = "sampler (its in-flight launch records)",
+  }
+  local function lowerStamps(text)
+    local sa = text:find("function clock.shift(delta)", 1, true)
+    local sz = sa and text:find("\nend\n", sa, true)
+    if sa and sz then text = text:sub(1, sa - 1) .. text:sub(sz) end
+    local miss, ctor, depth = {}, nil, 0
+    -- A local bound to os.date holds that ISO string: a field set from it
+    -- is the same written-out value. The credit follows the name's latest
+    -- binding as the scan reads down the file, so the same name bound to a
+    -- wall reading elsewhere is not excused.
+    local isoLocals = {}
+    for line in text:gmatch("[^\n]+") do
+      local bindName, bindValue = line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*(.*)$")
+      if not bindName then bindName, bindValue = line:match("^%s*([%a_][%w_]*)%s*=%s*([^=].*)$") end
+      if bindName then isoLocals[bindName] = bindValue:find("^os%.date%(") ~= nil or nil end
+      -- The table a constructor builds: the name right before "= {", or
+      -- before its index ("finals[pid] = {"). A field line counts toward it
+      -- only while that constructor is still open.
+      local open = line:match("([%a_][%w_]*)%s*%b[]%s*=%s*{") or line:match("([%a_][%w_]*)%s*=%s*{")
+      if open then ctor, depth = open, 0 end
+      -- A log row's ISO time (os.date) is a string written out, never a
+      -- held stamp: skipped by its value, not by a holder's name.
+      local iso = line:find("=%s*os%.date%(")
+      local held = line:match("[{,]%s*at%s*=%s*([%a_][%w_]*)%s*[,}]") or line:match("^%s*at%s*=%s*([%a_][%w_]*)%s*[,}]")
+        or line:match("^%s*at%s*=%s*([%a_][%w_]*)%s*$")
+      if held and isoLocals[held] then iso = true end
+      local holder = line:match("([%a_][%w_]*)%.at%s*=[^=]") or line:match("([%a_][%w_]*)%.since%s*=[^=]")
+        or line:match("([%a_][%w_]*)%.t%s*=[^=]")
+      if not holder and not iso and (line:match("[{,]%s*at%s*=[^=]") or line:match("^%s*at%s*=[^=]")
+          or line:match("[{,]%s*since%s*=[^=]") or line:match("[{,]%s*t%s*=[^=]")) then
+        holder = (ctor and depth >= 0) and ctor or "?"
+      end
+      if holder and not lowerHolders[holder] then miss[#miss + 1] = holder end
+      if ctor then
+        local _, opens = line:gsub("{", "")
+        local _, closes = line:gsub("}", "")
+        depth = depth + opens - closes
+        if depth <= 0 and not open then ctor = nil end
+        if open and depth <= 0 then ctor = nil end
+      end
+    end
+    return miss
+  end
+  local w1, w2 = lowerStamps(src), lowerStamps(psrc)
+  check("clock.shift: every holder of an at, since or t stamp is reviewed (" .. table.concat(w1, ",")
+    .. table.concat(w2, ",") .. ")", #w1 + #w2, 0)
+  check("clock.shift: the scan sees a new holder's at (positive control)", #lowerStamps("  newHolder.at = now\n"), 1)
+  check("clock.shift: and one built with it (positive control)",
+    #lowerStamps("  local fresh = {\n    pid = 1,\n    at = now,\n  }\n"), 1)
+  check("clock.shift: a field after a closed constructor is not credited to it (positive control)",
+    #lowerStamps("  local topCache = { map = nil }\n  register({\n    at = now,\n  })\n"), 1)
+  check("clock.shift: a log row's ISO time is not a stamp (control)",
+    #lowerStamps("  local row = {\n    at = os.date(\"!%Y\"),\n  }\n"), 0)
+  check("clock.shift: nor is one held in a local bound to os.date (control)",
+    #lowerStamps("  local iso = os.date(\"!%Y\")\n  write({\n    at = iso, seq = 1,\n  })\n"), 0)
+  check("clock.shift: a local holding a wall reading is still a stamp (positive control)",
+    #lowerStamps("  local iso = clock.now()\n  write({\n    at = iso, seq = 1,\n  })\n"), 1)
+  check("clock.shift: the os.date credit follows the name's latest binding (positive control)",
+    #lowerStamps("  local iso = os.date(\"!%Y\")\n  write({\n    at = iso,\n  })\n"
+      .. "  local iso = clock.now()\n  write({\n    at = iso, seq = 1,\n  })\n"), 1)
+  check("clock.shift: a constructor is named by the table it builds, not the statement around it",
+    table.concat(lowerStamps("  if ok then fresh[pid] = { at = now } end\n"), ","), "fresh")
+  -- A name is matched whole: one that appears in the shift only inside a
+  -- longer name is not shifted.
+  check("clock.shift: a name inside a longer one does not count (positive control)",
+    #unshifted("local sampleAt = 0\n", "lastSampleAt = sh(lastSampleAt)"), 1)
+  check("clock.shift: each holder is shifted under its own pcall",
+    body:find("local ok, err = pcall(step[2])", 1, true) ~= nil
+      and body:find('logError("clock-shift:" .. step[1], err)', 1, true) ~= nil, true)
+  -- A stamp written two holders deep is matched by its whole path: a field
+  -- of the same name on another holder (obs.lastAt) does not cover it.
+  local function nestedUnshifted(text, shiftBody)
+    local miss, seen = {}, {}
+    for chain in text:gmatch("([%a_][%w_]*%.[%a_][%w_]*%.[%a_][%w_%.]*)%s*=[^=]") do
+      if timeName(chain:match("([%a_][%w_]*)$")) and not seen[chain] then
+        seen[chain] = true
+        if not shiftBody:find(chain, 1, true) then miss[#miss + 1] = chain end
+      end
+    end
+    return miss
+  end
+  local n1, n2 = nestedUnshifted(src, body), nestedUnshifted(psrc, body)
+  check("clock.shift: every nested stamp is shifted by its whole path (" .. table.concat(n1, ",")
+    .. table.concat(n2, ",") .. ")", #n1 + #n2, 0)
+  check("clock.shift: a nested stamp is not covered by a namesake (positive control)",
+    #nestedUnshifted("obs.stats.lastAt = now\n", "obs.lastAt = sh(obs.lastAt)"), 1)
+  check("clock.shift: a stamp four holders deep is matched by its whole path (positive control)",
+    #nestedUnshifted("cache.entry.offender.lastAt = now\n", "offender.lastAt = sh(offender.lastAt)"), 1)
+  check("clock.shift: a nested read is not a stamp (control)",
+    #nestedUnshifted("if a.e.frozenAt < b.e.frozenAt then end\n", body), 0)
+  -- A wall reading kept in a function's local is out of the shift's reach
+  -- (a callback that captures it keeps the old basis), so a duration timed
+  -- from one belongs on the monotonic clock. Every time-named local inside
+  -- a function is listed here with how it is used, or the scan fails.
+  local functionLocal = {
+    sentAt = "dispatch: copied into lfmInFlight.at (shifted) in the same call; latency: a monotonic reading",
+    launchedAt = "launchSampler: the wall reading at launch, for start windows, which a step must not move "
+      .. "(they are anchored to the kernel's start record); the GC reads the shifted launch record instead",
+    rawDeliveredAt = "onSample: the raw wall reading at delivery, for start windows (anchored, never shifted); dates nothing",
+    rawAt = "assessProcesses: the raw wall reading of the tick's instant, for ages against start windows; stored nowhere",
+  }
+  local function localStamps(text)
+    local miss = {}
+    for line in text:gmatch("[^\n]+") do
+      local names = line:match("^%s+local%s+([%w_,%s]-)%s*=") or line:match("^%s+local%s+([%w_]+)%s*$")
+      for n in (names or ""):gmatch("[%w_]+") do
+        if timeName(n) and not functionLocal[n] then miss[#miss + 1] = n end
+      end
+    end
+    return miss
+  end
+  local l1, l2 = localStamps(src), localStamps(psrc)
+  check("closures: every time-named function local is reviewed (" .. table.concat(l1, ",")
+    .. table.concat(l2, ",") .. ")", #l1 + #l2, 0)
+  check("closures: the scan sees an indented stamp (positive control)",
+    #localStamps("  local spawnAt = lfmSpawnedAt\n"), 1)
+  -- Pure durations never need shifting: they run on the monotonic clock.
+  check("monotonic: a poller's error run", src:find("core.untilStep(run, ok, done, clock.mono(), UNTIL_GIVEUP_SEC)", 1, true) ~= nil, true)
+  check("monotonic: the retire's KILL deadline",
+    src:find("local deadline = clock.mono() + 5", 1, true) ~= nil and src:find("if clock.mono() > deadline then", 1, true) ~= nil, true)
+  check("monotonic: the server's health deadline",
+    src:find("local healthDeadline = clock.mono() + 60", 1, true) ~= nil
+      and src:find("if clock.mono() > healthDeadline then", 1, true) ~= nil, true)
+  check("monotonic: request latency", src:find("math.floor((clock.mono() - sentMono) * 1000)", 1, true) ~= nil, true)
+  -- Rule 4: a click's "nothing done" reaches it at the click (its probe),
+  -- so no engine reports it after the backstop has released the action;
+  -- should one ever do so, a released action is still never revived.
+  check("veto: a withdrawal needs the action still in flight",
+    src:find("if openReceipts[owed] and not owed.finished and not owed.vetoFinal", 1, true) ~= nil, true)
+  check("monotonic: the fast-crash window, keyed to this very spawn",
+    src:find("if lfmSpawn == spawn\n         and (clock.mono() - spawn.mono) < 10 then", 1, true) ~= nil, true)
+  check("monotonic: the error log's rate limit", src:find("local now = clock.mono()\n  if lastErrorMono[label]", 1, true) ~= nil, true)
+  -- A shift that throws never aborts the read that found the step, and
+  -- never runs again for the same step: the readings move first.
+  local ra = src:find("function clock.now()", 1, true)
+  local rz = ra and src:find("\nend\n", ra, true)
+  local reader = (ra and rz) and src:sub(ra, rz) or ""
+  local aa = src:find("function clock.apply(delta)", 1, true)
+  local az = aa and src:find("\nend\n", aa, true)
+  local applier = (aa and az) and src:sub(aa, az) or ""
+  local moved = reader:find("clock.wallAt, clock.monoAt = wall, mono", 1, true)
+  local applied = reader:find("clock.apply(delta)", 1, true)
+  check("clock.now: a step is applied only after the readings move",
+    moved ~= nil and applied ~= nil and moved < applied, true)
+  local counted = applier:find("clock.stepTotal = clock.stepTotal + delta", 1, true)
+  local guarded = applier:find("pcall(clock.shift, delta)", 1, true)
+  check("clock.apply: the step is counted, then the shift runs under pcall",
+    counted ~= nil and guarded ~= nil and counted < guarded, true)
+  -- A callback is never shifted under: a step seen mid-callback is held and
+  -- applied when it ends, and reads inside it stay on its starting basis.
+  check("clock frames: guard brackets every callback",
+    src:find("    clock.enter()\n    local ok, err = pcall(fn, ...)\n    clock.leave()", 1, true) ~= nil, true)
+  check("clock frames: a step seen anywhere inside a frame waits for its end",
+    reader:find("if clock.depth > 0 then\n      clock.pending = clock.pending + delta", 1, true) ~= nil, true)
+  check("clock frames: reads inside the frame stay on its basis", reader:find("return wall - clock.pending", 1, true) ~= nil, true)
+  -- Every entry point is a frame: the top stream's data callback (which
+  -- guard cannot wrap: the stream needs its true back) and the immediate
+  -- first tick at start, as well as every guarded callback.
+  check("clock frames: the top stream's data callback is one",
+    src:find("      clock.enter()\n      local ok, err = pcall(function()\n        local published = procs.feedTopStream", 1, true) ~= nil
+      and src:find("      end)\n      clock.leave()\n      if not ok then logError(\"topstream\", err) end", 1, true) ~= nil, true)
+  local _, rawTicks = src:gsub("\n%s+tick%(%)", "")
+  check("clock frames: no tick runs outside one", rawTicks, 0)
+  local function everyCounts(text)
+    local _, all = text:gsub("hs%.timer%.doEvery%(", "")
+    local _, framed = text:gsub("hs%.timer%.doEvery%([^\n]-guard%(", "")
+    return all, framed
+  end
+  local everies, framedEveries = everyCounts(src)
+  check("clock frames: every repeating timer's callback is guarded (" .. framedEveries .. "/" .. everies .. ")",
+    everies > 0 and framedEveries == everies, true)
+  local ctlAll, ctlFramed = everyCounts("  t = hs.timer.doEvery(5, function() tick() end)\n")
+  check("clock frames: an unguarded repeating timer is caught (control)", ctlAll == 1 and ctlFramed == 0, true)
+  check("clock frames: the held one-shot and the held poller each run one frame",
+    src:find("    clock.enter()\n    local ok, err = pcall(fn)\n    clock.leave()", 1, true) ~= nil
+      and src:find("    clock.enter()\n    local ok, finished = pcall(poll)\n    clock.leave()", 1, true) ~= nil, true)
+  check("clock frames: the menu's build and every item are frames",
+    src:find("    clock.enter()\n    local ok, items = pcall(buildMenu)\n    clock.leave()", 1, true) ~= nil
+      and src:find('it.fn = guard("menu-item", it.fn)', 1, true) ~= nil, true)
+  -- The stale-row branch answers for the process the row showed.
+  check("resume: a stale row over another frozen process answers for the one it showed",
+    src:find("if shown and not core.sameIdentity(shown, e) then\n    markInteracted(shown, nil, true)", 1, true) ~= nil, true)
+  check("resume: a stale row's Resume still answers for the process it showed",
+    src:find("if shown then markInteracted(shown, nil, true) end", 1, true) ~= nil, true)
+  -- Here the wait streak is a deferral ({ firstAt, count }): its first wait
+  -- is a stamp, shifted only where it is a table.
+  check("clock.shift: the deferral's first wait is shifted, tables only",
+    body:find('if type(w) == "table" then w.firstAt = sh(w.firstAt) end', 1, true) ~= nil, true)
+  check("unattended grace: a future stamp restarts from now (fails closed)",
+    src:find("if fired and type(fired.at) == \"number\" and fired.at > now then fired.at = now end", 1, true) ~= nil, true)
+  -- The ledger's own stamps that a step moves: the tick log, and the launch
+  -- the unattended-state GC compares, read on the wall clock as it reads now.
+  check("clock.shift: the ledger's tick log moves with the step",
+    body:find("for _, tk in ipairs(obs.ticks) do tk.at = sh(tk.at) end", 1, true) ~= nil, true)
+  check("sampler: the GC's launch is the record the shift moved with the sightings",
+    src:find("sampler.launchedAt = launch and launch.at or nil", 1, true) ~= nil
+      and body:find("for _, l in pairs(sampler.launches) do l.at = sh(l.at) end", 1, true) ~= nil, true)
+  -- One reader of the wall clock: clock.now. clock.mono reads the
+  -- monotonic clock, or the wall clock through clock.now when there is
+  -- none, and nothing reads os.time.
+  local _, raw = src:gsub("hs%.timer%.secondsSinceEpoch%(%)", "")
+  check("wall reads: only clock.now reads the wall clock raw", raw, 1)
+  local _, osTime = src:gsub("os%.time%(%)", "")
+  check("wall reads: os.time only names the ledger's session (never a stamp)", osTime, 1)
+  check("wall reads: that one is the session id",
+    src:find('session    = string.format("%d-%04x", os.time(), math.random(0, 0xffff)),', 1, true) ~= nil, true)
+  local ma = src:find("function clock.mono()", 1, true)
+  local mz = ma and src:find("\nend\n", ma, true)
+  local mono = (ma and mz) and src:sub(ma, mz) or ""
+  check("clock.mono: without a monotonic clock, the wall through the detector, steps added back",
+    mono:find("return clock.now() - clock.stepTotal", 1, true) ~= nil, true)
+
 end
 
 -- ---- the wait rail: a model's wait defers only on its own probability ----

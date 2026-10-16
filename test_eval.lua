@@ -987,7 +987,7 @@ do
                                              "--tree-depth", "deep" })
   check("cli: so is a number that is not one",
     okDepth == false and tostring(errDepth):find("must be a number", 1, true) ~= nil, true)
-  check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
+  check("cli: controls on an undecidable set exit 2, as the gate does", okCtl and ctl, 2)
   check("cli: and say it is undecidable first", (ctlLines[1] or ""):sub(1, 12), "UNDECIDABLE:")
   check("cli: reading neither control there", ctlRead, false)
   check("cli: the gate's result file says the set could not decide, and the size it needs",
@@ -1082,7 +1082,7 @@ local target = os.getenv("FAIL_OUT")
 local realOpen = io.open
 io.open = function(path, m)
   local f, e = realOpen(path, m)
-  if f and path == target and m == "w" then
+  if f and tostring(path):sub(1, #target) == target and m == "w" then
     return { write = function() return true end,
              close = function() f:close(); return nil, "No space left on device" end }
   end
@@ -1093,9 +1093,18 @@ dofile("eval/score-episodes.lua")
 ]])
   fw:close()
   local outFile = os.tmpname()
+  os.remove(outFile)
   check("cli: a result file whose close fails exits 3",
     exitOf("FAIL_OUT=" .. q(outFile) .. " lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
       .. " --candidate always-freeze --out " .. q(outFile)), 3)
+  local torn = io.open(outFile, "r")
+  if torn then torn:close() end
+  local dirOf = outFile:match("^(.*)/[^/]*$")
+  local partials = 0
+  local pp = io.popen("ls '" .. dirOf .. "' 2>/dev/null")
+  for n in pp:lines() do if n:find(outFile:match("([^/]*)$") .. ".partial-", 1, true) then partials = partials + 1 end end
+  pp:close()
+  check("cli: and leaves no result at the path, and no partial beside it", torn == nil and partials == 0, true)
   check("cli: the harness's control, writing elsewhere, exits 2",
     exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
       .. " --candidate always-freeze --out " .. q(outFile)), 2)

@@ -998,8 +998,9 @@ end
 
 -- The CLI. Returns the exit status: 0 when the gate passes or the controls
 -- hold, 1 when the gate fails or a control does, 2 when the set is too small
--- to decide. A refusal raises, and the script then exits 3, so a refusal is
--- never read as a verdict.
+-- to decide (for the controls, or too weak to show the gate's power). A
+-- refusal raises, and the script then exits 3, so a refusal is never read as
+-- a verdict.
 function M.main(argv)
   local status = 0
   local a = parse(argv)
@@ -1075,15 +1076,25 @@ function M.main(argv)
     print(string.format("ttx baseline horizon (fit on the same split): %d s%s", horizon, certified and ""
       or " (no horizon can meet the miss bound on a split this small: fit on its fewest misses)"))
     if a.out then
-      local f = assert(io.open(a.out, "w"))
       -- A result that did not reach the disk (a full volume) fails the run:
-      -- the flush surfaces only at close, so both are checked.
-      assert(f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
-        bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
-        missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
-        nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
-        decisive = g.decisive, minRunaways = g.minRunaways })), "\n"))
-      assert(f:close())
+      -- the flush surfaces only at close, so both are checked. It is written
+      -- whole beside the path, then renamed onto it, so a file at the path is
+      -- always a whole result.
+      local partial = a.out .. string.format(".partial-%08x", math.random(0, 0x7fffffff))
+      local okW, errW = pcall(function()
+        local f = assert(io.open(partial, "w"))
+        assert(f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
+          bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
+          missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
+          nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
+          decisive = g.decisive, minRunaways = g.minRunaways })), "\n"))
+        assert(f:close())
+        assert(os.rename(partial, a.out))
+      end)
+      if not okW then
+        os.remove(partial)
+        error(errW, 0)
+      end
     end
   elseif a.cmd == "tau" then
     assert(a.decisions, "--decisions is required")
@@ -1102,29 +1113,31 @@ function M.main(argv)
   elseif a.cmd == "controls" then
     local gO = M.gate(eps, M.candidates["oracle"](), baselines)
     -- An undecidable set (too few runaways for a one-miss baseline to
-    -- qualify, or no baseline meeting the bound) fails the run, and says so
-    -- first: the gate passes nothing on it, so neither control is read.
+    -- qualify, or no baseline meeting the bound) exits 2, as the gate does,
+    -- and says so first: the gate passes nothing on it, so neither control is
+    -- read.
     if not gO.decisive then
       print(string.format("UNDECIDABLE: this set holds %d runaways, under the %d G7 decides on, so the controls"
         .. " are not read: generate more episodes per template", gO.candidate.nRunaway, gO.minRunaways))
-      status = 1
+      status = 2
     elseif not gO.bestBaseline then
       print("UNDECIDABLE: no baseline meets the miss bound on this set, so the gate compares against nothing"
         .. " and the controls are not read")
-      status = 1
+      status = 2
     else
       local gF = M.gate(eps, M.candidates["always-freeze"](), baselines)
       print(string.format("control always-freeze must FAIL: %s", gF.pass and "FAILED (gate passed it)" or "ok (failed)"))
       print(string.format("control oracle must PASS: %s", gO.pass and "ok (passed)" or "FAILED (gate failed it)"))
       if gF.pass or not gO.pass then status = 1 end
-      -- An underpowered set fails the run too.
+      -- An underpowered set is too weak to show the gate works: exit 2, unless
+      -- a control failed (1).
       local trials = 50
       local passes = M.powerControl(eps, baselines, gO.bestBaseline, trials)
       local powered = (passes / trials) >= M.cfg.powerTarget
       print(string.format("power: a candidate %.0f%% of the way from %s to the oracle passed %d/%d seeds (target >= %.0f%%): %s",
         M.cfg.powerShare * 100, gO.bestBaseline, passes, trials, M.cfg.powerTarget * 100,
         powered and "ok" or "UNDERPOWERED"))
-      if not powered then status = 1 end
+      if not powered and status == 0 then status = 2 end
     end
   else
     error("usage: score-episodes.lua gate|controls|tau --dir <episodes> [--fit-dir <dev>] [--candidate <name>]")

@@ -161,8 +161,9 @@ that decision.
   public dev templates). `gate` exits 0 when G7 passes, 1 when it fails,
   2 when the set is too small to decide, and 3 when it refuses its input
   (a bad flag, a set it cannot read, decisions that do not answer the
-  episodes); `controls` exits nonzero when a control fails or the set is
-  undecidable or underpowered. A split holds each episode once: a
+  episodes). `controls` exits 1 when a control fails, 2 when the set is
+  undecidable or underpowered, and 3 on a refusal. A result file
+  (`--out`) is written whole and renamed into place. A split holds each episode once: a
   directory with the same episode twice (a copied file, or the episode
   under another id) is refused, since a copy would count twice toward the
   decisive size.

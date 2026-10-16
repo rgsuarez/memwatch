@@ -744,8 +744,15 @@ do
   local okCopy, errCopy = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", copy })
   -- The same episodes under other ids (another split label), or with only
   -- their descriptive fields edited, are the same split.
-  local relabeled, edited = tmpDir(), tmpDir()
+  local relabeled, edited, older = tmpDir(), tmpDir(), tmpDir()
   for _, e in ipairs(sc.loadDir(held)) do
+    -- As an older generator wrote it: the same inputs, no alertSeq, another id.
+    local o = lfm.jsonDecode(lfm.jsonEncode(e))
+    o.id = "old-" .. o.id
+    for _, st in ipairs(o.steps) do st.alertSeq = nil end
+    local of = assert(io.open(older .. "/" .. o.id .. ".json", "w"))
+    of:write(lfm.jsonEncode(o), "\n")
+    of:close()
     e.id = "alt-" .. e.id
     local rf = assert(io.open(relabeled .. "/" .. e.id .. ".json", "w"))
     rf:write(lfm.jsonEncode(e), "\n")
@@ -759,6 +766,7 @@ do
   end
   local okRel, errRel = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", relabeled })
   local okEdit, errEdit = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", edited })
+  local okOld, errOld = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", older })
   local okEmpty, errEmpty = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", empty })
   local okLate, errLate = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", late })
   print = quiet
@@ -785,11 +793,13 @@ do
     okRel == false and tostring(errRel):find("the same episode", 1, true) ~= nil, true)
   check("cli: and with only their descriptive fields edited",
     okEdit == false and tostring(errEdit):find("the same episode", 1, true) ~= nil, true)
+  check("cli: and as an older generator wrote them, without the fields it lacked",
+    okOld == false and tostring(errOld):find("the same episode", 1, true) ~= nil, true)
   check("cli: an empty fit split is refused",
     okEmpty == false and tostring(errEmpty):find("cannot be fit", 1, true) ~= nil, true)
   check("cli: so is one with only late episodes",
     okLate == false and tostring(errLate):find("cannot be fit", 1, true) ~= nil, true)
-  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "' '" .. relabeled .. "' '" .. edited .. "'")
+  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "' '" .. relabeled .. "' '" .. edited .. "' '" .. older .. "'")
 end
 
 -- ---- a split is read from the directory named, whatever its name ----

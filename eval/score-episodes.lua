@@ -881,11 +881,16 @@ function M.main(argv)
     -- Another directory holding the same episodes is the same split: a
     -- copy, the same templates and seeds regenerated under another split
     -- label, or a copy with only its descriptive fields edited. Episodes
-    -- are compared by what scoring reads (their steps and outcome labels),
-    -- and by id, which fails safe.
+    -- are compared by their inputs and outcome labels, and by id, which
+    -- fails safe.
+    -- The inputs alone (each step's time and snapshot), so a field a later
+    -- generator adds to a step (alertSeq, say) cannot make an older copy of
+    -- the same episode look new.
     local function fingerprint(ep)
       local L = ep.labels or {}
-      return lfm.jsonEncode({ steps = ep.steps, class = L.class, runaway = L.runaway,
+      local inputs = {}
+      for i, st in ipairs(ep.steps or {}) do inputs[i] = { t = st.t, snapshot = st.snapshot } end
+      return lfm.jsonEncode({ steps = lfm.jsonArray(inputs), class = L.class, runaway = L.runaway,
                               ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
     end
     local scored, scoredIds = {}, {}

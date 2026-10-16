@@ -1970,13 +1970,25 @@ do
   check("startReplayed: a start before every stretch is untouched",
     observe.startReplayed({ lo = 50, hi = 51 }, spans), false)
   check("startReplayed: no window, no stretches", observe.startReplayed(nil, spans) or observe.startReplayed({ lo = 150, hi = 151 }, nil), false)
-  -- A stretch matters until the clock has run past it.
-  local live2 = observe.replaysAt(spans, 300, 2)
-  check("replaysAt: a stretch the clock has run past no longer matters", #live2 == 1 and live2[1].lo == 500, true)
-  check("replaysAt: one it has not still does", #observe.replaysAt(spans, 150, 2), 2)
-  check("replaysAt: whole-second slack at the end", #observe.replaysAt(spans, 201, 2), 2)
-  check("replaysAt: no instant keeps them all", #observe.replaysAt(spans, nil, 2), 2)
-  check("replaysAt: a malformed stretch is skipped", #observe.replaysAt({ {} }, 100, 2), 0)
+  -- A start epoch (whole seconds) in a stretch, for signals, touches and
+  -- frozen-ledger entries.
+  check("epochReplayed: an epoch in a stretch", observe.epochReplayed(150, spans), true)
+  check("epochReplayed: one between stretches", observe.epochReplayed(300, spans), false)
+  check("epochReplayed: no epoch", observe.epochReplayed(nil, spans), false)
+  do
+    local ev = observe.newEvidence({ pid = 9, comm0 = "/bin/x", start0 = { lo = 149, hi = 150, etimeSec = 500 }, obsAt = 1000 })
+    ev.replays = spans
+    observe.foldSignal(ev, { action = "freeze", at = 1001, comm = "/bin/x", startEpoch = 150 })
+    check("foldSignal: a signal to a start a step replayed is uncertain, never the same",
+      ev.signals[1] ~= nil and ev.signals[1].uncertain == true, true)
+    local evOk = observe.newEvidence({ pid = 9, comm0 = "/bin/x", start0 = { lo = 299, hi = 300, etimeSec = 500 }, obsAt = 1000 })
+    evOk.replays = spans
+    observe.foldSignal(evOk, { action = "freeze", at = 1001, comm = "/bin/x", startEpoch = 300 })
+    check("foldSignal: one to a start between stretches is the same (control)",
+      evOk.signals[1] ~= nil and evOk.signals[1].uncertain == nil, true)
+    observe.foldTouch(ev, { at = 1002, comm = "/bin/x", startEpoch = 150 })
+    check("foldTouch: a touch on a replayed start is uncertain", ev.touchesUncertain == 1 and ev.touches == 0, true)
+  end
   -- Kept stretches: none is dropped (a process born in one starts there
   -- while it lives); past the cap the two oldest merge, wider, never less.
   -- A 500 s step at 1300 (replaying 800..1300), then sixteen more a second
@@ -1988,7 +2000,26 @@ do
     observe.startReplayed({ lo = 850, hi = 851 }, kept), true)
   local passed = observe.addReplay({ { lo = 100, hi = 200 } }, { lo = 500, hi = 600 }, 16)
   check("addReplay: a stretch the clock has run past is kept", #passed, 2)
+  -- Seventeen disjoint stretches: the merge keeps both oldest, and refuses
+  -- the gap between them too (the price of the cap).
+  local disjoint = {}
+  for i = 1, 17 do disjoint = observe.addReplay(disjoint, { lo = i * 100, hi = i * 100 + 10 }, 16) end
+  check("addReplay: past the cap, a start only the first stretch covered is still refused",
+    observe.startReplayed({ lo = 105, hi = 106 }, disjoint), true)
+  check("addReplay: and one only the second covered", observe.startReplayed({ lo = 205, hi = 206 }, disjoint), true)
+  check("addReplay: the merged stretch spans the gap between them", observe.startReplayed({ lo = 150, hi = 151 }, disjoint), true)
+  check("addReplay: a stretch the merge did not touch keeps its gaps (control)",
+    observe.startReplayed({ lo = 350, hi = 351 }, disjoint), false)
+  check("addReplay: a malformed stretch is skipped", #observe.addReplay({ {}, { lo = 1 } }, { lo = 5, hi = 6 }, 16), 1)
   check("addReplay: an empty list takes the new stretch", #observe.addReplay(nil, { lo = 1, hi = 2 }, 16), 1)
+  check("frozenMatches: an entry started in a replayed stretch is uncertain",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000150) }, { lo = 1700000149, hi = 1700000150, etimeSec = 500 },
+      nil, { { lo = 1700000100, hi = 1700000200 } }), nil)
+  check("frozenMatches: the same entry with no stretch is the same (control)",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000150) }, { lo = 1700000149, hi = 1700000150, etimeSec = 500 },
+      nil, {}), true)
+  check("row: a refused start says so", observe.row({ identityReplayed = true }).identityReplayed, true)
+  check("row: otherwise the field is absent", observe.row({}).identityReplayed, nil)
   end
   check("liveStamp: no tracker entry keeps it", observe.liveStamp(stamp, nil), stamp)
   check("liveStamp: no stamp is nil", observe.liveStamp(nil, live), nil)
@@ -2482,7 +2513,7 @@ do
   check("observe glue: the resettable HUD flag is not the operator signal",
     body:find("hudInteracted", 1, true), nil)
   check("observe glue: the frozen ledger counts only for the observed process, as of the horizon",
-    body:find("observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))", 1, true) ~= nil
+    body:find("observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0, nil, replays))", 1, true) ~= nil
       and body:find("frozenNow = observe.frozenAt(ev, tH)", 1, true) ~= nil
       and body:find("frozenLedger = frozenNow,", 1, true) ~= nil
       and body:find("frozen[pid], ev.start0", 1, true) == nil, true)
@@ -2618,11 +2649,13 @@ do
     src:find("observe.replaySpan(prevWall, prevMono, wall, mono, delta)", 1, true) ~= nil, true)
   check("replay glue: the kept stretches go through addReplay",
     src:find("clock.replays = observe.addReplay(clock.replays, span, 16)", 1, true) ~= nil, true)
-  check("replay glue: an observation's own start is checked against the stretches that matter now",
-    src:find("obs.startReplayed(start0, obs.replaysAt(now + clock.pending))", 1, true) ~= nil, true)
-  check("replay glue: its samples against every stretch recorded so far",
+  check("replay glue: an observation's own start is checked against every stretch recorded so far",
     src:find("for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end", 1, true) ~= nil
-      and src:find("ev.replays = replays", 1, true) ~= nil, true)
+      and src:find("local replayed = start0 and obs.startReplayed(start0, replays) or false", 1, true) ~= nil, true)
+  check("replay glue: and its record keeps them for its samples and frozen-ledger reads",
+    src:find("ev.replays = replays", 1, true) ~= nil
+      and src:find("observe.frozenMatches(frozen[pid], start0, nil, replays)", 1, true) ~= nil
+      and src:find("observe.frozenMatches(frozen[ev.pid], ev.start0, nil, ev.replays)", 1, true) ~= nil, true)
   check("replay glue: a sample's window is checked against its record's stretches",
     src:find("if start1 and obs.startReplayed(start1, ev.replays) then start1 = nil end", 1, true) ~= nil, true)
   check("sampler glue: a table without its launch record widens by every step back so far",

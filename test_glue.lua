@@ -2318,6 +2318,7 @@ scenario("ledger: a step back outliving a start window never lets a successor vo
   check("outlived: a row is written after the step (control)", nextRow ~= nil, true)
   if not nextRow then return end
   check("outlived: it takes no identity from the outlived window", nextRow.identityBasis, "none")
+  check("outlived: and says why", nextRow.identityReplayed, true)
   check("outlived: the successor is born after the row (control)", (t0 + S) > tRow, true)
   W.run(math.max(0, (t0 + S) - W.now))
   W.reusePid(4242, "leaker", 2000)    -- a same-name successor takes the pid
@@ -2391,13 +2392,12 @@ scenario("ledger: a successor born in replayed time never vouches for an older p
 end)
 
 -- The same, with the successor already holding the pid when the observation
--- is written. The observed process is younger than a step back, ps stalls,
--- and a same-name successor takes the pid during the replay, with a start a
--- couple of seconds from the observed one; the tracker still shows the
--- observed process's window. An observation written after the clock has
--- run past the stretch keeps that window as its identity. A slow table then
--- places the successor's window over it: checked against every stretch
--- recorded, not only those still being replayed, it proves nothing.
+-- is written, after the clock has run past the stretch. The observed process
+-- started just before the stretch (it keeps its identity), ps stalls, and a
+-- same-name successor takes the pid right after the step, born inside the
+-- stretch; the tracker still shows the observed process's window. A slow
+-- table then places the successor's window over it: checked against every
+-- stretch recorded, not only those still being replayed, it proves nothing.
 scenario("ledger: a successor already at the pid when the stretch has passed never vouches for it", nil, function(W, mw)
   local t0 = W.now
   local row = toDecision(W, 4242)
@@ -2406,18 +2406,17 @@ scenario("ledger: a successor already at the pid when the stretch has passed nev
   W.run(6)
   W.psStarved = true                  -- the tracker keeps the leaker's window (born 120 s before t0)
   W.run(4)
-  local age = math.floor(W.now - t0) + 120
-  local D = age + 30                  -- younger than the step: its start is 30 s into the stretch
+  -- A step back that leaves the leaker's start at least 3 s before the
+  -- stretch, which reaches back to the reading before the step.
   local tStep = W.now
+  local D = math.floor(tStep - t0) + 111
   W.wallOffset = (W.wallOffset or 0) - D
+  W.run(1)
+  W.reusePid(4242, "leaker", 2000, { bornAgoSec = 0 })  -- born inside the stretch, 1 s after the step
   check("passed-successor: the step was taken out (control)",
     runUntil(W, 6, function() return logHas(W, "clock-stepped-back:" .. D .. "s") end), true)
-  -- When the stepped clock is 2 s past the leaker's start, it exits and a
-  -- newborn takes its pid.
-  runUntil(W, 60, function() return W.now - tStep >= 32 end)
-  W.reusePid(4242, "leaker", 2000, { bornAgoSec = 0 })
   -- The first row written after the clock has run past the stretch.
-  runUntil(W, D + 30, function() return W.now - tStep >= D + 5 end)
+  runUntil(W, D + 30, function() return W.now - tStep >= D + 10 end)
   local before = {}
   for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
   local obsRow, tObs
@@ -2430,12 +2429,12 @@ scenario("ledger: a successor already at the pid when the stretch has passed nev
   end)
   check("passed-successor: a row after the stretch has passed (control)", obsRow ~= nil, true)
   if not obsRow then return end
-  check("passed-successor: it keeps the tracker's window as identity (control)", obsRow.identityBasis, "window")
-  -- One slow table (read at its delivery, 8 s after its launch) landing just
+  check("passed-successor: it keeps the older process's window as identity (control)", obsRow.identityBasis, "window")
+  -- One slow table (read at its delivery, 12 s after its launch) landing just
   -- before the +60 follow-up; nothing else lands before that horizon.
   W.psStarved, W.samplerStartFails = false, true
-  runUntil(W, 60, function() return W.now - tObs >= 46 end)
-  W.samplerStartFails, W.samplerReadsLate, W.samplerDelay = false, true, 8
+  runUntil(W, 60, function() return W.now - tObs >= 44 end)
+  W.samplerStartFails, W.samplerReadsLate, W.samplerDelay = false, true, 12
   local a0 = W.samplerStartAttempts or 0
   runUntil(W, 8, function() return (W.samplerStartAttempts or 0) > a0 end)
   W.samplerReadsLate, W.samplerDelay, W.samplerStartFails = nil, nil, true
@@ -2446,6 +2445,38 @@ scenario("ledger: a successor already at the pid when the stretch has passed nev
   local f = fu[1] or {}
   check("passed-successor: it never reads the gone process alive (" .. tostring(f.fate) .. ", "
     .. tostring(f.weightMB) .. " MB)", f.fate ~= "alive" and f.fate ~= "frozen", true)
+end)
+
+-- Without a monotonic clock a step back's stretch cannot be bounded: from
+-- then on identity is refused (until a reload), said once in the log, and
+-- marked on every row.
+scenario("ledger: with no monotonic clock a step back refuses identity from then on", nil, function(W, mw)
+  W.hs.timer.absoluteTime = nil
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  local row = toDecision(W, 4242)
+  if not row then check("blind: decision row", false, true); return end
+  check("blind: identity before any step (control)", row.identityBasis, "window")
+  W.wallOffset = (W.wallOffset or 0) - 30   -- a step back the wall clock alone shows
+  check("blind: the step was taken out (control)",
+    runUntil(W, 10, function() return logHas(W, "clock-stepped-back:") end), true)
+  check("blind: refusing identity from then on is logged", logHas(W, "replay-unbounded:identity-refused-until-reload"), true)
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local nextRow
+  runUntil(W, 120, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not before[r.seq] then nextRow = nextRow or r end
+    end
+    return nextRow ~= nil
+  end)
+  check("blind: a row after the step (control)", nextRow ~= nil, true)
+  if not nextRow then return end
+  check("blind: it takes no identity", nextRow.identityBasis, "none")
+  check("blind: and says why", nextRow.identityReplayed, true)
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("blind: its follow-up never reads the process alive", fu[1] ~= nil and fu[1].fate ~= "alive", true)
 end)
 
 -- (round 9) The jetsam blind ceiling is a raw file time: a second step back
@@ -2735,6 +2766,7 @@ scenario("ledger: a bound start time a step back replayed identifies nothing", n
   check("bound-replayed: the step was taken out (control)", logHas(W, "clock-stepped-back:" .. D .. "s"), true)
   check("bound-replayed: a decision row once the clock has passed the start again (control)", nextRow ~= nil, true)
   check("bound-replayed: it takes no identity from the replayed start", nextRow and nextRow.identityBasis, "none")
+  check("bound-replayed: and says why", nextRow and nextRow.identityReplayed, true)
 end)
 
 -- Follow-up timers that never run (a stalled run loop): the records stop

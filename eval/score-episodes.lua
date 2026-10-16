@@ -595,8 +595,8 @@ function M.score(episodes, decide, cfg)
   for _, ep in ipairs(episodes) do
     local res = M.play(ep, decide, cfg)
     local o = M.outcome(ep, res)
-    local fam = s.perFamily[ep.family] or { runaway = 0, savable = 0, misses = 0, wrongful = 0 }
-    s.perFamily[ep.family] = fam
+    local fam = s.perFamily[ep.family or "unknown"] or { runaway = 0, savable = 0, misses = 0, wrongful = 0 }
+    s.perFamily[ep.family or "unknown"] = fam
     -- The category the model sees (production categorizer over the name).
     local cname = ep.steps[1] and catOf(ep.steps[1]) or "unknown"
     local cat = s.perCategory[cname] or { runaway = 0, savable = 0, misses = 0, wrongful = 0 }

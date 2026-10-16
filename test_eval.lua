@@ -472,6 +472,9 @@ do
   local fgStep = gen.episode(fgTpl, 1, "test").steps[1]
   check("snapshot: a foreground offender's runaway row says so too",
     fgStep.snapshot.offender.foreground == true and fgStep.snapshot.runaways[1].foreground == true, true)
+  check("score: an episode with no family is scored, not refused",
+    (pcall(sc.score, { { id = "nf", labels = { class = "savable" }, steps = { { t = 0, snapshot = { availPct = 30 } } } } },
+      sc.candidates["always-freeze"]())), true)
   -- The history must fit the machine: the offender's physical footprint
   -- plus what is available, at most maxFill of it. The sum is the same at
   -- every tick of a trajectory, so one check at prepare covers the history.

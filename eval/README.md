@@ -169,20 +169,28 @@ that decision.
   5%, and the wrongful-freeze rate beats the best deterministic baseline
   that meets that bound: the paired improvement's one-sided sign-flip
   p-value over templates (one sign per template, since a template's
-  jittered copies are not independent) is at most 5%. Its null is that
-  the candidate's wrongful-freeze probability equals the baseline's on
-  every template. A template's savables are independent episodes and each
-  paired difference is -1, 0 or +1, so under that null each template's
-  sum is symmetric about zero and the test is exact (up to 50 differing
-  templates; the scorer refuses more rather than round); under the weaker
-  null of an equal rate in aggregate only, it is conservative. Four or
-  fewer savable templates can never pass, so a set with fewer than five
-  decides nothing. A template the set lacks is its
-  coverage to guard. The bootstrapped 95% lower bound is reported beside
-  the test as a diagnostic, since with few templates it passes a
-  no-better candidate more often than its nominal rate. `controls` also
-  measures the test's size at the set's shape under both nulls, and fails
-  if either is clearly above 5%. The
+  jittered copies share its structure: independent given the template,
+  not of it) is at most 5%. Its null is that the candidate's
+  wrongful-freeze probability equals the baseline's on every template.
+  A template's savables are independent episodes given the template and
+  each paired difference is -1, 0 or +1, so under that null each
+  template's sum is symmetric about zero and the test is exact (up to 50
+  differing templates; the scorer refuses more rather than round). The
+  beat so asks whether the candidate beats the baseline template by
+  template, not in pooled total: under a null equal only in aggregate no
+  test of this kind is exact, and this one can pass a candidate steadily
+  better on many templates and worse on a few noisy ones more often than
+  5% (in a search, about 4 to 7% where templates hold 2 to 14 savables,
+  far more beside one large template). The comparator is the baseline
+  with the fewest wrongful freezes on the evaluated set itself; the
+  exactness argument is for a fixed comparator. Four or fewer savable
+  templates can never pass, so a set with fewer than five decides
+  nothing. A template the set lacks is its coverage to guard. The
+  bootstrapped 95% lower bound is reported beside the test as a
+  diagnostic, since with few templates it passes a no-better candidate
+  more often than its nominal rate. `controls` also measures the test's
+  size at the set's shape: per template, failing if it is clearly above
+  5%, and in aggregate only, reported as a diagnostic. The
   baselines are always-freeze, a category rule, a time-to-exhaustion rule
   and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
   required, holding runaways and savables and none of the evaluated

@@ -237,39 +237,58 @@ do
     (sc.pairedLowerBound(byTemplate({ 1, 1, 1 }))) > 0 and (sc.signFlipP(byTemplate({ 1, 1, 1 }))) > 0.05, true)
   -- The size at the regenerated sets' shapes: candidates no better than the
   -- baseline pass the beat at most 5% of the time (sealed: 17 templates of 5
-  -- savables; dev: 10 of 10). Fewer draws than the controls take, for speed.
+  -- savables; dev: 10 of 10; and an unequal shape, 12 templates of 2 to 14).
+  -- Fewer draws than the controls take, for speed. per: savables per
+  -- template, one count for all or a list.
   local function shape(nTpl, per)
     local eps = {}
     for t = 1, nTpl do
-      for _ = 1, per do eps[#eps + 1] = { template = "T" .. t, labels = { class = "savable" } } end
+      for _ = 1, type(per) == "table" and per[t] or per do
+        eps[#eps + 1] = { template = "T" .. t, labels = { class = "savable" } }
+      end
     end
     return eps
   end
   -- Held to the controls' own rule: the share's one-sided lower bound.
   local quick = setmetatable({ sizeDatasets = 200 }, { __index = sc.cfg })
   local function sizeOk(passes, n) return 1 - sc.cpUpper(n - passes, n) <= 0.05 end
-  local sp, sa, sn, st = sc.nullSize(shape(17, 5), quick)
+  local sp, _, sn, st = sc.nullSize(shape(17, 5), quick)
   check("sign-flip: at sealed's shape, its size per template is within 5%", st == 17 and sizeOk(sp, sn), true)
-  check("sign-flip: and in aggregate only", sizeOk(sa, sn), true)
-  local dp, da, dn, dt = sc.nullSize(shape(10, 10), quick)
+  local dp, _, dn, dt = sc.nullSize(shape(10, 10), quick)
   check("sign-flip: at dev's shape, per template", dt == 10 and sizeOk(dp, dn), true)
-  check("sign-flip: and in aggregate only", sizeOk(da, dn), true)
-  -- Templates differing either way, equal only in aggregate: the flips'
-  -- spread includes each template's squared mean, so the test is
-  -- conservative there.
-  check("sign-flip: equal only in aggregate, it passes less often than per template", sa + da < sp + dp, true)
-  -- The aggregate null's shifts: one template of each pair worse and the
-  -- other better, by amounts whose weighted sum is zero; an odd template
-  -- out, or a pair whose shift would leave the rates' room, unshifted.
-  local coin = 0
-  local function alternate() coin = coin + 1; return coin % 2 == 1 and 0.25 or 0.75 end
-  local sh = sc.nullShifts({ "A", "B", "C", "D", "E" }, { A = 5, B = 5, C = 4, D = 8, E = 5 }, alternate, 0.3)
-  check("sign-flip: the aggregate null shifts each pair both ways, summing to zero",
-    sh.A == 0.3 and sh.B == -0.3 and sh.A * 5 + sh.B * 5 == 0, true)
-  check("sign-flip: a pair whose shift would leave the rates' room stays unshifted, as does an odd template",
-    sh.C == -0.3 and math.abs(sh.D - 0.15) < 1e-12 and sh.E == 0, true)
-  local wide = sc.nullShifts({ "A", "B" }, { A = 10, B = 5 }, alternate, 0.3)
-  check("sign-flip: so does a pair whose second shift is too wide", wide.A == 0 and wide.B == 0, true)
+  local up, _, un, ut = sc.nullSize(shape(12, { 2, 5, 9, 14, 2, 5, 9, 14, 2, 5, 9, 14 }), quick)
+  check("sign-flip: at an unequal shape, per template", ut == 12 and sizeOk(up, un), true)
+  -- Equal only in aggregate, the test makes no promise, and the diagnostic
+  -- sees why: at five templates of 100, a candidate steadily better on four
+  -- and worse on the fifth passes it well over 5% of the time.
+  local _, wa, wn, _, worst = sc.nullSize(shape(5, 100), quick)
+  check("sign-flip: equal only in aggregate, its diagnostic finds a null the test passes over 5%",
+    wa / wn > 0.05 and worst ~= nil and worst.m >= 1 and worst.j >= 1, true)
+  -- The aggregate-only null's construction, at an unequal shape: the
+  -- candidate worse on the largest templates, better on the next ones, and
+  -- no different on the rest, its expected wrongful freezes equal to the
+  -- baseline's in aggregate; none when the better templates cannot carry it.
+  local counts, names = { A = 2, B = 5, C = 9, D = 14, E = 3 }, { "A", "B", "C", "D", "E" }
+  local base, cand = sc.asymNull(names, counts, 1, 3, 0.2)
+  local weighted = 0
+  for _, t in ipairs(names) do weighted = weighted + counts[t] * (base[t] - cand[t]) end
+  check("sign-flip: the aggregate-only null is worse on the largest template, better on the next three, even in sum",
+    base.D == 0.4 and cand.D == 0.6 and cand.C == 0 and cand.B == 0 and cand.E == 0 and base.C == base.B
+      and base.B == base.E and base.C > 0 and base.A == 0 and cand.A == 0 and math.abs(weighted) < 1e-12, true)
+  check("sign-flip: and there is none when the better templates cannot carry the balance",
+    sc.asymNull(names, counts, 2, 1, 0.5), nil)
+  -- The size check's coupling: both models wrong together as rarely as
+  -- their rates allow, so at equal rates of 0.3 a savable differs either way
+  -- 30% of the time (21% were they independent), and at 0.5 always.
+  local tally = { [-1] = 0, [0] = 0, [1] = 0 }
+  local always = true
+  for i = 1, 1000 do
+    local u = (i - 0.5) / 1000
+    tally[sc.pairDiff(u, 0.3, 0.3)] = tally[sc.pairDiff(u, 0.3, 0.3)] + 1
+    if sc.pairDiff(u, 0.5, 0.5) == 0 then always = false end
+  end
+  check("sign-flip: the size check's savables disagree as often as their rates allow",
+    tally[1] == 300 and tally[-1] == 300 and always, true)
   check("sign-flip: the size check counts only savable templates",
     select(4, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
   check("sign-flip: a set needs five savable templates for the beat to be reachable", sc.minBeatTemplates(), 5)
@@ -2357,24 +2376,34 @@ do
   sc.candidates["always-freeze"] = sc.candidates.oracle
   local okC1, c1 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.cfg.powerTarget, sc.candidates["always-freeze"] = savedTarget, savedFreeze
-  -- A beat test passing no-better candidates too often, under either null,
-  -- fails the controls; a share above 5% whose lower bound is not above it
-  -- (22 of 400: 5.5%, lower bound about 3.8%) does not.
+  -- A beat test passing no-better candidates too often per template fails
+  -- the controls, at the lower-bound rule's edge: 28 of 400 (lower bound
+  -- 5.02%) fails, 27 (4.81%) does not. The aggregate-only share is reported
+  -- and never fails them, however high: the test promises nothing there.
   local savedNull = sc.nullSize
   sc.nullSize = function() return 400, 0, 400, 10 end
   local okCS, cs = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
-  sc.nullSize = function() return 0, 400, 400, 10 end
-  local okCK, ck = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
-  sc.nullSize = function() return 22, 22, 400, 10 end
+  sc.nullSize = function() return 28, 0, 400, 10 end
+  local okCE, ce = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = function() return 27, 0, 400, 10 end
   local okCB, cb = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  local shown = {}
+  print = function(...) shown[#shown + 1] = table.concat({ ... }, " ") end
+  sc.nullSize = function() return 0, 400, 400, 10, { m = 1, j = 9, gap = 0.15 } end
+  local okCK, ck = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.nullSize = savedNull
   print = quiet3
+  local aggShown = false
+  for _, line in ipairs(shown) do
+    if line:find("in aggregate only, a diagnostic", 1, true) and line:find("400 of 400", 1, true) then aggShown = true end
+  end
   check("decidable: controls that hold exit 0", okC0 and c0, 0)
   check("decidable: an underpowered set exits 2", okC2 and c2, 2)
   check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
   check("decidable: so does a beat test that passes no-better candidates per template", okCS and cs, 1)
-  check("decidable: or in aggregate only", okCK and ck, 1)
-  check("decidable: but not a share whose lower bound stays within 5%", okCB and cb, 0)
+  check("decidable: at the rule's edge, 28 of 400 fails", okCE and ce, 1)
+  check("decidable: and 27 of 400 does not", okCB and cb, 0)
+  check("decidable: an aggregate-only share is reported, and never fails the controls", okCK and ck == 0 and aggShown, true)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a failing gate exits 1", okFail and failStatus, 1)
   -- One runaway short of the floor, the same set decides nothing.

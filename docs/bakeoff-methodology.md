@@ -91,9 +91,10 @@ candidate passes when the one-sided 95% upper bound on missed runaways is
 at most 5% and its wrongful-freeze rate beats the best deterministic
 baseline that meets the same bound (a paired, one-sided sign-flip test
 over templates at 5%, exact under the null of an equal wrongful-freeze
-rate on every template, conservative under an equal rate in aggregate,
-up to 50 differing templates; a template the set lacks is its coverage
-to guard). Its wait counts only through the
+rate on every template: it asks whether the candidate beats the baseline
+template by template, and under a null equal only in pooled total it can
+pass a no-better candidate more often than 5%; a template the set lacks
+is its coverage to guard). Its wait counts only through the
 proposed wait rail, on its own probability: the contract it would be
 wired under (the live path does not consult the rail yet). The held-out set is
 generated from templates kept outside this repository and is scored once

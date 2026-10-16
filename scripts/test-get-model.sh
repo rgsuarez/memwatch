@@ -59,6 +59,10 @@ if [ -n "${FAKE_PARTIAL:-}" ] && [ "$FAKE_PARTIAL" = "$name" ]; then
   # A transfer cut after the headers: curl still reports the 200 it got.
   head -c 9 "$src" > "$out"; status 200; exit 18
 fi
+if [ -n "${FAKE_SHORT:-}" ] && [ "$FAKE_SHORT" = "$name" ]; then
+  # A cut curl cannot see (no length given): a short body, a 200, exit 0.
+  head -c 9 "$src" > "$out"; status 200; exit 0
+fi
 cp "$src" "$out"
 status 200
 STUB
@@ -108,6 +112,10 @@ expect 0 "a server error on the license is no answer: the verified local copy st
 expect 0 "so is rate limiting" FAKE_HTTP=LICENSE=429
 expect 0 "and a license transfer cut short after its 200" FAKE_PARTIAL=LICENSE
 check "  not read as a changed license" saysNot "license changed"
+expect 1 "a final redirect on the license is refused" FAKE_HTTP=LICENSE=302
+check "  before any download" noWeightsAsked
+expect 1 "a cut curl cannot see is refused" FAKE_SHORT=LICENSE
+check "  naming the cut as well as a changed license" grep -q "or its transfer was cut short" "$tmp/out"
 expect 1 "a curl that did not run is refused, not taken for offline" FAKE_NORUN=LICENSE
 check "  and says curl did not run" grep -q "curl did not run" "$tmp/out"
 rm -f "$localLic" "$models/m.gguf"

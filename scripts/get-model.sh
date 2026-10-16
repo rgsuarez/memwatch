@@ -72,7 +72,7 @@ elif [ "$CODE" = "200" ] && [ "$NOANSWER" = 0 ]; then
   GOTLICSHA="$(shasum -a 256 "$LICTMP" | awk '{print $1}')"
   if [ "$GOTLICSHA" != "$LICSHA" ]; then
     echo "get-model: $REPO license text hash mismatch (expected $LICSHA, got $GOTLICSHA)" >&2
-    echo "get-model: refusing to proceed; the model repo's license changed - re-review it" >&2
+    echo "get-model: refusing to proceed: the model repo's license changed, or its transfer was cut short where curl could not tell; retry, and if it persists, re-review the license" >&2
     exit 1
   fi
   if [ "$LIC" != "$CANON" ]; then cp "$LICTMP" "$LIC"; fi

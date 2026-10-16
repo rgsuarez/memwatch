@@ -729,6 +729,17 @@ end
 
 -- ---- a split is read from the directory named, whatever its name ----
 do
+  -- CDPATH never redirects the directory a split is resolved to.
+  local hb = io.popen("mktemp -d")
+  local cdbase = hb:read("l")
+  hb:close()
+  os.execute("mkdir '" .. cdbase .. "/only-in-cdpath'")
+  local pc = io.popen("CDPATH='" .. cdbase .. "' lua -e 'package.path = \"eval/?.lua;\" .. package.path; "
+    .. "io.write(tostring(require(\"score-episodes\").realDir(\"only-in-cdpath\")))'")
+  local resolved = pc:read("a")
+  pc:close()
+  os.execute("rm -rf '" .. cdbase .. "'")
+  check("realDir: CDPATH never resolves a name to another directory", resolved, "nil")
   local h = io.popen("mktemp -d")
   local base = h:read("l")
   h:close()

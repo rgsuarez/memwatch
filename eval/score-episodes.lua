@@ -792,7 +792,10 @@ end
 -- A directory's physical path (symlinks and relative spellings resolved),
 -- or nil when it does not exist.
 function M.realDir(dir)
-  local p = io.popen("cd '" .. tostring(dir):gsub("'", "'\\''") .. "' 2>/dev/null && pwd -P")
+  -- CDPATH unset: with it exported, cd can resolve a relative name to a
+  -- directory elsewhere (and print it), so two spellings could compare
+  -- equal or unequal for the wrong reason.
+  local p = io.popen("CDPATH= cd -P -- '" .. tostring(dir):gsub("'", "'\\''") .. "' 2>/dev/null && pwd -P")
   local out = p and p:read("l")
   if p then p:close() end
   return out

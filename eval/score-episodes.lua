@@ -936,7 +936,14 @@ function M.main(argv)
   return status
 end
 
-if arg and arg[0] and arg[0]:match("score%-episodes%.lua$") then
+-- Run as a script, whatever the file is named (a symlink, a copy): the
+-- chunk lua was asked to run is this one exactly when its source is the
+-- script's path. Required or loaded by another script, it only exports.
+local function isScript()
+  return arg ~= nil and arg[0] ~= nil and debug.getinfo(1, "S").source == "@" .. arg[0]
+end
+
+if isScript() then
   os.exit(M.main(arg))
 end
 

@@ -760,6 +760,39 @@ printf '0.010'
   os.execute("rm -rf '" .. root .. "'")
 end
 
+-- ---- each CLI runs as a script under any name, and never when required ----
+do
+  local h = io.popen("mktemp -d")
+  local base = h:read("l")
+  h:close()
+  local function status(cmd)
+    local ok, _, code = os.execute(cmd .. " >/dev/null 2>&1")
+    return ok and 0 or code
+  end
+  -- The process's own working directory (PWD can be stale under a parent
+  -- that set only the cwd).
+  local ph = io.popen("pwd -P")
+  local here = ph:read("l")
+  ph:close()
+  for _, f in ipairs({ "bakeoff", "gen-episodes", "score-episodes" }) do
+    os.execute(string.format("ln -s '%s/eval/%s.lua' '%s/%s-renamed.lua'", here, f, base, f))
+  end
+  -- Each refuses a run with no arguments (exit 1); a CLI that ran nothing
+  -- would exit 0.
+  check("cli: the runner under another name still runs", status("lua '" .. base .. "/bakeoff-renamed.lua'"), 1)
+  check("cli: so does the generator", status("lua '" .. base .. "/gen-episodes-renamed.lua'"), 1)
+  check("cli: and the scorer", status("lua '" .. base .. "/score-episodes-renamed.lua'"), 1)
+  -- A script whose own name ends like the scorer's only requires it.
+  local w = assert(io.open(base .. "/my-score-episodes.lua", "w"))
+  w:write('package.path = "eval/?.lua;" .. package.path\nrequire("score-episodes")\nprint("required")\n')
+  w:close()
+  local p = io.popen("lua '" .. base .. "/my-score-episodes.lua' 2>&1")
+  local said = p:read("a")
+  p:close()
+  check("cli: a script that requires the scorer runs only itself", said, "required\n")
+  os.execute("rm -rf '" .. base .. "'")
+end
+
 -- ---- the generator's output: a whole split or nothing ----
 do
   local h = io.popen("mktemp -d")

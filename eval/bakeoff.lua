@@ -779,9 +779,16 @@ end
 
 ------------------------------------------------------------------------------
 
--- Run as a script. Loaded as a module (by the tests), it exports its
--- scratch allocator and the episodes mode.
-if arg and arg[0] and arg[0]:match("bakeoff%.lua$") then
+-- Run as a script, whatever the file is named (a symlink, a copy): the
+-- chunk lua was asked to run is this one exactly when its source is the
+-- script's path. Required or loaded by another script, it only exports.
+local function isScript()
+  return arg ~= nil and arg[0] ~= nil and debug.getinfo(1, "S").source == "@" .. arg[0]
+end
+
+-- Loaded as a module (by the tests), it exports its scratch allocator and
+-- the episodes mode.
+if isScript() then
   local args = parseArgs(arg)
   local mode = args.positional[1] or "run"
   if mode == "run" then

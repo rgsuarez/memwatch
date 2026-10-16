@@ -602,7 +602,14 @@ function M.main(argv)
     #eps, a.out, counts.runaway, counts.savable, counts.late, noStep, refused))
 end
 
-if arg and arg[0] and arg[0]:match("gen%-episodes%.lua$") then
+-- Run as a script, whatever the file is named (a symlink, a copy): the
+-- chunk lua was asked to run is this one exactly when its source is the
+-- script's path. Required or loaded by another script, it only exports.
+local function isScript()
+  return arg ~= nil and arg[0] ~= nil and debug.getinfo(1, "S").source == "@" .. arg[0]
+end
+
+if isScript() then
   M.main(arg)
 end
 

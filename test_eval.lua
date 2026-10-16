@@ -1851,9 +1851,11 @@ do
   check("runner scratch: each is a directory", os.execute("test -d '" .. a .. "' && test -d '" .. b .. "'") == true, true)
   os.execute("rmdir '" .. a .. "' '" .. b .. "'")
   -- An existing output file is refused before anything runs, never truncated.
+  -- An episode with an id (checked before the claim) and a step with no
+  -- snapshot (the run fails on it only after the claim).
   local epDir = bk.privateDir()
   local ef = assert(io.open(epDir .. "/a.json", "w"))
-  ef:write("not json\n")
+  ef:write('{"id":"a","steps":[{"t":0}]}\n')
   ef:close()
   local out = os.tmpname()
   local f = assert(io.open(out, "w"))
@@ -2128,6 +2130,18 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   local _, okTpl, _, fTpl, saidTpl = run("completion", chat, "tpl", nil, "FAKE_TEMPLATE=" .. sq("not json"))
   check("runner: an /apply-template reply with no prompt fails the run",
     okTpl == false and fTpl == false and saidTpl:find("gave no prompt", 1, true) ~= nil, true)
+  local noIdDir = root .. "/eps-noid"
+  os.execute("mkdir -p '" .. noIdDir .. "'")
+  local noIdEp = lfm.jsonDecode(lfm.jsonEncode(ep))
+  noIdEp.id = nil
+  local nif = assert(io.open(noIdDir .. "/x.json", "w"))
+  nif:write(lfm.jsonEncode(noIdEp), "\n")
+  nif:close()
+  local _, okNoId, _, fNoId, saidNoId = run("chat", chat, "noid", nil, nil, noIdDir)
+  check("runner: an episode file with no id is refused before any row",
+    okNoId == false and fNoId == false and saidNoId:find("carries no episode id", 1, true) ~= nil, true)
+  local _, okTwice, _, fTwice = run("chat", chat, "twice", "--timeout 5 --timeout 6")
+  check("runner: a flag given twice is refused", okTwice == false and fTwice == false, true)
   local _, okRetryArg = run("chat", chat, "badretries", "--retries -1")
   check("runner: a negative --retries is refused", okRetryArg, false)
   -- A flag the mode would not send is refused before any row.

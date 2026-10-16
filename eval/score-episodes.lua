@@ -699,7 +699,7 @@ function M.loadDir(dir)
       -- and the sort all read it.
       if type(ep.id) ~= "string" or ep.id == "" then
         p:close()
-        error(string.format("%s/%s carries no episode id", dir, name), 0)
+        error(string.format("%s/%s carries no episode id (ids are non-empty strings)", dir, name), 0)
       end
       local fp = M.replayPrint(ep)
       local first = byId[ep.id] or byPrint[fp]

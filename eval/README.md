@@ -166,15 +166,18 @@ that decision.
   (a bad flag, a set it cannot read, decisions that do not answer the
   episodes). `controls` exits 1 when a control fails, 2 when the set is
   undecidable or underpowered, and 3 on a refusal. A result file
-  (`--out`) is this run's or nothing: the path is cleared before the run,
-  so an earlier result never stands after a refusal or a failed write, and
-  the new one is written whole and renamed into place. A split holds each episode once: a
+  (`--out`) is this run's or nothing: once the arguments parse, the path is
+  cleared before anything else (a path that cannot be cleared refuses the
+  run, and a flag given twice is refused), so an earlier result never
+  stands after a refusal or a failed write; the new one is written whole
+  and renamed into place. A split holds each episode once: a
   directory with the same episode twice (a copied file, or the episode
   under another id) is refused, since a copy would count twice toward the
   decisive size. Two episodes are the same when their trajectories are:
   the same steps, alert changes, per-tick headroom and labels, whatever
   their ids, their template or their alerts' numbering. Every episode
-  must carry an id.
+  must carry an id: the scorer refuses a file without one, and so does
+  the runner, before it claims its output.
 - `bakeoff.lua episodes` records a model's decision at every decision point
   through the production builders (`--api chat|systemone|completion`), and
   `score-episodes.lua` replays the rows through the proposed wait rail, the

@@ -590,6 +590,15 @@ local function episodesMode(args)
   end
   local files = listScenarios(dir)
   assert(#files > 0, "no episodes found in " .. dir)
+  -- Every row names its episode, so every episode file must carry an id (a
+  -- non-empty string, as the generator writes and the scorer requires),
+  -- checked before the output is claimed.
+  for _, fname in ipairs(files) do
+    local ep = lfm.jsonDecode(readFile(dir .. "/" .. fname) or "")
+    if type(ep) ~= "table" or type(ep.id) ~= "string" or ep.id == "" then
+      error(string.format("%s/%s carries no episode id (ids are non-empty strings)", dir, fname), 0)
+    end
+  end
   local systemPrompt = lfm.buildSystemPrompt({ variant = variant })
   local key = readKey(args)
   -- One run's decisions per file, reserved atomically in its directory

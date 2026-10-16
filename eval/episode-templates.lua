@@ -11,7 +11,10 @@
 -- climb on which the detector first tagged the offender, a grace window
 -- before t = 0; w0 is the footprint before that climb; age0 is the
 -- process's age at t = 0, at least the grace window, the climb and two
--- quiet ticks (the generator refuses a younger one).
+-- quiet ticks (the generator refuses a younger one); graceRate (MB/s,
+-- optional) is the growth through the grace window, by default the first
+-- phase's rate. A history must fit the machine: at most 90% of it
+-- available before the climb (the generator refuses more).
 -- The sealed evaluation set is generated from a DIFFERENT, private template
 -- set, so nothing here can leak into the held-out oracle.
 

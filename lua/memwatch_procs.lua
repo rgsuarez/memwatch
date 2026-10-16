@@ -105,11 +105,18 @@ function M.parsePsList(text)
   return list
 end
 
--- Human name for a comm path: the basename. Title compaction beyond that is
--- core.shortName's job.
+-- Human name for a comm path: the basename (a comm that ends in "/" is kept
+-- whole). Title compaction beyond that is core.shortName's job. Found by a
+-- backward byte scan, linear in the comm: a process can give itself any comm
+-- of any length, and a backtracking pattern over a long run without a slash
+-- costs time quadratic in it, on the tick that names the pid.
 function M.friendlyName(comm)
   if not comm or comm == "" then return "?" end
-  return comm:match("([^/]+)$") or comm
+  local n = #comm
+  if comm:byte(n) == 47 then return comm end
+  local b = n
+  while b > 0 and comm:byte(b) ~= 47 do b = b - 1 end
+  return comm:sub(b + 1)
 end
 
 local function memValMB(num, unit)

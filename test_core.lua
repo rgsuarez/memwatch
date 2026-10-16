@@ -574,6 +574,23 @@ check("kill: uid reason", whyUid, "not your process")
 local _, whyDeny = core.killAllowed({ pid = 500, uid = UID, comm = "Finder" }, UID, 999)
 check("kill: denylist reason", whyDeny, "protected process")
 check("kill: nil proc denied", (core.killAllowed(nil, UID, 999)), false)
+-- Linear in the name: a process can give itself any comm, of any length,
+-- and a backtracking pattern over a long run would stall the tick.
+do
+  local t0 = os.clock()
+  check("friendlyName: a long run before the last slash", procs.friendlyName(("a"):rep(40000) .. "/x"), "x")
+  check("shortName: a long whitespace run", core.shortName("a" .. (" "):rep(40000) .. "b"),
+    "a" .. (" "):rep(12) .. "\u{2026}")
+  local okK, whyK = core.killAllowed({ pid = 4242, uid = UID, comm = ("a"):rep(40000) .. "/WindowServer" }, UID, 999)
+  check("kill: a long path's basename is still the one denied", okK == false and whyK == "protected process", true)
+  check("name helpers: read in linear time", os.clock() - t0 < 0.25, true)
+  -- The same answers as before on ordinary names.
+  check("friendlyName: a comm ending in a slash is kept whole", procs.friendlyName("dir/"), "dir/")
+  check("shortName: a helper suffix after any whitespace is stripped", core.shortName("Slack \t Helper (GPU)"), "Slack")
+  check("shortName: Helper not after whitespace is kept", core.shortName("xHelper y"), "xHelper y")
+  check("kill: a comm ending in a slash names no denied process",
+    (core.killAllowed({ pid = 4243, uid = UID, comm = "/System/WindowServer/" }, UID, 999)), true)
+end
 
 -- ---- LFM: JSON codec (trust-boundary parser; adversarial floor) ----
 local lfm = require("memwatch_lfm")

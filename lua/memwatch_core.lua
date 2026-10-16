@@ -315,6 +315,14 @@ end
 -- adjudicator. It is an explicit fifth argument, NOT a cfg field, because
 -- cfg here is a full replace (cfg = cfg or M.cfg), so a partial cfg table
 -- would silently drop the denylist. Returns allowed, reason.
+-- A comm's basename: its trailing run without a slash ("" when it ends in
+-- one), by a backward byte scan, linear in the comm whatever it holds.
+local function commBase(comm)
+  local b = #comm
+  while b > 0 and comm:byte(b) ~= 47 do b = b - 1 end
+  return comm:sub(b + 1)
+end
+
 function M.killAllowed(proc, ownUid, selfPid, cfg, protectedPids)
   cfg = cfg or M.cfg
   if not proc or not proc.pid then return false, "no process" end
@@ -322,7 +330,7 @@ function M.killAllowed(proc, ownUid, selfPid, cfg, protectedPids)
   if selfPid and proc.pid == selfPid then return false, "own process" end
   if protectedPids and protectedPids[proc.pid] then return false, "protected pid (memwatch)" end
   if proc.uid ~= ownUid then return false, "not your process" end
-  local base = (proc.comm or ""):match("([^/]+)$") or ""
+  local base = commBase(proc.comm or "")
   if cfg.kill.deny[base] then return false, "protected process" end
   return true, "ok"
 end
@@ -354,10 +362,28 @@ M.DOT = "\u{25CF}" -- ● geometric circle (not an emoji)
 
 local TITLE_NAME_MAX = 14
 
+local function isSpace(c) return c == 32 or (c >= 9 and c <= 13) end
+
+-- The name up to its first whitespace run followed by "Helper" (a helper
+-- process's suffix), or the whole name. By plain finds and byte scans:
+-- linear in the name, where a backtracking pattern costs time quadratic in
+-- a long whitespace run.
+local function stripHelper(name)
+  local from = 1
+  while true do
+    local p = name:find("Helper", from, true)
+    if not p then return name end
+    local q = p - 1
+    while q >= 1 and isSpace(name:byte(q)) do q = q - 1 end
+    if q < p - 1 then return name:sub(1, q) end
+    from = p + 1
+  end
+end
+
 -- Compact a process name for the menu bar: strip helper suffixes, cap length.
 function M.shortName(name)
   if not name or name == "" then return nil end
-  name = name:gsub("%s+Helper.*$", "")
+  name = stripHelper(name)
   if #name > TITLE_NAME_MAX then
     name = name:sub(1, TITLE_NAME_MAX - 1) .. "\u{2026}"
   end

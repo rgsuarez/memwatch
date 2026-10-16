@@ -189,8 +189,10 @@ end
 -- status, so a failed request never reads a stale reply. Returns the body
 -- and the attempt's wall ms, or nil, the attempt's wall ms, why, and whether
 -- the request is worth trying again (rate limiting, a server error, or a
--- connection refused, timed out or dropped, or a transfer cut short). A
--- timeout took at least the time allowed, whatever curl reports. A 2xx with
+-- connection refused, timed out or dropped, or a transfer cut short). An
+-- attempt's time is the time curl reports; a timeout that reports none took
+-- the time allowed. (curl can time out early, under a connect timeout of its
+-- own configuration, and then reports how long it really took.) A 2xx with
 -- an empty body is no reply either. curl runs in the C locale, so its timing
 -- never prints with a decimal comma.
 local RETRYABLE_CURL = { [7] = true, [18] = true, [28] = true, [52] = true, [55] = true, [56] = true }
@@ -210,7 +212,7 @@ local function postOnce(url, body, reqPath, respPath, hdr, timeout)
   local exit = tonumber(line:match("exit=(%d+)"))
   local wall, code = line:match("^%s*([%d%.,]+)%s+(%d%d%d)")
   local ms = wall and math.floor((tonumber((wall:gsub(",", "."))) or 0) * 1000) or 0
-  if exit == 28 then ms = math.max(ms, math.floor(timeout * 1000)) end
+  if exit == 28 and not wall then ms = math.floor(timeout * 1000) end
   if exit ~= 0 then return nil, ms, "curl exit " .. tostring(exit), RETRYABLE_CURL[exit] == true end
   code = tonumber(code)
   if not code then return nil, ms, "no HTTP status", false end
@@ -225,16 +227,18 @@ end
 -- is no answer of the model's: recorded as an invalid reply it would stand as
 -- the deterministic freeze, which scores a runaway as caught. A request worth
 -- trying again is tried retries more times, waiting retryWait seconds, then
--- twice that, and so on. Returns the body, the wall ms the answer took
--- (every attempt and every wait, so a retried request never reads faster
--- than it was: the latency gate reads this), and the number of attempts.
+-- twice that, and so on. Returns the body, the wall ms the server took over
+-- every attempt (so a retried request never reads faster than it was: the
+-- latency gate reads this), the number of attempts, and the ms this runner
+-- waited between them, apart (its own backoff, a flag, is no latency of the
+-- model's).
 local function postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait)
   retries, retryWait = retries or 2, retryWait or 2
-  local total = 0
+  local total, waited = 0, 0
   for attempt = 0, retries do
     local resp, ms, why, again = postOnce(url, body, reqPath, respPath, hdr, timeout)
     total = total + ms
-    if resp then return resp, total, attempt + 1 end
+    if resp then return resp, total, attempt + 1, waited end
     if not again or attempt == retries then
       -- A 4xx other than rate limiting is the server refusing the request
       -- (the key, the URL, the API); anything else is a server error.
@@ -247,7 +251,7 @@ local function postJson(url, body, reqPath, respPath, hdr, timeout, retries, ret
     local wait = math.floor(retryWait * 2 ^ attempt)
     if wait > 0 then
       os.execute("sleep " .. string.format("%d", wait))
-      total = total + wait * 1000
+      waited = waited + wait * 1000
     end
   end
 end
@@ -357,7 +361,7 @@ local function runMode(args)
         retries, retryWait)
     end
     local userContent = assert(lfm.serializeSnapshot(scenario.snapshot, { redactNames = redact }))
-    local respBody, wallMs, attempts = ask(userContent)
+    local respBody, wallMs, attempts, waitMs = ask(userContent)
     if attempts > 1 then counts.retried = (counts.retried or 0) + 1 end
 
     local raw, perr = lfm.parseResponse(respBody)
@@ -435,7 +439,8 @@ local function runMode(args)
     -- with raw names, so the comparison is between cases shown the same way;
     -- these extra rows feed G1 alone and no other count.
     if redact and (scenario.class == "extreme-runaway" or scenario.class == "ambiguous-hog") then
-      local cBody = ask(assert(lfm.serializeSnapshot(scenario.snapshot, { redactNames = false })))
+      local cBody, _, cTries = ask(assert(lfm.serializeSnapshot(scenario.snapshot, { redactNames = false })))
+      if cTries > 1 then counts.retried = (counts.retried or 0) + 1 end
       local cRaw = lfm.parseResponse(cBody)
       local cVerdict = cRaw and lfm.validateVerdict(cRaw) or nil
       rows[#rows + 1] = { id = scenario.id, class = scenario.class, injection_control = true,
@@ -450,7 +455,7 @@ local function runMode(args)
       over_danger = overRaw, under_danger = underRaw, over_danger_effective = overEff,
       over_danger_freeze = overFreeze,
       confidence = verdict and verdict.confidence or 0,
-      wall_ms = wallMs, attempts = attempts,
+      wall_ms = wallMs, attempts = attempts, wait_ms = waitMs,
       parse_error = (not raw) and tostring(perr) or nil,
     }
     io.write(string.format("%-16s %-22s raw=%-9s eff=%-9s %s %dms\n",
@@ -489,17 +494,19 @@ local function runMode(args)
     tok_s_median = percentile(tokRates, 0.50),
     server_mb_max = counts.serverMBMax > 0 and counts.serverMBMax or nil,
     -- Requests that needed more than one attempt (their wall time counts
-    -- every attempt and wait).
+    -- every attempt; the waits between are each row's wait_ms).
     retried = counts.retried or 0,
     rows = rows,
   }
   local partial = out .. ".partial-" .. tag
-  local okWrite, writeErr = pcall(writeFile, partial, assert(lfm.jsonEncode(result)) .. "\n")
+  local okWrite, writeErr = pcall(function()
+    writeFile(partial, assert(lfm.jsonEncode(result)) .. "\n")
+    assert(os.rename(partial, out))
+  end)
   if not okWrite then
     os.remove(partial)
     error(writeErr, 0)
   end
-  assert(os.rename(partial, out))
   io.write(string.format(
     "\n%s/%s: gold=%.3f acc=%.3f over-danger=%.3f under=%d postRailOver=%d inj=%d/%d valid=%.3f p50=%dms p95=%dms\n-> %s\n",
     label, variant, result.gold_rate, result.acceptable_rate, result.danger_rate,
@@ -608,7 +615,7 @@ local function episodesMode(args)
     for _, fname in ipairs(files) do
       local ep = assert(lfm.jsonDecode(readFile(dir .. "/" .. fname)))
       for _, st in ipairs(ep.steps) do
-        local body, tmplMs, tmplTries
+        local body, tmplMs, tmplTries, tmplWait
         if api == "systemone" then
           body = assert(lfm.systemOneBody(st.snapshot, { model = args.model }))
         elseif api == "completion" then
@@ -616,7 +623,7 @@ local function episodesMode(args)
           local msgs = assert(lfm.jsonEncode({ messages = lfm.jsonArray({
             { role = "system", content = systemPrompt }, { role = "user", content = user } }) }))
           local tmpl
-          tmpl, tmplMs, tmplTries = postJson(server .. "/apply-template", msgs, reqPath, tmplPath, hdr, timeout,
+          tmpl, tmplMs, tmplTries, tmplWait = postJson(server .. "/apply-template", msgs, reqPath, tmplPath, hdr, timeout,
             retries, retryWait)
           local doc = lfm.jsonDecode(tmpl)
           -- The template is the server's, not the model's: a reply with no
@@ -633,7 +640,7 @@ local function episodesMode(args)
             maxTokens = tonumber(args.max_tokens) or 128, schema = true, model = args.model,
             temperature = tonumber(args.temperature), reasoningEffort = args.reasoning_effort }))
         end
-        local resp, wallMs, attempts = postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait)
+        local resp, wallMs, attempts, waitMs = postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait)
         local action, pWait, err
         if api == "systemone" then
           local v, perr = lfm.parseSystemOne(resp)
@@ -645,7 +652,7 @@ local function episodesMode(args)
           else
             err = perr
           end
-          wallMs, attempts = wallMs + tmplMs, attempts + tmplTries
+          wallMs, attempts, waitMs = wallMs + tmplMs, attempts + tmplTries, waitMs + tmplWait
         else
           local raw, perr = lfm.parseResponse(resp)
           local v = raw and lfm.validateVerdict(raw) or nil
@@ -659,7 +666,7 @@ local function episodesMode(args)
         -- it answered (the scorer computes the same: score-episodes.lua,
         -- M.stepHash).
         assert(of:write(assert(lfm.jsonEncode({ episode = ep.id, t = st.t, action = action or "freeze",
-          pWait = pWait, valid = action ~= nil, wall_ms = wallMs, attempts = attempts,
+          pWait = pWait, valid = action ~= nil, wall_ms = wallMs, attempts = attempts, wait_ms = waitMs,
           variant = variant, api = api, model = args.model, label = label, run = runId,
           snapshotHash = lfm.snapshotHash(assert(lfm.jsonEncode(st.snapshot))),
           error = err and tostring(err):sub(1, 120) or nil })), "\n"))

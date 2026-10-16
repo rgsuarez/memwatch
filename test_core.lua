@@ -1290,6 +1290,13 @@ do
       if lfm.categorize(n) ~= "system" then notSystem[#notSystem + 1] = n .. " -> " .. lfm.categorize(n) end
     end
     check("cat: Apple's daemon families read as system", table.concat(notSystem, "; "), "")
+    -- A user's process that carries a daemon token mid-name is not system.
+    local lookalikes = { "clouddrive-sync", "x-cloudd-leak", "my-launchd-helper", "backup-spotlight-index" }
+    local claimed = {}
+    for _, n in ipairs(lookalikes) do
+      if lfm.categorize(n) == "system" then claimed[#claimed + 1] = n end
+    end
+    check("cat: a token mid-name does not make a process system", table.concat(claimed, "; "), "")
   end
   -- Linear in the name: a process can give itself any name, of any length,
   -- and a backtracking pattern over a long run would stall the tick.

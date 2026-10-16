@@ -3316,6 +3316,8 @@ do
     (lfm.parseTokenProbs(tpReply("w", { { "w", 0.7 }, { "fr", 0.3 } })) or {}).action, "wait")
   check("tokenprob parse: its alternatives count by the option they start",
     math.abs(((lfm.parseTokenProbs(tpReply("w", { { "w", 0.7 }, { "fr", 0.3 } })) or {}).pWait or -1) - 0.7) < 1e-6, true)
+  check("tokenprob parse: a letter that starts no option counts for none",
+    (lfm.parseTokenProbs(tpReply("w", { { "w", 0.3 }, { "x", 0.4 }, { "a", 0.3 } }))), nil)
   check("tokenprob parse: a two-character fused piece",
     (lfm.parseTokenProbs(tpReply('"te', { { '"te', 0.6 }, { '"w', 0.4 } }, { '{"', "action", '":' })) or {}).action, "terminate")
   check("tokenprob parse: the option closed by its quote in one token",

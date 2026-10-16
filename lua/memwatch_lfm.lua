@@ -742,7 +742,12 @@ end
 -- the start of the word a tokenizer cut. Any cut start names exactly one
 -- option, since their first letters differ (w, f, t), so even a one-letter
 -- piece decides. A longer word that merely begins like one ("waiting",
--- "freedom") is none of them.
+-- "freedom") is none of them. Accepted ambiguity: among the raw candidates
+-- (not grammar-constrained), a one- or two-letter piece might begin some
+-- other word; the raw distribution cannot tell, so it is credited to the
+-- option it starts. The chosen token is safe (the grammar completes it to
+-- an option), and the parse refuses when the options carry under half the
+-- mass, which bounds what such credit can move.
 -- quoted: the token also carries the value's opening quote (a tokenizer
 -- that fuses the two).
 local OPTION_WORDS = { "wait", "freeze", "terminate" }

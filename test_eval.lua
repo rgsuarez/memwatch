@@ -1244,6 +1244,19 @@ dofile("eval/score-episodes.lua")
   check("cli: an empty file at --out is named as no gate result, and kept", okEmpty == false
     and tostring(errEmpty):find("it is not a gate result", 1, true) ~= nil and stillThere ~= nil, true)
   os.remove(emptyOut)
+  -- A FIFO at --out is refused at once, never opened (an open would block
+  -- with no writer), and kept. The alarm turns a hang into a failure.
+  do
+    local fifoOut = outFile .. "-fifo.json"
+    os.execute("mkfifo " .. q(fifoOut))
+    local fh = io.popen("perl -e 'alarm 20; exec @ARGV' " .. gateCmd .. " --candidate always-freeze --out " .. q(fifoOut)
+      .. " 2>&1; echo \"exit=$?\"")
+    local fifoSaid = fh:read("a")
+    fh:close()
+    check("cli: a FIFO at --out is refused at once, and kept", fifoSaid:find("exit=3", 1, true) ~= nil
+      and fifoSaid:find("it is not a regular file", 1, true) ~= nil and os.execute("test -p " .. q(fifoOut)) == true, true)
+    os.remove(fifoOut)
+  end
   os.remove(epAtOut)
   -- --out names a gate's result; the controls and tau write none.
   local okCtlOut, errCtlOut = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev, "--out", outFile })
@@ -1504,6 +1517,18 @@ printf '0.010 %s' "$status"
     if lf2 then lf2:close() end
     check("runner: the gates refuse a contradiction, the league untouched", gatesSaid:find("contradict each other", 1, true) ~= nil
       and gatesSaid:find("exit=0", 1, true) == nil and leagueNow == '{"league":[],"earlier":true}\n', true)
+  end
+  -- A FIFO at a run's --out is refused at once, never opened, and kept.
+  do
+    local fifoOut = root .. "/fifo.json"
+    os.execute("mkfifo '" .. fifoOut .. "'")
+    local fh = io.popen(string.format("PATH='%s':\"$PATH\" perl -e 'alarm 20; exec @ARGV' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1; echo \"exit=$?\"", stubDir, corpus, fifoOut))
+    local fifoSaid = fh:read("a")
+    fh:close()
+    check("runner: a FIFO at --out is refused at once, and kept", fifoSaid:find("it is not a regular file", 1, true) ~= nil
+      and fifoSaid:find("exit=0", 1, true) == nil and os.execute("test -p '" .. fifoOut .. "'") == true, true)
+    os.remove(fifoOut)
   end
   os.remove(pidOut)
   -- Only a run result is ever cleared: --out naming an input, a file that is

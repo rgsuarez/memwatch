@@ -358,6 +358,13 @@ end
 local CLEAR_READ_MAX = 1048576
 local function isRunResult(doc) return type(doc.label) == "string" and type(doc.rows) == "table" end
 local function clearResult(path)
+  -- Opening a FIFO blocks (and a socket or a device is no result either),
+  -- so a path that is one is refused before anything opens it.
+  local q = shellQuote(path)
+  if os.execute(string.format("test -p %s || test -S %s || test -c %s || test -b %s", q, q, q, q)) == true then
+    error(string.format("cannot clear %s: it is not a regular file; only a run result is cleared,"
+      .. " so remove it or name another path", path), 0)
+  end
   local f, oerr, ocode = io.open(path, "r")
   if not f and ocode == 2 then return end
   local text, rerr

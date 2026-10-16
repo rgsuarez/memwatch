@@ -1177,17 +1177,23 @@ dofile("eval/score-episodes.lua")
   check("cli: an --out given twice is refused, clearing neither path",
     twice == 3 and exists(saved) and exists(current), true)
   os.remove(saved); os.remove(current)
+  -- A path that cannot be cleared: a directory with something in it (which
+  -- no one, root included, removes with a file's unlink).
   local locked = outFile .. "-locked"
-  os.execute("mkdir -p " .. q(locked))
-  writePass(locked .. "/result.json")
-  os.execute("chmod 555 " .. q(locked))
-  local lh = io.popen(gateCmd .. " --candidate always-freeze --out " .. q(locked .. "/result.json") .. " 2>&1; echo \"exit=$?\"")
+  os.execute("mkdir -p " .. q(locked .. "/inside"))
+  local lh = io.popen(gateCmd .. " --candidate always-freeze --out " .. q(locked) .. " 2>&1; echo \"exit=$?\"")
   local lockedSaid = lh:read("a")
   lh:close()
-  os.execute("chmod 755 " .. q(locked))
   check("cli: a result that cannot be cleared refuses the run, and says so",
     lockedSaid:find("exit=3", 1, true) ~= nil and lockedSaid:find("cannot clear", 1, true) ~= nil, true)
   os.execute("rm -rf " .. q(locked))
+  -- --out names a gate's result; the controls and tau write none.
+  local okCtlOut, errCtlOut = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev, "--out", outFile })
+  check("cli: --out is refused where nothing writes one",
+    okCtlOut == false and tostring(errCtlOut):find("--out applies to gate only", 1, true) ~= nil, true)
+  local okBogus, errBogus = pcall(sc.main, { "gate", "--dir", held, "--bogus", "1", "--bogus", "2" })
+  check("cli: an unknown flag is called unknown, even given twice",
+    okBogus == false and tostring(errBogus):find("unknown argument --bogus", 1, true) ~= nil, true)
   check("cli: the harness's control, writing elsewhere, exits 2",
     exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
       .. " --candidate always-freeze --out " .. q(outFile)), 2)

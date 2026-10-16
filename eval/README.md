@@ -173,7 +173,7 @@ that decision.
   cleared before anything else (a path that cannot be cleared refuses the
   run, and a flag given twice is refused), so an earlier result never
   stands after a refusal or a failed write; the new one is written whole
-  and renamed into place. A split holds each episode once: a
+  and renamed into place. `--out` applies to `gate` only. A split holds each episode once: a
   directory with the same episode twice (a copied file, or the episode
   under another id) is refused, since a copy would count twice toward the
   decisive size. Two episodes are the same when their trajectories are:

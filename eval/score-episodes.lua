@@ -859,6 +859,9 @@ end
 -- CLI
 ------------------------------------------------------------------------------
 
+local KNOWN_FLAGS = { ["--dir"] = true, ["--fit-dir"] = true, ["--candidate"] = true, ["--out"] = true,
+                      ["--tree-depth"] = true, ["--decisions"] = true, ["--key"] = true, ["--tau"] = true,
+                      ["--prevalence"] = true }
 local function parse(argv)
   local a = { cmd = argv[1] }
   local seen = {}
@@ -871,6 +874,7 @@ local function parse(argv)
     if type(k) == "string" and k:match("^%-%-") and (v == nil or v:match("^%-%-")) then
       error(k .. " needs a value", 0)
     end
+    if not KNOWN_FLAGS[k] then error("unknown argument " .. tostring(k), 0) end
     if seen[k] then error(tostring(k) .. " given twice", 0) end
     seen[k] = true
     local function number(x) return assert(tonumber(x), k .. " must be a number, not " .. tostring(x)) end
@@ -1015,8 +1019,9 @@ end
 
 -- Clear a result path before a run writes one: already absent is fine
 -- (errno 2, no such file), but a path that cannot be cleared (permissions,
--- a directory) refuses the run, since an earlier result left there would
--- read as this run's.
+-- a directory with something in it) refuses the run, since an earlier
+-- result left there would read as this run's. (An empty directory is
+-- removed, as os.remove removes one.)
 function M.clearResult(path)
   local ok, err, code = os.remove(path)
   if not ok and code ~= 2 then
@@ -1038,6 +1043,9 @@ function M.main(argv)
   -- fails to write, so once the arguments parse, the path is cleared before
   -- anything else. (A command line that does not parse touches nothing.)
   if a.cmd == "gate" and a.out then M.clearResult(a.out) end
+  -- Only the gate writes a result file: --out elsewhere would name a path
+  -- nothing writes, and a stale gate result there would stand unclaimed.
+  assert(a.out == nil or a.cmd == "gate", "--out applies to gate only")
   assert(a.dir, "--dir is required")
   local eps = M.loadDir(a.dir)
   assert(#eps > 0, "no episodes in " .. a.dir)

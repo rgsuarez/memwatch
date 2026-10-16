@@ -12,7 +12,8 @@
 --     --model kimi-k2.6 --api-key-file ~/.lcp/keys/kimi --timeout 90 \
 --     --variant taxonomy --max-tokens 256
 --   The key rides an @file curl header (never argv, never ps-visible) from a
---   private directory removed on every exit; --api-key-env VAR reads it from
+--   private directory, removed when the run returns or raises (a killing
+--   signal skips that cleanup); --api-key-env VAR reads it from
 --   the environment instead of a file. No server pid means footprint reads
 --   0, which is honest for a remote brain. Names are redacted as production
 --   redacts them, except in the injection suite (--raw-names: all raw).
@@ -150,14 +151,19 @@ local function withAuthHeader(key, fn)
   if not key then return fn(nil) end
   local dir = privateDir()
   local hdr = dir .. "/auth"
-  local f = assert(io.open(hdr, "w"))
-  f:write("Authorization: Bearer " .. key .. "\n")
-  f:close()
-  os.execute("chmod 600 " .. shellQuote(hdr))
-  local ok, err = pcall(fn, hdr)
+  -- Everything after the directory exists, the header write included, runs
+  -- inside the cleanup, and fn's results come back as on the keyless path.
+  local ok, a, b = pcall(function()
+    local f = assert(io.open(hdr, "w"))
+    f:write("Authorization: Bearer " .. key .. "\n")
+    f:close()
+    os.execute("chmod 600 " .. shellQuote(hdr))
+    return fn(hdr)
+  end)
   os.remove(hdr)
   os.execute("rmdir " .. shellQuote(dir))
-  if not ok then error(err, 0) end
+  if not ok then error(a, 0) end
+  return a, b
 end
 
 -- One POST with curl, gated on curl's own exit status so a failed request
@@ -212,7 +218,8 @@ local function runMode(args)
   local reqPath = "eval/tmp/req-" .. tag .. ".json"
   local respPath = "eval/tmp/resp-" .. tag .. ".json"
   -- Remote-endpoint auth: see withAuthHeader (the key never reaches a
-  -- command line, and its header file is removed on every exit path).
+  -- command line, and its header file is removed when the run returns or
+  -- raises; a killing signal skips that).
   local apiKey = readKey(args)
   local curlTimeout = tonumber(args.timeout) or 60
 
@@ -438,9 +445,12 @@ local function episodesMode(args)
   -- truncated, even by a run racing for the same path.
   os.execute("mkdir -p " .. shellQuote(out:match("^(.*)/[^/]*$") or "."))
   if not reserveOutput(out) then
-    error(out .. " exists or cannot be created; name another --out or remove it", 0)
+    error(out .. " exists or cannot be created; name another --out, or remove it"
+      .. " (a file left by an interrupted run can be removed)", 0)
   end
-  -- From here every exit removes the reservation on failure. This
+  -- From here a failure that raises removes the reservation. A signal that
+  -- kills the process (Ctrl-C, SIGTERM) skips that cleanup, as it does the
+  -- auth header's, and leaves the file, perhaps with partial rows. This
   -- invocation's own private scratch directory: two runs never share a
   -- request or a reply, whatever their label, API or start second.
   local okScratch, scratch = pcall(privateDir)
@@ -739,4 +749,5 @@ if arg and arg[0] and arg[0]:match("bakeoff%.lua$") then
   end
 end
 
-return { privateDir = privateDir, reserveOutput = reserveOutput, episodes = episodesMode }
+return { privateDir = privateDir, reserveOutput = reserveOutput, withAuthHeader = withAuthHeader,
+         episodes = episodesMode }

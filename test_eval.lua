@@ -869,6 +869,101 @@ do
   os.execute("rm -rf '" .. dir .. "' '" .. bad .. "' '" .. noEps .. "' '" .. epDir .. "'")
 end
 
+-- ---- the runner's key handling and its three request paths ----
+do
+  local bk = require("bakeoff")
+  -- The header file exists, private, only while the run does; it goes on
+  -- return and on error, and the run's own results come back either way.
+  local seen = {}
+  local r1, r2 = bk.withAuthHeader("sk-test-123", function(hdr)
+    local hf = assert(io.open(hdr, "r"))
+    seen.line = hf:read("l")
+    hf:close()
+    local st = io.popen("stat -f %Lp '" .. hdr .. "'")
+    seen.mode = st:read("l")
+    st:close()
+    seen.path = hdr
+    return "a", "b"
+  end)
+  check("auth: the header carries the key, during the run", seen.line, "Authorization: Bearer sk-test-123")
+  check("auth: private to its owner", seen.mode, "600")
+  check("auth: removed after the run", io.open(seen.path, "r") == nil, true)
+  check("auth: the run's results come back", r1 .. r2, "ab")
+  local errPath
+  local okErr = pcall(bk.withAuthHeader, "sk-test-123", function(hdr) errPath = hdr; error("boom") end)
+  check("auth: an error still removes it", okErr == false and io.open(errPath, "r") == nil, true)
+  check("auth: no key, no header, the same results", select(2, bk.withAuthHeader(nil, function(h) return h, "x" end)), "x")
+
+  -- The three request paths end to end, through a stub curl that answers
+  -- as each server would (and once with garbage).
+  local root = bk.privateDir()
+  local stubDir, epDir = root .. "/bin", root .. "/eps"
+  os.execute("mkdir -p '" .. stubDir .. "' '" .. epDir .. "'")
+  local stub = assert(io.open(stubDir .. "/curl", "w"))
+  stub:write([[#!/usr/bin/env bash
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w|-m|-X|-H|-d) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+case "$url" in
+  */v1/chat/completions) body="$FAKE_CHAT" ;;
+  */v1/systemone) body='{"model":"d1","answers":{"action":{"type":"choice","choice":"freeze","probabilities":{"freeze":0.8,"wait":0.2},"confidence":0.4}}}' ;;
+  */apply-template) body='{"prompt":"PROMPT"}' ;;
+  */completion) body="$FAKE_COMPLETION" ;;
+  *) exit 7 ;;
+esac
+printf '%s' "$body" > "$out"
+printf '0.010'
+]])
+  stub:close()
+  os.execute("chmod +x '" .. stubDir .. "/curl'")
+  local tpl = { id = "T-run", names = { "rg" }, avail0 = 25, w0 = 3000, age0 = 120, peak0 = 9000,
+                compress = 1.5, phases = { { dur = 10, rate = 150 } }, after = "exit", releaseAt = 30 }
+  local ep = gen.episode(tpl, 1, "run")
+  local ef = assert(io.open(epDir .. "/" .. ep.id .. ".json", "w"))
+  ef:write(lfm.jsonEncode(ep), "\n")
+  ef:close()
+  local verdict = '{"action":"wait","process_class":"runaway","confidence":0.9,"rationale":"x"}'
+  local chat = lfm.jsonEncode({ choices = lfm.jsonArray({ { message = { content = verdict } } }) })
+  local function pos(tok, cands)
+    local tl = {}
+    for _, c in ipairs(cands) do tl[#tl + 1] = { token = c[1], logprob = math.log(c[2]) } end
+    return { token = tok, logprob = 0, top_logprobs = lfm.jsonArray(tl) }
+  end
+  local completion = lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray({
+    pos('{"', { { '{"', 0.99 } }), pos("action", { { "action", 0.99 } }), pos('":"', { { '":"', 0.99 } }),
+    pos("wait", { { "wait", 0.7 }, { "free", 0.3 } }) }) })
+  local function sq(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
+  local function run(api, chatBody, tag)
+    local out = root .. "/rows-" .. tag .. ".jsonl"
+    os.execute(string.format("PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_COMPLETION=%s lua eval/bakeoff.lua episodes "
+      .. "--server http://stub --label t --dir %s --api %s --out %s >/dev/null 2>&1",
+      sq(stubDir), sq(chatBody), sq(completion), sq(epDir), api, sq(out)))
+    local rows = {}
+    local rf = io.open(out, "r")
+    if rf then
+      for line in rf:lines() do rows[#rows + 1] = lfm.jsonDecode(line) end
+      rf:close()
+    end
+    return rows[1] or {}
+  end
+  local rc, rs = run("chat", chat, "chat"), run("systemone", chat, "systemone")
+  local rp, rbad = run("completion", chat, "completion"), run("chat", "not json", "bad")
+  check("runner: a chat verdict is recorded as the model's action", rc.action, "wait")
+  check("runner: with no probability (a chat verdict carries none)", rc.action ~= nil and rc.pWait == nil, true)
+  check("runner: a decision model's option probability is kept", rs.action == "freeze" and rs.pWait, 0.2)
+  check("runner: a local model's token probability is kept",
+    rp.action == "wait" and math.abs((rp.pWait or -1) - 0.7) < 1e-6, true)
+  check("runner: an invalid reply is recorded as the deterministic freeze, marked invalid",
+    rbad.action == "freeze" and rbad.valid == false and rbad.error ~= nil, true)
+  os.execute("rm -rf '" .. root .. "'")
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

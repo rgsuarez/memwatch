@@ -3,10 +3,13 @@
 # real download.
 #
 # Runs a copy of get-model.sh in a throwaway tree whose registry has one
-# synthetic row, with a stub curl first on PATH that serves fixture files
-# (or fails, as curl -f does, when FAKE_FAIL names part of the URL). The
-# first case is the positive control: the same setup that must refuse in
-# the later cases fetches and verifies when nothing is wrong.
+# synthetic row, with a stub curl first on PATH that serves fixture files.
+# The stub answers as curl does: FAKE_FAIL (part of a URL) is no network at
+# all (status 000); FAKE_HTTP=<file>=<code> is an HTTP answer without the
+# file (with -f, exit 22); FAKE_PARTIAL=<file> breaks the transfer after a
+# few bytes (exit 18). The first case is the positive control: the same
+# setup that must refuse in the later cases fetches and verifies when
+# nothing is wrong.
 #
 # Usage: bash scripts/test-get-model.sh
 set -euo pipefail
@@ -30,18 +33,29 @@ localLic="$tmp/root/licenses/owner_repo.LICENSE"
 
 cat > "$tmp/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-out=""; url=""
+out=""; url=""; wfmt=""; fail=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
-    -*) shift ;;
+    -w) wfmt="$2"; shift 2 ;;
+    --*) shift ;;
+    -*) [[ "$1" == *f* ]] && fail=1; shift ;;
     *) url="$1"; shift ;;
   esac
 done
-if [ -n "${FAKE_FAIL:-}" ] && [[ "$url" == *"$FAKE_FAIL"* ]]; then exit 22; fi
-src="$FAKE_SRV/${url##*/}"
-[ -f "$src" ] || exit 22
+name="${url##*/}"
+status() { [ -n "$wfmt" ] && printf '%s' "$1"; return 0; }
+if [ -n "${FAKE_FAIL:-}" ] && [[ "$url" == *"$FAKE_FAIL"* ]]; then status 000; exit 6; fi
+if [ -n "${FAKE_HTTP:-}" ] && [ "${FAKE_HTTP%%=*}" = "$name" ]; then
+  status "${FAKE_HTTP#*=}"; [ "$fail" = 1 ] && exit 22; exit 0
+fi
+src="$FAKE_SRV/$name"
+if [ ! -f "$src" ]; then status 404; [ "$fail" = 1 ] && exit 22; exit 0; fi
+if [ -n "${FAKE_PARTIAL:-}" ] && [ "$FAKE_PARTIAL" = "$name" ]; then
+  head -c 9 "$src" > "$out"; exit 18
+fi
 cp "$src" "$out"
+status 200
 STUB
 chmod +x "$tmp/bin/curl"
 
@@ -78,6 +92,7 @@ check "  before any download" test ! -e "$models/m.gguf"
 printf 'synthetic license text\n' > "$tmp/srv/LICENSE"
 
 expect 0 "offline, a previously verified local license stands" FAKE_FAIL=LICENSE
+expect 1 "an HTTP answer without the license is refused, not taken for offline" FAKE_HTTP=LICENSE=404
 rm -f "$localLic" "$models/m.gguf"
 expect 1 "offline with no verified local license, refused" FAKE_FAIL=LICENSE
 check "  before any download" test ! -e "$models/m.gguf"
@@ -86,6 +101,11 @@ printf 'truncated' > "$tmp/srv/m.gguf"
 expect 1 "a corrupt or partial download is refused"
 check "  and deleted" test ! -e "$models/m.gguf"
 printf 'synthetic weights\n' > "$tmp/srv/m.gguf"
+expect 22 "an HTTP error on the weights is refused" FAKE_HTTP=m.gguf=503
+check "  and leaves nothing behind" test ! -e "$models/m.gguf" -a ! -e "$models/m.gguf.partial"
+expect 18 "an interrupted transfer is refused" FAKE_PARTIAL=m.gguf
+check "  and leaves nothing where the runtime looks" test ! -e "$models/m.gguf"
+check "  nor its partial file" test ! -e "$models/m.gguf.partial"
 
 mkdir -p "$models"
 printf 'stale bytes\n' > "$models/m.gguf"

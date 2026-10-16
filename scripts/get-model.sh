@@ -44,8 +44,13 @@ else
   LIC="$ROOT/licenses/$(printf '%s' "$REPO" | tr '/' '_').LICENSE"
 fi
 LICTMP="$(mktemp)"
-trap 'rm -f "$LICTMP"' EXIT
-if curl -fsSL -o "$LICTMP" "https://huggingface.co/$REPO/resolve/main/LICENSE"; then
+PART=""
+trap 'rm -f "$LICTMP" ${PART:+"$PART"}' EXIT
+# The HTTP status tells an answer from no network: only no response at all
+# (000) falls back to the verified local copy. Any other status (a license
+# removed, renamed or gated upstream) is a refusal.
+CODE="$(curl -sSL -o "$LICTMP" -w '%{http_code}' "https://huggingface.co/$REPO/resolve/main/LICENSE" 2>/dev/null || true)"
+if [ "$CODE" = "200" ]; then
   GOTLICSHA="$(shasum -a 256 "$LICTMP" | awk '{print $1}')"
   if [ "$GOTLICSHA" != "$LICSHA" ]; then
     echo "get-model: $REPO license text hash mismatch (expected $LICSHA, got $GOTLICSHA)" >&2
@@ -53,8 +58,11 @@ if curl -fsSL -o "$LICTMP" "https://huggingface.co/$REPO/resolve/main/LICENSE"; 
     exit 1
   fi
   if [ "$LIC" != "$CANON" ]; then cp "$LICTMP" "$LIC"; fi
+elif [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
+  echo "get-model: upstream answered HTTP $CODE for the $REPO license; refusing - re-review it" >&2
+  exit 1
 elif [ -f "$LIC" ] && [ "$(shasum -a 256 "$LIC" | awk '{print $1}')" = "$LICSHA" ]; then
-  echo "get-model: could not re-fetch the $REPO license; using the verified local copy" >&2
+  echo "get-model: could not reach upstream for the $REPO license; using the verified local copy" >&2
 else
   echo "get-model: cannot fetch or verify the $REPO license; refusing" >&2
   exit 1
@@ -80,17 +88,23 @@ if [ "$SHA" = "PENDING" ] && [ "${ALLOW_UNPINNED:-0}" != "1" ]; then
   exit 1
 fi
 
+# The download lands beside the final path and takes its name only once
+# verified: an interrupted transfer (set -e stops at curl) leaves nothing
+# where the runtime looks, and the EXIT trap removes the partial file.
+PART="$OUT.partial"
+rm -f "$PART"
 echo "get-model: fetching $FILE from $REPO"
-curl -fL --progress-bar -o "$OUT" "$URL"
-GOT="$(shasum -a 256 "$OUT" | awk '{print $1}')"
+curl -fL --progress-bar -o "$PART" "$URL"
+GOT="$(shasum -a 256 "$PART" | awk '{print $1}')"
 if [ "$SHA" = "PENDING" ]; then
+  mv "$PART" "$OUT"
   echo "get-model: ALLOW_UNPINNED set; computed $GOT (NOT verified)" >&2
   echo "get-model: pin it in scripts/models.tsv before shipping this label" >&2
 else
   if [ "$GOT" != "$SHA" ]; then
-    rm -f "$OUT"
     echo "get-model: sha256 mismatch for $FILE (expected $SHA, got $GOT); deleted" >&2
     exit 1
   fi
+  mv "$PART" "$OUT"
   echo "get-model: verified $FILE ($SHA)"
 fi

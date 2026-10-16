@@ -426,20 +426,28 @@ local function episodesMode(args)
     "--api must be chat, systemone or completion")
   local variant = args.variant or "discriminate"
   local out = args.out or string.format("eval/results/episodes-%s-%s.jsonl", label, api)
-  -- One run's decisions per file, reserved atomically: another run's file
-  -- is never truncated, even by a run racing for the same path.
-  if not reserveOutput(out) then
-    error(out .. " exists or cannot be created; name another --out or remove it", 0)
-  end
   local timeout = tonumber(args.timeout) or 60
-  os.execute("mkdir -p eval/results eval/tmp")
+  -- Everything that can refuse does so before the output is claimed, so a
+  -- refusal never leaves a reserved, empty file behind to block a retry.
   local files = listScenarios(dir)
   assert(#files > 0, "no episodes found in " .. dir)
   local systemPrompt = lfm.buildSystemPrompt({ variant = variant })
-  -- This invocation's own private scratch directory: two runs never share
-  -- a request or a reply, whatever their label, API or start second.
   local key = readKey(args)
-  local scratch = privateDir()
+  -- One run's decisions per file, reserved atomically in its directory
+  -- (made if absent, as on a fresh checkout): another run's file is never
+  -- truncated, even by a run racing for the same path.
+  os.execute("mkdir -p " .. shellQuote(out:match("^(.*)/[^/]*$") or "."))
+  if not reserveOutput(out) then
+    error(out .. " exists or cannot be created; name another --out or remove it", 0)
+  end
+  -- From here every exit removes the reservation on failure. This
+  -- invocation's own private scratch directory: two runs never share a
+  -- request or a reply, whatever their label, API or start second.
+  local okScratch, scratch = pcall(privateDir)
+  if not okScratch then
+    os.remove(out)
+    error(scratch, 0)
+  end
   local reqPath, respPath = scratch .. "/req.json", scratch .. "/resp.json"
   local tmplPath = scratch .. "/tmpl.json"
   local url = server .. ((api == "systemone") and "/v1/systemone"

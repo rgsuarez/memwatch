@@ -603,11 +603,15 @@ do
   check("runner scratch: each is a directory", os.execute("test -d '" .. a .. "' && test -d '" .. b .. "'") == true, true)
   os.execute("rmdir '" .. a .. "' '" .. b .. "'")
   -- An existing output file is refused before anything runs, never truncated.
+  local epDir = bk.privateDir()
+  local ef = assert(io.open(epDir .. "/a.json", "w"))
+  ef:write("not json\n")
+  ef:close()
   local out = os.tmpname()
   local f = assert(io.open(out, "w"))
   f:write("another run's rows\n")
   f:close()
-  local ok, err = pcall(bk.episodes, { positional = {}, label = "x", dir = "eval/episodes-none", out = out })
+  local ok, err = pcall(bk.episodes, { positional = {}, label = "x", dir = epDir, out = out })
   local kept = io.open(out, "r")
   local body = kept and kept:read("a")
   if kept then kept:close() end
@@ -639,7 +643,25 @@ do
   if left then left:close() end
   check("runner output: a failed run raises", okRun, false)
   check("runner output: and leaves no partial rows", left == nil, true)
-  os.execute("rm -rf '" .. dir .. "' '" .. bad .. "'")
+  -- Refusals come before the claim, so none leaves a reserved file behind.
+  local noEps = bk.privateDir()
+  local claim = dir .. "/never.jsonl"
+  local okNoEps = pcall(bk.episodes, { positional = {}, label = "x", dir = noEps, out = claim })
+  local okNoKey = pcall(bk.episodes, { positional = {}, label = "x", dir = epDir, out = claim,
+                                       api_key_env = "MEMWATCH_TEST_UNSET_KEY_VAR" })
+  local stale = io.open(claim, "r")
+  if stale then stale:close() end
+  check("runner output: an empty episode set is refused", okNoEps, false)
+  check("runner output: so is a missing key", okNoKey, false)
+  check("runner output: and neither leaves a claimed file", stale == nil, true)
+  -- On a fresh checkout the output's directory does not exist yet: the run
+  -- makes it, and only then fails on the malformed episode.
+  local fresh = dir .. "/new/sub/rows.jsonl"
+  local okFresh, errFresh = pcall(bk.episodes, { positional = {}, label = "x", dir = epDir, out = fresh })
+  check("runner output: a missing output directory is made, not refused",
+    okFresh == false and tostring(errFresh):find("cannot be created", 1, true) == nil
+      and os.execute("test -d '" .. dir .. "/new/sub'") == true, true)
+  os.execute("rm -rf '" .. dir .. "' '" .. bad .. "' '" .. noEps .. "' '" .. epDir .. "'")
 end
 
 if fails == 0 then

@@ -230,13 +230,33 @@ do
     end
     return eps
   end
+  -- Held to the controls' own rule: the share's one-sided lower bound.
   local quick = setmetatable({ sizeDatasets = 200 }, { __index = sc.cfg })
-  local sp, sn, st = sc.nullSize(shape(17, 5), quick)
-  check("sign-flip: its size at sealed's shape is at most 5%", st == 17 and sp / sn <= 0.05, true)
-  local dp, dn, dt = sc.nullSize(shape(10, 10), quick)
-  check("sign-flip: and at dev's", dt == 10 and dp / dn <= 0.05, true)
+  local function sizeOk(passes, n) return 1 - sc.cpUpper(n - passes, n) <= 0.05 end
+  local sp, sa, sn, st = sc.nullSize(shape(17, 5), quick)
+  check("sign-flip: at sealed's shape, its size per template is within 5%", st == 17 and sizeOk(sp, sn), true)
+  check("sign-flip: and in aggregate only", sizeOk(sa, sn), true)
+  local dp, da, dn, dt = sc.nullSize(shape(10, 10), quick)
+  check("sign-flip: at dev's shape, per template", dt == 10 and sizeOk(dp, dn), true)
+  check("sign-flip: and in aggregate only", sizeOk(da, dn), true)
+  -- Templates differing either way, equal only in aggregate: the flips'
+  -- spread includes each template's squared mean, so the test is
+  -- conservative there.
+  check("sign-flip: equal only in aggregate, it passes less often than per template", sa + da < sp + dp, true)
+  -- The aggregate null's shifts: one template of each pair worse and the
+  -- other better, by amounts whose weighted sum is zero; an odd template
+  -- out, or a pair whose shift would leave the rates' room, unshifted.
+  local coin = 0
+  local function alternate() coin = coin + 1; return coin % 2 == 1 and 0.25 or 0.75 end
+  local sh = sc.nullShifts({ "A", "B", "C", "D", "E" }, { A = 5, B = 5, C = 4, D = 8, E = 5 }, alternate, 0.3)
+  check("sign-flip: the aggregate null shifts each pair both ways, summing to zero",
+    sh.A == 0.3 and sh.B == -0.3 and sh.A * 5 + sh.B * 5 == 0, true)
+  check("sign-flip: a pair whose shift would leave the rates' room stays unshifted, as does an odd template",
+    sh.C == -0.3 and math.abs(sh.D - 0.15) < 1e-12 and sh.E == 0, true)
+  local wide = sc.nullShifts({ "A", "B" }, { A = 10, B = 5 }, alternate, 0.3)
+  check("sign-flip: so does a pair whose second shift is too wide", wide.A == 0 and wide.B == 0, true)
   check("sign-flip: the size check counts only savable templates",
-    select(3, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
+    select(4, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----
@@ -2321,16 +2341,24 @@ do
   sc.candidates["always-freeze"] = sc.candidates.oracle
   local okC1, c1 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.cfg.powerTarget, sc.candidates["always-freeze"] = savedTarget, savedFreeze
-  -- A beat test passing no-better candidates too often fails the controls.
+  -- A beat test passing no-better candidates too often, under either null,
+  -- fails the controls; a share above 5% whose lower bound is not above it
+  -- (22 of 400: 5.5%, lower bound about 3.8%) does not.
   local savedNull = sc.nullSize
-  sc.nullSize = function() return 400, 400, 10 end
+  sc.nullSize = function() return 400, 0, 400, 10 end
   local okCS, cs = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = function() return 0, 400, 400, 10 end
+  local okCK, ck = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = function() return 22, 22, 400, 10 end
+  local okCB, cb = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.nullSize = savedNull
   print = quiet3
   check("decidable: controls that hold exit 0", okC0 and c0, 0)
   check("decidable: an underpowered set exits 2", okC2 and c2, 2)
   check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
-  check("decidable: so does a beat test that passes no-better candidates", okCS and cs, 1)
+  check("decidable: so does a beat test that passes no-better candidates per template", okCS and cs, 1)
+  check("decidable: or in aggregate only", okCK and ck, 1)
+  check("decidable: but not a share whose lower bound stays within 5%", okCB and cb, 0)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a failing gate exits 1", okFail and failStatus, 1)
   -- One runaway short of the floor, the same set decides nothing.

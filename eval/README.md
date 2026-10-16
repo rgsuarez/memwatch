@@ -169,13 +169,19 @@ that decision.
   5%, and the wrongful-freeze rate beats the best deterministic baseline
   that meets that bound: the paired improvement's one-sided sign-flip
   p-value over templates (one sign per template, since a template's
-  jittered copies are not independent) is at most 5%. The test is exact,
-  so a candidate no better than the baseline passes at most 5% of the
-  time at any template count, and four or fewer templates can never pass;
-  the bootstrapped 95% lower bound is reported beside it as a diagnostic,
-  since with few templates it passes such a candidate more often than its
-  nominal rate. `controls` also measures the test's size at the set's
-  shape, on null candidates, and fails if it is clearly above 5%. The
+  jittered copies are not independent) is at most 5%. Its null is that
+  the candidate's wrongful-freeze probability equals the baseline's on
+  every template. A template's savables are independent episodes and each
+  paired difference is -1, 0 or +1, so under that null each template's
+  sum is symmetric about zero and the test is exact at any template count;
+  under the weaker null of an equal rate in aggregate only, it is
+  conservative. Four or fewer savable templates can never pass. A
+  template the set lacks is its
+  coverage to guard. The bootstrapped 95% lower bound is reported beside
+  the test as a diagnostic, since with few templates it passes a
+  no-better candidate more often than its nominal rate. `controls` also
+  measures the test's size at the set's shape under both nulls, and fails
+  if either is clearly above 5%. The
   baselines are always-freeze, a category rule, a time-to-exhaustion rule
   and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
   required, holding runaways and savables and none of the evaluated

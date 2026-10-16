@@ -23,11 +23,21 @@
 -- is at most 5% AND the candidate's wrongful-freeze rate beats the best
 -- deterministic baseline that itself meets the miss bound: the paired
 -- improvement's one-sided sign-flip p-value over templates must be at most
--- 5%. The test is exact, so a candidate no better than the baseline passes
--- at most 5% of the time, at any template count; with four or fewer
--- templates it cannot pass at all. The paired improvement's 95% lower bound,
--- bootstrapped by template, is reported beside it as a diagnostic only:
--- with few templates it passes a no-better candidate more often than that.
+-- 5%. Its null: the candidate's wrongful-freeze probability equals the
+-- baseline's on every template. A template's savables are independent
+-- episodes and each paired difference is -1, 0 or +1, so under that null
+-- each difference, and each template's sum, is symmetric about zero, and
+-- the test is exact at any template count; four or fewer templates cannot
+-- pass at all. Under the
+-- weaker null of an equal rate in aggregate only (templates differing
+-- either way), the flips' spread includes each template's squared mean, so
+-- the test is conservative. `controls` measures its size under both. A
+-- difference skewed within a template (all its savables worse together,
+-- rarely) needs savables that are not independent, which the generator
+-- does not produce, and a template the set lacks is its coverage to guard.
+-- The paired improvement's 95% lower bound, bootstrapped by template, is
+-- reported beside the test as a diagnostic only: with few templates it
+-- passes a no-better candidate more often than its nominal 5%.
 --
 -- Usage (from the repo root):
 --   lua eval/score-episodes.lua gate --dir <episodes> --fit-dir <dev episodes> \
@@ -60,7 +70,7 @@ M.cfg = {
   bootstrap    = 2000,
   bootSeed     = 20261015,
   sizeDatasets = 400,    -- null datasets the controls' size check draws
-  sizeShare    = 0.3,    -- the share of a null template's savables that differ
+  sizeShift    = 0.3,    -- the aggregate null's per-template shift in the candidate's rate
   noisyFlip    = 0.10,
   powerShare   = 0.50,   -- the power control's share of the oracle's improvement
   powerTarget  = 0.80,
@@ -261,14 +271,17 @@ function M.quantileIndex(conf, b)
 end
 
 -- The sign-flip permutation test of the paired improvement, one-sided. Under
--- the null that the candidate is no better than the baseline, each
--- template's summed difference is as likely negative as positive, so the
--- p-value is the share of sign flips (one sign per template, since jittered
--- copies of one template are not independent) whose pooled sum is at least
--- the observed one. The sums are whole numbers, so the flips' distribution
--- is convolved exactly, at any template count. A template summing to zero
--- changes no flip's sum and is left out. With k templates the smallest p is
--- 1/2^k, so four or fewer cannot reach 0.05. Returns the p-value and k.
+-- the sharp null that the candidate is no different from the baseline (each
+-- template's paired outcomes exchangeable), each template's summed
+-- difference is as likely negative as positive, so the p-value is the share
+-- of sign flips (one sign per template, since jittered copies of one
+-- template are not independent) whose pooled sum is at least the observed
+-- one. The sums are whole numbers, so the flips' distribution is convolved
+-- exactly, at any template count. A template summing to zero changes no
+-- flip's sum and is left out. With k templates the smallest p is 1/2^k, so
+-- four or fewer cannot reach 0.05. (Under a null equal only in mean, with
+-- the differences skewed, the test is approximate: the controls measure its
+-- size under such a null too.) Returns the p-value and k.
 function M.signFlipP(prs)
   local byTpl, tpls = {}, {}
   for _, pr in ipairs(prs) do
@@ -843,7 +856,7 @@ function M.compare(cand, base, cfg)
     end
   end
   local lower, point = M.pairedLowerBound(prs, cfg)
-  local p, k = M.signFlipP(prs)
+  local p, k = M.signFlipP(prs, cfg)
   return lower, point, p, k
 end
 
@@ -987,12 +1000,36 @@ function M.powerControl(eps, baselines, bestName, trials, cfg)
 end
 
 -- The beat test's size at a set's shape: candidates no better than the
--- baseline pass it in what share of cfg.sizeDatasets null datasets. Each
--- null template's savables differ from the baseline by one shared sign, a
--- fair coin's, on cfg.sizeShare of them, so each template is a cluster, as
--- the test treats it. The sign-flip test is exact, so the share is at most
--- 1 - confidence but for sampling: a monitor of the test at the shape it is
--- read at. Returns the passes, the datasets and the savable templates.
+-- baseline pass it in what share of cfg.sizeDatasets null datasets. As the
+-- generator draws them, a template's savables are independent episodes, and
+-- the baseline's and the candidate's wrongful freezes on each are draws at
+-- their per-template rates, the baseline's rate drawn per template. Two
+-- nulls:
+--   per template: the candidate's rate equals the baseline's on every
+--     template, so each paired difference, and each template's sum, is
+--     symmetric about zero: the null the test is exact under;
+--   aggregate: the candidate is worse by cfg.sizeShift on one template of
+--     each pair and better on the other, by the shift that keeps the pair's
+--     expected difference at zero: equal only in aggregate, every template's
+--     difference skewed, where the test should be conservative.
+-- Returns the passes under each, the datasets and the savable templates.
+-- The aggregate null's shifts in the candidate's rate, per template: in each
+-- pair of templates, one worse by shift and the other better by the amount
+-- that keeps the pair's expected difference at zero (which side, a fair
+-- coin's). A pair whose second shift would leave the rates' room is left
+-- unshifted, and so is an odd template out.
+function M.nullShifts(tpls, count, r, shift)
+  local out = {}
+  for _, t in ipairs(tpls) do out[t] = 0 end
+  for i = 1, #tpls - 1, 2 do
+    local t1, t2 = tpls[i], tpls[i + 1]
+    local s1 = r() < 0.5 and shift or -shift
+    local s2 = -s1 * count[t1] / count[t2]
+    if math.abs(s2) <= 0.35 then out[t1], out[t2] = s1, s2 end
+  end
+  return out
+end
+
 function M.nullSize(eps, cfg)
   cfg = cfg or M.cfg
   local count, tpls = {}, {}
@@ -1003,19 +1040,31 @@ function M.nullSize(eps, cfg)
     end
   end
   table.sort(tpls)
-  local r = rng(cfg.bootSeed + 1)
-  local passes = 0
-  for _ = 1, cfg.sizeDatasets do
-    local prs = {}
-    for _, t in ipairs(tpls) do
-      local sign = r() < 0.5 and 1 or -1
-      for _ = 1, count[t] do
-        prs[#prs + 1] = { template = t, d = (r() < cfg.sizeShare) and sign or 0 }
+  local function size(aggregate)
+    local r = rng(cfg.bootSeed + (aggregate and 2 or 1))
+    local passes = 0
+    for _ = 1, cfg.sizeDatasets do
+      -- Each template's baseline rate, and the candidate's shift from it.
+      local base, shift = {}, {}
+      for _, t in ipairs(tpls) do
+        base[t] = aggregate and (0.35 + 0.3 * r()) or (0.1 + 0.8 * r())
+        shift[t] = 0
       end
+      if aggregate then shift = M.nullShifts(tpls, count, r, cfg.sizeShift) end
+      local prs = {}
+      for _, t in ipairs(tpls) do
+        local cand = base[t] + shift[t]
+        for _ = 1, count[t] do
+          local b = r() < base[t] and 1 or 0
+          local c = r() < cand and 1 or 0
+          prs[#prs + 1] = { template = t, d = b - c }
+        end
+      end
+      if M.signFlipP(prs) <= 1 - cfg.confidence then passes = passes + 1 end
     end
-    if M.signFlipP(prs) <= 1 - cfg.confidence then passes = passes + 1 end
+    return passes
   end
-  return passes, cfg.sizeDatasets, #tpls
+  return size(false), size(true), cfg.sizeDatasets, #tpls
 end
 
 -- What a decisions file holds: rows the runner recorded as invalid replies
@@ -1310,16 +1359,19 @@ function M.main(argv)
         M.cfg.powerShare * 100, gO.bestBaseline, passes, trials, M.cfg.powerTarget * 100,
         powered and "ok" or "UNDERPOWERED"))
       if not powered and status == 0 then status = 2 end
-      -- The beat test's size at this set's shape. A share whose lower bound
-      -- is above 1 - confidence is a test passing no-better candidates too
-      -- often, a failed control.
-      local sizePasses, sizeN, sizeTpls = M.nullSize(eps)
+      -- The beat test's size at this set's shape, under both nulls it is
+      -- claimed for (see M.nullSize). A share whose lower bound is above
+      -- 1 - confidence is a test passing no-better candidates too often, a
+      -- failed control.
+      local perPasses, aggPasses, sizeN, sizeTpls = M.nullSize(eps)
       local alpha = 1 - M.cfg.confidence
-      local sizeLower = 1 - M.cpUpper(sizeN - sizePasses, sizeN)
-      print(string.format("size: candidates no better than the best baseline passed the beat test in %d of %d null"
-        .. " datasets shaped like this set (%d savable templates): %.3f, at most %.3f expected: %s", sizePasses, sizeN,
-        sizeTpls, sizePasses / sizeN, alpha, sizeLower > alpha and "FAILED (anti-conservative)" or "ok"))
-      if sizeLower > alpha then status = 1 end
+      for _, row in ipairs({ { "per template", perPasses }, { "in aggregate only", aggPasses } }) do
+        local lowerShare = 1 - M.cpUpper(sizeN - row[2], sizeN)
+        print(string.format("size: candidates no better than the best baseline %s passed the beat test in %d of %d"
+          .. " null datasets shaped like this set (%d savable templates): %.3f, at most %.3f expected: %s", row[1],
+          row[2], sizeN, sizeTpls, row[2] / sizeN, alpha, lowerShare > alpha and "FAILED (anti-conservative)" or "ok"))
+        if lowerShare > alpha then status = 1 end
+      end
     end
   else
     error(USAGE, 0)

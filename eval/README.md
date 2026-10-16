@@ -144,6 +144,15 @@ that decision.
   threshold chosen on dev (`tau`), and a wait with no probability (a chat
   verdict) is never honored. Candidates are scored on the `discriminate` prompt
   variant.
+- A decisions file is one JSON row per decision point: `episode`, `t`,
+  `action` (`freeze` or `wait`), `pWait` when the model gives one, and
+  `snapshotHash`, the hash of the step's snapshot the row answered
+  (`gate` and `tau` refuse a row without it, or one recorded on another
+  snapshot). A judge's rows can instead carry an opaque `qid` with
+  `p_runaway`, mapped to episode and step by a key file whose rows carry
+  each step's hash. A file holds one run: rows that name different
+  variants, APIs, models, labels or runs (`bakeoff.lua episodes` writes
+  all five) are refused, and so is a decision point recorded twice.
 
 ```
 lua eval/gen-episodes.lua --templates eval/episode-templates.lua --split dev \

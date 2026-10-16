@@ -888,16 +888,6 @@ end
 -- none, so the search starts under the zero-miss size, doubles until a size
 -- meets the bound, then bisects: a small bound costs a few dozen steps, not
 -- one per runaway.
--- The fewest savable templates a set must hold for the beat test to be
--- reachable at all: with k templates its smallest p is 1/2^k, so the set
--- needs the k at which that reaches 1 - confidence (5 at 95%).
-function M.minBeatTemplates(cfg)
-  cfg = cfg or M.cfg
-  local alpha, k = 1 - cfg.confidence, 0
-  while 2 ^ -k > alpha + 1e-12 do k = k + 1 end
-  return k
-end
-
 function M.decisiveRunaways(cfg)
   cfg = cfg or M.cfg
   local bound, conf = cfg.missBound, cfg.confidence
@@ -920,6 +910,18 @@ function M.decisiveRunaways(cfg)
     if meets(mid) then hi = mid else lo = mid end
   end
   return hi
+end
+
+-- The fewest savable templates a set must hold for the beat test to be
+-- reachable at all: with k templates its smallest p is 1/2^k, so the set
+-- needs the k at which that reaches 1 - confidence (5 at 95%, 7 at 99%).
+function M.minBeatTemplates(cfg)
+  cfg = cfg or M.cfg
+  local conf = cfg.confidence
+  assert(type(conf) == "number" and conf > 0 and conf < 1, "the confidence must be between 0 and 1")
+  local alpha, k = 1 - conf, 0
+  while 2 ^ -k > alpha + 1e-12 do k = k + 1 end
+  return k
 end
 
 function M.gate(episodes, candDecide, baselines, cfg)
@@ -1137,12 +1139,17 @@ end
 
 -- Why a gate's set decides nothing, for the operator.
 function M.undecidableWhy(g)
+  local why = {}
   if g.candidate.nRunaway < g.minRunaways then
-    return string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a baseline"
-      .. " missing one can be the comparator: generate more episodes per template", g.candidate.nRunaway, g.minRunaways)
+    why[#why + 1] = string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a"
+      .. " baseline missing one can be the comparator: generate more episodes per template", g.candidate.nRunaway,
+      g.minRunaways)
   end
-  return string.format("this set holds %d savable templates; the beat test can pass only on %d or more (its smallest"
-    .. " p over k templates is 1/2^k): add savable templates", g.savableTemplates, g.minTemplates)
+  if g.savableTemplates < g.minTemplates then
+    why[#why + 1] = string.format("this set holds %d savable templates; the beat test can pass only on %d or more"
+      .. " (its smallest p over k templates is 1/2^k): add savable templates", g.savableTemplates, g.minTemplates)
+  end
+  return table.concat(why, "; also ")
 end
 
 -- What a decisions file holds: rows the runner recorded as invalid replies
@@ -1365,6 +1372,10 @@ function M.main(argv)
       g.flipTemplates or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
       (not g.decisive) and "UNDECIDABLE" or g.pass and "PASS" or "FAIL"))
     if not g.decisive then print(M.undecidableWhy(g)) end
+    if g.decisive and g.bestBaseline and g.flipTemplates < g.minTemplates then
+      print(string.format("the candidate differs from %s on %d savable templates; the beat test can pass only on %d"
+        .. " or more (a tied template is no evidence of a beat)", g.bestBaseline, g.flipTemplates, g.minTemplates))
+    end
     -- 0 pass, 1 fail, 2 a set too small to decide.
     status = (not g.decisive) and 2 or g.pass and 0 or 1
     print("tree baseline (fit on " .. (a.fitDir or a.dir) .. "):\n" .. M.describeTree(tree, "  "))

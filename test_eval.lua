@@ -292,6 +292,9 @@ do
   check("sign-flip: the size check counts only savable templates",
     select(4, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
   check("sign-flip: a set needs five savable templates for the beat to be reachable", sc.minBeatTemplates(), 5)
+  check("sign-flip: seven at 99% and four at 90%",
+    sc.minBeatTemplates({ confidence = 0.99 }) == 7 and sc.minBeatTemplates({ confidence = 0.9 }) == 4, true)
+  check("sign-flip: and a confidence outside (0, 1) is refused", (pcall(sc.minBeatTemplates, { confidence = 1 })), false)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----
@@ -2364,7 +2367,8 @@ do
   check("decidable: and its result file says the set could decide",
     pdoc ~= nil and pdoc.decisive == true and pdoc.pass == true and pdoc.minRunaways == 93, true)
   check("decidable: and records the beat test's p-value and its templates",
-    pdoc ~= nil and type(pdoc.improvementP) == "number" and pdoc.improvementP <= 0.05 and pdoc.flipTemplates >= 5, true)
+    pdoc ~= nil and type(pdoc.improvementP) == "number" and pdoc.improvementP <= 0.05 and pdoc.flipTemplates >= 5
+      and pdoc.savableTemplates == 10 and pdoc.minTemplates == 5, true)
   print = function() end
   local okFail, failStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "always-freeze" })
   -- The controls on a decidable set: 0 when they hold; 2 when the set is too
@@ -2414,6 +2418,11 @@ do
   end
   local gShort = sc.gate(short, sc.candidates.oracle(), baselines)
   check("decidable: one runaway under the floor, the oracle is not passed", gShort.decisive == false and gShort.pass == false, true)
+  check("decidable: and the gate says it needs more runaways",
+    sc.undecidableWhy(gShort):find("runaways", 1, true) ~= nil and sc.undecidableWhy(gShort):find("savable templates", 1, true) == nil, true)
+  local both = sc.undecidableWhy({ candidate = { nRunaway = 80 }, minRunaways = 93, savableTemplates = 4, minTemplates = 5 })
+  check("decidable: short of both floors, it names both", both:find("80 runaways", 1, true) ~= nil
+    and both:find("4 savable templates", 1, true) ~= nil, true)
   -- So does a set with too few savable templates for the beat to be
   -- reachable: four decide nothing, five do.
   local function keepSavableTemplates(nKeep)
@@ -2451,17 +2460,25 @@ do
       end
     end
     table.sort(tpls)
-    local three = {}
-    for _, t in ipairs(tpls) do if wrongIn[t] > 0 and #three < 3 then three[#three + 1] = t end end
-    local inThree = {}
-    for _, t in ipairs(three) do inThree[t] = true end
-    local mix3 = function(st, ep)
-      if inThree[ep.template] and ep.labels.class == "savable" then return oracle(st, ep) end
-      return base(st, ep)
+    local function mixOn(n)
+      local chosen = {}
+      for _, t in ipairs(tpls) do if wrongIn[t] > 0 and #chosen < n then chosen[#chosen + 1] = t; chosen[t] = true end end
+      return #chosen, function(st, ep)
+        if chosen[ep.template] and ep.labels.class == "savable" then return oracle(st, ep) end
+        return base(st, ep)
+      end
     end
+    local n3, mix3 = mixOn(3)
     local g3 = sc.gate(dev, mix3, baselines)
     check("decidable: a beat carried by three templates is no pass, though the bootstrap's bound is above zero",
-      #three == 3 and (g3.improvementLower or 0) > 0 and g3.flipTemplates == 3 and g3.passBeat == false, true)
+      n3 == 3 and (g3.improvementLower or 0) > 0 and g3.flipTemplates == 3 and g3.passBeat == false, true)
+    -- On a set that can decide, a candidate differing from the baseline on
+    -- only four templates fails rather than leaving the set undecided: a
+    -- tied template is no evidence of a beat.
+    local n4, mix4 = mixOn(4)
+    local g4m = sc.gate(dev, mix4, baselines)
+    check("decidable: a candidate differing on four templates of a decisive set fails, not undecided",
+      n4 == 4 and g4m.decisive == true and g4m.flipTemplates == 4 and g4m.pass == false, true)
   end
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)

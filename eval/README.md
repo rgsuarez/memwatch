@@ -113,7 +113,10 @@ that decision.
   exactly: runaway (it
   exhausts the machine at 5% available, or settles at or below the 8%
   starvation line as the snapshot reports it), savable (it resolves within
-  the 120 s deferral bound) or late (excluded).
+  the 120 s deferral bound) or late (excluded). The output must be absent
+  or empty, and a split is published whole or not at all: a template whose
+  sample could not exist (one that would not fit the machine, say) refuses
+  the run, naming the template and the seed.
 - `score-episodes.lua` plays a candidate through each episode the way
   production defers, then applies G7: the one-sided 95% Clopper-Pearson
   upper bound on missed runaways is at most 5%, and the wrongful-freeze

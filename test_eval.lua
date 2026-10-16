@@ -638,6 +638,70 @@ do
   os.execute("rm -rf '" .. base .. "'")
 end
 
+-- ---- the generator's output: a whole split or nothing ----
+do
+  local h = io.popen("mktemp -d")
+  local base = h:read("l")
+  h:close()
+  local function listing(d)
+    local l = io.popen("ls -A '" .. d .. "' 2>/dev/null")
+    local names = {}
+    for f in l:lines() do names[#names + 1] = f end
+    l:close()
+    return names
+  end
+  local tf = base .. "/templates.lua"
+  local f = assert(io.open(tf, "w"))
+  f:write([[
+return {
+  { id = "T-fits", split = "test", class = "runaway", family = "script", names = { "python3" },
+    avail0 = 12, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
+    phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "fits the machine" },
+  { id = "T-overfull", split = "test", class = "runaway", family = "script", names = { "python3" },
+    avail0 = 40, w0 = 30000, age0 = 150, peak0 = 12000, compress = 1,
+    phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "cannot exist" },
+}
+]])
+  f:close()
+  local quiet, said = print, nil
+  print = function(line) said = line end
+  local okBad, errBad = pcall(gen.main, { "--templates", tf, "--split", "test", "--seed", "1",
+                                         "--per-template", "2", "--out", base .. "/bad" })
+  local good = base .. "/good"
+  gen.main({ "--templates", "eval/episode-templates.lua", "--split", "dev", "--seed", "1",
+             "--per-template", "1", "--out", good })
+  local wrote = tonumber(tostring(said):match("^wrote (%d+) episodes"))
+  local okAgain, errAgain = pcall(gen.main, { "--templates", "eval/episode-templates.lua", "--split", "dev",
+                                             "--seed", "2", "--per-template", "1", "--out", good })
+  -- A write that fails partway (an id naming no file) publishes nothing and
+  -- removes its staging directory.
+  local tw = base .. "/slash.lua"
+  local fw = assert(io.open(tw, "w"))
+  fw:write([[
+return {
+  { id = "T/fits", split = "test", class = "runaway", family = "script", names = { "python3" },
+    avail0 = 12, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
+    phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "fits the machine" },
+}
+]])
+  fw:close()
+  local okWrite, errWrite = pcall(gen.main, { "--templates", tw, "--split", "test", "--seed", "1",
+                                             "--per-template", "1", "--out", base .. "/torn" })
+  print = quiet
+  check("generator: a write that fails publishes nothing",
+    okWrite == false and tostring(errWrite):find("nothing published", 1, true) ~= nil, true)
+  check("generator: a sample that cannot exist refuses the run, naming its template and seed",
+    okBad == false and tostring(errBad):find("T-overfull seed 1001", 1, true) ~= nil, true)
+  check("generator: and neither leaves anything behind, published or staged",
+    table.concat(listing(base), ","), "good,slash.lua,templates.lua")
+  local files = listing(good)
+  check("generator: a finished split is published whole", wrote ~= nil and #files == wrote, true)
+  check("generator: an output that is not empty is refused",
+    okAgain == false and tostring(errAgain):find("name a fresh directory", 1, true) ~= nil, true)
+  check("generator: and is left as it was", #listing(good), #files)
+  os.execute("rm -rf '" .. base .. "'")
+end
+
 -- ---- on a set large enough to decide the gate (the documented dev size) ----
 do
   local templates = dofile("eval/episode-templates.lua")

@@ -500,40 +500,75 @@ local function parseArgs(argv)
     local k = argv[i]
     if k == "--templates" then a.templates = argv[i + 1]; i = i + 2
     elseif k == "--split" then a.split = argv[i + 1]; i = i + 2
-    elseif k == "--seed" then a.seed = tonumber(argv[i + 1]); i = i + 2
-    elseif k == "--per-template" then a.per = tonumber(argv[i + 1]); i = i + 2
+    -- Integers only: a float seed ("1.0") would run the stream's arithmetic
+    -- in floating point and yield another set under the same episode ids.
+    elseif k == "--seed" then a.seed = assert(math.tointeger(tonumber(argv[i + 1])), "--seed must be an integer"); i = i + 2
+    elseif k == "--per-template" then
+      a.per = assert(math.tointeger(tonumber(argv[i + 1])), "--per-template must be an integer"); i = i + 2
     elseif k == "--out" then a.out = argv[i + 1]; i = i + 2
     else error("unknown argument " .. tostring(k)) end
   end
   return a
 end
 
+local function quote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+
 function M.main(argv)
   local a = parseArgs(argv)
   assert(a.templates and a.out, "usage: --templates <file> --out <dir> [--split s --seed n --per-template k]")
   local templates = dofile(a.templates)
-  os.execute("mkdir -p '" .. a.out:gsub("'", "") .. "'")
+  local out = a.out:gsub("/+$", "")
+  -- One set per directory: files already there would merge silently into
+  -- this one, and the scorer reads every episode it finds. The set is
+  -- published by renaming a finished directory onto the output, which
+  -- needs the output absent or empty.
+  local ls = io.popen("ls -A " .. quote(out) .. " 2>/dev/null")
+  local held = ls:read("l")
+  ls:close()
+  if held then error(a.out .. " is not empty; name a fresh directory", 0) end
+  -- Every episode is built before anything is written, so a refusal (a
+  -- template whose sample cannot exist) leaves no partial split behind.
   local counts = { runaway = 0, savable = 0, late = 0 }
-  local n, noStep = 0, 0
+  local eps, noStep = {}, 0
   for _, tpl in ipairs(templates) do
     if tpl.split == nil or tpl.split == a.split then
       for k = 1, a.per do
-        local ep = M.episode(tpl, a.seed * 1000 + k, a.split)
+        local seed = a.seed * 1000 + k
+        local ok, ep = pcall(M.episode, tpl, seed, a.split)
+        if not ok then error(string.format("%s seed %d: %s", tostring(tpl.id), seed, tostring(ep)), 0) end
         if #ep.steps == 0 then
           noStep = noStep + 1   -- no decision point would ever exist; not an episode
         else
-          local enc = assert(lfm.jsonEncode(ep))
-          local f = assert(io.open(a.out .. "/" .. ep.id .. ".json", "w"))
-          f:write(enc, "\n")
-          f:close()
+          eps[#eps + 1] = { id = ep.id, enc = assert(lfm.jsonEncode(ep)) }
           counts[ep.labels.class] = counts[ep.labels.class] + 1
-          n = n + 1
         end
       end
     end
   end
+  assert(#eps > 0, "no episode written: does a template name the split '" .. tostring(a.split) .. "'?")
+  -- Written into a fresh directory beside the output, then renamed onto it:
+  -- the output holds the whole split or nothing. A failure removes the
+  -- staging directory; one left by a killed run is named <out>.partial.*.
+  local parent = out:match("^(.*)/[^/]*$")
+  if parent and parent ~= "" then os.execute("mkdir -p " .. quote(parent)) end
+  local h = io.popen("mktemp -d " .. quote(out .. ".partial.XXXXXX") .. " 2>/dev/null")
+  local stage = h:read("l")
+  h:close()
+  assert(stage and stage ~= "", "could not make a staging directory beside " .. a.out)
+  local ok, err = pcall(function()
+    for _, e in ipairs(eps) do
+      local f = assert(io.open(stage .. "/" .. e.id .. ".json", "w"))
+      assert(f:write(e.enc, "\n"))
+      assert(f:close())
+    end
+    assert(os.rename(stage, out))
+  end)
+  if not ok then
+    os.execute("rm -rf " .. quote(stage))
+    error("writing the split failed, nothing published: " .. tostring(err), 0)
+  end
   print(string.format("wrote %d episodes to %s (runaway %d, savable %d, late %d; %d samples had no decision point)",
-    n, a.out, counts.runaway, counts.savable, counts.late, noStep))
+    #eps, a.out, counts.runaway, counts.savable, counts.late, noStep))
 end
 
 if arg and arg[0] and arg[0]:match("gen%-episodes%.lua$") then

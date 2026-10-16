@@ -108,6 +108,8 @@ function M.row(a)
     },
     snapshot = a.snapshot, snapshotHash = a.snapshotHash,
     identityBasis = a.identityBasis,
+    -- The start was refused because a clock step back is replaying it.
+    identityReplayed = a.identityReplayed == true or nil,
   }
 end
 
@@ -235,6 +237,57 @@ function M.startFromLstart(s, now)
   return { lo = epoch, hi = epoch + 1, etimeSec = now - epoch }
 end
 
+-- The stretch of wall time a step back makes the clock run through again,
+-- from the reading that saw it: { lo, hi }. The step fell somewhere after
+-- the previous reading (prevWall, prevMono), so the stretch runs from the
+-- stepped clock as it read then (prevWall + delta) to the old clock as it
+-- would read now (wall - delta). Without a monotonic reading the time since
+-- the previous reading cannot be bounded (a stalled run loop), so the
+-- stretch is unbounded: it fails closed. Pure.
+function M.replaySpan(prevWall, prevMono, wall, mono, delta)
+  if type(prevWall) ~= "number" or type(wall) ~= "number" or type(delta) ~= "number" then return nil end
+  if type(mono) == "number" and type(prevMono) == "number" then
+    return { lo = prevWall + delta, hi = wall - delta }
+  end
+  return { lo = -math.huge, hi = math.huge }
+end
+
+-- The stretches kept after a new one (`span`) is added. None is dropped:
+-- a process born in a stretch carries its start there for as long as it
+-- lives. Past `max`, the two oldest are merged into the stretch that spans
+-- both: wider, so it refuses more, never less. Returns a new list. Pure.
+function M.addReplay(spans, span, max)
+  local function ok(r) return type(r) == "table" and type(r.lo) == "number" and type(r.hi) == "number" end
+  local out = {}
+  for _, r in ipairs(spans or {}) do if ok(r) then out[#out + 1] = r end end
+  if ok(span) then out[#out + 1] = span end
+  max = tonumber(max) or 16
+  while #out > max and #out >= 2 do
+    local a, b = out[1], out[2]
+    table.remove(out, 1)
+    out[1] = { lo = math.min(a.lo, b.lo), hi = math.max(a.hi, b.hi) }
+  end
+  return out
+end
+
+-- Does a start window overlap one of these stretches? Then it cannot tell
+-- the process it names from the pid's next one. A start before every
+-- stretch (a process older than the step) is untouched. Pure.
+function M.startReplayed(w, spans)
+  if type(w) ~= "table" or type(w.lo) ~= "number" or type(w.hi) ~= "number" then return false end
+  for _, r in ipairs(spans or {}) do
+    if type(r) == "table" and type(r.lo) == "number" and type(r.hi) == "number"
+       and w.hi >= r.lo and w.lo <= r.hi then return true end
+  end
+  return false
+end
+
+-- A start epoch (as ps prints whole seconds: [epoch, epoch + 1]) in one of
+-- these stretches. Pure.
+function M.epochReplayed(epoch, spans)
+  return type(epoch) == "number" and M.startReplayed({ lo = epoch, hi = epoch + 1 }, spans)
+end
+
 -- Is a process with this start epoch (and comm) the observed one?
 -- "different" when the comm differs or the epoch falls outside the
 -- observation's start window. Inside the window it is "same" only when the
@@ -262,7 +315,7 @@ end
 -- only this record, as of its horizon, so a delivery stall, a late timer,
 -- an expired tracker entry, a reused pid or an event from before the
 -- observation cannot change what it reports.
--- a: { pid, comm0, start0, obsAt, weightMB, minSeq, horizons }. minSeq is
+-- a: { pid, comm0, start0, obsAt, weightMB, minSeq, horizons, replays }. minSeq is
 -- the first sampler sequence launched after the observation (nil: decide by
 -- launch time); see foldSample. horizons are the follow-up offsets, whose
 -- machine readings are kept in the record (snapshotHorizons).
@@ -272,7 +325,10 @@ function M.newEvidence(a)
            weight0 = a.weightMB, peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil,
            gone = nil, lastMiss = nil, misses = {}, samples = {}, signals = {},
            touches = 0, touchesUncertain = 0, touchLog = {}, actions = {},
-           frozenLog = {}, clockStep = nil }
+           frozenLog = {}, clockStep = nil,
+           -- the stretches a step back replayed, as of the observation
+           -- (see startReplayed); none recorded is an empty list
+           replays = type(a.replays) == "table" and a.replays or {} }
 end
 
 -- Why the record has no fresh sighting, dated when that became known, so a
@@ -355,6 +411,9 @@ function M.foldSignal(ev, sig)
   if ev.clockStep then return end
   local m = M.matchStart(ev.start0, ev.comm0, sig.startEpoch, sig.comm)
   if m == "different" then return end
+  -- A target started in wall time a step back replayed cannot be told from
+  -- the observed process (see epochReplayed): uncertain, never the same.
+  if m == "same" and M.epochReplayed(sig.startEpoch, ev.replays) then m = "unknown" end
   ev.signals[#ev.signals + 1] = { action = sig.action, at = sig.at, uncertain = (m ~= "same") or nil }
 end
 
@@ -366,6 +425,7 @@ function M.foldTouch(ev, t)
   if ev.clockStep then return end
   local m = M.matchStart(ev.start0, ev.comm0, t and t.startEpoch, t and t.comm)
   if m == "different" then return end
+  if m == "same" and M.epochReplayed(t and t.startEpoch, ev.replays) then m = "unknown" end
   local uncertain = m ~= "same"
   if uncertain then ev.touchesUncertain = ev.touchesUncertain + 1 else ev.touches = ev.touches + 1 end
   ev.touchLog[#ev.touchLog + 1] = { at = t and t.at, uncertain = uncertain or nil }
@@ -550,11 +610,14 @@ end
 -- Does a frozen-ledger entry hold the observed process? From the entry's
 -- bound start time against the observation's start window; nil when that
 -- cannot be told.
-function M.frozenMatches(entry, start0, comm0)
+function M.frozenMatches(entry, start0, comm0, replays)
   if type(entry) ~= "table" then return false end
   -- An entry started in a daylight-saving fold names two epochs: it cannot
-  -- be placed, so it is nil (uncertain), never a confident false.
-  local m = M.matchStart(start0, nil, M.lstartEpochUnambiguous(entry.lstart), nil)
+  -- be placed, so it is nil (uncertain), never a confident false. So is one
+  -- started in wall time a step back replayed (see epochReplayed).
+  local epoch = M.lstartEpochUnambiguous(entry.lstart)
+  local m = M.matchStart(start0, nil, epoch, nil)
+  if m == "same" and M.epochReplayed(epoch, replays) then m = "unknown" end
   if m == "unknown" then return nil end
   return m == "same"
 end

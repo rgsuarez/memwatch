@@ -55,7 +55,8 @@ local sampler = { task = nil, startedAt = 0, at = 0,
 -- and clock.shift, below the state they shift, keep waits whole across a
 -- wall clock stepped back), and the step that counts as one.
 local clock = { wallAt = nil, monoAt = nil, stepSec = 2, stepTotal = 0,
-                depth = 0, pending = 0 }
+                depth = 0, pending = 0,
+                replays = {} }  -- { lo, hi } per step back: the wall time it replays (see observe.addReplay)
 local lastStaleLogAt = 0
 local lastStaleNotifyAt = 0 -- degraded-during-pressure notification cooldown
 local staleNotif = nil     -- the live degraded page: at most one, withdrawn on recovery
@@ -216,7 +217,7 @@ function obs.noteFrozen()
   local ok, err = pcall(function()
     local now = clock.now()
     for _, ev in pairs(obs.pending) do
-      observe.foldFrozen(ev, now, observe.frozenMatches(frozen[ev.pid], ev.start0))
+      observe.foldFrozen(ev, now, observe.frozenMatches(frozen[ev.pid], ev.start0, nil, ev.replays))
     end
   end)
   if not ok then M.logSnapshot("observe-frozen-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
@@ -1653,12 +1654,17 @@ local function onSample(blob, exitCode, launchedAt, seq)
       -- start record (and read as a reuse). Either way the sample is no
       -- evidence of identity.
       local placeable = row and type(row.etimeSec) == "number" and row.etimeSec > 0
+      -- No identity evidence from a table whose launch record is gone (how
+      -- far the clock moved since its launch is unknown), nor from a window
+      -- in wall time a step back replayed: a process born since the step
+      -- can start there, while the observation's age, taken before the step,
+      -- overstates how late the pid's next process could start on this clock.
+      local start1 = placeable and steppedSec ~= nil
+        and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil
+      if start1 and obs.startReplayed(start1, ev.replays) then start1 = nil end
       observe.foldSample(ev, {
         complete = sampler.complete, row = row,
-        -- No identity evidence from a table whose launch record is gone:
-        -- how far the clock moved since its launch is unknown.
-        start1 = placeable and steppedSec ~= nil
-          and procs.startWindow(row.etimeSec, launchedAt, rawDeliveredAt, steppedSec) or nil,
+        start1 = start1,
         weightMB = row and ((e and e.weightMB) or row.rssMB) or nil,
         -- Ordering and the fold's own step check compare the launch with
         -- the observation's time, so they read the launch record the shift
@@ -2147,7 +2153,8 @@ function clock.shift(delta)
       for _, e in pairs(tracker.procs) do
         e.lastSeen, e.extremeUntil = sh(e.lastSeen), sh(e.extremeUntil)
         -- (Its start window is not shifted: it is anchored to the kernel's
-        -- start record, which a step does not move; see procs.startWindow.)
+        -- start record, which a step does not move; see procs.startWindow.
+        -- What a step does to its use as identity: obs.startReplayed.)
         for _, smp in ipairs(e.ring or {}) do smp.t = sh(smp.t) end
       end
     end },
@@ -2219,6 +2226,7 @@ function clock.now()
   local wall = hs.timer.secondsSinceEpoch()
   local mono = hs.timer.absoluteTime and hs.timer.absoluteTime() / 1e9 or nil
   local delta = 0
+  local prevWall, prevMono = clock.wallAt, clock.monoAt
   if clock.wallAt then
     if mono and clock.monoAt then
       delta = (wall - clock.wallAt) - (mono - clock.monoAt)
@@ -2230,6 +2238,18 @@ function clock.now()
   end
   clock.wallAt, clock.monoAt = wall, mono
   if delta < -clock.stepSec then
+    -- The stretch of wall time this step makes the clock run through again
+    -- (see obs.startReplayed). The step fell somewhere after the previous
+    -- reading: the stretch runs from the stepped clock as it read then to
+    -- the old clock as it would read now. Without a monotonic clock the time
+    -- since the previous reading cannot be bounded, so the stretch is
+    -- unbounded (it fails closed).
+    local span = observe.replaySpan(prevWall, prevMono, wall, mono, delta)
+    if span then clock.replays = observe.addReplay(clock.replays, span, 16) end
+    if span and span.lo == -math.huge and not clock.replayBlind then
+      clock.replayBlind = true
+      M.logSnapshot("replay-unbounded:identity-refused-until-reload")
+    end
     if clock.depth > 0 then
       clock.pending = clock.pending + delta
       -- The stamps wait for the frame's end, but what must take no evidence
@@ -3653,6 +3673,11 @@ end
 -- grace expiry) or "synthetic" (memwatch.testObserve). Never forks: the
 -- snapshot is built from tick state, fates come from the latest ps sample
 -- and the frozen ledger, exit-cause evidence from a directory listing.
+-- Whether a start window overlaps a stretch of wall time a step back made
+-- the clock run through again (clock.replays; observe.startReplayed): such a
+-- start identifies nothing.
+function obs.startReplayed(w, spans) return observe.startReplayed(w, spans) end
+
 obs.writeObservation = function(point, offender, now, extra)
   if not obs.enabled or type(offender) ~= "table" then return end
   extra = extra or {}
@@ -3687,6 +3712,16 @@ obs.writeObservation = function(point, offender, now, extra)
     start0 = observe.startFromLstart(extra.lstart, now + clock.pending)
     identityBasis = start0 and "lstart" or "none"
   end
+  -- A start in wall time a step back replayed identifies nothing: a process
+  -- born during the replay can carry the same start, and with ps stalled the
+  -- pid may already hold one under the window of the process it followed
+  -- (obs.startReplayed). Every stretch recorded so far counts, whether or
+  -- not the clock has run past it, and the record keeps them for its
+  -- samples, signals, touches and frozen-ledger reads.
+  local replays = {}
+  for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end
+  local replayed = start0 and obs.startReplayed(start0, replays) or false
+  if replayed then start0, identityBasis = nil, "none" end
   local row = observe.row({
     at = obsIso, session = obs.session, seq = seq, point = point, synthetic = extra.synthetic,
     state = smState.state, kern = lastKern,
@@ -3702,7 +3737,7 @@ obs.writeObservation = function(point, offender, now, extra)
                  peakSlopeMBmin = offender.peakSlopeMBmin, ageSec = offender.ageSec,
                  foreground = foreground },
     snapshot = user, snapshotHash = user and lfm.snapshotHash(user) or nil,
-    identityBasis = identityBasis,
+    identityBasis = identityBasis, identityReplayed = replayed or nil,
   })
   -- An oversize row drops its snapshot, never the row. A row that was not
   -- written gets no follow-ups and no sequence number back.
@@ -3720,8 +3755,9 @@ obs.writeObservation = function(point, offender, now, extra)
   local horizons = extra.horizons or observe.cfg.horizons
   local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
                                    start0 = start0, obsAt = now, weightMB = weight0,
-                                   minSeq = sampler.nextSeq + 1, horizons = horizons })
-  observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))
+                                   minSeq = sampler.nextSeq + 1, horizons = horizons,
+                                   replays = replays })
+  observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0, nil, replays))
   -- Its life is a duration (on the monotonic clock): a step back, which
   -- closes the record, never lengthens it.
   ev.expiresMono = clock.mono() + (horizons[#horizons] or 0) + 600

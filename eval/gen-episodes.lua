@@ -469,9 +469,11 @@ local function snapshotAt(p, k)
     compRate = k.rates.comp,
     frozenCount = p.frozenCount,
     offender = offender,
+    -- The runaway row as production builds it, foreground included, so a
+    -- foreground offender's snapshot agrees with itself.
     runaways = lfm.jsonArray({ { name = p.name, kind = offender.kind, weightMB = offender.weightMB,
                                  slopeMBmin = offender.slopeMBmin, peakSlopeMBmin = offender.peakSlopeMBmin,
-                                 ageSec = offender.ageSec } }),
+                                 ageSec = offender.ageSec, foreground = offender.foreground } }),
   }
 end
 

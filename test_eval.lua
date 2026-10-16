@@ -465,6 +465,13 @@ do
     if not any then dead[#dead + 1] = tpl.id end
   end
   check("policy: every public template yields an episode", table.concat(dead, ","), "")
+  -- The runaway row agrees with the offender on foreground, as production's
+  -- rows do.
+  local fgTpl
+  for _, tpl in ipairs(dofile("eval/episode-templates.lua")) do if tpl.foreground then fgTpl = tpl; break end end
+  local fgStep = gen.episode(fgTpl, 1, "test").steps[1]
+  check("snapshot: a foreground offender's runaway row says so too",
+    fgStep.snapshot.offender.foreground == true and fgStep.snapshot.runaways[1].foreground == true, true)
   -- The history must fit the machine: the offender's physical footprint
   -- plus what is available, at most maxFill of it. The sum is the same at
   -- every tick of a trajectory, so one check at prepare covers the history.

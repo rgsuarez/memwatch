@@ -809,6 +809,22 @@ return {
   fw:close()
   local okWrite, errWrite = pcall(gen.main, { "--templates", tw, "--split", "test", "--seed", "1",
                                              "--per-template", "1", "--out", base .. "/torn" })
+  -- Two templates under one id are refused, not merged into one file.
+  local td = base .. "/dup.lua"
+  local fd = assert(io.open(td, "w"))
+  fd:write([[
+return {
+  { id = "T-twice", split = "test", class = "runaway", family = "script", names = { "python3" },
+    avail0 = 12, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
+    phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "first" },
+  { id = "T-twice", split = "test", class = "savable", family = "script", names = { "python3" },
+    avail0 = 25, w0 = 2000, age0 = 150, peak0 = 12000, compress = 2,
+    phases = { { dur = 10, rate = 150 } }, after = "exit", releaseAt = 30, rationale = "second" },
+}
+]])
+  fd:close()
+  local okDup, errDup = pcall(gen.main, { "--templates", td, "--split", "test", "--seed", "1",
+                                         "--per-template", "1", "--out", base .. "/dup" })
   local tr = base .. "/root.lua"
   local fr = assert(io.open(tr, "w"))
   fr:write([[
@@ -826,6 +842,8 @@ return {
     okWrite == false and tostring(errWrite):find("nothing published", 1, true) ~= nil, true)
   check("generator: a sample that cannot exist refuses the run, naming its template and seed",
     okBad == false and tostring(errBad):find("T-overfull seed 1001", 1, true) ~= nil, true)
+  check("generator: an episode id that repeats is refused",
+    okDup == false and tostring(errDup):find("repeats", 1, true) ~= nil, true)
   check("generator: so is a template whose every name production never freezes",
     okRoot == false and tostring(errRoot):find("never freezes any of its names", 1, true) ~= nil, true)
   local stray = {}

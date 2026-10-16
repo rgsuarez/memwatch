@@ -545,7 +545,7 @@ function M.main(argv)
   -- Every episode is built before anything is written, so a refusal (a
   -- template whose sample cannot exist) leaves no partial split behind.
   local counts = { runaway = 0, savable = 0, late = 0 }
-  local eps, noStep, refused = {}, 0, 0
+  local eps, noStep, refused, seen = {}, 0, 0, {}
   for _, tpl in ipairs(templates) do
     if tpl.split == nil or tpl.split == a.split then
       -- A template none of whose names production's policy would freeze can
@@ -564,6 +564,11 @@ function M.main(argv)
           noStep = noStep + 1   -- no decision point would ever exist; not an episode
           if ep.policyRefused then refused = refused + 1 end
         else
+          -- Two templates under one id would write one file twice, and the
+          -- split would silently hold the second only.
+          if seen[ep.id] then error(string.format("%s seed %d: episode id %s repeats (a template id used twice?)",
+            tostring(tpl.id), seed, ep.id), 0) end
+          seen[ep.id] = true
           eps[#eps + 1] = { id = ep.id, enc = assert(lfm.jsonEncode(ep)) }
           counts[ep.labels.class] = counts[ep.labels.class] + 1
         end

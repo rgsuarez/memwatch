@@ -205,7 +205,8 @@ that decision.
   refused: `--raw-names` and `--no-schema` always, `--variant` other than
   `discriminate` with `--api systemone` (System One sends its own
   instructions), `--model` with `--api completion` (no request names one),
-  and `--temperature` and `--reasoning-effort` with any API but chat.
+  `--temperature` and `--reasoning-effort` with any API but chat, and
+  `--server-pid` (the mode samples no footprint).
 - A decisions file is one JSON row per decision point: `episode`, `t`,
   `action` (`freeze` or `wait`), `pWait` when the model gives one, and
   `snapshotHash`, the hash of the step's snapshot the row answered

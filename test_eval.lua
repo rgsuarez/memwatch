@@ -2735,6 +2735,11 @@ printf ' ip=%s' "${FAKE_REMOTE_IP-127.0.0.1}"
   local _, okContra, _, _, saidContra = run("chat", chat, "contra", "--raw-names --redact-names")
   check("runner: --raw-names with --redact-names is refused as a contradiction",
     okContra == false and saidContra:find("contradict each other", 1, true) ~= nil, true)
+  do
+    local _, okSpid, _, fSpid, saidSpid = run("chat", chat, "spid", "--server-pid 1")
+    check("runner: episodes mode refuses --server-pid, before any row",
+      okSpid == false and fSpid == false and saidSpid:find("samples no footprint", 1, true) ~= nil, true)
+  end
   local _, okKeys, _, fKeys, saidKeys = run("chat", chat, "twokeys", "--api-key-env FAKE_KEY --api-key-file "
     .. sq(root .. "/no-such-key"))
   check("runner: so is --api-key-env with --api-key-file, before any row",

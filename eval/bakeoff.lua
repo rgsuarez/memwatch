@@ -668,7 +668,8 @@ local function episodesMode(args)
   -- own instructions (the discriminate clause), so --variant does not apply
   -- to it. A completion request names no model (the server serves one), so
   -- --model does not apply to it. Only the chat path sends sampling settings
-  -- (--temperature, --reasoning-effort).
+  -- (--temperature, --reasoning-effort). The mode samples no footprint, so
+  -- --server-pid does not apply.
   refuseContradiction(args)
   if args.raw_names or args.no_schema then
     error("episodes mode redacts names as production does and asks for the schema:"
@@ -684,6 +685,9 @@ local function episodesMode(args)
   if api ~= "chat" and (args.temperature or args.reasoning_effort) then
     error("--api " .. api .. " sends no sampling settings: --temperature and --reasoning-effort apply to"
       .. " --api chat only", 0)
+  end
+  if args.server_pid then
+    error("episodes mode samples no footprint: --server-pid applies to run mode only", 0)
   end
   local files = listScenarios(dir)
   assert(#files > 0, "no episodes found in " .. dir)

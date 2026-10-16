@@ -3502,6 +3502,15 @@ do
   check("systemone parse: a negative probability is refused", (lfm.parseSystemOne(reply({ freeze = 1.2, wait = -0.2 }))), nil)
   check("systemone parse: a probability above one is refused, though the sum is within tolerance",
     (lfm.parseSystemOne(reply({ freeze = 0, wait = 1.01 }))), nil)
+  -- A saturated option a float32 step past 1 is rounding: it reads as 1, as
+  -- the token path reads it. Past the slack it is out of range, and says so.
+  local sat = lfm.parseSystemOne(reply({ freeze = 0, wait = 1.0000001 }))
+  check("systemone parse: a probability within rounding of 1 reads as 1",
+    sat ~= nil and sat.action == "wait" and sat.pWait == 1, true)
+  check("systemone parse: and is honored as the token path's would be", sat ~= nil and lfm.waitHonored(sat, 0.9), true)
+  local noFar, whyFar = lfm.parseSystemOne(reply({ freeze = 0, wait = 1.00001 }))
+  check("systemone parse: past the slack it is out of range, and says so",
+    noFar == nil and tostring(whyFar):find("out of range", 1, true) ~= nil, true)
   check("systemone parse: no answers is refused", (lfm.parseSystemOne('{"model":"d1"}')), nil)
   check("systemone parse: non-JSON is refused", (lfm.parseSystemOne("not json")), nil)
   check("systemone parse: empty is refused", (lfm.parseSystemOne("")), nil)

@@ -728,6 +728,13 @@ function M.systemOneBody(snap, opts)
   })
 end
 
+-- Probabilities come from float32 arithmetic upstream, so one can read a
+-- hair over 1 (a token's logprob of 1e-8, a saturated option), and a
+-- confident distribution's top candidates a hair over 1 together. Within
+-- PROB_SLACK that is rounding and reads as 1; beyond it the numbers are
+-- malformed. Both adapters read probabilities by it.
+local PROB_SLACK = 1e-6
+
 -- Bounded parse of a /v1/systemone reply. The decoder bounds size and depth;
 -- the answer must carry exactly the offered options, each a probability,
 -- summing to about 1. Returns { action, pWait, pFreeze, confidence } with
@@ -746,11 +753,13 @@ function M.parseSystemOne(text)
   end
   local pf, pw = probs.freeze, probs.wait
   if type(pf) ~= "number" or type(pw) ~= "number" then return nil, "systemone: missing option" end
-  -- Each a probability in [0, 1] (NaN fails both comparisons), summing to
-  -- about 1.
-  if not (pf >= 0 and pf <= 1 and pw >= 0 and pw <= 1) or math.abs(pf + pw - 1) > 0.02 then
-    return nil, "systemone: probabilities do not sum to 1"
+  -- Each a probability in [0, 1] (NaN fails every comparison), within
+  -- PROB_SLACK of rounding past 1, read as 1 there; then summing to about 1.
+  if not (pf >= 0 and pf <= 1 + PROB_SLACK and pw >= 0 and pw <= 1 + PROB_SLACK) then
+    return nil, "systemone: a probability out of range"
   end
+  pf, pw = math.min(pf, 1), math.min(pw, 1)
+  if math.abs(pf + pw - 1) > 0.02 then return nil, "systemone: probabilities do not sum to 1" end
   return { action = (pf >= pw) and "freeze" or "wait", pFreeze = pf, pWait = pw,
            confidence = type(answer.confidence) == "number" and answer.confidence or nil }
 end
@@ -829,6 +838,16 @@ local function optionOf(tok, quoted)
   return nil
 end
 
+-- A candidate's probability, read by PROB_SLACK (above): the probability,
+-- nil when the candidate carries none, or false when it is out of range.
+local function readProb(c)
+  local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
+    or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
+  if pr == nil then return nil end
+  if not (pr >= 0 and pr <= 1 + PROB_SLACK) then return false end
+  return math.min(pr, 1)
+end
+
 -- P(wait) from a /completion reply's token probabilities. The value of
 -- "action" starts right after the key's ":" token, and its first token alone
 -- tells the options apart ("wait", "free..." for freeze, "termin..." for
@@ -843,20 +862,6 @@ end
 -- the model did not take are not read. Bounded by the decoder (64 KB,
 -- depth 8).
 -- Returns { action, pWait, pFreeze, pTerminate, mass } or nil, err.
--- Probabilities come from float32 arithmetic upstream, so a token's can read
--- a hair over 1 (a logprob of 1e-8), and a confident distribution's top
--- candidates a hair over 1 together. Within PROB_SLACK that is rounding and
--- reads as 1; beyond it the numbers are malformed. Returns the probability,
--- nil when the candidate carries none, or false when it is out of range.
-local PROB_SLACK = 1e-6
-local function readProb(c)
-  local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
-    or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
-  if pr == nil then return nil end
-  if not (pr >= 0 and pr <= 1 + PROB_SLACK) then return false end
-  return math.min(pr, 1)
-end
-
 -- opts.prefill: the text written into the prompt before the reply (the
 -- body's prefill). When it ends at the value's opening quote, the reply's
 -- first token is the value, read there, with no quote of the model's own.

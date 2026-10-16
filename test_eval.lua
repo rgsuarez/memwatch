@@ -1318,6 +1318,16 @@ printf '0.010 %s' "$status"
   local red, raw = resultAt(cwdRoot .. "/eval/results/t-taxonomy.json"), resultAt(cwdRoot .. "/eval/results/t-taxonomy-rawnames.json")
   check("runner: a redacted run writes its default file", red.redact_names, true)
   check("runner: a raw-names run writes its own beside it, naming its condition", raw.redact_names, false)
+  -- A failed rerun leaves no stale result at the default path either.
+  local defaultPath = cwdRoot .. "/eval/results/t-taxonomy.json"
+  local dw = assert(io.open(defaultPath, "w"))
+  dw:write('{"label":"t","variant":"taxonomy","stale":true}\n')
+  dw:close()
+  os.execute(string.format("cd '%s' && PATH='%s':\"$PATH\" FAKE_STATUS=503 FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --variant taxonomy --scenarios '%s' --retries 0 >/dev/null 2>&1", cwdRoot, stubDir, log, corpus))
+  local df = io.open(defaultPath, "r")
+  if df then df:close() end
+  check("runner: a failed rerun leaves no stale result at the default path", df == nil, true)
   -- A server error fails the run, writing no results, rather than scoring
   -- the error as the model's invalid reply.
   local outErr = root .. "/run-err.json"
@@ -1339,6 +1349,21 @@ printf '0.010 %s' "$status"
   local refFile = io.open(outRef, "r")
   if refFile then refFile:close() end
   check("runner: a refusal once the path is known leaves no stale result either", refFile == nil, true)
+  -- An explicit --out is cleared before any other check: a mistyped variant
+  -- or a missing label refuses the run without leaving the stale result.
+  local function staleAfter(argsTail)
+    local sp = root .. "/run-early.json"
+    local sw = assert(io.open(sp, "w"))
+    sw:write('{"label":"t","stale":true}\n')
+    sw:close()
+    os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--scenarios '%s' %s --out '%s' >/dev/null 2>&1", stubDir, log, corpus, argsTail, sp))
+    local sf3 = io.open(sp, "r")
+    if sf3 then sf3:close(); os.remove(sp) end
+    return sf3 ~= nil
+  end
+  check("runner: a mistyped variant leaves no stale result at an explicit --out", staleAfter("--label t --variant typo"), false)
+  check("runner: nor does a missing label", staleAfter(""), false)
   local leftovers = 0
   for _, dirScan in ipairs({ cwdRoot .. "/eval/results", root }) do
     local lp = io.popen("ls '" .. dirScan .. "' 2>/dev/null")
@@ -1367,7 +1392,7 @@ printf '0.010 %s' "$status"
 local target = os.getenv("FAIL_RENAME")
 local realRename = os.rename
 os.rename = function(a, b)
-  if target and tostring(b):sub(-#target) == target then return nil, "rename refused" end
+  if target and tostring(b) == target then return nil, "rename refused" end
   return realRename(a, b)
 end
 arg[0] = "eval/bakeoff.lua"
@@ -1375,8 +1400,8 @@ dofile("eval/bakeoff.lua")
 ]])
   rw:close()
   local renameOut = root .. "/rename-fails.json"
-  local okRename = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='rename-fails.json' FAKE_BODY_LOG='%s' lua '%s' run "
-    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, root .. "/renamewrap.lua", corpus, renameOut))
+  local okRename = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='%s' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, renameOut, log, root .. "/renamewrap.lua", corpus, renameOut))
   local rp2 = io.popen("ls '" .. root .. "' 2>/dev/null")
   local renamePartials = 0
   for n in rp2:lines() do if n:find("rename-fails.json.partial-", 1, true) then renamePartials = renamePartials + 1 end end
@@ -1387,8 +1412,8 @@ dofile("eval/bakeoff.lua")
     okRename ~= true and renamePartials == 0 and renameLanded == nil, true)
   -- The harness's control: the same run through it, renaming elsewhere, lands.
   local controlOut = root .. "/rename-control.json"
-  local okRenameCtl = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='no-such-target.json' FAKE_BODY_LOG='%s' lua '%s' run "
-    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, root .. "/renamewrap.lua", corpus, controlOut))
+  local okRenameCtl = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='%s' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, renameOut, log, root .. "/renamewrap.lua", corpus, controlOut))
   local controlLanded = io.open(controlOut, "r")
   if controlLanded then controlLanded:close() end
   check("runner: the rename harness's control lands its result", okRenameCtl == true and controlLanded ~= nil, true)
@@ -2178,6 +2203,19 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
     okNoId == false and fNoId == false and saidNoId:find("carries no episode id", 1, true) ~= nil, true)
   local _, okTwice, _, fTwice = run("chat", chat, "twice", "--timeout 5 --timeout 6")
   check("runner: a flag given twice is refused", okTwice == false and fTwice == false, true)
+  local _, okSpell, _, fSpell = run("chat", chat, "twice2", "--retry-wait 1 --retry_wait 2")
+  check("runner: so is one given twice under its two spellings", okSpell == false and fSpell == false, true)
+  local _, okContra, _, _, saidContra = run("chat", chat, "contra", "--raw-names --redact-names")
+  check("runner: --raw-names with --redact-names is refused as a contradiction",
+    okContra == false and saidContra:find("contradict each other", 1, true) ~= nil, true)
+  local badDir = root .. "/eps-bad"
+  os.execute("mkdir -p '" .. badDir .. "'")
+  local bdf = assert(io.open(badDir .. "/x.json", "w"))
+  bdf:write("not json\n")
+  bdf:close()
+  local _, okBadEp, _, fBadEp, saidBadEp = run("chat", chat, "badep", nil, nil, badDir)
+  check("runner: an episode file that is not JSON is named as such, before any row",
+    okBadEp == false and fBadEp == false and saidBadEp:find("is not an episode", 1, true) ~= nil, true)
   local _, okRetryArg = run("chat", chat, "badretries", "--retries -1")
   check("runner: a negative --retries is refused", okRetryArg, false)
   -- A flag the mode would not send is refused before any row.

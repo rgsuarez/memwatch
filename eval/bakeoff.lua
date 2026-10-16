@@ -46,10 +46,12 @@ local function parseArgs(argv)
   while i <= #argv do
     local a = argv[i]
     local key = a:match("^%-%-(.+)$")
-    -- A flag given twice is refused: which value was meant is not this
+    -- A flag given twice is refused, under either spelling (--retry-wait
+    -- and --retry_wait are one flag): which value was meant is not this
     -- script's to guess.
-    if key and seen[key] then error("--" .. key .. " given twice", 0) end
-    if key then seen[key] = true end
+    local norm = key and key:gsub("%-", "_")
+    if norm and seen[norm] then error("--" .. key .. " given twice", 0) end
+    if norm then seen[norm] = true end
     if key then
       if key == "no-schema" or key == "raw-names" or key == "redact-names" then
         -- --redact-names is the default now; it takes no value, so it never
@@ -67,6 +69,10 @@ local function parseArgs(argv)
       args.positional[#args.positional + 1] = a
     end
     i = i + 1
+  end
+  -- --raw-names and --redact-names contradict each other; neither wins.
+  if args.raw_names and args.redact_names then
+    error("--raw-names and --redact-names contradict each other: give one", 0)
   end
   return args
 end
@@ -270,6 +276,19 @@ local function retryArgs(args)
   return math.floor(retries), math.floor(wait)
 end
 
+-- Clear a result path before a run writes one: already absent is fine
+-- (errno 2, no such file), but a path that cannot be cleared (permissions,
+-- a directory with something in it) refuses the run, since an earlier
+-- result left there would read as this run's. (An empty directory is
+-- removed, as os.remove removes one.)
+local function clearResult(path)
+  local ok, err, code = os.remove(path)
+  if not ok and code ~= 2 then
+    error(string.format("cannot clear %s (%s): an earlier result left there would read as this run's",
+      path, tostring(err)), 0)
+  end
+end
+
 -- The production prompt builder falls back to the baseline prompt for any
 -- name it does not know, so a mistyped --variant would silently run the
 -- baseline under another label. A name is known when it is "baseline" or
@@ -284,6 +303,11 @@ end
 ------------------------------------------------------------------------------
 
 local function runMode(args)
+  -- A rerun's file is the rerun's or nothing: a stale result left at the path
+  -- would read as this run's if the run failed or was refused, so an explicit
+  -- --out is cleared before any other check, and a default path as soon as
+  -- it is known. The new result is written whole, then renamed into place.
+  if args.out then clearResult(args.out) end
   local server = args.server or "http://127.0.0.1:11435"
   local label = assert(args.label, "--label required")
   local variant = args.variant or "baseline"
@@ -298,16 +322,9 @@ local function runMode(args)
   local redactRun = lfm.cfg.redactNames == true and not args.raw_names
   local out = args.out or string.format("eval/results/%s-%s%s%s.json",
     label, variant, useSchema and "" or "-noschema", redactRun and "" or "-rawnames")
-  -- A rerun's file is the rerun's or nothing: a stale result left at the path
-  -- would read as this run's if it failed, so the path is cleared as soon as
-  -- it is known (only the label and the variant name it). The new one is
-  -- written whole, then renamed into place. Already absent is fine (errno
-  -- 2); a path that cannot be cleared refuses the run.
-  local okRm, errRm, codeRm = os.remove(out)
-  if not okRm and codeRm ~= 2 then
-    error(string.format("cannot clear %s (%s): an earlier result left there would read as this run's",
-      out, tostring(errRm)), 0)
-  end
+  -- (A default path is cleared here, once the label and variant that name it
+  -- are known; an explicit --out was cleared before anything else.)
+  if not args.out then clearResult(out) end
   local serverPid = tonumber(args.server_pid)
 
   os.execute("mkdir -p eval/results eval/tmp")
@@ -594,8 +611,13 @@ local function episodesMode(args)
   -- non-empty string, as the generator writes and the scorer requires),
   -- checked before the output is claimed.
   for _, fname in ipairs(files) do
-    local ep = lfm.jsonDecode(readFile(dir .. "/" .. fname) or "")
-    if type(ep) ~= "table" or type(ep.id) ~= "string" or ep.id == "" then
+    local text = readFile(dir .. "/" .. fname)
+    if text == nil then error(string.format("%s/%s cannot be read", dir, fname), 0) end
+    local ep, why = lfm.jsonDecode(text)
+    if type(ep) ~= "table" then
+      error(string.format("%s/%s is not an episode (%s)", dir, fname, tostring(why or "not a JSON object")), 0)
+    end
+    if type(ep.id) ~= "string" or ep.id == "" then
       error(string.format("%s/%s carries no episode id (ids are non-empty strings)", dir, fname), 0)
     end
   end

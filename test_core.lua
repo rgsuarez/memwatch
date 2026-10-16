@@ -3195,7 +3195,9 @@ do
 end
 
 -- ---- the wait rail: a model's wait defers only on its own probability ----
-check("wait rail: no threshold set by default", lfm.cfg.tauWait, nil)
+check("wait rail: the default threshold honors no wait, even a certain one",
+  lfm.waitHonored({ action = "wait", pWait = 1 }, lfm.cfg.tauWait), false)
+check("wait rail: the default is a number, so local config can set it", type(lfm.cfg.tauWait), "number")
 check("wait rail: a confident wait is honored", lfm.waitHonored({ action = "wait", pWait = 0.93 }, 0.9), true)
 check("wait rail: a hesitant wait is not", lfm.waitHonored({ action = "wait", pWait = 0.7 }, 0.9), false)
 check("wait rail: a self-reported confidence never qualifies",

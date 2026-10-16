@@ -73,11 +73,12 @@ M.cfg = {
   remoteCooldownSec = 15,     -- backoff after a remote timeout/error before retry
   redactNames = true,         -- send deterministic categories, not raw names (F4.1)
   -- The wait rail's threshold: a model's wait at grace expiry defers the
-  -- deterministic freeze only when its own P(wait) reaches this. Unset
-  -- means no wait is honored (the deterministic policy acts), which is the
-  -- only safe value until a threshold is chosen on dev data and frozen
-  -- before held-out scoring.
-  tauWait = nil,
+  -- deterministic freeze only when its own P(wait) reaches this. The
+  -- default is above 1, which no probability reaches, so no wait is honored
+  -- (the deterministic policy acts): the only safe value until a threshold
+  -- is chosen on dev data and frozen before held-out scoring. It is a
+  -- number so the operator's local config can set one.
+  tauWait = 2,
 }
 
 ------------------------------------------------------------------------------
@@ -380,7 +381,7 @@ local CLAUSE_OUTPUT = 'Reply with a single JSON object and no other text: {"acti
 -- This clause keeps the plateau lesson (a capped runaway still holding the
 -- machine is the problem) but makes the dynamics decide, so a self-limiting
 -- burst that the detector also tags extreme can be waited out.
-local CLAUSE_DISCRIMINATE = "The detector has tagged this offender kind=extreme and its alert went unanswered; the tag says it grew fast, not that it will exhaust the machine. Tell a runaway from a self-limiting burst by its dynamics. Freeze a runaway: still growing with no sign of stopping while availPct falls, or PLATEAUED (a high peakSlopeMBmin with slopeMBmin near 0) while still holding the machine near starvation (availPct at or below about 8). Wait for a self-limiting burst: growth ending or reversing while headroom remains, the shape of a build, install, search or index pass that finishes, releases or exits within about two minutes. Waiting is not giving up: memwatch looks again in a minute, and after two minutes of waiting it freezes anyway."
+local CLAUSE_DISCRIMINATE = "The detector has tagged this offender kind=extreme and its alert went unanswered; the tag says it grew fast, not that it will exhaust the machine. Tell a runaway from a self-limiting burst by its dynamics. Freeze a runaway: still growing with no sign of stopping while availPct falls, or PLATEAUED (a high peakSlopeMBmin with slopeMBmin near 0) while still holding the machine near starvation (availPct at or below about 8). Wait for a self-limiting burst: growth ending or reversing while headroom remains, the shape of a build, install, search or index pass that finishes, releases or exits within about two minutes. Waiting is not giving up: while the detector still tags it, memwatch looks again in a minute and may freeze it then."
 
 -- Exported for the regression test: the baseline, taxonomy and fewshot
 -- variants carry each of these.

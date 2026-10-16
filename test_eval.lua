@@ -194,6 +194,10 @@ do
     (pcall(sc.checkDeferral, { { id = "x", params = { deferralSec = sc.cfg.deferralSec - 30 } } })), false)
   check("deferral: one labeled under this bound is scored",
     (pcall(sc.checkDeferral, { { id = "x", params = { deferralSec = sc.cfg.deferralSec } } })), true)
+  -- An episode written before the bound was recorded is accepted on purpose:
+  -- the default bound has not changed since, and its hash binding still holds.
+  check("deferral: one written before the record existed is accepted deliberately",
+    (pcall(sc.checkDeferral, { { id = "x", params = {} }, { id = "y" } })), true)
   -- Each step carries the hash its decision rows must carry, and it holds
   -- once the episode has been written and read back, as the scorer reads it.
   local stored, rt = true, 0
@@ -909,6 +913,11 @@ do
   check("cli: the runner under another name still runs", status("lua '" .. base .. "/bakeoff-renamed.lua'"), 1)
   check("cli: so does the generator", status("lua '" .. base .. "/gen-episodes-renamed.lua'"), 1)
   check("cli: and the scorer", status("lua '" .. base .. "/score-episodes-renamed.lua'"), 1)
+  -- The other spellings of the same script: a ./ path, and a symlinked
+  -- directory (each refuses an empty run, so exit 1 means it ran).
+  os.execute(string.format("ln -s '%s/eval' '%s/evlink'", here, base))
+  check("cli: a ./ path runs the scorer", status("lua ./eval/score-episodes.lua"), 1)
+  check("cli: so does a path through a symlinked directory", status("lua '" .. base .. "/evlink/score-episodes.lua'"), 1)
   -- A script whose own name ends like the scorer's only requires it.
   local w = assert(io.open(base .. "/my-score-episodes.lua", "w"))
   w:write('package.path = "eval/?.lua;" .. package.path\nrequire("score-episodes")\nprint("required")\n')

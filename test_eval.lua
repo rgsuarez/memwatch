@@ -325,6 +325,15 @@ do
   check("labels: one that releases only after the deferral bound starves the machine past it",
     gen.simulate(params({ avail0 = 8.5, phases = { { dur = 2, rate = 150 } },
                           after = "release", releaseAt = 150 })).class, "runaway")
+  -- Growth that ends at the release instant: the line is read from what the
+  -- process held, 9.5 - 300 MB / 368.64 MB per point = 8.69% (shown 8), not
+  -- from the memory it gives back that same instant.
+  local function slowExit(dur, at)
+    return gen.simulate(params({ avail0 = 9.5, phases = { { dur = dur, rate = 2 } }, after = "exit", releaseAt = at }))
+  end
+  check("labels: growth ending at a release past the bound starves the machine", slowExit(150, 150).class, "runaway")
+  check("labels: as it does a second before it", slowExit(149, 150).class, "runaway")
+  check("labels: one released at the end of growth within the bound resolves", slowExit(100, 100).class, "savable")
 end
 
 -- ---- eligibility, state and footprint, from production's own logic ----

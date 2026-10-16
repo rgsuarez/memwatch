@@ -160,6 +160,12 @@ function M.weightAt(p, t)
   if p.releaseAt and t >= p.releaseAt then
     return (p.after == "exit") and 0 or p.w0
   end
+  return M.grownAt(p, t)
+end
+
+-- The footprint the trajectory has grown to at time t, any release
+-- ignored: what the offender holds up to the instant it lets go.
+function M.grownAt(p, t)
   if t < 0 then
     local cStart = p.onsetAt - p.climbSec
     if t <= cStart then return p.w0 end
@@ -415,7 +421,10 @@ function M.simulate(p, cfg)
   -- percent, floored), so a plateau the model sees at the line is labeled
   -- at the line. A plateau that releases within the bound is not starving:
   -- it resolves, and freezing it would only keep it from releasing.
-  local plateau = M.availAt(p, p.growthEnd, cfg)
+  -- The plateau is read from the footprint held when growth ends, before
+  -- any release: a release at that same instant gives the memory back only
+  -- after the machine has been held at the plateau.
+  local plateau = p.avail0 - (M.grownAt(p, p.growthEnd) - p.wAt0) * fracOf(p, cfg)
   local lasts = (p.releaseAt == nil) or (p.releaseAt > cfg.deferralSec)
   local starving = lasts and math.floor(plateau) <= cfg.starvePct
   -- When the machine is lost: exhaustion before the process resolves. No

@@ -1598,6 +1598,29 @@ printf '0.010 %s ip=%s' "$status" "$ip"
     os.remove(seqFile)
     os.remove(pidOut)
   end
+  -- A retried request is held to its successful attempt's address: a retry
+  -- answered from elsewhere fails the run, while an attempt that failed from
+  -- elsewhere and was retried from here does not.
+  do
+    local remoteFile, statusFile = root .. "/remote-seq2", root .. "/status-seq2"
+    local function retried(remotes)
+      os.remove(remoteFile)
+      os.remove(statusFile)
+      local said = runSaid("--server http://stub --server-pid 1 --retry-wait 0", pidOut,
+        "FAKE_STATUS_SEQ='503 200' FAKE_SEQ_FILE='" .. statusFile .. "' FAKE_REMOTE_SEQ='" .. remotes
+        .. "' FAKE_REMOTE_SEQ_FILE='" .. remoteFile .. "'")
+      local ok = landed(pidOut)
+      os.remove(pidOut)
+      os.remove(remoteFile)
+      os.remove(statusFile)
+      return said, ok
+    end
+    local farRetry, farLanded = retried("127.0.0.1 203.0.113.7 127.0.0.1")
+    check("runner: a retry answered from elsewhere fails a --server-pid run",
+      farRetry:find("the server answered from 203.0.113.7", 1, true) ~= nil and not farLanded, true)
+    local _, nearLanded = retried("203.0.113.7 127.0.0.1")
+    check("runner: an attempt that failed from elsewhere, retried from here, lands", nearLanded, true)
+  end
   local nearSaid = runSaid("--server http://127.0.0.1:9 --server-pid 1", pidOut)
   check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
   os.remove(pidOut)
@@ -1620,7 +1643,7 @@ printf '0.010 %s ip=%s' "$status" "$ip"
     end
     local withPid = argvOf("--server http://127.0.0.1:9 --server-pid 1")
     local withoutPid = argvOf("--server http://127.0.0.1:9")
-    check("runner: a --server-pid run's requests skip any proxy, and only its", withPid:find("--noproxy", 1, true) ~= nil
+    check("runner: a --server-pid run's requests skip any proxy, and only its", withPid:find("--noproxy * ", 1, true) ~= nil
       and withoutPid ~= "" and withoutPid:find("--noproxy", 1, true) == nil, true)
   end
   -- The gates refuse a contradiction too, before writing the league.
@@ -2581,6 +2604,7 @@ printf ' ip=%s' "${FAKE_REMOTE_IP-127.0.0.1}"
       and tostring(errDev):find("it is not a regular file", 1, true) ~= nil, true)
     local sock = root .. "/s.sock"
     os.execute("python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' '" .. sock .. "'")
+    check("runner: (the socket fixture is made)", os.execute("test -S '" .. sock .. "'") == true, true)
     local okSock, errSock = pcall(bk.clearResult, sock)
     check("runner: and so is a socket, kept", os.execute("test -S '" .. sock .. "'") == true and okSock == false
       and tostring(errSock):find("it is not a regular file", 1, true) ~= nil, true)

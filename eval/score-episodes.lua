@@ -244,8 +244,14 @@ function M.pairedLowerBound(pairs, cfg)
     stats[b] = meanOf(sample)
   end
   table.sort(stats)
-  local idx = math.max(1, math.floor((1 - cfg.confidence) * cfg.bootstrap))
-  return stats[idx], point
+  return stats[M.quantileIndex(cfg.confidence, cfg.bootstrap)], point
+end
+
+-- The order statistic a one-sided lower bound at conf reads among b sorted
+-- resamples: the floor of (1 - conf) * b, which float arithmetic can land a
+-- hair under (at 0.9, 0.1 * 2000 is 199.99...), so it is nudged up first.
+function M.quantileIndex(conf, b)
+  return math.max(1, math.floor((1 - conf) * b + 1e-9))
 end
 
 ------------------------------------------------------------------------------

@@ -183,6 +183,8 @@ do
   end
   check("bootstrap: uniform improvement has lower bound 1", (sc.pairedLowerBound(ones)), 1)
   check("bootstrap: no improvement has lower bound 0", (sc.pairedLowerBound(zeros)), 0)
+  check("bootstrap: the lower bound at 0.9 reads the 200th of 2000", sc.quantileIndex(0.9, 2000), 200)
+  check("bootstrap: and at 0.95 the 100th", sc.quantileIndex(0.95, 2000), 100)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----

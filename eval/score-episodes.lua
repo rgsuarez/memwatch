@@ -515,7 +515,7 @@ end
 
 function M.loadDir(dir)
   local eps = {}
-  local p = io.popen("ls '" .. dir:gsub("'", "") .. "'")
+  local p = io.popen("ls '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
   for name in p:lines() do
     if name:match("%.json$") then
       local f = assert(io.open(dir .. "/" .. name, "r"))

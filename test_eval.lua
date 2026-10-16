@@ -624,6 +624,20 @@ do
   os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "' '" .. relabeled .. "' '" .. edited .. "'")
 end
 
+-- ---- a split is read from the directory named, whatever its name ----
+do
+  local h = io.popen("mktemp -d")
+  local base = h:read("l")
+  h:close()
+  local dir = base .. "/it's here"
+  os.execute("mkdir -p '" .. dir:gsub("'", "'\\''") .. "'")
+  local f = assert(io.open(dir .. "/e1.json", "w"))
+  f:write(lfm.jsonEncode({ id = "e1", template = "T", steps = lfm.jsonArray({}), labels = { class = "savable" } }), "\n")
+  f:close()
+  check("loadDir: a directory with a quote in its name is read as named", #sc.loadDir(dir), 1)
+  os.execute("rm -rf '" .. base .. "'")
+end
+
 -- ---- on a set large enough to decide the gate (the documented dev size) ----
 do
   local templates = dofile("eval/episode-templates.lua")

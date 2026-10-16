@@ -1389,6 +1389,25 @@ printf '0.010 %s' "$status"
   end
   check("runner: a mistyped variant leaves no stale result at an explicit --out", staleAfter("--label t --variant typo"), false)
   check("runner: nor does a missing label", staleAfter(""), false)
+  check("runner: nor does --raw-names with --redact-names", staleAfter("--label t --raw-names --redact-names"), false)
+  -- A command line that does not parse touches nothing: the stale result is
+  -- left as it was, and the run is refused.
+  local function untouchedAfter(argsTail)
+    local sp = root .. "/run-unparsed.json"
+    local staleText = '{"label":"t","rows":[],"stale":true}\n'
+    local sw = assert(io.open(sp, "w"))
+    sw:write(staleText)
+    sw:close()
+    local ok = os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--scenarios '%s' %s --out '%s' >/dev/null 2>&1", stubDir, log, corpus, argsTail, sp))
+    local sf = io.open(sp, "r")
+    local now = sf and sf:read("a")
+    if sf then sf:close() end
+    os.remove(sp)
+    return ok ~= true and now == staleText
+  end
+  check("runner: a flag given twice touches nothing", untouchedAfter("--label t --label u"), true)
+  check("runner: nor does a flag missing its value", untouchedAfter("--label"), true)
   -- Only a run result is ever cleared: --out naming an input, a file that is
   -- not JSON, or a directory refuses the run and leaves it as it was.
   local keptSaid
@@ -2336,6 +2355,10 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   local _, okContra, _, _, saidContra = run("chat", chat, "contra", "--raw-names --redact-names")
   check("runner: --raw-names with --redact-names is refused as a contradiction",
     okContra == false and saidContra:find("contradict each other", 1, true) ~= nil, true)
+  local _, okKeys, _, fKeys, saidKeys = run("chat", chat, "twokeys", "--api-key-env FAKE_KEY --api-key-file "
+    .. sq(root .. "/no-such-key"))
+  check("runner: so is --api-key-env with --api-key-file, before any row",
+    okKeys == false and fKeys == false and saidKeys:find("name two keys", 1, true) ~= nil, true)
   local badDir = root .. "/eps-bad"
   os.execute("mkdir -p '" .. badDir .. "'")
   local bdf = assert(io.open(badDir .. "/x.json", "w"))

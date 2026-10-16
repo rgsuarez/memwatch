@@ -70,11 +70,20 @@ local function parseArgs(argv)
     end
     i = i + 1
   end
-  -- --raw-names and --redact-names contradict each other; neither wins.
+  return args
+end
+
+-- Pairs that contradict each other, where neither wins: --raw-names with
+-- --redact-names, and two key sources. Each mode refuses them itself: run
+-- mode once its explicit output is cleared, episodes mode before it claims
+-- its output.
+local function refuseContradiction(args)
   if args.raw_names and args.redact_names then
     error("--raw-names and --redact-names contradict each other: give one", 0)
   end
-  return args
+  if args.api_key_env and args.api_key_file then
+    error("--api-key-env and --api-key-file name two keys: give one", 0)
+  end
 end
 
 local function readFile(path)
@@ -325,6 +334,7 @@ local function runMode(args)
   -- it is known (only a run result is ever cleared: see clearResult). The new
   -- result is written whole, then renamed into place.
   if args.out then clearResult(args.out) end
+  refuseContradiction(args)
   local server = args.server or "http://127.0.0.1:11435"
   local label = assert(args.label, "--label required")
   local variant = args.variant or "baseline"
@@ -607,6 +617,7 @@ local function episodesMode(args)
   -- to it. A completion request names no model (the server serves one), so
   -- --model does not apply to it. Only the chat path sends sampling settings
   -- (--temperature, --reasoning-effort).
+  refuseContradiction(args)
   if args.raw_names or args.no_schema then
     error("episodes mode redacts names as production does and asks for the schema:"
       .. " --raw-names and --no-schema do not apply", 0)

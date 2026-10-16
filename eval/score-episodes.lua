@@ -399,7 +399,11 @@ function M.loadDecisions(path, keyPath)
       end
       out[ep] = out[ep] or {}
       if out[ep][t] then
-        error(string.format("the decision for %s at %s s appears twice; score one run's rows", tostring(ep), tostring(t)), 0)
+        -- Through a key, a step can repeat because the key maps two qids to
+        -- it: the key's defect, not the rows'.
+        local why = key and ": a qid repeats in the rows, or the key maps two qids to that step"
+          or "; score one run's rows"
+        error(string.format("the decision for %s at %s s appears twice%s", tostring(ep), tostring(t), why), 0)
       end
       out[ep][t] = { action = r.action, pWait = pWait, hash = hash }
       n = n + 1

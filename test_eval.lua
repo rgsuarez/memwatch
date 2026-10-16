@@ -286,6 +286,18 @@ do
   local okTwice, errTwice = pcall(sc.loadDecisions, tmp)
   check("decisions: a decision point recorded twice is refused",
     okTwice == false and tostring(errTwice):find("appears twice", 1, true) ~= nil, true)
+  -- Through a key, the repeat can be the key's: two qids mapped to one step.
+  local dupKey = os.tmpname()
+  kf = assert(io.open(dupKey, "w"))
+  kf:write('{"rows":{"q1":{"episode":"r1","t":0},"q2":{"episode":"r1","t":0}}}')
+  kf:close()
+  f = assert(io.open(tmp, "w"))
+  f:write('{"qid":"q1","action":"freeze"}\n{"qid":"q2","action":"wait"}\n')
+  f:close()
+  local okDupKey, errDupKey = pcall(sc.loadDecisions, tmp, dupKey)
+  os.remove(dupKey)
+  check("decisions: a key that maps two qids to one step is refused, naming the key",
+    okDupKey == false and tostring(errDupKey):find("the key maps two qids to that step", 1, true) ~= nil, true)
   f = assert(io.open(tmp, "w"))
   f:write('{"episode":"r1","t":0,"action":"freeze","model":"a"}\n{"episode":"s1","t":0,"action":"wait","model":"b"}\n')
   f:close()

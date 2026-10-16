@@ -288,7 +288,7 @@ do
   -- 8: at the line, so starving. Read a whole second early (9.41%, shown 9)
   -- it would pass for savable.
   check("labels: a fractional burst settling at the line starves",
-    gen.simulate(params({ avail0 = 10.5, phases = { { dur = 1.9, rate = 400 } } })).class, "runaway")
+    gen.simulate(params({ avail0 = 10.5, graceRate = 0, phases = { { dur = 1.9, rate = 400 } } })).class, "runaway")
   -- The line is read as the snapshot reports availability (floored).
   check("labels: a plateau shown at 8 (8.3%) is at the line",
     gen.simulate(params({ avail0 = 8.3, phases = {} })).class, "runaway")
@@ -342,6 +342,24 @@ do
   check("alert: a lapse while critical keeps the alert and its grace", table.concat(rts, ","), "0,120")
   check("alert: so waiting through it is not a miss",
     sc.outcome(eres, sc.play(eres, function() return "wait" end)).missed, false)
+  -- The history must fit the machine.
+  local cap, worstAvail = true, 0
+  for _, tpl in ipairs(dofile("eval/episode-templates.lua")) do
+    for k = 1, 25 do
+      local r = gen.rng(((7000 + k) * 7919 + gen.idHash(tpl.id)) % 4294967296)
+      local p = gen.sample(tpl, r)
+      gen.prepare(p)
+      local tk = gen.track(p, gen.cfg, p.onsetAt - p.climbSec - gen.cfg.leadSec, gen.cfg.horizonSec)
+      for _, k2 in pairs(tk) do
+        if k2.avail > worstAvail then worstAvail = k2.avail end
+        if k2.avail > gen.cfg.maxAvailPct then cap = false end
+      end
+    end
+  end
+  check("capacity: every public template's history fits the machine", cap, true)
+  local okCap, errCap = pcall(gen.simulate, params({ avail0 = 10.5, phases = { { dur = 1.9, rate = 400 } } }))
+  check("capacity: a history the machine cannot hold is refused",
+    okCap == false and tostring(errCap):find("needs", 1, true) ~= nil, true)
   -- Decision points as production re-arms them, on synthetic ticks: grace
   -- expiry, then the first open tick a grace window or more after the last.
   local function ticksOpen(openAt)

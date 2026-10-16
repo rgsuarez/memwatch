@@ -119,7 +119,7 @@ return {
   { id = "E-model-load", split = "train", class = "savable", family = "model-server",
     names = { "llama-server", "lm-studio" }, avail0 = { 24, 36 }, w0 = { 200, 1200 },
     age0 = { 115, 200 }, peak0 = { 20000, 30000 }, compress = { 1.0, 1.1 },
-    phases = { { dur = { 4, 12 }, rate = { 280, 420 } } }, after = "hold",
+    phases = { { dur = { 4, 12 }, rate = { 280, 420 } } }, after = "hold", graceRate = { 40, 110 },
     rationale = "a model server mapping its weights in at full speed, then flat" },
   { id = "E-db-warm", split = "dev", class = "savable", family = "database",
     names = { "postgres", "redis-server" }, avail0 = { 18, 30 }, w0 = { 2000, 5000 },

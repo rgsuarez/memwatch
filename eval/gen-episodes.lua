@@ -76,6 +76,7 @@ M.cfg = {
   graceSec        = core.cfg.cool.autoKillGraceSec, -- the alert's unanswered window
   exposureStepMax = 15,     -- production's EXPOSURE_STEP_MAX: a stalled tick's most grace
   settleSec       = 10,     -- below critical this long ends the alert, as in production
+  maxAvailPct     = 90,     -- no history may have more of the machine available than this
 }
 
 -- Deterministic PRNG (xorshift32), identical across Lua 5.4 and 5.5 so a
@@ -284,6 +285,11 @@ function M.prepare(p, cfg)
       .. cfg.graceSec .. " + climb " .. p.climbSec .. " + two ticks")
   p.wOn = p.w0 + p.climbRate * p.climbSec
   p.wAt0 = p.wOn + p.graceRate * cfg.graceSec
+  -- The history must fit the machine: before the climb the offender held
+  -- only its base, so the machine had that much more of itself available.
+  local before = M.availAt(p, p.onsetAt - p.climbSec, cfg)
+  assert(before <= cfg.maxAvailPct, string.format(
+    "the history needs %.1f%% of the machine available before the climb (over %d%%)", before, cfg.maxAvailPct))
   return p
 end
 

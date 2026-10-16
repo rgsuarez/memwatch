@@ -365,13 +365,12 @@ function M.fill(p, cfg, wAt0)
   return p.avail0 / 100 + (wAt0 or p.wAt0) / (math.max(1, p.compress or 1) * cfg.totalMB)
 end
 
--- The first time at or after t = 0 that availability reaches the
--- exhaustion floor while the offender still holds its growth, exactly
--- (growth is piecewise linear), or nil within the horizon.
-local function exhaustAt(p, cfg)
-  local needMB = (p.avail0 - cfg.exhaustPct) / fracOf(p, cfg)
+-- The first time at or after t = 0 that availability reaches pct while
+-- the offender still holds its growth, exactly (growth is piecewise
+-- linear), or nil before limit.
+local function crossAt(p, cfg, pct, limit)
+  local needMB = (p.avail0 - pct) / fracOf(p, cfg)
   if needMB <= 0 then return 0 end
-  local limit = math.min(cfg.horizonSec, p.releaseAt or math.huge)
   local grown = 0
   for _, ph in ipairs(p.phases) do
     if ph.from >= limit then break end
@@ -383,7 +382,20 @@ local function exhaustAt(p, cfg)
   end
   return nil
 end
+
+-- When availability reaches the exhaustion floor, within the horizon.
+local function exhaustAt(p, cfg)
+  return crossAt(p, cfg, cfg.exhaustPct, math.min(cfg.horizonSec, p.releaseAt or math.huge))
+end
 M.exhaustAt = exhaustAt
+
+-- When the snapshot first shows the starvation line: availability is
+-- reported floored to a whole percent, so the line shows once it drops
+-- below the next whole percent above it.
+function M.starveAt(p, cfg)
+  cfg = cfg or M.cfg
+  return crossAt(p, cfg, cfg.starvePct + 1, math.huge)
+end
 
 -- Whether exhaustion comes first: at or before a hold resolves (a hold
 -- crossing as its growth ends settles at the floor, starving anyway), but
@@ -451,10 +463,12 @@ function M.simulate(p, cfg)
   local class
   if runaway then
     class = "runaway"
-    -- The deadline: when the machine is lost, if it is; otherwise (a
-    -- starving plateau) the deferral bound. Never an exhaustion that a
-    -- release at that same instant cancelled.
-    ttx = lostAt or cfg.deferralSec
+    -- The deadline: when the machine is lost, if it is (never an
+    -- exhaustion that a release at that same instant cancelled). Otherwise,
+    -- for a starving plateau, the later of the deferral bound and the moment
+    -- the snapshot first shows the line: a freeze before the harm begins is
+    -- in time.
+    ttx = lostAt or math.max(cfg.deferralSec, M.starveAt(p, cfg) or cfg.deferralSec)
   elseif resolve <= cfg.deferralSec then
     class = "savable"
   else

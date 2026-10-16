@@ -119,7 +119,10 @@ that decision.
   exhausts the machine at 5% available, or settles at or below the 8%
   starvation line as the snapshot reports it and stays there past the
   deferral bound: a hold, or a release or exit after the bound), savable (it
-  resolves within the 120 s deferral bound) or late (excluded). The output must be absent
+  resolves within the 120 s deferral bound) or late (excluded). A runaway is
+  missed when its first freeze comes after its deadline: when the machine
+  is lost, if it is, and otherwise the later of the deferral bound and the
+  moment the snapshot first shows the starvation line. The output must be absent
   or empty, and a split is published whole or not at all: a template whose
   sample could not exist (one that would not fit the machine, say) refuses
   the run, naming the template and the seed.

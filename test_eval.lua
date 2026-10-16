@@ -63,6 +63,18 @@ do
   local sp = gen.simulate(params({ avail0 = 7.5, phases = { { dur = 2, rate = 100 } } }))
   check("sim starving plateau: runaway", sp.class, "runaway")
   check("sim starving plateau: ttx is the deferral bound", sp.ttxSec, 120)
+  -- One that reaches the line only after the bound (a climb, a pause, a
+  -- regrow): its deadline is when the snapshot first shows the line, below
+  -- 9% available, so a freeze before then is in time and one after is not.
+  local rg = gen.simulate(params({ avail0 = 30, compress = 1,
+    phases = { { dur = 20, rate = 120 }, { dur = 110, rate = 0 }, { dur = 30, rate = 200 } } }))
+  local onset = 130 + ((30 - 9) * gen.cfg.totalMB / 100 - 20 * 120) / 200
+  check("sim regrow: a starving runaway, never lost", rg.class == "runaway" and rg.lostAt == nil, true)
+  check("sim regrow: its deadline is the line's first showing, past the bound",
+    rg.ttxSec > 120 and math.abs(rg.ttxSec - onset) < 1e-6, true)
+  local asLabeled = { labels = { class = "runaway", ttxSec = rg.ttxSec } }
+  check("sim regrow: a freeze before the onset is in time", sc.outcome(asLabeled, { freezeAt = 135 }).missed, false)
+  check("sim regrow: one after it misses", sc.outcome(asLabeled, { freezeAt = rg.ttxSec + 5 }).missed, true)
   -- A bounded pass that resolves only after the deferral bound: late.
   local sz = gen.simulate(params({ avail0 = 30, compress = 3, phases = { { dur = 150, rate = 100 } },
                                    after = "release", releaseAt = 160 }))

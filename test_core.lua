@@ -311,6 +311,32 @@ check("top plus suffix", topMap[600].memMB, 1250)
 check("top B unit", topMap[70239].cmprsMB, 0)
 check("top G unit", topMap[99].cmprsMB, 1024)
 check("top preamble skipped", topMap[34], nil)
+-- top truncates its names, so a line far longer than a row is no row: it is
+-- refused at once, never matched (the name pattern is lazy).
+do
+  local t0 = os.clock()
+  local long = procs.parseTop("4242  a" .. (" "):rep(40000) .. "b  12M  0B\n1372   Terminal         944M  522M\n")
+  check("top: a line longer than any row is refused in linear time", os.clock() - t0 < 0.25 and long[4242] == nil, true)
+  check("top: the rows beside it still parse", long[1372] and long[1372].memMB, 944)
+  -- The cap's edge: a row of exactly 512 bytes parses, name whole; 513 does not.
+  local function rowOf(n)
+    local head, tail = "4242  ", "  12M  0B"
+    return head .. ("x"):rep(n - #head - #tail) .. tail
+  end
+  local at512 = procs.parseTop(rowOf(512) .. "\n")[4242]
+  check("top: a row of 512 bytes parses, its name whole", at512 and #at512.name, 512 - 6 - 9)
+  check("top: one of 513 is refused", procs.parseTop(rowOf(513) .. "\n")[4242], nil)
+  -- The live path is the stream: a block holding the long line between two
+  -- rows publishes promptly, without it, and keeps its neighbors.
+  local st = procs.newTopStream()
+  local t1 = os.clock()
+  procs.feedTopStream(st, "PID    COMMAND          MEM   CMPRS\n1372   Terminal         944M  522M\n")
+  local pub = procs.feedTopStream(st, "4242  a" .. (" "):rep(40000) .. "b  12M  0B\n600    WindowServer     1250M+ 206M\n"
+    .. "PID    COMMAND          MEM   CMPRS\n")
+  check("top stream: a block with a line longer than any row publishes in linear time", os.clock() - t1 < 0.25, true)
+  check("top stream: without it, keeping its neighbors",
+    pub ~= nil and pub[4242] == nil and pub[1372] ~= nil and pub[600] ~= nil, true)
+end
 
 -- ---- procs: growth detection (three-case floor) ----
 local PC = {}
@@ -574,6 +600,38 @@ check("kill: uid reason", whyUid, "not your process")
 local _, whyDeny = core.killAllowed({ pid = 500, uid = UID, comm = "Finder" }, UID, 999)
 check("kill: denylist reason", whyDeny, "protected process")
 check("kill: nil proc denied", (core.killAllowed(nil, UID, 999)), false)
+-- Linear in the name: a process can give itself any comm, of any length,
+-- and a backtracking pattern over a long run would stall the tick.
+do
+  local t0 = os.clock()
+  check("friendlyName: a long run before the last slash", procs.friendlyName(("a"):rep(40000) .. "/x"), "x")
+  check("shortName: a long whitespace run", core.shortName("a" .. (" "):rep(40000) .. "b"),
+    "a" .. (" "):rep(12) .. "\u{2026}")
+  local okK, whyK = core.killAllowed({ pid = 4242, uid = UID, comm = ("a"):rep(40000) .. "/WindowServer" }, UID, 999)
+  check("kill: a long path's basename is still the one denied", okK == false and whyK == "protected process", true)
+  check("name helpers: read in linear time", os.clock() - t0 < 0.25, true)
+  -- The same answers as before on ordinary names.
+  check("friendlyName: a comm ending in a slash is kept whole", procs.friendlyName("dir/"), "dir/")
+  check("shortName: a helper suffix after any whitespace is stripped", core.shortName("Slack \t Helper (GPU)"), "Slack")
+  check("shortName: Helper not after whitespace is kept", core.shortName("xHelper y"), "xHelper y")
+  check("kill: a comm ending in a slash names no denied process",
+    (core.killAllowed({ pid = 4243, uid = UID, comm = "/System/WindowServer/" }, UID, 999)), true)
+  -- And at the edges: empty, a lone slash, Helper first, whitespace other
+  -- than a space or tab, and bytes past ASCII.
+  check("friendlyName: an empty comm is unnamed", procs.friendlyName(""), "?")
+  check("friendlyName: a lone slash is kept whole", procs.friendlyName("/"), "/")
+  check("friendlyName: a multibyte basename is whole", procs.friendlyName("/opt/caf\xc3\xa9"), "caf\xc3\xa9")
+  check("shortName: a name that starts with Helper is kept", core.shortName("Helper"), "Helper")
+  check("shortName: whitespace then Helper at the start leaves nothing", core.shortName(" Helper"), "")
+  check("shortName: Helper after a newline is stripped", core.shortName("Slack\nHelper"), "Slack")
+  check("shortName: Helper after a vertical tab or form feed is stripped",
+    core.shortName("Slack\vHelper") .. "|" .. core.shortName("Zoom\f\rHelper (GPU)"), "Slack|Zoom")
+  check("shortName: a multibyte name keeps its bytes", core.shortName("Caf\xc3\xa9 Helper"), "Caf\xc3\xa9")
+  check("kill: an empty comm, a lone slash or no comm names no denied process",
+    (core.killAllowed({ pid = 4244, uid = UID, comm = "" }, UID, 999))
+      and (core.killAllowed({ pid = 4245, uid = UID, comm = "/" }, UID, 999))
+      and (core.killAllowed({ pid = 4246, uid = UID }, UID, 999)), true)
+end
 
 -- ---- LFM: JSON codec (trust-boundary parser; adversarial floor) ----
 local lfm = require("memwatch_lfm")
@@ -963,6 +1021,24 @@ do
   local selfOnly = core.parseProbeRows(
     "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF)
   check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
+  -- The comm is the process's own claim, of any length: it is read in
+  -- linear time, whole, with only its trailing whitespace trimmed.
+  local ctl = "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n"
+  local function commOf(tail)
+    local r = core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026 " .. tail .. "\n", SELF)
+    return r and r[4242] and r[4242].comm
+  end
+  local t0 = os.clock()
+  local long = commOf("a" .. (" "):rep(40000) .. "b")
+  check("probe: a comm with a long whitespace run is read in linear time", os.clock() - t0 < 0.25, true)
+  check("probe: and kept whole", long, "a" .. (" "):rep(40000) .. "b")
+  check("probe: a comm's trailing whitespace is trimmed", commOf("node \t "), "node")
+  check("probe: every whitespace byte is trimmed", commOf("node\v\f\r"), "node")
+  check("probe: and only those", commOf("node\xa0"), "node\xa0")
+  check("probe: its leading whitespace is the separator's", commOf("   node"), "node")
+  check("probe: a row that ends after the start time has an empty comm", commOf(""), "")
+  check("probe: one that ends at the year, with no separator, makes the reply unknown",
+    core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026\n", SELF), nil)
 end
 
 -- ---- identity: a recorded process may be signaled only while it holds ----

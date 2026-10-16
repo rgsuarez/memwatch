@@ -3294,7 +3294,7 @@ local function retireLfmServer(reason)
     if not owner then return false end
     local info = sh(string.format("/bin/ps -p %d -o comm=,args= 2>/dev/null", owner))
     local comm = info:match("^(%S+)")
-    return comm ~= nil and comm:match("([^/]+)$") == "llama-server"
+    return comm ~= nil and procs.friendlyName(comm) == "llama-server"
       and info:find("projects/memwatch/models/", 1, true) ~= nil
   end
   local function signalTargets(sig)

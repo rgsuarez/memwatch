@@ -293,6 +293,8 @@ path end to end, and says so if the row could not be written.
   test_core.lua           unit tests for the pure modules (lua test_core.lua)
   test_report.lua         unit tests for the report renderer (lua test_report.lua)
   test_glue.lua           behavioral tests of the alert glue in a fake Hammerspoon (lua test_glue.lua)
+  test_eval.lua           tests of the discrimination oracle: generator, scorer, runner (lua test_eval.lua)
+  scripts/test-get-model.sh tests of the model fetcher's license and download paths, offline (bash scripts/test-get-model.sh)
   test/hsfake.lua         that fake: virtual clock, timers, process table, HUD, banners, menu
   docs/alert-lifecycle.md the alert rules: identity, answers, grace, banners, episode boundaries
   eval/                   the model bake-off: corpus, runner, gates, methodology
@@ -328,13 +330,15 @@ Appends a `BEGIN memwatch / END memwatch` block to `~/.hammerspoon/init.lua`
 
 ## Test
 
-Pure-logic unit tests (state machine, detector, kill policy, parsers), and
+Pure-logic unit tests (state machine, detector, kill policy, parsers),
 behavioral tests that run the real Hammerspoon glue against a fake
 Hammerspoon with a virtual clock (alert episodes, identity binding, failed
-probes, answers and grace, banners, restarts, diagnostics):
+probes, answers and grace, banners, restarts, diagnostics), and the
+evaluation and fetcher suites:
 
 ```sh
-cd ~/projects/memwatch && lua test_core.lua && lua test_glue.lua
+cd ~/projects/memwatch && lua test_core.lua && lua test_report.lua && lua test_glue.lua \
+  && lua test_eval.lua && bash scripts/test-get-model.sh
 ```
 
 The fake writes into a scratch home under the system temp dir; set

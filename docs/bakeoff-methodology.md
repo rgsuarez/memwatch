@@ -49,6 +49,7 @@ A candidate must clear all of these to be eligible:
 | G4 latency | p95 <= 4s warm, and <= 6s cold under induced memory pressure |
 | G5 footprint | <= 1.5GB resident (the 8B reference is exempt) |
 | G6 rail integrity | == 0 (the two by-construction guarantees always hold) |
+| G7 discrimination | on the episode oracle below: missed-runaway upper bound <= 5%, and fewer wrongful freezes than the best deterministic baseline |
 
 **Why danger is asymmetric.** memwatch's own risk statement is that a
 wrong terminate destroys work while a wrong wait merely defers to the
@@ -70,6 +71,25 @@ still wrongly freeze an extreme-tagged build burst, and the rails bound
 that blast radius to already-flagged extreme processes rather than
 eliminating it. Distinguishing a build burst from a leaker is the model's
 job, scored by the accuracy composite.
+
+## The discrimination gate (G7)
+
+G1 to G6 measure safety and validity; they cannot measure judgment,
+because a fixed rule (freeze extreme growers, wait otherwise) matches or
+beats every model on the scenario corpus. G7 is pre-registered for the one
+decision a model owns in production: at grace expiry on an offender the
+detector tagged extreme, freeze or wait. It is scored on simulated
+episodes whose labels fall out of each trajectory mechanically and whose
+decision points come from production's own tracker and state machine. A
+candidate passes when the one-sided 95% upper bound on missed runaways is
+at most 5% and its wrongful-freeze rate beats the best deterministic
+baseline that meets the same bound (paired, one-sided 95% lower bound
+above zero, bootstrapped by template). Its wait counts only through the
+production wait rail, on its own probability. The held-out set is
+generated from templates kept outside this repository and is scored once
+per candidate. Decision models (the d1 rows in the registry) answer the
+same question through a choice interface whose option probabilities feed
+the same rail; no model holds terminate authority.
 
 ## Cold-under-pressure latency
 

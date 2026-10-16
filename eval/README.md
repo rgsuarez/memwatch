@@ -93,6 +93,53 @@ The committed public artifact is `eval/shipped-summary.json` (winner, gates
 passed, shipped-model headline numbers only). The full per-model league
 lives in gitignored `results/` only.
 
+## Discrimination oracle (episodes and G7)
+
+The corpus above measures safety and validity, but it cannot reward
+judgment: the rule "extreme -> freeze, else wait" outscores every model
+benchmarked on it. The decision a model owns in production is narrower:
+at grace expiry on an offender the detector tagged kind=extreme, under the
+freeze ceiling, freeze it or wait. The discrimination oracle scores exactly
+that decision.
+
+- `gen-episodes.lua` simulates episodes from `episode-templates.lua`: one
+  offender's trajectory from grace expiry, with decision points where
+  production makes one (+0, +60 and +120 s, while the process is alive,
+  production's own tracker reads kind=extreme, and its state machine is
+  critical). Labels fall out of the trajectory exactly: runaway (it
+  exhausts the machine at 5% available, or settles at or below the 8%
+  starvation line as the snapshot reports it), savable (it resolves within
+  the 120 s deferral bound) or late (excluded).
+- `score-episodes.lua` plays a candidate through each episode the way
+  production defers, then applies G7: the one-sided 95% Clopper-Pearson
+  upper bound on missed runaways is at most 5%, and the wrongful-freeze
+  rate beats the best deterministic baseline that meets that bound (paired,
+  one-sided 95% lower bound above zero, bootstrapped by template). The
+  baselines are always-freeze, a category rule, a time-to-exhaustion rule
+  and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
+  required, never the evaluated directory).
+- A set decides the gate only with enough runaways: 59 at zero misses, 93
+  at one. Generate dev with `--per-template 8` or more (88 runaways from
+  the public dev templates). `gate` exits nonzero when G7 fails, and
+  `controls` exits nonzero when a control fails or the set is undecidable
+  or underpowered.
+- `bakeoff.lua episodes` records a model's decision at every decision point
+  through the production builders (`--api chat|systemone|completion`), and
+  `score-episodes.lua` replays the rows through the production wait rail:
+  a wait counts only when the model's own P(wait) reaches the threshold
+  chosen on dev (`tau`), and a wait with no probability (a chat verdict) is
+  never honored. Candidates are scored on the `discriminate` prompt
+  variant.
+
+```
+lua eval/gen-episodes.lua --templates eval/episode-templates.lua --split dev \
+  --seed 1 --per-template 8 --out eval/episodes/dev
+lua eval/score-episodes.lua controls --dir eval/episodes/dev --fit-dir <another split>
+```
+
+Held-out templates are kept outside this repository, so the sealed set
+never becomes public or training material.
+
 ## Runtime verification
 
 Dual-runtime note: the pure modules run under the Hammerspoon Lua 5.4

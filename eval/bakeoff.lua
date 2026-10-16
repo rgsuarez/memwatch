@@ -370,9 +370,9 @@ local function runMode(args)
     if not (serverPid and serverPid > 0) then
       error("--server-pid must be a process id, not " .. args.server_pid, 0)
     end
-    local host = server:match("^https?://([^/?#]+)")
-    host = host and host:gsub(":%d+$", ""):lower()
-    if not (host == "127.0.0.1" or host == "localhost" or host == "[::1]") then
+    local host = server:lower():match("^https?://([^/?#]+)")
+    host = host and host:gsub(":%d+$", "")
+    if not (host == "localhost" or host == "[::1]" or (host and host:match("^127%.%d+%.%d+%.%d+$"))) then
       error("--server-pid samples a process on this machine; " .. server .. " is not on this machine", 0)
     end
   end

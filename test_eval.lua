@@ -1487,6 +1487,8 @@ printf '0.010 %s' "$status"
     badPidSaid:find("must be a process id", 1, true) ~= nil and badPidSaid:find("exit=0", 1, true) == nil, true)
   local nearSaid = runSaid("--server http://127.0.0.1:9 --server-pid 1", pidOut)
   check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil, true)
+  local otherSaid = runSaid("--server HTTP://127.0.0.2:9 --server-pid 1", pidOut)
+  check("runner: under any loopback name, its scheme in capitals", otherSaid:find("exit=0", 1, true) ~= nil, true)
   os.remove(pidOut)
   -- Only a run result is ever cleared: --out naming an input, a file that is
   -- not JSON, or a directory refuses the run and leaves it as it was.

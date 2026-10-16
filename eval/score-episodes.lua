@@ -699,6 +699,24 @@ function M.realDir(dir)
   return out
 end
 
+-- The decide function a gate run scores: a fitted baseline by its fitted
+-- self (tree, ttx), recorded decisions through the rail, or a candidate.
+function M.resolveCandidate(name, baselines, a)
+  a = a or {}
+  if name == "noisy-oracle" then return M.noisyOracle(M.cfg.noisyFlip, 1) end
+  if name == "tree" or name == "ttx" then return baselines[name] end
+  if name == "decisions" then
+    assert(a.decisions, "--decisions is required for the decisions candidate")
+    assert(a.tau, "--tau is required for the decisions candidate (choose it on dev)")
+    local decisions, n, noP = M.loadDecisions(a.decisions, a.key)
+    local note = noProbabilityNote(n, noP)
+    if note then print(note) end
+    return M.decisionsCandidate(decisions, a.tau)
+  end
+  if M.candidates[name] then return M.candidates[name]() end
+  error("unknown candidate " .. name)
+end
+
 -- Returns the exit status: 0, or 1 when the gate fails or a control does.
 function M.main(argv)
   local status = 0
@@ -721,22 +739,17 @@ function M.main(argv)
     for _, ep in ipairs(fitEps) do has[ep.labels and ep.labels.class or "?"] = true end
     assert(has.runaway and has.savable,
       "--fit-dir has no runaway or no savable episode; the baselines cannot be fit on it")
+    -- Another directory holding the same episodes (a copy) is the same split.
+    local scored = {}
+    for _, ep in ipairs(eps) do scored[ep.id] = true end
+    for _, ep in ipairs(fitEps) do
+      assert(not scored[ep.id], "--fit-dir shares episode " .. tostring(ep.id) .. " with the evaluated set")
+    end
   end
   local baselines, tree, horizon = M.baselineSet(fitEps, a.depth)
   if a.cmd == "gate" then
     local name = a.candidate or "oracle"
-    local decide
-    if name == "noisy-oracle" then decide = M.noisyOracle(M.cfg.noisyFlip, 1)
-    elseif name == "tree" then decide = baselines.tree
-    elseif name == "decisions" then
-      assert(a.decisions, "--decisions is required for the decisions candidate")
-      assert(a.tau, "--tau is required for the decisions candidate (choose it on dev)")
-      local decisions, n, noP = M.loadDecisions(a.decisions, a.key)
-      local note = noProbabilityNote(n, noP)
-      if note then print(note) end
-      decide = M.decisionsCandidate(decisions, a.tau)
-    elseif M.candidates[name] then decide = M.candidates[name]()
-    else error("unknown candidate " .. name) end
+    local decide = M.resolveCandidate(name, baselines, a)
     local g = M.gate(eps, decide, baselines)
     for _, bn in ipairs(sortedKeys(g.baselines)) do print(summary("base:" .. bn, g.baselines[bn])) end
     print(summary("cand:" .. name, g.candidate))

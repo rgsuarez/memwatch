@@ -466,6 +466,9 @@ do
       steps = lfm.jsonArray({ { t = 0, snapshot = { availPct = 20 } } }) }), "\n")
     lf:close()
   end
+  local copy = tmpDir()
+  os.execute("cp '" .. held .. "'/*.json '" .. copy .. "'/")
+  local okCopy, errCopy = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", copy })
   local okEmpty, errEmpty = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", empty })
   local okLate, errLate = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", late })
   print = quiet
@@ -477,11 +480,13 @@ do
     okLink == false and tostring(errLink):find("evaluated directory", 1, true) ~= nil, true)
   check("cli: a gate without a fit split is refused", okNone, false)
   check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
+  check("cli: a copy of the evaluated set is refused as the fit split",
+    okCopy == false and tostring(errCopy):find("shares episode", 1, true) ~= nil, true)
   check("cli: an empty fit split is refused",
     okEmpty == false and tostring(errEmpty):find("cannot be fit", 1, true) ~= nil, true)
   check("cli: so is one with only late episodes",
     okLate == false and tostring(errLate):find("cannot be fit", 1, true) ~= nil, true)
-  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "'")
+  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "'")
 end
 
 -- ---- on a set large enough to decide the gate (the documented dev size) ----
@@ -509,6 +514,8 @@ do
   check("decidable: always-freeze fails it", sc.gate(dev, sc.candidates["always-freeze"](), baselines).pass, false)
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)
+  check("cli: the ttx candidate is the fitted baseline", sc.resolveCandidate("ttx", baselines) == baselines.ttx, true)
+  check("cli: so is the tree", sc.resolveCandidate("tree", baselines) == baselines.tree, true)
   check("ttx: the fitted horizon makes fewer wrongful freezes than always-freeze",
     gO.baselines.ttx.wrongful < gO.baselines["always-freeze"].wrongful
       and gO.baselines.ttx.missUpper <= sc.cfg.missBound, true)

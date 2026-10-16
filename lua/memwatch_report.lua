@@ -350,8 +350,10 @@ function M.renderHTML(agg, opts)
     if opts.public then
       -- Public rendering: the winning row's headline only.
       w("<h2>Bake-off winner</h2>")
+      local shown = false
       for _, row in ipairs(opts.league.league) do
         if isWinner(row, opts.league) then
+          shown = true
           w("<div class='card'>")
           w(string.format("<div><span class='blue'>%s</span> <span class='sub'>prompt variant %s \u{00B7} selected by the gated bake-off on %s</span></div>",
             esc(row.label), esc(row.variant or "?"), esc(basis)))
@@ -361,6 +363,12 @@ function M.renderHTML(agg, opts)
           w("<div class='glossary'>Methodology in docs/bakeoff-methodology.md; the full comparative table is not published.</div>")
           w("</div>")
         end
+      end
+      -- A league can have no winner: none passed, or none passed in the
+      -- condition production runs. The heading never stands empty.
+      if not shown then
+        w(string.format("<div class='card'><div class='sub'>No winner: no model passed the gates (%s) in the condition production runs.</div></div>",
+          esc(basis)))
       end
     else
       w("<h2>Bake-off league (local)</h2>")

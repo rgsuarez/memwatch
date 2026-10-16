@@ -132,6 +132,17 @@ check("public: it says what the league chose it on", pub2:find("on G1-G6; G7 is 
 local loc2 = report.renderHTML(advAgg, { league = LEAGUE2, generatedAt = "x" })
 check("html: one row is marked the winner", count(loc2, "<tr class='winner'>"), 1)
 check("html: each row says its condition", loc2:find("taxonomy \u{00B7} raw", 1, true) ~= nil, true)
+-- A league no row wins (none passed, or none in production's condition)
+-- says so under its heading.
+local pub3 = report.renderHTML(advAgg, { league = { league = lfm.jsonArray({ lrow("taxonomy", "raw") }),
+  winner_gates = "G1-G6; G7 is scored separately" }, public = true, generatedAt = "x" })
+check("public: a league with no winner says so",
+  pub3:find("No winner: no model passed the gates", 1, true) ~= nil and pub3:find("<span class='blue'>m</span>", 1, true) == nil, true)
+-- The condition cell carries values read from a results file: escaped.
+local loc4 = report.renderHTML(advAgg, { league = { league = lfm.jsonArray({ lrow("taxonomy", "<b>x</b>") }),
+  winner = "m" }, generatedAt = "x" })
+check("html: the condition cell is escaped",
+  loc4:find("&lt;b&gt;x&lt;/b&gt;", 1, true) ~= nil and loc4:find("<b>x</b>", 1, true) == nil, true)
 
 -- ---- markdown parity from the same aggregate ----
 local md = report.renderMD(agg, {})

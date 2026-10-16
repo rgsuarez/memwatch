@@ -123,9 +123,14 @@ function M.sample(tpl, r)
   -- Growth ends with the last phase that grows: a flat phase after it
   -- (rate 0) is the plateau, not more growth.
   local t, grownTo = 0, 0
-  for _, ph in ipairs(tpl.phases or {}) do
+  for i, ph in ipairs(tpl.phases or {}) do
     local dur = sampleRange(r, ph.dur)
     local rate = sampleRange(r, ph.rate)
+    -- A phase grows the footprint or holds it; memory given back is a
+    -- release or an exit. A shrinking phase is not modeled (the plateau and
+    -- the exhaustion time both assume growth), so it is refused.
+    assert(rate >= 0, string.format("%s: phase %d's rate is %s MB/s; a phase grows or holds the footprint "
+      .. "(0 or more), and memory given back is a release or an exit", tostring(tpl.id), i, tostring(rate)))
     p.phases[#p.phases + 1] = { from = t, to = t + dur, rate = rate }
     t = t + dur
     if rate > 0 then grownTo = t end

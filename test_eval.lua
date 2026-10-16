@@ -451,6 +451,13 @@ do
     after = "hold" }, 1, "test")
   check("labels: a flat phase after the growth is the plateau", flatTail.labels.class .. ":"
     .. tostring(flatTail.labels.resolvesBySec), "savable:20")
+  -- A shrinking phase is not modeled (memory given back is a release or an
+  -- exit), so a template that has one is refused.
+  local okShrink, errShrink = pcall(gen.episode, { id = "T-shrink", names = { "python3" }, avail0 = 10, w0 = 3000,
+    age0 = 600, peak0 = 12000, compress = 1, graceRate = 0,
+    phases = { { dur = 10, rate = 150 }, { dur = 10, rate = -150 } }, after = "hold" }, 1, "test")
+  check("labels: a shrinking phase is refused, not read as a plateau",
+    okShrink == false and tostring(errShrink):find("grows or holds the footprint", 1, true) ~= nil, true)
   -- Production's policy gate never freezes another user's process: an
   -- offender macOS runs under its own service user is no episode, while the
   -- same trajectory under the user's own process is.

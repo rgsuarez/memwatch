@@ -172,12 +172,16 @@ do
   end
   sc.cfg.bootstrap = 400   -- keep the unit test fast; the CLI default stays 2000
   local baselines = { ["always-freeze"] = sc.candidates["always-freeze"](), rule = sc.candidates.rule() }
+  -- This small set cannot decide the gate (too few runaways for the miss
+  -- bound), and the gate must say so rather than pass anything: the
+  -- controls on a decidable set are pinned further on.
   local g = sc.gate(eps, sc.candidates["always-freeze"](), baselines)
-  check("gate control: always-freeze cannot beat itself", g.passBeat, false)
+  check("gate: a set too small to decide names no baseline and passes nothing",
+    g.bestBaseline == nil and g.pass == false, true)
   local s = sc.score(eps, sc.candidates.oracle())
   check("gate: the oracle never misses", s.misses, 0)
   check("gate: the oracle itself never freezes a savable", s.wrongful - s.wrongfulByFloor, 0)
-  check("gate: floor freezes are attributed to the floor", s.wrongfulByFloor >= 0, true)
+  check("gate: the floor's own freezes are counted as the floor's", s.wrongfulByFloor > 0, true)
   -- The power control mixes the oracle into a baseline by episode.
   local af = sc.candidates["always-freeze"]()
   local none, all = sc.mixedOracle(af, 0, 1), sc.mixedOracle(af, 1, 1)

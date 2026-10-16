@@ -309,7 +309,7 @@ end
 -- only this record, as of its horizon, so a delivery stall, a late timer,
 -- an expired tracker entry, a reused pid or an event from before the
 -- observation cannot change what it reports.
--- a: { pid, comm0, start0, obsAt, weightMB, minSeq, horizons }. minSeq is
+-- a: { pid, comm0, start0, obsAt, weightMB, minSeq, horizons, replays }. minSeq is
 -- the first sampler sequence launched after the observation (nil: decide by
 -- launch time); see foldSample. horizons are the follow-up offsets, whose
 -- machine readings are kept in the record (snapshotHorizons).
@@ -319,7 +319,10 @@ function M.newEvidence(a)
            weight0 = a.weightMB, peakMB = a.weightMB, lastWeightMB = nil, seenAcq = nil,
            gone = nil, lastMiss = nil, misses = {}, samples = {}, signals = {},
            touches = 0, touchesUncertain = 0, touchLog = {}, actions = {},
-           frozenLog = {}, clockStep = nil }
+           frozenLog = {}, clockStep = nil,
+           -- the stretches a step back replayed, as of the observation
+           -- (see startReplayed); none recorded is an empty list
+           replays = type(a.replays) == "table" and a.replays or {} }
 end
 
 -- Why the record has no fresh sighting, dated when that became known, so a

@@ -143,8 +143,10 @@ runs after its record stopped collecting still reads its own horizon.
     signal's or touch's target and of a frozen-ledger entry (uncertain).
   - At most 16 stretches are kept; past that the two oldest merge into one
     that spans both, so a start in the gap between them is refused too.
-  - A process that started before every stretch keeps its identity, and so
-    does one that started between two of them, unless the cap merged them.
+  - A process whose start window lies wholly before every stretch keeps its
+    identity, and so does one whose window lies between two of them, unless
+    the cap merged them. A window is ps's bound on the start, so one that
+    reaches into a stretch is refused even when the true start does not.
 - A sample: the same program in an overlapping window that rules out a
   successor is a sighting; another program or a disjoint window is a reuse
   (the observed process is gone); anything else is `identity-uncertain`.

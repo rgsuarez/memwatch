@@ -1988,6 +1988,12 @@ do
       evOk.signals[1] ~= nil and evOk.signals[1].uncertain == nil, true)
     observe.foldTouch(ev, { at = 1002, comm = "/bin/x", startEpoch = 150 })
     check("foldTouch: a touch on a replayed start is uncertain", ev.touchesUncertain == 1 and ev.touches == 0, true)
+    observe.foldTouch(evOk, { at = 1002, comm = "/bin/x", startEpoch = 300 })
+    check("foldTouch: one on a start between stretches is certain (control)",
+      evOk.touches == 1 and evOk.touchesUncertain == 0, true)
+    check("newEvidence: the stretches it was given",
+      observe.newEvidence({ pid = 9, replays = spans }).replays, spans)
+    check("newEvidence: none given is an empty list", #observe.newEvidence({ pid = 9 }).replays, 0)
   end
   -- Kept stretches: none is dropped (a process born in one starts there
   -- while it lives); past the cap the two oldest merge, wider, never less.
@@ -2015,6 +2021,12 @@ do
   check("frozenMatches: an entry started in a replayed stretch is uncertain",
     observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000150) }, { lo = 1700000149, hi = 1700000150, etimeSec = 500 },
       nil, { { lo = 1700000100, hi = 1700000200 } }), nil)
+  check("frozenMatches: an entry between stretches is the same, stretches present",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000300) }, { lo = 1700000299, hi = 1700000300, etimeSec = 500 },
+      nil, { { lo = 1700000100, hi = 1700000200 }, { lo = 1700000500, hi = 1700000600 } }), true)
+  check("frozenMatches: one outside the window is another process, stretches present",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000400) }, { lo = 1700000299, hi = 1700000300, etimeSec = 500 },
+      nil, { { lo = 1700000100, hi = 1700000200 } }), false)
   check("frozenMatches: the same entry with no stretch is the same (control)",
     observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000150) }, { lo = 1700000149, hi = 1700000150, etimeSec = 500 },
       nil, {}), true)
@@ -2653,7 +2665,7 @@ do
     src:find("for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end", 1, true) ~= nil
       and src:find("local replayed = start0 and obs.startReplayed(start0, replays) or false", 1, true) ~= nil, true)
   check("replay glue: and its record keeps them for its samples and frozen-ledger reads",
-    src:find("ev.replays = replays", 1, true) ~= nil
+    src:find("replays = replays })", 1, true) ~= nil
       and src:find("observe.frozenMatches(frozen[pid], start0, nil, replays)", 1, true) ~= nil
       and src:find("observe.frozenMatches(frozen[ev.pid], ev.start0, nil, ev.replays)", 1, true) ~= nil, true)
   check("replay glue: a sample's window is checked against its record's stretches",

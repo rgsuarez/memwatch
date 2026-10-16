@@ -2329,6 +2329,22 @@ scenario("ledger: a step back outliving a start window never lets a successor vo
   local last = fu[#fu]
   check("outlived: the gone process is never read alive or frozen (" .. tostring(last and last.fate) .. ")",
     last ~= nil and last.fate ~= "alive" and last.fate ~= "frozen", true)
+  -- Once the clock has run past the stretch, a row on the successor (born in
+  -- it) still takes no identity from a start the step replayed.
+  local function wall() return W.now + (W.wallOffset or 0) end
+  runUntil(W, 400, function() return wall() > t0 + S + 10 end)
+  local seen = {}
+  for _, r in ipairs(ledgerRows(W)) do seen[r.seq or -1] = true end
+  local late
+  runUntil(W, 120, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not seen[r.seq] then late = late or r end
+    end
+    return late ~= nil
+  end)
+  check("outlived: a row once the clock has run past the stretch (control)", late ~= nil, true)
+  check("outlived: it still takes no identity from a replayed start",
+    late and late.identityBasis == "none" and late.identityReplayed == true, true)
 end)
 
 -- A successor born in wall time a step back replayed, against a process
@@ -2461,6 +2477,12 @@ scenario("ledger: with no monotonic clock a step back refuses identity from then
   check("blind: the step was taken out (control)",
     runUntil(W, 10, function() return logHas(W, "clock-stepped-back:") end), true)
   check("blind: refusing identity from then on is logged", logHas(W, "replay-unbounded:identity-refused-until-reload"), true)
+  W.wallOffset = (W.wallOffset or 0) - 30   -- a second step back
+  runUntil(W, 10, function() return false end)
+  local n = 0
+  local f = io.open(W.home .. "/projects/memwatch/memwatch.log", "r")
+  if f then for line in f:lines() do if line:find("replay-unbounded:", 1, true) then n = n + 1 end end f:close() end
+  check("blind: and said once, across a second step (" .. n .. ")", n, 1)
   local before = {}
   for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
   local nextRow
@@ -2767,6 +2789,20 @@ scenario("ledger: a bound start time a step back replayed identifies nothing", n
   check("bound-replayed: a decision row once the clock has passed the start again (control)", nextRow ~= nil, true)
   check("bound-replayed: it takes no identity from the replayed start", nextRow and nextRow.identityBasis, "none")
   check("bound-replayed: and says why", nextRow and nextRow.identityReplayed, true)
+  -- Once the clock has run past the stretch, still none.
+  runUntil(W, D + 60, function() return W.now - tStep >= D + 10 end)
+  local seen = {}
+  for _, r in ipairs(ledgerRows(W)) do seen[r.seq or -1] = true end
+  local late
+  runUntil(W, 150, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not seen[r.seq] then late = late or r end
+    end
+    return late ~= nil
+  end)
+  check("bound-replayed: a decision row once the clock has run past the stretch (control)", late ~= nil, true)
+  check("bound-replayed: it still takes no identity from the replayed start",
+    late and late.identityBasis == "none" and late.identityReplayed == true, true)
 end)
 
 -- Follow-up timers that never run (a stalled run loop): the records stop

@@ -3669,8 +3669,8 @@ obs.writeObservation = function(point, offender, now, extra)
   local horizons = extra.horizons or observe.cfg.horizons
   local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
                                    start0 = start0, obsAt = now, weightMB = weight0,
-                                   minSeq = sampler.nextSeq + 1, horizons = horizons })
-  ev.replays = replays
+                                   minSeq = sampler.nextSeq + 1, horizons = horizons,
+                                   replays = replays })
   observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0, nil, replays))
   -- Its life is a duration (on the monotonic clock): a step back, which
   -- closes the record, never lengthens it.

@@ -1518,6 +1518,14 @@ printf '0.010 %s' "$status"
   local badPidSaid = runSaid("--server http://127.0.0.1:9 --server-pid abc", pidOut)
   check("runner: and when it is not a process id",
     badPidSaid:find("must be a process id", 1, true) ~= nil and badPidSaid:find("exit=0", 1, true) == nil, true)
+  do
+    local notPids = {}
+    for _, v in ipairs({ "0", "-1", "1.5" }) do
+      local said = runSaid("--server http://127.0.0.1:9 --server-pid " .. v, pidOut)
+      if not (said:find("must be a process id", 1, true) and not said:find("exit=0", 1, true)) then notPids[#notPids + 1] = v end
+    end
+    check("runner: nor 0, a negative or a fraction", table.concat(notPids, " "), "")
+  end
   local nearSaid = runSaid("--server http://127.0.0.1:9 --server-pid 1", pidOut)
   check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil, true)
   local otherSaid = runSaid("--server HTTP://127.0.0.2:9 --server-pid 1", pidOut)
@@ -1537,6 +1545,15 @@ printf '0.010 %s' "$status"
     if lf2 then lf2:close() end
     check("runner: the gates refuse a contradiction, the league untouched", gatesSaid:find("contradict each other", 1, true) ~= nil
       and gatesSaid:find("exit=0", 1, true) == nil and leagueNow == '{"league":[],"earlier":true}\n', true)
+    local kh = io.popen(string.format("lua eval/bakeoff.lua gates --results '%s' --api-key-env A --api-key-file B 2>&1; echo \"exit=$?\"",
+      gatesDir))
+    local keysSaid = kh:read("a")
+    kh:close()
+    local lf3 = io.open(gatesDir .. "/league.json", "r")
+    local leagueAfterKeys = lf3 and lf3:read("a")
+    if lf3 then lf3:close() end
+    check("runner: and so is the key pair", keysSaid:find("name two keys", 1, true) ~= nil
+      and keysSaid:find("exit=0", 1, true) == nil and leagueAfterKeys == '{"league":[],"earlier":true}\n', true)
   end
   -- A FIFO at a run's --out is refused at once, never opened, and kept.
   do

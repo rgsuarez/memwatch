@@ -28,7 +28,7 @@
 -- episodes and each paired difference is -1, 0 or +1, so under that null
 -- each difference, and each template's sum, is symmetric about zero, and
 -- the test is exact at any template count; four or fewer templates cannot
--- pass at all. Under the
+-- pass at all, so a set needs five savable templates to decide. Under the
 -- weaker null of an equal rate in aggregate only (templates differing
 -- either way), the flips' spread includes each template's squared mean, so
 -- the test is conservative. `controls` measures its size under both. A
@@ -867,6 +867,16 @@ end
 -- none, so the search starts under the zero-miss size, doubles until a size
 -- meets the bound, then bisects: a small bound costs a few dozen steps, not
 -- one per runaway.
+-- The fewest savable templates a set must hold for the beat test to be
+-- reachable at all: with k templates its smallest p is 1/2^k, so the set
+-- needs the k at which that reaches 1 - confidence (5 at 95%).
+function M.minBeatTemplates(cfg)
+  cfg = cfg or M.cfg
+  local alpha, k = 1 - cfg.confidence, 0
+  while 2 ^ -k > alpha + 1e-12 do k = k + 1 end
+  return k
+end
+
 function M.decisiveRunaways(cfg)
   cfg = cfg or M.cfg
   local bound, conf = cfg.missBound, cfg.confidence
@@ -917,13 +927,19 @@ function M.gate(episodes, candDecide, baselines, cfg)
   -- beside it, a diagnostic (see the header).
   local passBeat = (p ~= nil) and p <= 1 - cfg.confidence
   -- A set too small to let a one-miss baseline qualify decides nothing: it
-  -- neither passes nor fails a candidate.
-  local minRunaways = M.decisiveRunaways(cfg)
-  local decisive = cand.nRunaway >= minRunaways
+  -- neither passes nor fails a candidate. Neither does one with too few
+  -- savable templates for the beat to be reachable.
+  local minRunaways, minTemplates = M.decisiveRunaways(cfg), M.minBeatTemplates(cfg)
+  local savTpl, savableTemplates = {}, 0
+  for _, pe in pairs(cand.perEpisode) do
+    if pe.class == "savable" and not savTpl[pe.template] then savTpl[pe.template] = true; savableTemplates = savableTemplates + 1 end
+  end
+  local decisive = cand.nRunaway >= minRunaways and savableTemplates >= minTemplates
   return {
     candidate = cand, bestBaseline = bestName, baselines = baseScores,
     improvementLower = lower, improvementPoint = point, improvementP = p, flipTemplates = flipTemplates,
     passMiss = passMiss, passBeat = passBeat, decisive = decisive, minRunaways = minRunaways,
+    savableTemplates = savableTemplates, minTemplates = minTemplates,
     pass = decisive and passMiss and passBeat,
   }
 end
@@ -1065,6 +1081,16 @@ function M.nullSize(eps, cfg)
     return passes
   end
   return size(false), size(true), cfg.sizeDatasets, #tpls
+end
+
+-- Why a gate's set decides nothing, for the operator.
+function M.undecidableWhy(g)
+  if g.candidate.nRunaway < g.minRunaways then
+    return string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a baseline"
+      .. " missing one can be the comparator: generate more episodes per template", g.candidate.nRunaway, g.minRunaways)
+  end
+  return string.format("this set holds %d savable templates; the beat test can pass only on %d or more (its smallest"
+    .. " p over k templates is 1/2^k): add savable templates", g.savableTemplates, g.minTemplates)
 end
 
 -- What a decisions file holds: rows the runner recorded as invalid replies
@@ -1286,10 +1312,7 @@ function M.main(argv)
       tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementP and string.format("%.4f", g.improvementP) or "n/a",
       g.flipTemplates or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
       (not g.decisive) and "UNDECIDABLE" or g.pass and "PASS" or "FAIL"))
-    if not g.decisive then
-      print(string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a baseline"
-        .. " missing one can be the comparator: generate more episodes per template", g.candidate.nRunaway, g.minRunaways))
-    end
+    if not g.decisive then print(M.undecidableWhy(g)) end
     -- 0 pass, 1 fail, 2 a set too small to decide.
     status = (not g.decisive) and 2 or g.pass and 0 or 1
     print("tree baseline (fit on " .. (a.fitDir or a.dir) .. "):\n" .. M.describeTree(tree, "  "))
@@ -1308,7 +1331,8 @@ function M.main(argv)
           improvementP = g.improvementP, flipTemplates = g.flipTemplates,
           missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
           nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
-          decisive = g.decisive, minRunaways = g.minRunaways })), "\n"))
+          decisive = g.decisive, minRunaways = g.minRunaways, savableTemplates = g.savableTemplates,
+          minTemplates = g.minTemplates })), "\n"))
         assert(f:close())
         assert(os.rename(partial, a.out))
       end)
@@ -1338,8 +1362,7 @@ function M.main(argv)
     -- and says so first: the gate passes nothing on it, so neither control is
     -- read.
     if not gO.decisive then
-      print(string.format("UNDECIDABLE: this set holds %d runaways, under the %d G7 decides on, so the controls"
-        .. " are not read: generate more episodes per template", gO.candidate.nRunaway, gO.minRunaways))
+      print("UNDECIDABLE: " .. M.undecidableWhy(gO) .. "; the controls are not read")
       status = 2
     elseif not gO.bestBaseline then
       print("UNDECIDABLE: no baseline meets the miss bound on this set, so the gate compares against nothing"

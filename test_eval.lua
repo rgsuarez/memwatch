@@ -257,6 +257,7 @@ do
   check("sign-flip: so does a pair whose second shift is too wide", wide.A == 0 and wide.B == 0, true)
   check("sign-flip: the size check counts only savable templates",
     select(4, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
+  check("sign-flip: a set needs five savable templates for the beat to be reachable", sc.minBeatTemplates(), 5)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----
@@ -2369,6 +2370,26 @@ do
   end
   local gShort = sc.gate(short, sc.candidates.oracle(), baselines)
   check("decidable: one runaway under the floor, the oracle is not passed", gShort.decisive == false and gShort.pass == false, true)
+  -- So does a set with too few savable templates for the beat to be
+  -- reachable: four decide nothing, five do.
+  local function keepSavableTemplates(nKeep)
+    local tpls, seenT = {}, {}
+    for _, ep in ipairs(dev) do
+      if ep.labels.class == "savable" and not seenT[ep.template] then seenT[ep.template] = true; tpls[#tpls + 1] = ep.template end
+    end
+    table.sort(tpls)
+    local keep = {}
+    for i = 1, nKeep do keep[tpls[i]] = true end
+    local out = {}
+    for _, ep in ipairs(dev) do
+      if ep.labels.class ~= "savable" or keep[ep.template] then out[#out + 1] = ep end
+    end
+    return out
+  end
+  local g4 = sc.gate(keepSavableTemplates(4), sc.candidates.oracle(), baselines)
+  check("decidable: four savable templates decide nothing, and say why", g4.decisive == false and g4.savableTemplates == 4
+    and sc.undecidableWhy(g4):find("savable templates", 1, true) ~= nil, true)
+  check("decidable: five do", sc.gate(keepSavableTemplates(5), sc.candidates.oracle(), baselines).decisive, true)
   check("decidable: always-freeze fails it", sc.gate(dev, sc.candidates["always-freeze"](), baselines).pass, false)
   -- A beat carried by three templates is no pass, though the bootstrap's
   -- bound is above zero: this candidate decides as the oracle on the

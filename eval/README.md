@@ -175,8 +175,8 @@ that decision.
   paired difference is -1, 0 or +1, so under that null each template's
   sum is symmetric about zero and the test is exact at any template count;
   under the weaker null of an equal rate in aggregate only, it is
-  conservative. Four or fewer savable templates can never pass. A
-  template the set lacks is its
+  conservative. Four or fewer savable templates can never pass, so a set
+  with fewer than five decides nothing. A template the set lacks is its
   coverage to guard. The bootstrapped 95% lower bound is reported beside
   the test as a diagnostic, since with few templates it passes a
   no-better candidate more often than its nominal rate. `controls` also
@@ -187,7 +187,8 @@ that decision.
   required, holding runaways and savables and none of the evaluated
   episodes), and `--candidate ttx|tree` scores them as fit there.
 - G7 decides only on a set with enough runaways that a baseline missing
-  one can still meet the miss bound: 93 at the defaults. On a smaller set
+  one can still meet the miss bound (93 at the defaults), and five or
+  more savable templates. On a smaller set
   the comparator would fall back to always-freeze, which any fixed rule
   can beat. Generate dev with `--per-template 10` (110 runaways from the
   public dev templates). `gate` exits 0 when G7 passes, 1 when it fails,

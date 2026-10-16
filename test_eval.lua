@@ -342,6 +342,39 @@ do
   check("alert: a lapse while critical keeps the alert and its grace", table.concat(rts, ","), "0,120")
   check("alert: so waiting through it is not a miss",
     sc.outcome(eres, sc.play(eres, function() return "wait" end)).missed, false)
+  -- The alert's lifecycle, tick by tick: a dip below critical shorter than
+  -- the settle keeps the alert and its grace; a settle ends it; the next
+  -- rise starts grace over.
+  local al = { active = false, exposureSec = 0 }
+  for t = 0, 60, 5 do gen.alertStep(al, t, true, true, true) end
+  local graced = al.exposureSec
+  gen.alertStep(al, 65, false, true, true)
+  gen.alertStep(al, 70, true, true, true)
+  gen.alertStep(al, 75, true, true, true)
+  check("alert: grace accrues while it heads the alert as extreme", graced, 60)
+  check("alert: a dip shorter than the settle keeps the alert and its grace", al.active and al.exposureSec, 65)
+  for t = 80, 90, 5 do gen.alertStep(al, t, false, true, true) end
+  check("alert: below critical for the settle ends it", al.active, false)
+  gen.alertStep(al, 95, true, true, true)
+  check("alert: the next rise starts grace over", al.exposureSec, 0)
+  -- A process that exits while the state settles is not alerted again when
+  -- the state returns to critical: nothing heads the alert, so no grace runs.
+  local gone = { active = false, exposureSec = 0 }
+  for t = 0, 60, 5 do gen.alertStep(gone, t, true, true, true) end
+  for t = 65, 75, 5 do gen.alertStep(gone, t, false, true, true) end
+  gen.alertStep(gone, 80, true, false, true)
+  gen.alertStep(gone, 85, true, false, true)
+  check("alert: a process gone during the settle raises no new alert", gone.active, false)
+  -- The simulated machine calms as production's does once nothing grows and
+  -- the room is back: an exit at 40 s with 30% available leaves critical.
+  local ex = params({ avail0 = 30, age0 = 3600, compress = 2, phases = { { dur = 20, rate = 160 } },
+                      after = "exit", releaseAt = 40 })
+  gen.prepare(ex)
+  local calmed = false
+  for t, k in pairs(gen.track(ex, gen.cfg, ex.onsetAt - ex.climbSec - gen.cfg.leadSec, gen.cfg.horizonSec)) do
+    if t > 40 and k.state ~= "critical" then calmed = true end
+  end
+  check("state: the machine leaves critical once the offender is gone and the room is back", calmed, true)
   -- Production's policy gate never freezes another user's process: an
   -- offender macOS runs under its own service user is no episode, while the
   -- same trajectory under the user's own process is.

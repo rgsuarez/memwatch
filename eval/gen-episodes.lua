@@ -196,9 +196,37 @@ end
 local function pressureOf(avail, slopeMBmin)
   local pressure = (20 - avail) / 20
   if pressure < 0 then pressure = 0 end
+  -- Swap-out runs while there is pressure or growth; a machine with room
+  -- and nothing growing goes quiet, so its state machine can calm.
+  local swapBase = (pressure > 0 or slopeMBmin > 0) and 200 or 0
   return avail <= 10 and 4 or 2,
-    { swapOut = math.floor(200 + pressure * 2200 + slopeMBmin / 8),
+    { swapOut = math.floor(swapBase + pressure * 2200 + slopeMBmin / 8),
       comp = math.floor(500 + pressure * 4800 + slopeMBmin / 3) }, pressure
+end
+
+-- One tick of the alert, as production runs it (pure). st: { active,
+-- exposureSec, prevT, headed, belowSince }. While critical: the alert rises
+-- (grace starting over) when the process is alive to head it, and grace
+-- accrues over the last interval if the offender headed it as extreme
+-- (a stalled interval counts at most exposureStepMax). Below critical: no
+-- grace accrues, and the alert ends once the state has stayed below for
+-- settleSec. Returns st.
+function M.alertStep(st, t, critical, alive, extreme, cfg)
+  cfg = cfg or M.cfg
+  if critical then
+    st.belowSince = nil
+    if not st.active and alive then st.active, st.exposureSec, st.prevT, st.headed = true, 0, nil, false end
+    if st.headed and st.prevT then
+      st.exposureSec = st.exposureSec + math.min(math.max(t - st.prevT, 0), cfg.exposureStepMax)
+    end
+    st.prevT = t
+    st.headed = (st.active and alive and extreme) or false
+  else
+    st.prevT, st.headed = nil, false
+    st.belowSince = st.belowSince or t
+    if st.active and (t - st.belowSince) >= cfg.settleSec then st.active = false end
+  end
+  return st
 end
 
 function M.track(p, cfg, first, last)
@@ -210,7 +238,7 @@ function M.track(p, cfg, first, last)
   -- On the sampler's grid, from the later of the first tick and the birth.
   local t0 = math.floor(math.max(first, born) / cfg.tickSec) * cfg.tickSec
   if t0 < born then t0 = t0 + cfg.tickSec end
-  local exposureSec, headed, prevT, alertActive, onset, belowSince = 0, false, nil, false, nil, nil
+  local alert, onset = { active = false, exposureSec = 0 }, nil
   for t = t0, last, cfg.tickSec do
     local alive = not (p.after == "exit" and p.releaseAt and t >= p.releaseAt)
     local w = M.weightAt(p, t)
@@ -228,28 +256,18 @@ function M.track(p, cfg, first, last)
     local sig = core.signals({ availPct = avail }, rates, kern, run ~= nil and run.kind == "extreme")
     core.smStep(sm, sig, t)
     local critical = sm.state == "critical"
+    M.alertStep(alert, t, critical, alive, run ~= nil and run.kind == "extreme", cfg)
+    if alert.headed and onset == nil then onset = t end
     local gate = "closed"
     if critical then
-      belowSince = nil
-      if not alertActive and alive then alertActive, exposureSec, prevT, headed = true, 0, nil, false end
-      if headed and prevT then
-        exposureSec = exposureSec + math.min(math.max(t - prevT, 0), cfg.exposureStepMax)
-      end
-      prevT = t
-      headed = alertActive and alive and run ~= nil and run.kind == "extreme"
-      if headed and onset == nil then onset = t end
       gate = core.unattendedGate({
-        kind = run and run.kind or (alive and "hog") or nil, alertActive = alertActive, hudHold = false,
+        kind = run and run.kind or (alive and "hog") or nil, alertActive = alert.active, hudHold = false,
         sameAsHud = alive, answered = false, interacted = false, final = false, bound = true,
-        exposureSec = exposureSec, graceSec = cfg.graceSec,
+        exposureSec = alert.exposureSec, graceSec = cfg.graceSec,
       })
-    else
-      prevT, headed = nil, false
-      belowSince = belowSince or t
-      if alertActive and (t - belowSince) >= cfg.settleSec then alertActive = false end
     end
     ticks[t] = { t = t, alive = alive, w = w, avail = avail, run = run, state = sm.state,
-                 kern = kern, rates = rates, pressure = pressure, exposureSec = exposureSec, gate = gate }
+                 kern = kern, rates = rates, pressure = pressure, exposureSec = alert.exposureSec, gate = gate }
   end
   return ticks, onset
 end

@@ -809,9 +809,10 @@ end
 -- tells the options apart ("wait", "free..." for freeze, "termin..." for
 -- terminate), so the three options' probabilities there are the model's
 -- own probabilities for the decision; what it puts on other tokens (mass
--- short of 1) is left out, never spread over the options. Where an option
--- is split between the quote fused with it and the quote alone, both
--- positions are read (below). Bounded by the decoder (64 KB, depth 8).
+-- short of 1) is left out, never spread over the options. Where the quote
+-- is a token of its own, the value's reading is weighted by the quote's own
+-- probability, and an option fused with the quote at that position counts
+-- too (below). Bounded by the decoder (64 KB, depth 8).
 -- Returns { action, pWait, pFreeze, pTerminate, mass } or nil, err.
 function M.parseTokenProbs(text)
   if type(text) ~= "string" or text == "" then return nil, "tokenprob: empty reply" end
@@ -851,36 +852,49 @@ function M.parseTokenProbs(text)
     if op and pr then p[op] = p[op] + pr end
   end
   -- The value's first token came after the quote as a token of its own.
-  -- Where the model also put probability, at the quote's position, on the
-  -- quote fused with an option ('"wait' as one token), the option's
-  -- probability is split across the two positions: the fused mass, plus the
-  -- probability of the path that reached the quote times what the value's
-  -- position gives on that path. Read from one position alone, the second
-  -- overstates it (a bare quote at 0.55 and '"wait' at 0.05 would read 0.99
-  -- for a wait the model gives 0.59).
+  -- What the value's position gives is conditional on the path the model
+  -- took, through the quote it sampled, so it is weighted by that quote's
+  -- own probability. An option the model fused with the quote at that
+  -- position ('"wait' as one token) counts with its own mass. Every other
+  -- branch there (a space before the quote, say) was not taken, and where
+  -- it would have led is unknown, so it counts for no option: each option
+  -- reads as a lower bound, never more than the paths read give it. A bare
+  -- quote at 0.55 with '"wait' at 0.05 reads 0.59 for the wait, not the
+  -- 0.99 the value's position gives on its path. The key before the quote
+  -- is taken as written: the schema fixes it.
   if quotePos then
     local qc = quotePos.top_logprobs or quotePos.top_probs
-    local fused, onPath = { wait = 0, freeze = 0, terminate = 0 }, 0
+    local function probOf(c)
+      return type(c.prob) == "number" and c.prob or (type(c.logprob) == "number" and math.exp(c.logprob)) or nil
+    end
+    -- The sampled quote's own probability, or else its entry among the
+    -- candidates.
+    local q = probOf(quotePos)
+    local fused, others = { wait = 0, freeze = 0, terminate = 0 }, 0
     if type(qc) == "table" then
       for _, c in ipairs(qc) do
-        local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
-          or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
+        local pr = type(c) == "table" and probOf(c) or nil
         if type(c) == "table" and type(c.token) == "string" and pr then
           if not (pr >= 0 and pr <= 1) then return nil, "tokenprob: a probability out of range" end
-          local text = before .. c.token
-          local rest = text:match('"action"%s*:%s*"(.+)$')
-          if text:find('"action"%s*:%s*"$') then
-            onPath = onPath + pr
-          elseif rest then
-            local op = optionOf(rest, false)
+          if c.token == quotePos.token then
+            if q == nil then q = pr end
+          else
+            others = others + pr
+            local rest = (before .. c.token):match('"action"%s*:%s*"(.+)$')
+            local op = rest and optionOf(rest, false) or nil
             if op then fused[op] = fused[op] + pr end
           end
         end
       end
     end
-    if fused.wait + fused.freeze + fused.terminate > 0 then
-      for k in pairs(p) do p[k] = fused[k] + onPath * p[k] end
+    if q == nil then return nil, "tokenprob: no probability for the quote before the value" end
+    if not (q >= 0 and q <= 1) then return nil, "tokenprob: a probability out of range" end
+    -- The sampled quote and the other candidates there are distinct tokens
+    -- of one distribution: more than 1 among them is malformed.
+    if q + others > 1 + 1e-9 then
+      return nil, "tokenprob: the probabilities at the quote sum past 1"
     end
+    for k in pairs(p) do p[k] = fused[k] + q * p[k] end
   end
   local mass = p.wait + p.freeze + p.terminate
   if mass < 0.5 then return nil, "tokenprob: the options carry too little probability" end

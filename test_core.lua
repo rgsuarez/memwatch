@@ -3326,10 +3326,11 @@ do
   check("tokenprob body: temperature 0", cb.temperature, 0)
   check("tokenprob body: the verdict schema as a grammar", cb.json_schema and cb.json_schema.properties.action ~= nil, true)
   check("tokenprob body: top probabilities requested", cb.n_probs, 10)
-  local function pos(tok, cands)
+  -- own: the sampled token's own probability (1 unless given).
+  local function pos(tok, cands, own)
     local tl = {}
     for _, c in ipairs(cands or {}) do tl[#tl + 1] = { token = c[1], logprob = math.log(c[2]) } end
-    return { token = tok, logprob = 0, top_logprobs = lfm.jsonArray(tl) }
+    return { token = tok, logprob = math.log(own or 1), top_logprobs = lfm.jsonArray(tl) }
   end
   local function tpReply(valueTok, cands, keyToks)
     local ps = {}
@@ -3348,13 +3349,68 @@ do
   do
     local ps = {}
     for _, t in ipairs({ '{"', "action", '":' }) do ps[#ps + 1] = pos(t, { { t, 0.99 } }) end
-    ps[#ps + 1] = pos('"', { { '"', 0.55 }, { '"free', 0.40 }, { '"wait', 0.05 } })
+    ps[#ps + 1] = pos('"', { { '"', 0.55 }, { '"free', 0.40 }, { '"wait', 0.05 } }, 0.55)
     ps[#ps + 1] = pos("wait", { { "wait", 0.99 }, { "free", 0.01 } })
     ps[#ps + 1] = pos('","', { { '","', 0.99 } })
     local split = lfm.parseTokenProbs(lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray(ps) }))
     check("tokenprob parse: an option split across two tokenizations is read whole",
       split ~= nil and split.action == "wait" and math.abs(split.pWait - (0.05 + 0.55 * 0.99)) < 1e-9
         and math.abs(split.pFreeze - (0.40 + 0.55 * 0.01)) < 1e-9, true)
+  end
+  -- A branch at the quote the model did not take (a space before the
+  -- quote) leads somewhere unknown, so it counts for no option: the value's
+  -- reading is weighted by the sampled quote's own probability alone.
+  local function quoteReply(quote)
+    local ps = {}
+    for _, t in ipairs({ '{"', "action", '":' }) do ps[#ps + 1] = pos(t, { { t, 1 } }) end
+    ps[#ps + 1] = quote
+    ps[#ps + 1] = pos("wait", { { "wait", 0.99 } })
+    return lfm.parseTokenProbs(lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray(ps) }))
+  end
+  do
+    local v = quoteReply(pos('"', { { '"', 0.51 }, { ' "', 0.44 }, { '"free', 0.05 } }, 0.51))
+    check("tokenprob parse: an untaken branch at the quote credits no option",
+      v ~= nil and math.abs(v.pWait - 0.51 * 0.99) < 1e-9 and math.abs(v.pFreeze - 0.05) < 1e-9, true)
+    check("tokenprob parse: so its wait is no confident one", v ~= nil and lfm.waitHonored(v, 0.9), false)
+    local w = quoteReply(pos('"', { { '"', 0.51 }, { ' "', 0.44 } }, 0.51))
+    check("tokenprob parse: and with no option fused there, the same weighting",
+      w ~= nil and math.abs(w.pWait - 0.51 * 0.99) < 1e-9, true)
+    local listed = quoteReply({ token = '"', top_logprobs = lfm.jsonArray({ { token = '"', logprob = math.log(0.8) },
+      { token = ' "', logprob = math.log(0.2) } }) })
+    check("tokenprob parse: the quote's probability is read from its candidates when it carries none",
+      listed ~= nil and math.abs(listed.pWait - 0.8 * 0.99) < 1e-9, true)
+    check("tokenprob parse: a quote with no probability at all is refused",
+      (quoteReply({ token = '"' })), nil)
+    check("tokenprob parse: so is one only its rivals are listed for",
+      (quoteReply({ token = '"', top_logprobs = lfm.jsonArray({ { token = ' "', logprob = math.log(0.2) } }) })), nil)
+    -- Below 0 beside a large fused mass: only the range check catches it.
+    check("tokenprob parse: a quote's probability out of range is refused",
+      (quoteReply({ token = '"', prob = -0.2, top_logprobs = lfm.jsonArray({ { token = '"wait', logprob = math.log(0.9) } }) })), nil)
+    check("tokenprob parse: a quote and its fused options past 1 are refused",
+      (quoteReply(pos('"', { { '"', 0.7 }, { '"free', 0.5 } }, 0.7))), nil)
+    check("tokenprob parse: so is a quote and other candidates past 1",
+      (quoteReply(pos('"', { { '"', 0.7 }, { ' "', 0.5 } }, 0.7))), nil)
+    -- The quote's own probability stands when it is not among the listed
+    -- candidates, or when none are listed.
+    local unlisted = quoteReply({ token = '"', logprob = math.log(0.6),
+      top_logprobs = lfm.jsonArray({ { token = ' "', logprob = math.log(0.3) } }) })
+    check("tokenprob parse: an unlisted quote is weighted by its own probability",
+      unlisted ~= nil and math.abs(unlisted.pWait - 0.6 * 0.99) < 1e-9, true)
+    local bare = quoteReply({ token = '"', logprob = math.log(0.9) })
+    check("tokenprob parse: so is a quote with no candidates listed",
+      bare ~= nil and math.abs(bare.pWait - 0.9 * 0.99) < 1e-9, true)
+  end
+  -- The mirror case: the model sampled the quote fused with an option, so
+  -- the value is read there, and the bare quote it did not take counts for
+  -- no option.
+  do
+    local ps = {}
+    for _, t in ipairs({ '{"', "action", '":' }) do ps[#ps + 1] = pos(t, { { t, 1 } }) end
+    ps[#ps + 1] = pos('"wait', { { '"wait', 0.6 }, { '"free', 0.1 }, { '"', 0.3 } }, 0.6)
+    ps[#ps + 1] = pos('","', { { '","', 1 } })
+    local m = lfm.parseTokenProbs(lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray(ps) }))
+    check("tokenprob parse: a sampled fused option leaves the untaken bare quote out",
+      m ~= nil and m.action == "wait" and math.abs(m.pWait - 0.6) < 1e-9 and math.abs(m.pFreeze - 0.1) < 1e-9, true)
   end
   -- Mass on other tokens counts against waiting: half the probability on an
   -- unrelated word leaves P(wait) at half, not certainty.

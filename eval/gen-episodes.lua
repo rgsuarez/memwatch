@@ -136,8 +136,10 @@ function M.sample(tpl, r)
     if rate > 0 then grownTo = t end
   end
   p.growthEnd = grownTo
+  -- A release comes no earlier than the template's whole timeline: a flat
+  -- phase after the growth is time the process holds the memory.
   if p.after == "exit" or p.after == "release" then
-    p.releaseAt = math.max(p.growthEnd, sampleRange(r, tpl.releaseAt))
+    p.releaseAt = math.max(t, sampleRange(r, tpl.releaseAt))
   end
   -- Growth through the alert's grace window, before t = 0: the template's
   -- own (graceRate, MB/s), else the trajectory's first phase continuing.

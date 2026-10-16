@@ -451,6 +451,13 @@ do
     after = "hold" }, 1, "test")
   check("labels: a flat phase after the growth is the plateau", flatTail.labels.class .. ":"
     .. tostring(flatTail.labels.resolvesBySec), "savable:20")
+  -- And it holds the memory for its whole length: a release drawn inside
+  -- it comes when the timeline ends.
+  local flatRel = gen.sample({ id = "T-flat-release", names = { "python3" }, avail0 = 30, w0 = 3000, age0 = 600,
+    peak0 = 12000, compress = 2, phases = { { dur = 20, rate = 150 }, { dur = 40, rate = 0 } }, after = "exit",
+    releaseAt = { 30, 40 } }, gen.rng(7))
+  check("labels: a release drawn inside a flat tail comes when the timeline ends",
+    flatRel.growthEnd .. "/" .. flatRel.releaseAt, "20/60")
   -- A shrinking phase is not modeled (memory given back is a release or an
   -- exit), so a template that has one is refused.
   local okShrink, errShrink = pcall(gen.episode, { id = "T-shrink", names = { "python3" }, avail0 = 10, w0 = 3000,

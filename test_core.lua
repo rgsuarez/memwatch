@@ -1282,6 +1282,14 @@ do
       if lfm.categorize(c[1]) ~= c[2] then wrong[#wrong + 1] = c[1] .. " -> " .. lfm.categorize(c[1]) end
     end
     check("cat: truncated and retitled names keep their family", table.concat(wrong, "; "), "")
+    -- Apple's daemon families carry their token mid-name; they stay system.
+    local daemons = { "managedcorespotlightd", "CoreSpotlightService", "RemindersSpotlightIndexExtension",
+                      "itunescloudd", "CloudDocsDaemon", "iCloudDelegate", "launchd_sim" }
+    local notSystem = {}
+    for _, n in ipairs(daemons) do
+      if lfm.categorize(n) ~= "system" then notSystem[#notSystem + 1] = n .. " -> " .. lfm.categorize(n) end
+    end
+    check("cat: Apple's daemon families read as system", table.concat(notSystem, "; "), "")
   end
   -- Linear in the name: a process can give itself any name, of any length,
   -- and a backtracking pattern over a long run would stall the tick.

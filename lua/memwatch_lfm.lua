@@ -525,11 +525,14 @@ local CATEGORY_RULES = {
   -- adjudicator is "protected OS process, do not kill" (the same-uid kill
   -- gate also refuses these in production, but the category must not invite
   -- an over-action in the first place: 2026-07-10 redaction drill, mds_stores
-  -- was over-terminated when bucketed as search-tool).
-  { "system",          { "^com%.apple%.", "^windowserver$", "^launchd$", "^kernel_task$", "^backupd",
-                         "^time machine", "^mds_stores$", "^mdworker", "^mdbulkimport$", "^spotlight",
-                         "^cloudd$", "^bird$", "^nsurlsessiond$", "^corespotlightd$",
-                         "^photoanalysisd$", "^mdsync$" } },
+  -- was over-terminated when bucketed as search-tool). Three tokens match
+  -- anywhere in the name, as they always did: they are Apple's own daemon
+  -- vocabulary, long enough not to occur by accident, and the families
+  -- carry them mid-name (managedcorespotlightd, CoreSpotlightService,
+  -- itunescloudd, CloudDocsDaemon, launchd_sim).
+  { "system",          { "^com%.apple%.", "^windowserver$", "launchd", "^kernel_task$", "^backupd",
+                         "^time machine", "^mds_stores$", "^mdworker", "^mdbulkimport$", "spotlight",
+                         "cloudd", "^bird$", "^nsurlsessiond$", "^photoanalysisd$", "^mdsync$" } },
   { "search-tool",     { "^ugrep$", "^grep$", "^ripgrep$", "^rg$", "^the_silver", "^ag$", "^find$",
                          "^mdfind$", "^fd$" } },
   { "terminal",        { "^iterm2?$", "^itermserver", "^terminal$", "^ghostty$", "^alacritty$", "^kitty$", "^warp$",

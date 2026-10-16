@@ -27,7 +27,8 @@
 -- baseline's on every template. A template's savables are independent
 -- episodes and each paired difference is -1, 0 or +1, so under that null
 -- each difference, and each template's sum, is symmetric about zero, and
--- the test is exact at any template count; four or fewer templates cannot
+-- the test is exact (its flips counted in whole numbers, up to 50 differing
+-- templates; a set with more is refused); four or fewer templates cannot
 -- pass at all, so a set needs five savable templates to decide. Under the
 -- weaker null of an equal rate in aggregate only (templates differing
 -- either way), the flips' spread includes each template's squared mean, so
@@ -270,23 +271,30 @@ function M.quantileIndex(conf, b)
   return math.max(1, math.floor((1 - conf) * b + 1e-9))
 end
 
--- The sign-flip permutation test of the paired improvement, one-sided. Under
--- the sharp null that the candidate is no different from the baseline (each
+-- The sign-flip permutation test of the paired improvement, one-sided. Each
+-- paired difference is -1, 0 or +1 (baseline wrongful minus candidate
+-- wrongful on one savable), and anything else is refused. Under the sharp
+-- null that the candidate is no different from the baseline (each
 -- template's paired outcomes exchangeable), each template's summed
 -- difference is as likely negative as positive, so the p-value is the share
 -- of sign flips (one sign per template, since jittered copies of one
 -- template are not independent) whose pooled sum is at least the observed
 -- one. The sums are whole numbers, so the flips' distribution is convolved
--- exactly, at any template count. A template summing to zero changes no
--- flip's sum and is left out. With k templates the smallest p is 1/2^k, so
--- four or fewer cannot reach 0.05. (Under a null equal only in mean, with
--- the differences skewed, the test is approximate: the controls measure its
--- size under such a null too.) Returns the p-value and k.
+-- exactly, in whole-number counts; up to M.flipTemplatesMax differing
+-- templates, every count and so every p-value is a double exactly, and a set
+-- with more is refused rather than rounded. A template summing to zero
+-- changes no flip's sum and is left out. With k templates the smallest p is
+-- 1/2^k, so four or fewer cannot reach 0.05. (Under a null equal only in
+-- mean, with the differences skewed, the test is approximate: the controls
+-- measure its size under such a null too.) Returns the p-value and k.
+M.flipTemplatesMax = 50
 function M.signFlipP(prs)
   local byTpl, tpls = {}, {}
   for _, pr in ipairs(prs) do
+    local d = type(pr.d) == "number" and math.tointeger(pr.d)
+    assert(d and d >= -1 and d <= 1, "a paired difference that is not -1, 0 or 1")
     if byTpl[pr.template] == nil then byTpl[pr.template] = 0; tpls[#tpls + 1] = pr.template end
-    byTpl[pr.template] = byTpl[pr.template] + pr.d
+    byTpl[pr.template] = byTpl[pr.template] + d
   end
   table.sort(tpls)
   local sums, obs = {}, 0
@@ -295,18 +303,16 @@ function M.signFlipP(prs)
   end
   local k = #sums
   if k == 0 then return 1, 0 end
-  -- ways[v]: how many of the 2^j flips of the first j sums reach v, counted
-  -- in whole numbers while 2^k fits one exactly, else as shares.
-  local exact = k <= 60
+  assert(k <= M.flipTemplatesMax, string.format("%d templates differ; the beat test counts its flips exactly"
+    .. " only up to %d, so it refuses more rather than round its p-value", k, M.flipTemplatesMax))
+  -- ways[v]: how many of the 2^j flips of the first j sums reach v.
   local ways = { [0] = 1 }
   for j = 1, k do
     local sj = sums[j]
-    assert(math.type(sj) == "integer", "a paired difference that is not a whole number")
     local nxt = {}
     for v, w in pairs(ways) do
-      local add = exact and w or w / 2
-      nxt[v + sj] = (nxt[v + sj] or 0) + add
-      nxt[v - sj] = (nxt[v - sj] or 0) + add
+      nxt[v + sj] = (nxt[v + sj] or 0) + w
+      nxt[v - sj] = (nxt[v - sj] or 0) + w
     end
     ways = nxt
   end
@@ -314,7 +320,14 @@ function M.signFlipP(prs)
   for v, w in pairs(ways) do
     if v >= obs then ge = ge + w end
   end
-  return exact and ge / (1 << k) or ge, k
+  return ge / (1 << k), k
+end
+
+-- Whether a beat test's p-value passes G7's beat: at most 1 - confidence.
+-- No p-value over M.flipTemplatesMax or fewer templates falls between 5% and
+-- the double 1 - 0.95, so at the default this is p <= 0.05 exactly.
+function M.beatPasses(p, cfg)
+  return p ~= nil and p <= 1 - (cfg or M.cfg).confidence
 end
 
 ------------------------------------------------------------------------------
@@ -856,7 +869,7 @@ function M.compare(cand, base, cfg)
     end
   end
   local lower, point = M.pairedLowerBound(prs, cfg)
-  local p, k = M.signFlipP(prs, cfg)
+  local p, k = M.signFlipP(prs)
   return lower, point, p, k
 end
 
@@ -925,7 +938,7 @@ function M.gate(episodes, candDecide, baselines, cfg)
   local passMiss = cand.missUpper <= cfg.missBound
   -- The beat is the sign-flip test's; the bootstrap's bound is reported
   -- beside it, a diagnostic (see the header).
-  local passBeat = (p ~= nil) and p <= 1 - cfg.confidence
+  local passBeat = M.beatPasses(p, cfg)
   -- A set too small to let a one-miss baseline qualify decides nothing: it
   -- neither passes nor fails a candidate. Neither does one with too few
   -- savable templates for the beat to be reachable.
@@ -1076,7 +1089,7 @@ function M.nullSize(eps, cfg)
           prs[#prs + 1] = { template = t, d = b - c }
         end
       end
-      if M.signFlipP(prs) <= 1 - cfg.confidence then passes = passes + 1 end
+      if M.beatPasses(M.signFlipP(prs), cfg) then passes = passes + 1 end
     end
     return passes
   end

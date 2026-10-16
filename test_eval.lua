@@ -207,17 +207,32 @@ do
   check("sign-flip: no difference at all is p 1", (sc.signFlipP(byTemplate({ 0, 0 }))), 1)
   check("sign-flip: one strong template among weak ones is no beat (3/8)",
     (sc.signFlipP(byTemplate({ 4, -1, 1 }))), 0.375)
-  -- Exact at any template count: 14 templates of +1 and 3 of -1 reach the
+  -- Exact in whole-number counts: 14 templates of +1 and 3 of -1 reach the
   -- observed sum, 11, when 14 or more of the 17 flips are +: 834 of 2^17.
   local seventeen = {}
   for i = 1, 17 do seventeen[i] = i <= 14 and 1 or -1 end
   local p17, k17 = sc.signFlipP(byTemplate(seventeen))
   check("sign-flip: exact past sixteen templates (834 / 2^17)", k17 == 17 and p17 == 834 / 2 ^ 17, true)
-  local forty = {}
-  for i = 1, 40 do forty[i] = 1 end
-  check("sign-flip: and at forty (2^-40)", (sc.signFlipP(byTemplate(forty))), 2 ^ -40)
+  local fifty = {}
+  for i = 1, 50 do fifty[i] = 1 end
+  check("sign-flip: and at fifty, its cap (2^-50)", (sc.signFlipP(byTemplate(fifty))), 2 ^ -50)
+  fifty[51] = 1
+  check("sign-flip: fifty-one differing templates are refused, not rounded",
+    (pcall(sc.signFlipP, byTemplate(fifty))), false)
+  -- At the threshold: at ten templates the p-values nearest 5%, 51 and 52
+  -- of 1024, fall on either side of it.
+  local pIn = sc.signFlipP(byTemplate({ -1, -1, -1, 1, 1, 2, 2, 2, 2, 3 }))
+  local pOut = sc.signFlipP(byTemplate({ -1, -1, -1, 1, 1, 1, 2, 3, 3, 3 }))
+  check("sign-flip: at the threshold, 51/1024 passes the beat and 52/1024 does not",
+    pIn == 51 / 1024 and pOut == 52 / 1024 and sc.beatPasses(pIn) and not sc.beatPasses(pOut), true)
   check("sign-flip: a difference that is not a whole number is refused",
     (pcall(sc.signFlipP, { { template = "T", d = 0.5 } })), false)
+  check("sign-flip: but a whole number held as a float counts",
+    select(2, pcall(sc.signFlipP, { { template = "T", d = 1.0 } })), 0.5)
+  check("sign-flip: so are fractions that cancel within a template",
+    (pcall(sc.signFlipP, { { template = "T", d = 0.5 }, { template = "T", d = -0.5 } })), false)
+  check("sign-flip: and a difference outside -1, 0 and 1, either way",
+    (pcall(sc.signFlipP, { { template = "T", d = 2 } })) or (pcall(sc.signFlipP, { { template = "T", d = -2 } })), false)
   check("sign-flip: three improving templates are no beat, though the bootstrap's bound is above zero",
     (sc.pairedLowerBound(byTemplate({ 1, 1, 1 }))) > 0 and (sc.signFlipP(byTemplate({ 1, 1, 1 }))) > 0.05, true)
   -- The size at the regenerated sets' shapes: candidates no better than the

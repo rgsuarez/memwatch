@@ -173,10 +173,11 @@ that decision.
   the candidate's wrongful-freeze probability equals the baseline's on
   every template. A template's savables are independent episodes and each
   paired difference is -1, 0 or +1, so under that null each template's
-  sum is symmetric about zero and the test is exact at any template count;
-  under the weaker null of an equal rate in aggregate only, it is
-  conservative. Four or fewer savable templates can never pass, so a set
-  with fewer than five decides nothing. A template the set lacks is its
+  sum is symmetric about zero and the test is exact (up to 50 differing
+  templates; the scorer refuses more rather than round); under the weaker
+  null of an equal rate in aggregate only, it is conservative. Four or
+  fewer savable templates can never pass, so a set with fewer than five
+  decides nothing. A template the set lacks is its
   coverage to guard. The bootstrapped 95% lower bound is reported beside
   the test as a diagnostic, since with few templates it passes a
   no-better candidate more often than its nominal rate. `controls` also

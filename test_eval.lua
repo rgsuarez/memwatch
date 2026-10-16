@@ -1660,7 +1660,19 @@ do
     pdoc ~= nil and pdoc.decisive == true and pdoc.pass == true and pdoc.minRunaways == 93, true)
   print = function() end
   local okFail, failStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "always-freeze" })
+  -- The controls on a decidable set: 0 when they hold; 2 when the set is too
+  -- weak to show the gate's power; 1 when a control fails, even then.
+  local okC0, c0 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  local savedTarget, savedFreeze = sc.cfg.powerTarget, sc.candidates["always-freeze"]
+  sc.cfg.powerTarget = 1.01
+  local okC2, c2 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.candidates["always-freeze"] = sc.candidates.oracle
+  local okC1, c1 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.cfg.powerTarget, sc.candidates["always-freeze"] = savedTarget, savedFreeze
   print = quiet3
+  check("decidable: controls that hold exit 0", okC0 and c0, 0)
+  check("decidable: an underpowered set exits 2", okC2 and c2, 2)
+  check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a failing gate exits 1", okFail and failStatus, 1)
   -- One runaway short of the floor, the same set decides nothing.

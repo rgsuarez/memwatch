@@ -750,10 +750,13 @@ function M.decisiveRunaways(cfg)
   -- lo never meets the bound: under the zero-miss size (less two, for
   -- rounding) not even a set with no miss does. hi will.
   local lo = math.max(0, math.ceil(math.log(1 - conf) / math.log(1 - bound)) - 2)
+  -- The doubling stops at the cap, which is tried itself: a bound only a
+  -- larger set meets is refused, never answered past the cap.
+  local cap = 1 << 24
   local hi = lo + 1
   while not meets(hi) do
-    assert(hi < 2 ^ 24, "the miss bound is too small: no set of up to 2^24 runaways meets it with a miss")
-    lo, hi = hi, hi * 2
+    assert(hi < cap, "the miss bound is too small: no set of up to 2^24 runaways meets it with a miss")
+    lo, hi = hi, math.min(hi * 2, cap)
   end
   while hi - lo > 1 do
     local mid = (lo + hi) // 2

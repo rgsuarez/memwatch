@@ -1384,6 +1384,13 @@ do
   check("decidable: a small bound is searched, not scanned", okSmall, true)
   check("decidable: and its size is the first to meet the bound", okSmall
     and sc.cpUpper(1, nSmall, 0.95) <= 1e-5 and sc.cpUpper(1, nSmall - 1, 0.95) > 1e-5, true)
+  -- The cap is a cap: a bound only a set past 2^24 meets (2e-7 needs about
+  -- 23.7 million) is refused, and one just inside it is answered under it.
+  check("decidable: a bound no set of up to 2^24 runaways meets is refused",
+    (pcall(sc.decisiveRunaways, { missBound = 2e-7, confidence = 0.95 })), false)
+  local okNear, nNear = pcall(sc.decisiveRunaways, { missBound = 3e-7, confidence = 0.95 })
+  check("decidable: one just inside the cap is searched to its size", okNear and nNear <= (1 << 24)
+    and sc.cpUpper(1, nNear, 0.95) <= 3e-7 and sc.cpUpper(1, nNear - 1, 0.95) > 3e-7, true)
   check("decidable: a bound outside (0, 1) is refused",
     (pcall(sc.decisiveRunaways, { missBound = 0, confidence = 0.95 }))
       or (pcall(sc.decisiveRunaways, { missBound = 1, confidence = 0.95 })), false)

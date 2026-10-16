@@ -465,9 +465,6 @@ function M.loadDecisions(path, keyPath)
   return out, n, noP, invalid
 end
 
--- How many of the episodes' decision points carry no recorded decision
--- (scored as the deterministic freeze, so a short or mismatched file makes
--- a model look like always-freeze there). Returns missing, total.
 -- The hash a recorded decision carries of the input it answered: the
 -- step's snapshot as the episode file holds it. The runner computes the
 -- same (eval/bakeoff.lua, episodes mode); the end-to-end test pins that the
@@ -495,6 +492,9 @@ function M.contentCheck(episodes, decisions)
   return mismatched, unchecked
 end
 
+-- How many of the episodes' decision points carry no recorded decision
+-- (scored as the deterministic freeze, so a short or mismatched file makes
+-- a model look like always-freeze there). Returns missing, total.
 function M.coverage(episodes, decisions)
   local missing, total = 0, 0
   for _, ep in ipairs(episodes) do

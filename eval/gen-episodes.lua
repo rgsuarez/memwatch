@@ -205,21 +205,6 @@ function M.availAt(p, t, cfg)
   return p.avail0 - (M.weightAt(p, t) - p.wAt0) * fracOf(p, cfg)
 end
 
--- Sampler ticks from first to last (multiples of tickSec), feeding the
--- PRODUCTION tracker (memwatch_procs) one ps row per tick while the process
--- exists, and the production pressure state machine (memwatch_core) the
--- same tick's signals. The alert runs as production runs it: it rises (its
--- grace starting over) when the state goes critical with the process alive
--- to head it, as a runaway or, once its latch lapses, as the hog fallback,
--- and it ends only once the state has settled below critical for
--- settleSec. Grace accrues, interval by interval and only while critical,
--- while the offender heads the alert as extreme (a stalled interval counts
--- at most exposureStepMax). The PRODUCTION unattended gate
--- (core.unattendedGate), asked only while critical as production asks it,
--- says whether the tick could act. Returns ticks[t] = { alive, w, avail,
--- run (the tracker's runaway row for the offender, or nil), state, kern,
--- rates, exposureSec, gate }, plus the first tick the alert's head was
--- extreme (onset).
 local function pressureOf(avail, slopeMBmin)
   local pressure = (20 - avail) / 20
   if pressure < 0 then pressure = 0 end
@@ -260,6 +245,21 @@ function M.alertStep(st, t, critical, alive, extreme, cfg)
   return st
 end
 
+-- Sampler ticks from first to last (multiples of tickSec), feeding the
+-- PRODUCTION tracker (memwatch_procs) one ps row per tick while the process
+-- exists, and the production pressure state machine (memwatch_core) the
+-- same tick's signals. The alert runs as production runs it: it rises (its
+-- grace starting over) when the state goes critical with the process alive
+-- to head it, as a runaway or, once its latch lapses, as the hog fallback,
+-- and it ends only once the state has settled below critical for
+-- settleSec. Grace accrues, interval by interval and only while critical,
+-- while the offender heads the alert as extreme (a stalled interval counts
+-- at most exposureStepMax). The PRODUCTION unattended gate
+-- (core.unattendedGate), asked only while critical as production asks it,
+-- says whether the tick could act. Returns ticks[t] = { alive, w, avail,
+-- run (the tracker's runaway row for the offender, or nil), state, kern,
+-- rates, exposureSec, gate }, plus the first tick the alert's head was
+-- extreme (onset).
 function M.track(p, cfg, first, last)
   cfg = cfg or M.cfg
   local tr = procs.newTracker()

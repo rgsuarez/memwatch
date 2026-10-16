@@ -1040,7 +1040,8 @@ function M.main(argv)
       f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
         bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
         missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
-        nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate })), "\n")
+        nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
+        decisive = g.decisive, minRunaways = g.minRunaways })), "\n")
       f:close()
     end
   elseif a.cmd == "tau" then
@@ -1058,22 +1059,24 @@ function M.main(argv)
     print(string.format("chosen tau %.2f (%s)", best.tau, best.meets and "fewest wrongful within the miss bound"
       or "no threshold meets the miss bound on this set; fewest misses"))
   elseif a.cmd == "controls" then
-    local gF = M.gate(eps, M.candidates["always-freeze"](), baselines)
     local gO = M.gate(eps, M.candidates["oracle"](), baselines)
-    print(string.format("control always-freeze must FAIL: %s", gF.pass and "FAILED (gate passed it)" or "ok (failed)"))
-    print(string.format("control oracle must PASS: %s", gO.pass and "ok (passed)" or "FAILED (gate failed it)"))
-    if gF.pass or not gO.pass then status = 1 end
     -- An undecidable set (too few runaways for a one-miss baseline to
-    -- qualify, or no baseline meeting the bound) or an underpowered one
-    -- fails the run.
+    -- qualify, or no baseline meeting the bound) fails the run, and says so
+    -- first: the gate passes nothing on it, so neither control is read.
     if not gO.decisive then
-      print(string.format("power: this set holds %d runaways, under the %d G7 decides on (UNDECIDABLE)",
-        gO.candidate.nRunaway, gO.minRunaways))
+      print(string.format("UNDECIDABLE: this set holds %d runaways, under the %d G7 decides on, so the controls"
+        .. " are not read: generate more episodes per template", gO.candidate.nRunaway, gO.minRunaways))
       status = 1
     elseif not gO.bestBaseline then
-      print("power: no baseline meets the miss bound on this set; the gate compares against nothing (UNDECIDABLE)")
+      print("UNDECIDABLE: no baseline meets the miss bound on this set, so the gate compares against nothing"
+        .. " and the controls are not read")
       status = 1
     else
+      local gF = M.gate(eps, M.candidates["always-freeze"](), baselines)
+      print(string.format("control always-freeze must FAIL: %s", gF.pass and "FAILED (gate passed it)" or "ok (failed)"))
+      print(string.format("control oracle must PASS: %s", gO.pass and "ok (passed)" or "FAILED (gate failed it)"))
+      if gF.pass or not gO.pass then status = 1 end
+      -- An underpowered set fails the run too.
       local trials = 50
       local passes = M.powerControl(eps, baselines, gO.bestBaseline, trials)
       local powered = (passes / trials) >= M.cfg.powerTarget

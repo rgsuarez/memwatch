@@ -918,7 +918,19 @@ do
   local okLink, errLink = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", held .. ".link" })
   local okNone = pcall(sc.main, { "gate", "--dir", held })
   local okNoCand, errNoCand = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", dev })
+  local ctlLines = {}
+  print = function(s) ctlLines[#ctlLines + 1] = tostring(s) end
   local okCtl, ctl = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev })
+  print = function() end
+  local ctlRead = false
+  for _, l in ipairs(ctlLines) do if l:find("must PASS", 1, true) or l:find("must FAIL", 1, true) then ctlRead = true end end
+  local gateOut = os.tmpname()
+  os.remove(gateOut)
+  local okOut = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", dev, "--candidate", "always-freeze", "--out", gateOut })
+  local gof = io.open(gateOut, "r")
+  local gdoc = gof and lfm.jsonDecode(gof:read("a")) or nil
+  if gof then gof:close() end
+  os.remove(gateOut)
   local empty, late = tmpDir(), tmpDir()
   for i = 1, 3 do
     local lf = assert(io.open(late .. "/late-" .. i .. ".json", "w"))
@@ -976,6 +988,10 @@ do
   check("cli: so is a number that is not one",
     okDepth == false and tostring(errDepth):find("must be a number", 1, true) ~= nil, true)
   check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
+  check("cli: and say it is undecidable first", (ctlLines[1] or ""):sub(1, 12), "UNDECIDABLE:")
+  check("cli: reading neither control there", ctlRead, false)
+  check("cli: the gate's result file says the set could not decide, and the size it needs",
+    okOut and gdoc ~= nil and gdoc.decisive == false and gdoc.pass == false and gdoc.minRunaways == 93, true)
   check("cli: a copy of the evaluated set is refused as the fit split",
     okCopy == false and tostring(errCopy):find("the same episode", 1, true) ~= nil, true)
   check("cli: so are the same episodes under other ids",
@@ -1389,9 +1405,18 @@ do
   local devDir, fitDir = writeSplit(dev), writeSplit(fit)
   local quiet3 = print
   print = function() end
-  local okPass, passStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "oracle" })
+  local passOut = os.tmpname()
+  os.remove(passOut)
+  local okPass, passStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "oracle",
+                                              "--out", passOut })
   print = quiet3
+  local pof = io.open(passOut, "r")
+  local pdoc = pof and lfm.jsonDecode(pof:read("a")) or nil
+  if pof then pof:close() end
+  os.remove(passOut)
   check("decidable: a passing gate exits 0", okPass and passStatus, 0)
+  check("decidable: and its result file says the set could decide",
+    pdoc ~= nil and pdoc.decisive == true and pdoc.pass == true and pdoc.minRunaways == 93, true)
   print = function() end
   local okFail, failStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "always-freeze" })
   print = quiet3

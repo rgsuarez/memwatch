@@ -1238,13 +1238,20 @@ do
   check("runner output: a fresh path is reserved", bk.reserveOutput(path), true)
   check("runner output: a second claim on it is refused", bk.reserveOutput(path), false)
   check("runner output: an uncreatable path is refused", bk.reserveOutput(dir .. "/missing/rows.jsonl"), false)
-  -- Eight claimants racing for one path: exactly one wins.
-  local race = dir .. "/race.jsonl"
-  local h = io.popen("for i in 1 2 3 4 5 6 7 8; do ( { set -C; : > '" .. race .. "'; } 2>/dev/null && echo won ) & done; wait")
-  local winners = 0
-  for line in h:lines() do if line == "won" then winners = winners + 1 end end
-  h:close()
-  check("runner output: of eight racing claims exactly one wins", winners, 1)
+  -- Eight runs racing for one path through the runner's own reservation,
+  -- five times over: each time exactly one wins.
+  local rounds = {}
+  for round = 1, 5 do
+    local race = dir .. "/race-" .. round .. ".jsonl"
+    local claimant = "RACE_PATH='" .. race .. "' lua -e 'package.path = \"eval/?.lua;lua/?.lua;\" .. package.path; "
+      .. "if require(\"bakeoff\").reserveOutput(os.getenv(\"RACE_PATH\")) then print(\"won\") end'"
+    local h = io.popen("for i in 1 2 3 4 5 6 7 8; do ( " .. claimant .. " ) & done; wait")
+    local winners = 0
+    for line in h:lines() do if line == "won" then winners = winners + 1 end end
+    h:close()
+    rounds[#rounds + 1] = winners
+  end
+  check("runner output: of eight runs racing to reserve, exactly one wins, every time", table.concat(rounds, ","), "1,1,1,1,1")
   -- A run that fails mid-way removes its own partial rows.
   local bad = bk.privateDir()
   local bf = assert(io.open(bad .. "/a.json", "w"))

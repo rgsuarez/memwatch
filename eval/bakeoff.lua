@@ -498,6 +498,10 @@ local function episodesMode(args)
   local url = server .. ((api == "systemone") and "/v1/systemone"
     or (api == "completion") and "/completion" or "/v1/chat/completions")
   local n, valid = 0, 0
+  -- This invocation's own name, on every row: the scorer refuses a file
+  -- whose rows come from more than one run (two partial runs put together,
+  -- of one model or of two).
+  local runId = string.format("%s-%06x", os.date("!%Y%m%dT%H%M%SZ"), math.random(0, 0xffffff))
   local ok, runErr = pcall(withAuthHeader, key, function(hdr)
     local of = assert(io.open(out, "w"))
     for _, fname in ipairs(files) do
@@ -547,13 +551,14 @@ local function episodesMode(args)
         end
         n = n + 1
         if action then valid = valid + 1 end
-        -- Each row says what asked it: the prompt variant, the API and the
-        -- model, so rows from two runs can never be mistaken for one.
-        -- snapshotHash binds the row to the input it answered (the scorer
-        -- computes the same: score-episodes.lua, M.stepHash).
+        -- Each row says what asked it (the prompt variant, the API, the
+        -- model and the label) and which run wrote it, so rows from two runs
+        -- are never scored as one. snapshotHash binds the row to the input
+        -- it answered (the scorer computes the same: score-episodes.lua,
+        -- M.stepHash).
         assert(of:write(assert(lfm.jsonEncode({ episode = ep.id, t = st.t, action = action or "freeze",
           pWait = pWait, valid = action ~= nil, wall_ms = wallMs,
-          variant = variant, api = api, model = args.model,
+          variant = variant, api = api, model = args.model, label = label, run = runId,
           snapshotHash = lfm.snapshotHash(assert(lfm.jsonEncode(st.snapshot))),
           error = err and tostring(err):sub(1, 120) or nil })), "\n"))
       end

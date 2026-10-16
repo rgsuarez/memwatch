@@ -368,9 +368,9 @@ function M.loadDecisions(path, keyPath)
     kf:close()
   end
   local out, n, noP, invalid = {}, 0, 0, 0
-  -- One run per file: the rows a runner writes say what asked them, and
-  -- rows from two runs (two models, or a rerun appended to a partial run)
-  -- would score as one candidate no output names.
+  -- One run per file: the rows a runner writes say what asked them and
+  -- which run wrote them, and rows from two runs (two models, or two
+  -- partial runs of one) would score as one candidate no output names.
   local origin
   for line in io.lines(path) do
     if line:match("%S") then
@@ -392,7 +392,8 @@ function M.loadDecisions(path, keyPath)
         pWait = type(r.p_runaway) == "number" and (1 - r.p_runaway) or nil
       end
       assert(r.action == "freeze" or r.action == "wait", "decision action must be freeze or wait")
-      local who = string.format("%s/%s/%s", tostring(r.variant), tostring(r.api), tostring(r.model))
+      local who = string.format("%s/%s/%s/%s/%s", tostring(r.variant), tostring(r.api), tostring(r.model),
+        tostring(r.label), tostring(r.run))
       origin = origin or who
       if who ~= origin then
         error("the decisions come from more than one run (" .. origin .. " and " .. who .. "); score one run's rows", 0)

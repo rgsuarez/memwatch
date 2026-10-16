@@ -304,6 +304,18 @@ do
   local okMixed, errMixed = pcall(sc.loadDecisions, tmp)
   check("decisions: rows from two runs are refused",
     okMixed == false and tostring(errMixed):find("more than one run", 1, true) ~= nil, true)
+  -- Local runs name no model: their label and their run tell them apart.
+  local function mixed(a, b)
+    f = assert(io.open(tmp, "w"))
+    f:write('{"episode":"r1","t":0,"action":"freeze",' .. a .. '}\n{"episode":"s1","t":0,"action":"wait",' .. b .. '}\n')
+    f:close()
+    local ok, err = pcall(sc.loadDecisions, tmp)
+    return ok == false and tostring(err):find("more than one run", 1, true) ~= nil
+  end
+  check("decisions: two local models' rows are refused", mixed('"label":"m"', '"label":"n"'), true)
+  check("decisions: so are two runs of one model", mixed('"label":"m","run":"a"', '"label":"m","run":"b"'), true)
+  check("decisions: one run's rows load", mixed('"label":"m","run":"a"', '"label":"m","run":"a"'), false)
+  check("decisions: and load whole", select(2, sc.loadDecisions(tmp)), 2)
   f = assert(io.open(tmp, "w"))
   f:write('{"episode":"r1","t":0,"action":"freeze","pWait":0.1}\n{"episode":"s1","t":0,"action":"freeze","valid":false}\n')
   f:close()
@@ -1411,7 +1423,9 @@ printf '0.010'
   check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)
   check("runner: and binds the input it answered, as the scorer hashes it",
     rc.snapshotHash ~= nil and rc.snapshotHash == sc.stepHash(ep.steps[1]), true)
-  run("chat", chat, "effort", "--reasoning-effort low")
+  check("runner: and names its label and its run", rc.label == "t" and type(rc.run) == "string", true)
+  local reff = run("chat", chat, "effort", "--reasoning-effort low")
+  check("runner: another run of the same model names another run", reff.run ~= nil and reff.run ~= rc.run, true)
   local bl = io.open(root .. "/bodies-effort.log", "r")
   local bodies = bl and bl:read("a") or ""
   if bl then bl:close() end

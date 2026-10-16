@@ -747,18 +747,22 @@ function M.main(argv)
     for _, ep in ipairs(fitEps) do has[ep.labels and ep.labels.class or "?"] = true end
     assert(has.runaway and has.savable,
       "--fit-dir has no runaway or no savable episode; the baselines cannot be fit on it")
-    -- Another directory holding the same episodes (a copy, or the same
-    -- templates and seeds regenerated under another split label) is the
-    -- same split: episodes are compared by what they hold, not by id.
-    local function content(ep)
-      return lfm.jsonEncode({ template = ep.template, labels = ep.labels, steps = ep.steps })
+    -- Another directory holding the same episodes is the same split: a
+    -- copy, the same templates and seeds regenerated under another split
+    -- label, or a copy with only its descriptive fields edited. Episodes
+    -- are compared by what scoring reads (their steps and outcome labels),
+    -- and by id, which fails safe.
+    local function fingerprint(ep)
+      local L = ep.labels or {}
+      return lfm.jsonEncode({ steps = ep.steps, class = L.class, runaway = L.runaway,
+                              ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
     end
-    local scored = {}
-    for _, ep in ipairs(eps) do scored[content(ep)] = ep.id end
+    local scored, scoredIds = {}, {}
+    for _, ep in ipairs(eps) do scored[fingerprint(ep)] = ep.id; scoredIds[ep.id] = true end
     for _, ep in ipairs(fitEps) do
-      local twin = scored[content(ep)]
-      assert(not twin, "--fit-dir holds " .. tostring(ep.id) .. ", the same episode as " .. tostring(twin)
-        .. " in the evaluated set")
+      local twin = scored[fingerprint(ep)]
+      assert(not twin and not scoredIds[ep.id], "--fit-dir holds " .. tostring(ep.id) .. ", the same episode as "
+        .. tostring(twin or ep.id) .. " in the evaluated set")
     end
   end
   local baselines, tree, horizon = M.baselineSet(fitEps, a.depth)

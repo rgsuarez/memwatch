@@ -372,14 +372,16 @@ function M.loadDecisions(path, keyPath)
     if line:match("%S") then
       local r = assert(lfm.jsonDecode(line), "bad decisions row")
       local ep, t, pWait = r.episode, r.t, r.pWait
+      local hash = r.snapshotHash
       if key then
         local k = assert(key[r.qid], "decision for an unknown qid")
-        ep, t = k.episode, k.t
+        -- A key carries each step's snapshot hash, as a runner's row does.
+        ep, t, hash = k.episode, k.t, k.snapshotHash
         pWait = type(r.p_runaway) == "number" and (1 - r.p_runaway) or nil
       end
       assert(r.action == "freeze" or r.action == "wait", "decision action must be freeze or wait")
       out[ep] = out[ep] or {}
-      out[ep][t] = { action = r.action, pWait = pWait, hash = r.snapshotHash }
+      out[ep][t] = { action = r.action, pWait = pWait, hash = hash }
       n = n + 1
       if type(pWait) ~= "number" then noP = noP + 1 end
       if r.valid == false then invalid = invalid + 1 end
@@ -751,7 +753,8 @@ end
 -- (each stands as the deterministic freeze) are noted. A decision point it
 -- does not cover is refused: scored as the deterministic freeze it would
 -- make a short, interrupted or mismatched file pass for a model (rows that
--- wait on the savables alone, say, pass with no runaway asked).
+-- wait on the savables alone, say, pass with no runaway asked). So is a row
+-- recorded on another snapshot, or with no snapshot hash to check.
 local function decisionsNotes(episodes, decisions, n, invalid)
   if invalid > 0 then
     print(string.format("note: %d of %d rows are invalid replies, recorded as the deterministic freeze", invalid, n))
@@ -766,9 +769,12 @@ local function decisionsNotes(episodes, decisions, n, invalid)
     error(string.format("%d of %d decision points were recorded on another snapshot than the episode holds "
       .. "(the split was regenerated since, or another set shares its ids); record them again", mismatched, total), 0)
   end
+  -- A row with no hash cannot be shown to answer this episode, so it does
+  -- not decide a gate either: rows recorded before rows carried one, or a
+  -- key that carries none, are recorded again (or the key rebuilt).
   if unchecked > 0 then
-    print(string.format("note: %d of %d rows carry no snapshot hash, so the inputs they answered are not checked",
-      unchecked, total))
+    error(string.format("%d of %d rows carry no snapshot hash, so the inputs they answered cannot be checked; "
+      .. "record them again (a key file carries each step's snapshotHash)", unchecked, total), 0)
   end
 end
 

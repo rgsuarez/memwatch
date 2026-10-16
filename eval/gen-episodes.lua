@@ -518,8 +518,13 @@ function M.episode(tpl, seed, split, cfg)
   for _, t in ipairs(allowed and M.decisionTimes(ticks, cfg, sim.lostAt) or {}) do
     -- alertSeq: which alert the decision belongs to. Production starts a
     -- new decision sequence (its deferral included) once an alert settles,
-    -- so the scorer restarts the deferral when this changes.
-    steps[#steps + 1] = { t = t, alertSeq = ticks[t].alertSeq, snapshot = snapshotAt(p, ticks[t]) }
+    -- so the scorer restarts the deferral when this changes. snapshotHash:
+    -- the hash a decision row must carry to answer this step (the scorer
+    -- recomputes it from the snapshot; a driver that cannot encode JSON as
+    -- Lua does copies it from here).
+    local snap = snapshotAt(p, ticks[t])
+    steps[#steps + 1] = { t = t, alertSeq = ticks[t].alertSeq, snapshot = snap,
+                          snapshotHash = lfm.snapshotHash(assert(lfm.jsonEncode(snap))) }
   end
   return {
     id = string.format("%s-%s-s%d", split, tpl.id, seed),

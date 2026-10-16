@@ -194,6 +194,18 @@ do
     (pcall(sc.checkDeferral, { { id = "x", params = { deferralSec = sc.cfg.deferralSec - 30 } } })), false)
   check("deferral: one labeled under this bound is scored",
     (pcall(sc.checkDeferral, { { id = "x", params = { deferralSec = sc.cfg.deferralSec } } })), true)
+  -- Each step carries the hash its decision rows must carry, and it holds
+  -- once the episode has been written and read back, as the scorer reads it.
+  local stored, rt = true, 0
+  for _, tpl in ipairs(dofile("eval/episode-templates.lua")) do
+    local ep = gen.episode(tpl, 1001, "test")
+    local back = lfm.jsonDecode(lfm.jsonEncode(ep))
+    for i, st in ipairs(back.steps) do
+      rt = rt + 1
+      if st.snapshotHash ~= sc.stepHash(st) or st.snapshotHash ~= ep.steps[i].snapshotHash then stored = false end
+    end
+  end
+  check("hash: every step's stored hash is the scorer's, after a write and a read", stored and rt > 0, true)
   check("deferral: a generated episode records its bound",
     gen.episode(dofile("eval/episode-templates.lua")[1], 1, "test").params.deferralSec, sc.cfg.deferralSec)
   check("play: a new alert starts the deferral over", sc.play(seqEp(1, 1, 2), waitAll).freezeAt, nil)
@@ -240,7 +252,7 @@ do
   check("decisions: plain row keyed by episode and step", d1.s1[0].pWait, 0.9)
   local keyTmp = os.tmpname()
   local kf = assert(io.open(keyTmp, "w"))
-  kf:write('{"rows":{"q1":{"episode":"r1","t":0},"q2":{"episode":"s1","t":60}}}')
+  kf:write('{"rows":{"q1":{"episode":"r1","t":0},"q2":{"episode":"s1","t":60,"snapshotHash":"abcd1234"}}}')
   kf:close()
   f = assert(io.open(tmp, "w"))
   f:write('{"qid":"q1","action":"freeze","p_runaway":0.8}\n{"qid":"q2","action":"wait","p_runaway":0.25}\n')
@@ -248,6 +260,7 @@ do
   local d2 = sc.loadDecisions(tmp, keyTmp)
   check("decisions: a judge's row maps through the key", d2.s1[60].action, "wait")
   check("decisions: P(wait) is 1 - p_runaway", math.abs(d2.s1[60].pWait - 0.75) < 1e-9, true)
+  check("decisions: a key's snapshot hash binds the judge's row", d2.s1[60].hash, "abcd1234")
   f = assert(io.open(tmp, "w"))
   f:write('{"episode":"r1","t":0,"action":"freeze","pWait":0.1}\n{"episode":"s1","t":0,"action":"freeze","valid":false}\n')
   f:close()
@@ -1090,8 +1103,12 @@ do
   print = function() end
   local partial = rowsFile(function(ep) return not ep.labels.runaway end)
   local okPart, errPart = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = partial, tau = 0.5, episodes = dev })
-  local whole = rowsFile(function() return true end)
+  local whole = rowsFile(function() return true end, sc.stepHash)
   local okWhole = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = whole, tau = 0.5, episodes = dev })
+  -- Rows with no hash cannot be shown to answer these episodes.
+  local unhashed = rowsFile(function() return true end)
+  local okUnhashed, errUnhashed = pcall(sc.resolveCandidate, "decisions", baselines,
+    { decisions = unhashed, tau = 0.5, episodes = dev })
   -- Rows recorded on other inputs (the split regenerated since) are refused,
   -- whatever their coverage; rows on these inputs resolve.
   local stale = rowsFile(function() return true end, function() return "00000000" end)
@@ -1099,13 +1116,15 @@ do
   local fresh = rowsFile(function() return true end, sc.stepHash)
   local okFresh = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = fresh, tau = 0.5, episodes = dev })
   print = quiet2
-  os.remove(partial); os.remove(whole); os.remove(stale); os.remove(fresh)
+  os.remove(partial); os.remove(whole); os.remove(stale); os.remove(fresh); os.remove(unhashed)
   check("cli: decisions recorded on another snapshot are refused",
     okStale == false and tostring(errStale):find("another snapshot", 1, true) ~= nil, true)
   check("cli: decisions recorded on these snapshots resolve", okFresh, true)
   check("cli: decisions that leave decision points uncovered are refused",
     okPart == false and tostring(errPart):find("the decisions cover", 1, true) ~= nil, true)
   check("cli: decisions covering every decision point resolve", okWhole, true)
+  check("cli: rows that carry no snapshot hash are refused",
+    okUnhashed == false and tostring(errUnhashed):find("no snapshot hash", 1, true) ~= nil, true)
   check("ttx: the fitted horizon makes fewer wrongful freezes than always-freeze",
     gO.baselines.ttx.wrongful < gO.baselines["always-freeze"].wrongful
       and gO.baselines.ttx.missUpper <= sc.cfg.missBound, true)

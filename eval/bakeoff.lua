@@ -276,12 +276,28 @@ local function retryArgs(args)
   return math.floor(retries), math.floor(wait)
 end
 
--- Clear a result path before a run writes one: already absent is fine
--- (errno 2, no such file), but a path that cannot be cleared (permissions,
--- a directory with something in it) refuses the run, since an earlier
--- result left there would read as this run's. (An empty directory is
--- removed, as os.remove removes one.)
+-- Clear a result path before a run writes one. Already absent is fine
+-- (errno 2, no such file). Only a run result is ever cleared: --out may name
+-- the wrong path, so a file there that is not one (an input, a script, a
+-- directory, a file that is not JSON or cannot be read) refuses the run
+-- untouched. A result that cannot be removed refuses it too, since an earlier
+-- result left there would read as this run's.
+local function isRunResult(doc) return type(doc.label) == "string" and type(doc.rows) == "table" end
 local function clearResult(path)
+  local f, oerr, ocode = io.open(path, "r")
+  if not f and ocode == 2 then return end
+  local text = f and f:read("a") or nil
+  if f then f:close() end
+  local doc, derr = nil, nil
+  if text then doc, derr = lfm.jsonDecode(text) end
+  if not (type(doc) == "table" and isRunResult(doc)) then
+    local why = not f and ("it cannot be read: " .. tostring(oerr))
+      or not text and "it is a directory, or cannot be read"
+      or derr and ("it is not a run result: " .. derr)
+      or "it is not a run result"
+    error(string.format("cannot clear %s: %s; only a run result is cleared, so remove it or name another path",
+      path, why), 0)
+  end
   local ok, err, code = os.remove(path)
   if not ok and code ~= 2 then
     error(string.format("cannot clear %s (%s): an earlier result left there would read as this run's",
@@ -306,7 +322,8 @@ local function runMode(args)
   -- A rerun's file is the rerun's or nothing: a stale result left at the path
   -- would read as this run's if the run failed or was refused, so an explicit
   -- --out is cleared before any other check, and a default path as soon as
-  -- it is known. The new result is written whole, then renamed into place.
+  -- it is known (only a run result is ever cleared: see clearResult). The new
+  -- result is written whole, then renamed into place.
   if args.out then clearResult(args.out) end
   local server = args.server or "http://127.0.0.1:11435"
   local label = assert(args.label, "--label required")

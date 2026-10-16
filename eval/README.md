@@ -49,11 +49,13 @@ counts the time the server took over every attempt (a timeout that reports
 no time counts its limit); the runner's own waits between attempts are
 recorded apart, as `wait_ms`. A rerun's result file is the rerun's or
 nothing: an explicit `--out` is cleared before any other check, and a
-default path as soon as the label and variant naming it are known (a path
-that cannot be cleared refuses the run); the new result is written whole
-and renamed into place. A flag given twice is refused, under either
-spelling (`--retry-wait` and `--retry_wait` are one flag), and so are
-`--raw-names` with `--redact-names`.
+default path as soon as the label and variant naming it are known; the
+new result is written whole and renamed into place. Only a run result is
+ever cleared: a path holding anything else (a scenario, a script, a
+directory) refuses the run untouched, and so does a result that cannot be
+removed. A flag given twice is refused, under either spelling
+(`--retry-wait` and `--retry_wait` are one flag), and so are `--raw-names`
+with `--redact-names`.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count
@@ -170,10 +172,13 @@ that decision.
   episodes). `controls` exits 1 when a control fails, 2 when the set is
   undecidable or underpowered, and 3 on a refusal. A result file
   (`--out`) is this run's or nothing: once the arguments parse, the path is
-  cleared before anything else (a path that cannot be cleared refuses the
-  run, and a flag given twice is refused), so an earlier result never
-  stands after a refusal or a failed write; the new one is written whole
-  and renamed into place. `--out` applies to `gate` only. A split holds each episode once: a
+  cleared before anything else, so an earlier result never stands after a
+  refusal or a failed write; the new one is written whole and renamed into
+  place. Only a gate result is ever cleared: a path holding anything else
+  (an episode, a script, a directory) refuses the run untouched, and so
+  does a result that cannot be removed. A command line that does not
+  parse (an unknown flag, a flag given twice) touches nothing.
+  `--out` applies to `gate` only. A split holds each episode once: a
   directory with the same episode twice (a copied file, or the episode
   under another id) is refused, since a copy would count twice toward the
   decisive size. Two episodes are the same when their trajectories are:

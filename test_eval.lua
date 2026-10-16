@@ -1130,12 +1130,12 @@ do
 local target = os.getenv("FAIL_OUT")
 local realOpen = io.open
 io.open = function(path, m)
-  local f, e = realOpen(path, m)
+  local f, e, c = realOpen(path, m)
   if f and tostring(path):sub(1, #target) == target and m == "w" then
     return { write = function() return true end,
              close = function() f:close(); return nil, "No space left on device" end }
   end
-  return f, e
+  return f, e, c
 end
 arg[0] = "eval/score-episodes.lua"
 dofile("eval/score-episodes.lua")
@@ -1186,7 +1186,26 @@ dofile("eval/score-episodes.lua")
   lh:close()
   check("cli: a result that cannot be cleared refuses the run, and says so",
     lockedSaid:find("exit=3", 1, true) ~= nil and lockedSaid:find("cannot clear", 1, true) ~= nil, true)
+  check("cli: and the directory at the path is kept", os.execute("test -d " .. q(locked .. "/inside")) == true, true)
   os.execute("rm -rf " .. q(locked))
+  -- Only a gate result is ever cleared: --out naming an episode is refused,
+  -- the episode kept.
+  local epAtOut = outFile .. "-episode.json"
+  local eaf = assert(io.open(epAtOut, "w"))
+  local epText = lfm.jsonEncode(one) .. "\n"
+  eaf:write(epText)
+  eaf:close()
+  local eph = io.popen(gateCmd .. " --candidate always-freeze --out " .. q(epAtOut) .. " 2>&1; echo \"exit=$?\"")
+  local epSaid = eph:read("a")
+  eph:close()
+  local eaf2 = io.open(epAtOut, "r")
+  local epNow = eaf2 and eaf2:read("a")
+  if eaf2 then eaf2:close() end
+  check("cli: --out naming an episode is refused, the episode kept",
+    epSaid:find("exit=3", 1, true) ~= nil and epNow == epText, true)
+  check("cli: and the refusal says only a gate result is cleared",
+    epSaid:find("only a gate result is cleared", 1, true) ~= nil, true)
+  os.remove(epAtOut)
   -- --out names a gate's result; the controls and tau write none.
   local okCtlOut, errCtlOut = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev, "--out", outFile })
   check("cli: --out is refused where nothing writes one",
@@ -1327,7 +1346,7 @@ printf '0.010 %s' "$status"
   -- A failed rerun leaves no stale result at the default path either.
   local defaultPath = cwdRoot .. "/eval/results/t-taxonomy.json"
   local dw = assert(io.open(defaultPath, "w"))
-  dw:write('{"label":"t","variant":"taxonomy","stale":true}\n')
+  dw:write('{"label":"t","variant":"taxonomy","rows":[],"stale":true}\n')
   dw:close()
   os.execute(string.format("cd '%s' && PATH='%s':\"$PATH\" FAKE_STATUS=503 FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
     .. "--label t --variant taxonomy --scenarios '%s' --retries 0 >/dev/null 2>&1", cwdRoot, stubDir, log, corpus))
@@ -1338,7 +1357,7 @@ printf '0.010 %s' "$status"
   -- the error as the model's invalid reply.
   local outErr = root .. "/run-err.json"
   local stale = assert(io.open(outErr, "w"))
-  stale:write('{"label":"t","variant":"baseline","stale":true}\n')
+  stale:write('{"label":"t","variant":"baseline","rows":[],"stale":true}\n')
   stale:close()
   local okErr = os.execute(string.format("PATH='%s':\"$PATH\" FAKE_STATUS=503 FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run "
     .. "--server http://stub --label t --scenarios '%s' --retries 0 --out '%s' >/dev/null 2>&1", stubDir, log, corpus, outErr))
@@ -1348,7 +1367,7 @@ printf '0.010 %s' "$status"
     okErr ~= true and errFile == nil, true)
   local outRef = root .. "/run-refused.json"
   local staleR = assert(io.open(outRef, "w"))
-  staleR:write('{"label":"t","stale":true}\n')
+  staleR:write('{"label":"t","rows":[],"stale":true}\n')
   staleR:close()
   os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
     .. "--label t --scenarios '%s' --retries -1 --out '%s' >/dev/null 2>&1", stubDir, log, corpus, outRef))
@@ -1360,7 +1379,7 @@ printf '0.010 %s' "$status"
   local function staleAfter(argsTail)
     local sp = root .. "/run-early.json"
     local sw = assert(io.open(sp, "w"))
-    sw:write('{"label":"t","stale":true}\n')
+    sw:write('{"label":"t","rows":[],"stale":true}\n')
     sw:close()
     os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
       .. "--scenarios '%s' %s --out '%s' >/dev/null 2>&1", stubDir, log, corpus, argsTail, sp))
@@ -1370,6 +1389,84 @@ printf '0.010 %s' "$status"
   end
   check("runner: a mistyped variant leaves no stale result at an explicit --out", staleAfter("--label t --variant typo"), false)
   check("runner: nor does a missing label", staleAfter(""), false)
+  -- Only a run result is ever cleared: --out naming an input, a file that is
+  -- not JSON, or a directory refuses the run and leaves it as it was.
+  local keptSaid
+  local function keptAfter(path, content)
+    local kh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--scenarios '%s' --out '%s' 2>&1", stubDir, log, corpus, path))
+    keptSaid = kh:read("a")
+    kh:close()
+    if content == nil then return os.execute("test -d '" .. path .. "'") == true end
+    local kf = io.open(path, "r")
+    local now = kf and kf:read("a")
+    if kf then kf:close() end
+    return now == content
+  end
+  local scenCopy = root .. "/scenario-copy.json"
+  os.execute("cp '" .. corpus .. "/extreme-02.json' '" .. scenCopy .. "'")
+  local scf = io.open(scenCopy, "r")
+  local scenText = scf:read("a")
+  scf:close()
+  check("runner: --out naming a scenario is refused, the scenario kept", keptAfter(scenCopy, scenText), true)
+  check("runner: and the refusal says only a run result is cleared",
+    keptSaid:find("only a run result is cleared", 1, true) ~= nil, true)
+  local notes = root .. "/notes.txt"
+  local nf2 = assert(io.open(notes, "w"))
+  nf2:write("not a result\n")
+  nf2:close()
+  check("runner: so is --out naming a file that is not JSON", keptAfter(notes, "not a result\n"), true)
+  local emptyDir = root .. "/empty-dir"
+  os.execute("mkdir -p '" .. emptyDir .. "'")
+  check("runner: and --out naming a directory, even an empty one", keptAfter(emptyDir, nil), true)
+  -- A successful rerun replaces an earlier result.
+  local replaced = root .. "/replaced.json"
+  local rf4 = assert(io.open(replaced, "w"))
+  rf4:write('{"label":"old","rows":[]}\n')
+  rf4:close()
+  os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, corpus, replaced))
+  local rf5 = io.open(replaced, "r")
+  local replacedDoc = rf5 and lfm.jsonDecode(rf5:read("a")) or {}
+  if rf5 then rf5:close() end
+  check("runner: a successful rerun replaces the earlier result", replacedDoc.label, "t")
+  -- A result that cannot be removed (its directory read-only) refuses the
+  -- run. (Root removes it anyway, so this pin runs only as another user.)
+  local idh = io.popen("id -u")
+  local uid = idh:read("l")
+  idh:close()
+  if uid ~= "0" then
+    local roDir = root .. "/ro"
+    os.execute("mkdir -p '" .. roDir .. "'")
+    local rof = assert(io.open(roDir .. "/r.json", "w"))
+    rof:write('{"label":"t","rows":[]}\n')
+    rof:close()
+    os.execute("chmod 555 '" .. roDir .. "'")
+    local roh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1", stubDir, log, corpus, roDir .. "/r.json"))
+    local roSaid = roh:read("a")
+    roh:close()
+    os.execute("chmod 755 '" .. roDir .. "'")
+    check("runner: a result that cannot be removed refuses the run", roSaid:find("cannot clear", 1, true) ~= nil
+      and roSaid:find("would read as this run's", 1, true) ~= nil, true)
+    -- A file at --out that cannot be read is refused and kept, never taken
+    -- for absent.
+    local unreadable = root .. "/unreadable.json"
+    local urf = assert(io.open(unreadable, "w"))
+    urf:write('{"label":"t","rows":[]}\n')
+    urf:close()
+    os.execute("chmod 000 '" .. unreadable .. "'")
+    local urh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1", stubDir, log, corpus, unreadable))
+    local urSaid = urh:read("a")
+    urh:close()
+    os.execute("chmod 644 '" .. unreadable .. "'")
+    local urKept = io.open(unreadable, "r")
+    local urNow = urKept and urKept:read("a")
+    if urKept then urKept:close() end
+    check("runner: a file at --out that cannot be read is refused and kept",
+      urSaid:find("cannot clear", 1, true) ~= nil and urNow == '{"label":"t","rows":[]}\n', true)
+  end
   local leftovers = 0
   for _, dirScan in ipairs({ cwdRoot .. "/eval/results", root }) do
     local lp = io.popen("ls '" .. dirScan .. "' 2>/dev/null")
@@ -1406,12 +1503,12 @@ end
 local partialPrefix = os.getenv("FAIL_PARTIAL")
 local realOpen = io.open
 io.open = function(path, m)
-  local f, e = realOpen(path, m)
+  local f, e, c = realOpen(path, m)
   if f and partialPrefix and m == "w" and tostring(path):sub(1, #partialPrefix) == partialPrefix then
     return { write = function(_, ...) return f:write(...) end,
              close = function() f:close(); return nil, "No space left on device" end }
   end
-  return f, e
+  return f, e, c
 end
 arg[0] = "eval/bakeoff.lua"
 dofile("eval/bakeoff.lua")
@@ -2307,7 +2404,7 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
 local match, mode = os.getenv("FAIL_MATCH"), os.getenv("FAIL_MODE")
 local realOpen = io.open
 io.open = function(path, m)
-  local f, e = realOpen(path, m)
+  local f, e, c = realOpen(path, m)
   if f and m == "w" and match and tostring(path):find(match) then
     local proxy = {}
     function proxy:write(...)
@@ -2321,7 +2418,7 @@ io.open = function(path, m)
     end
     return proxy
   end
-  return f, e
+  return f, e, c
 end
 arg[0] = "eval/bakeoff.lua"
 dofile("eval/bakeoff.lua")

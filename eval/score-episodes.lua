@@ -1017,12 +1017,27 @@ function M.checkDeferral(episodes, cfg)
   end
 end
 
--- Clear a result path before a run writes one: already absent is fine
--- (errno 2, no such file), but a path that cannot be cleared (permissions,
--- a directory with something in it) refuses the run, since an earlier
--- result left there would read as this run's. (An empty directory is
--- removed, as os.remove removes one.)
+-- Clear a result path before a run writes one. Already absent is fine
+-- (errno 2, no such file). Only a gate result is ever cleared: --out may name
+-- the wrong path, so a file there that is not one (an episode, a script, a
+-- directory, a file that is not JSON or cannot be read) refuses the run
+-- untouched. A result that cannot be removed refuses it too, since an earlier
+-- result left there would read as this run's.
 function M.clearResult(path)
+  local f, oerr, ocode = io.open(path, "r")
+  if not f and ocode == 2 then return end
+  local text = f and f:read("a") or nil
+  if f then f:close() end
+  local doc, derr = nil, nil
+  if text then doc, derr = lfm.jsonDecode(text) end
+  if not (type(doc) == "table" and type(doc.candidate) == "string" and type(doc.pass) == "boolean") then
+    local why = not f and ("it cannot be read: " .. tostring(oerr))
+      or not text and "it is a directory, or cannot be read"
+      or derr and ("it is not a gate result: " .. derr)
+      or "it is not a gate result"
+    error(string.format("cannot clear %s: %s; only a gate result is cleared, so remove it or name another path",
+      path, why), 0)
+  end
   local ok, err, code = os.remove(path)
   if not ok and code ~= 2 then
     error(string.format("cannot clear %s (%s): an earlier result left there would read as this run's",

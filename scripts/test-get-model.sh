@@ -108,8 +108,17 @@ printf 'synthetic license text\n' > "$tmp/srv/LICENSE"
 expect 0 "offline, a previously verified local license stands" FAKE_FAIL=LICENSE
 expect 1 "an HTTP answer without the license is refused, not taken for offline" FAKE_HTTP=LICENSE=404
 check "  before any download" noWeightsAsked
+rm -f "$models/m.gguf"
 expect 0 "a server error on the license is no answer: the verified local copy stands" FAKE_HTTP=LICENSE=503
+check "  and the weights are then fetched and verified" hashIs "$models/m.gguf" "$msha"
 expect 0 "so is rate limiting" FAKE_HTTP=LICENSE=429
+# No usable answer upstream and a local copy that fails its pin: nothing
+# verified stands in, so the run is refused before any download.
+printf 'tampered license text\n' > "$localLic"
+rm -f "$models/m.gguf"
+expect 1 "no usable answer beside a local license that fails its pin is refused" FAKE_HTTP=LICENSE=503
+check "  before any download" noWeightsAsked
+cp "$tmp/srv/LICENSE" "$localLic"
 expect 0 "and a license transfer cut short after its 200" FAKE_PARTIAL=LICENSE
 check "  not read as a changed license" saysNot "license changed"
 expect 1 "a final redirect on the license is refused" FAKE_HTTP=LICENSE=302

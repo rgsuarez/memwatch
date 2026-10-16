@@ -714,6 +714,14 @@ function M.main(argv)
     assert(fitReal ~= M.realDir(a.dir), "--fit-dir is the evaluated directory; fit the tree on another split")
   end
   local fitEps = a.fitDir and M.loadDir(a.fitDir) or eps
+  -- A split with no runaway or no savable episode fits nothing: the tree
+  -- would be one leaf and the ttx horizon its default, weakening the gate.
+  if a.cmd == "gate" or a.cmd == "controls" then
+    local has = {}
+    for _, ep in ipairs(fitEps) do has[ep.labels and ep.labels.class or "?"] = true end
+    assert(has.runaway and has.savable,
+      "--fit-dir has no runaway or no savable episode; the baselines cannot be fit on it")
+  end
   local baselines, tree, horizon = M.baselineSet(fitEps, a.depth)
   if a.cmd == "gate" then
     local name = a.candidate or "oracle"

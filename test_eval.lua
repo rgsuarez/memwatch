@@ -436,6 +436,16 @@ do
   local okLink, errLink = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", held .. ".link" })
   local okNone = pcall(sc.main, { "gate", "--dir", held })
   local okCtl, ctl = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev })
+  local empty, late = tmpDir(), tmpDir()
+  for i = 1, 3 do
+    local lf = assert(io.open(late .. "/late-" .. i .. ".json", "w"))
+    lf:write(lfm.jsonEncode({ id = "late-" .. i, template = "T", family = "f",
+      labels = { class = "late", runaway = false, resolvesBySec = 150 },
+      steps = lfm.jsonArray({ { t = 0, snapshot = { availPct = 20 } } }) }), "\n")
+    lf:close()
+  end
+  local okEmpty, errEmpty = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", empty })
+  local okLate, errLate = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", late })
   print = quiet
   sc.cfg.bootstrap = 2000
   check("cli: a failing gate exits nonzero", ok and status, 1)
@@ -445,7 +455,11 @@ do
     okLink == false and tostring(errLink):find("evaluated directory", 1, true) ~= nil, true)
   check("cli: a gate without a fit split is refused", okNone, false)
   check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
-  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link'")
+  check("cli: an empty fit split is refused",
+    okEmpty == false and tostring(errEmpty):find("cannot be fit", 1, true) ~= nil, true)
+  check("cli: so is one with only late episodes",
+    okLate == false and tostring(errLate):find("cannot be fit", 1, true) ~= nil, true)
+  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "'")
 end
 
 -- ---- on a set large enough to decide the gate (the documented dev size) ----

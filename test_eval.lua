@@ -1025,6 +1025,50 @@ do
   os.execute("rm -rf '" .. base .. "'")
 end
 
+-- ---- gates: noschema pairing by condition, and a league no row can win ----
+do
+  local function gatesRun(results, measurements)
+    local h = io.popen("mktemp -d")
+    local base = h:read("l")
+    h:close()
+    for name, r in pairs(results) do
+      r.rows = lfm.jsonArray({})
+      local f = assert(io.open(base .. "/" .. name .. ".json", "w"))
+      f:write(assert(lfm.jsonEncode(r)))
+      f:close()
+    end
+    local mf = assert(io.open(base .. "/measurements.json", "w"))
+    mf:write(assert(lfm.jsonEncode(measurements)))
+    mf:close()
+    local ph = io.popen("lua eval/bakeoff.lua gates --results '" .. base .. "' 2>&1")
+    local said = ph:read("a")
+    ph:close()
+    local lf = io.open(base .. "/league.json")
+    local out = lf and lfm.jsonDecode(lf:read("a")) or {}
+    if lf then lf:close() end
+    os.execute("rm -rf '" .. base .. "'")
+    return out, said
+  end
+  local function res(label, redacted, schema, valid)
+    return { label = label, variant = "taxonomy", schema = schema, redact_names = redacted, gold_rate = 0.6,
+      acceptable_rate = 0.9, danger_rate = 0, json_valid_rate = valid or 1, wall_p95_ms = 100, injection_compliance = 0 }
+  end
+  local fits = { cold_p95_ms = 100, footprint_mb = 500 }
+  -- p's noschema run shares its names condition; q's ran with names raw.
+  local out, said = gatesRun({ p = res("p", true, true), ["p-ns"] = res("p", true, false, 0.5),
+    q = res("q", true, true), ["q-ns"] = res("q", false, false, 0.5) }, { p = fits, q = fits })
+  local un = {}
+  for _, r in ipairs(out.league or {}) do un[r.label] = r.json_valid_unconstrained end
+  check("gates: a noschema run under the same names condition pairs", un.p, 0.5)
+  check("gates: one under the other condition does not", un.q, 0)
+  check("gates: and the unpaired run is named",
+    said:find("note: q (taxonomy, names redacted) has a noschema run only with names raw", 1, true) ~= nil, true)
+  -- The only row that passes ran with names raw, where production redacts.
+  local out2, said2 = gatesRun({ r = res("r", false, true) }, { r = fits })
+  check("gates: a league whose only passer ran with raw names has no winner", out2.winner, nil)
+  check("gates: and says why", said2:find("note: no winner: the 1 row(s) that passed G1 to G6", 1, true) ~= nil, true)
+end
+
 -- ---- the generator's output: a whole split or nothing ----
 do
   local h = io.popen("mktemp -d")

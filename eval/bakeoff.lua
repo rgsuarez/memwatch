@@ -690,9 +690,9 @@ local function gatesMode(args)
   -- The names the model saw are part of the combo: a run with names
   -- redacted and one with them raw are different conditions, never ranked
   -- as one (a result from before the record was all raw).
-  local function comboKey(r)
-    local names = (r.redact_names == true) and "redacted" or "raw"
-    return (r.label or "?") .. "|" .. (r.variant or "?") .. "|" .. names
+  local function namesOf(r) return (r.redact_names == true) and "redacted" or "raw" end
+  local function comboKey(r, names)
+    return (r.label or "?") .. "|" .. (r.variant or "?") .. "|" .. (names or namesOf(r))
   end
   local p = assert(io.popen("ls " .. shellQuote(resultsDir)))
   for fname in p:lines() do
@@ -770,6 +770,19 @@ local function gatesMode(args)
     }
   end
   table.sort(league, function(a, b) return a.composite > b.composite end)
+  -- A schema run's unconstrained term comes from the noschema run under its
+  -- own names condition. One that exists only under the other condition is
+  -- never paired, and the term scores 0: say so.
+  local notes = {}
+  for key, r in pairs(byCombo) do
+    local other = comboKey(r, namesOf(r) == "redacted" and "raw" or "redacted")
+    if not noschema[key] and noschema[other] then
+      notes[#notes + 1] = string.format("note: %s (%s, names %s) has a noschema run only with names %s;"
+        .. " its unconstrained validity scores 0\n", r.label, tostring(r.variant), namesOf(r),
+        namesOf(noschema[other]))
+    end
+  end
+  table.sort(notes)
 
   -- Promotion: among gate-passing, non-reference, promotion-eligible rows,
   -- best composite; any row within 0.02 of best -> the lightest wins.
@@ -800,6 +813,21 @@ local function gatesMode(args)
       row.warm_p95_ms, tostring(row.cold_p95_ms or "-"), tostring(row.footprint_mb or "-"),
       row.gates_passed and "PASS" or "FAIL",
       (row.reference_only and " (reference)" or "") .. (row.remote and " (remote)" or "")))
+  end
+  for _, n in ipairs(notes) do io.write(n) end
+  -- Rows that passed but cannot win (another prompt variant, or names shown
+  -- raw where production redacts) leave no winner: say why.
+  if not winner then
+    local barred = 0
+    for _, row in ipairs(league) do
+      if row.gates_passed and not row.reference_only and (row.variant_diagnostic or row.names_diagnostic) then
+        barred = barred + 1
+      end
+    end
+    if barred > 0 then
+      io.write(string.format("note: no winner: the %d row(s) that passed G1 to G6 ran under another prompt variant"
+        .. " or names condition than production's\n", barred))
+    end
   end
   io.write("\nwinner on G1 to G6 (G7 is scored separately, by score-episodes.lua gate): "
     .. tostring(out.winner) .. " (" .. tostring(out.winner_variant) .. ", names "

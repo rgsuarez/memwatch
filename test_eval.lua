@@ -275,6 +275,83 @@ do
   check("prevalence: a category with no episodes is reported uncovered", pw.uncovered[1], "editor")
 end
 
+-- ---- replay, attribution and ties ----
+do
+  local function mk1(id, class, ttx, resolves, times)
+    local steps = {}
+    for _, t in ipairs(times) do steps[#steps + 1] = { t = t, snapshot = {} } end
+    return { id = id, template = "T" .. id, family = "f", steps = steps,
+             labels = { class = class, runaway = class == "runaway", ttxSec = ttx, resolvesBySec = resolves } }
+  end
+  -- A wait recorded with no probability (a chat verdict) is refused at
+  -- every threshold, exactly as the live rail refuses it.
+  local e = mk1("n1", "savable", nil, 50, { 0 })
+  local noP = { n1 = { [0] = { action = "wait" } } }
+  check("replay: a wait without a probability is refused at 0.9", (sc.decisionsCandidate(noP, 0.9)(e.steps[1], e)), "freeze")
+  check("replay: and at 0", (sc.decisionsCandidate(noP, 0)(e.steps[1], e)), "freeze")
+  check("replay: its score is the recorded action", select(2, sc.decisionsCandidate(noP, 0.9)(e.steps[1], e)), 0)
+  -- The candidate is asked before the floor, as production consults the
+  -- model first: a freeze it makes at 120 is its own.
+  local e3 = mk1("f3", "savable", nil, 150, { 0, 60, 120 })
+  check("attribution: a candidate's own freeze at 120 is the candidate's",
+    sc.play(e3, function(st) return st.t < 120 and "wait" or "freeze" end).by, "candidate")
+  check("attribution: a wait at 120 is superseded by the floor", sc.play(e3, function() return "wait" end).by, "floor")
+  -- Baselines tied on wrongful freezes: fewer misses wins, then the name.
+  local eps = {}
+  for i = 1, 100 do eps[#eps + 1] = mk1("r" .. i, "runaway", 30, nil, { 0, 60 }) end
+  for i = 1, 30 do eps[#eps + 1] = mk1("s" .. i, "savable", nil, 40, { 0 }) end
+  local function base(missR, fromS)
+    return function(st, ep)
+      if ep.labels.class == "runaway" then return (ep.id == missR and st.t == 0) and "wait" or "freeze" end
+      local i = tonumber(ep.id:sub(2))
+      return (i >= fromS and i < fromS + 10) and "freeze" or "wait"
+    end
+  end
+  sc.cfg.bootstrap = 200
+  check("ties: equal wrongful rates go to fewer misses",
+    sc.gate(eps, base(nil, 21), { a = base("r1", 1), b = base(nil, 11) }).bestBaseline, "b")
+  check("ties: then to the first name",
+    sc.gate(eps, base(nil, 21), { b = base(nil, 11), a = base(nil, 1) }).bestBaseline, "a")
+  -- The tau sweep breaks a tie toward the stricter threshold.
+  local decs = {}
+  for i = 1, 100 do decs["r" .. i] = { [0] = { action = "wait", pWait = 0.5 }, [60] = { action = "wait", pWait = 0.5 } } end
+  for i = 1, 30 do decs["s" .. i] = { [0] = { action = "wait", pWait = 0.97 } } end
+  check("tau sweep: a tie goes to the stricter threshold", sc.chooseTau(eps, decs, { 0.9, 0.95 }).tau, 0.95)
+  sc.cfg.bootstrap = 2000
+end
+
+-- ---- the CLI's exit status and its refusals ----
+do
+  local function tmpDir()
+    local h = io.popen("mktemp -d")
+    local d = h:read("l")
+    h:close()
+    return d
+  end
+  local dev, held = tmpDir(), tmpDir()
+  local quiet = print
+  print = function() end
+  gen.main({ "--templates", "eval/episode-templates.lua", "--split", "dev", "--seed", "1", "--per-template", "1", "--out", dev })
+  gen.main({ "--templates", "eval/episode-templates.lua", "--split", "dev", "--seed", "2", "--per-template", "1", "--out", held })
+  sc.cfg.bootstrap = 200
+  local ok, status = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", dev, "--candidate", "always-freeze" })
+  local okSame, errSame = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", held })
+  os.execute("ln -s '" .. held .. "' '" .. held .. ".link'")
+  local okLink, errLink = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", held .. ".link" })
+  local okNone = pcall(sc.main, { "gate", "--dir", held })
+  local okCtl, ctl = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev })
+  print = quiet
+  sc.cfg.bootstrap = 2000
+  check("cli: a failing gate exits nonzero", ok and status, 1)
+  check("cli: fitting on the evaluated directory is refused",
+    okSame == false and tostring(errSame):find("evaluated directory", 1, true) ~= nil, true)
+  check("cli: and under another spelling",
+    okLink == false and tostring(errLink):find("evaluated directory", 1, true) ~= nil, true)
+  check("cli: a gate without a fit split is refused", okNone, false)
+  check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
+  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link'")
+end
+
 -- ---- every corpus and template name keeps its category ----
 do
   -- The scenario corpus and the episode templates name the families the

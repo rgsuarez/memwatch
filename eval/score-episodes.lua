@@ -5,7 +5,9 @@
 -- at each decision point (grace expiry +0/+60/+120 s) it says freeze or
 -- wait; the first freeze ends the episode; a wait defers, but once the
 -- deferral bound has elapsed since the first wait the deterministic floor
--- freezes regardless. Outcomes, from the simulator's labels:
+-- supersedes a wait with its freeze. As in production, the candidate is
+-- asked first, so a freeze it makes itself is its own, never the floor's.
+-- Outcomes, from the simulator's labels:
 --
 --   missed runaway   a runaway whose first freeze lands after ttxSec (or never)
 --   wrongful freeze  any freeze on a savable episode (it would have resolved)
@@ -45,7 +47,10 @@ M.cfg = {
   totalMB      = 36864, -- the deployment machine, for the time-to-exhaustion baseline
   floorPct     = 5,     -- exhaustion, as the labels define it
   starvePct    = 8,     -- the starvation line, as the labels define it
-  ttxHorizonSec = 180,  -- freeze when exhaustion is projected sooner than this
+  -- the time-to-exhaustion baseline freezes when exhaustion is projected
+  -- sooner than its horizon, fit on dev (fitTtx); this is the default when
+  -- no horizon meets the miss bound there: the next decision point
+  ttxHorizonSec = 60,
 }
 
 ------------------------------------------------------------------------------
@@ -74,24 +79,26 @@ function M.play(ep, decide, cfg)
   local firstWaitT = nil
   local trace = {}
   for _, st in ipairs(ep.steps) do
+    local act, p = decide(st, ep)
+    if act == "freeze" then
+      trace[#trace + 1] = { t = st.t, act = act, p = p }
+      return { freezeAt = st.t, by = "candidate", trace = trace }
+    end
     -- The deterministic floor: once the deferral bound has elapsed since the
-    -- first wait, freeze. cfg.floorMaxAvailPct (unset = always) is the
-    -- proposed contract variant: the floor fires only while headroom is at
-    -- or below that level, and otherwise the candidate keeps deciding.
+    -- first wait, a wait is superseded by the freeze. cfg.floorMaxAvailPct
+    -- (unset = always) is the proposed contract variant: the floor fires
+    -- only while headroom is at or below that level, and otherwise the
+    -- candidate keeps deciding.
     local floorDue = firstWaitT and (st.t - firstWaitT) >= cfg.deferralSec
     if floorDue and cfg.floorMaxAvailPct
        and (st.snapshot and st.snapshot.availPct or 0) > cfg.floorMaxAvailPct then
       floorDue = false
     end
     if floorDue then
-      trace[#trace + 1] = { t = st.t, act = "freeze", by = "floor" }
+      trace[#trace + 1] = { t = st.t, act = "freeze", by = "floor", p = p }
       return { freezeAt = st.t, by = "floor", trace = trace }
     end
-    local act, p = decide(st, ep)
     trace[#trace + 1] = { t = st.t, act = act, p = p }
-    if act == "freeze" then
-      return { freezeAt = st.t, by = "candidate", trace = trace }
-    end
     firstWaitT = firstWaitT or st.t
   end
   return { freezeAt = nil, by = nil, trace = trace }
@@ -248,14 +255,33 @@ function M.ttxSec(st, cfg)
   if f.slopeMBmin <= 0 then return math.huge end
   return room / f.slopeMBmin * 60
 end
-M.candidates["ttx"] = function()
+M.candidates["ttx"] = function(horizonSec)
+  local horizon = horizonSec or M.cfg.ttxHorizonSec
   return function(st)
     local f = M.features(st)
     if f.availPct <= M.cfg.starvePct then return "freeze", 0.95 end
     local ttx = M.ttxSec(st)
-    if ttx <= M.cfg.ttxHorizonSec then return "freeze", 0.9 end
+    if ttx <= horizon then return "freeze", 0.9 end
     return "wait", 0.2
   end
+end
+
+-- The ttx baseline's horizon, fit on dev like the tree: the fewest wrongful
+-- freezes among the horizons (0 to 180 s, by 5) that meet the miss bound
+-- there, ties to the longer, more cautious one. At grace expiry every
+-- offender already grows at the extreme rate, so any horizon near a minute
+-- freezes nearly everything; fitting is what makes this baseline more than
+-- always-freeze. No horizon meets the bound: the default.
+function M.fitTtx(fitEpisodes, cfg)
+  cfg = cfg or M.cfg
+  local best, bestWrongful = nil, nil
+  for h = 0, 180, 5 do
+    local s = M.score(fitEpisodes, M.candidates.ttx(h), cfg)
+    if s.missUpper <= cfg.missBound and (bestWrongful == nil or s.wrongful <= bestWrongful) then
+      best, bestWrongful = h, s.wrongful
+    end
+  end
+  return best or cfg.ttxHorizonSec
 end
 
 M.candidates["oracle"] = function()
@@ -294,23 +320,28 @@ end
 
 -- Recorded model decisions replayed through the production wait rail:
 -- decisions[episodeId][t] = { action, pWait }. A model's wait defers only
--- when lfm.waitHonored passes at tauWait; a step with no recorded decision
--- gets the deterministic freeze. tauWait = 0 honors every recorded wait
--- (a judge's own calls, unthresholded). The score is 1 - P(wait).
+-- when lfm.waitHonored passes at tauWait, exactly as the live rail decides:
+-- a wait recorded with no probability (a chat verdict, whose confidence is
+-- self-reported) is never honored, at any threshold. A step with no
+-- recorded decision gets the deterministic freeze. tauWait = 0 honors every
+-- wait that carries a probability. The score is 1 - P(wait) (with no
+-- probability, the recorded action: 0 for a wait, 1 for a freeze).
 function M.decisionsCandidate(decisions, tauWait)
   return function(st, ep)
     local d = decisions[ep.id] and decisions[ep.id][st.t]
     if not d then return "freeze", 1 end
-    local p = type(d.pWait) == "number" and d.pWait or (d.action == "wait" and 1 or 0)
-    if lfm.waitHonored({ action = d.action, pWait = p }, tauWait) then return "wait", 1 - p end
-    return "freeze", 1 - p
+    local p = type(d.pWait) == "number" and d.pWait or nil
+    local score = p and (1 - p) or (d.action == "wait" and 0 or 1)
+    if lfm.waitHonored({ action = d.action, pWait = p }, tauWait) then return "wait", score end
+    return "freeze", score
   end
 end
 
 -- Load recorded decisions from JSONL rows { episode, t, action, pWait }.
 -- With a key file (an independent judge's opaque ids), rows are
 -- { qid, action, p_runaway } and the key maps each qid to its episode and
--- step; P(wait) is 1 - p_runaway.
+-- step; P(wait) is 1 - p_runaway. Returns the decisions, the row count, and
+-- how many rows carry no probability (their waits are never honored).
 function M.loadDecisions(path, keyPath)
   local key = nil
   if keyPath then
@@ -318,7 +349,7 @@ function M.loadDecisions(path, keyPath)
     key = assert(lfm.jsonDecode(kf:read("a"))).rows
     kf:close()
   end
-  local out, n = {}, 0
+  local out, n, noP = {}, 0, 0
   for line in io.lines(path) do
     if line:match("%S") then
       local r = assert(lfm.jsonDecode(line), "bad decisions row")
@@ -332,9 +363,10 @@ function M.loadDecisions(path, keyPath)
       out[ep] = out[ep] or {}
       out[ep][t] = { action = r.action, pWait = pWait }
       n = n + 1
+      if type(pWait) ~= "number" then noP = noP + 1 end
     end
   end
-  return out, n
+  return out, n, noP
 end
 
 -- The tau sweep on dev: score the replayed decisions at each threshold and
@@ -349,10 +381,14 @@ function M.chooseTau(episodes, decisions, grid, cfg)
     local r = { tau = tau, misses = s.misses, missUpper = s.missUpper, wrongful = s.wrongful,
                 wrongfulRate = s.wrongfulRate, meets = s.missUpper <= cfg.missBound }
     rows[#rows + 1] = r
+    -- Ties go to the stricter threshold: it costs no wrongful freezes here
+    -- and can only catch more runaways.
     local better = best == nil
       or (r.meets and not best.meets)
-      or (r.meets == best.meets and r.meets and r.wrongful < best.wrongful)
-      or (r.meets == best.meets and not r.meets and r.misses < best.misses)
+      or (r.meets == best.meets and r.meets and (r.wrongful < best.wrongful
+          or (r.wrongful == best.wrongful and r.tau > best.tau)))
+      or (r.meets == best.meets and not r.meets and (r.misses < best.misses
+          or (r.misses == best.misses and r.tau > best.tau)))
     if better then best = r end
   end
   return best, rows
@@ -559,10 +595,17 @@ function M.gate(episodes, candDecide, baselines, cfg)
   local cand = M.score(episodes, candDecide, cfg)
   local best, bestName = nil, nil
   local baseScores = {}
-  for name, decide in pairs(baselines) do
-    local b = M.score(episodes, decide, cfg)
+  -- The fewest wrongful freezes among the baselines meeting the miss bound;
+  -- ties go to fewer misses, then to the first name. The choice never
+  -- depends on a table's iteration order.
+  local names = {}
+  for name in pairs(baselines) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local b = M.score(episodes, baselines[name], cfg)
     baseScores[name] = b
-    if b.missUpper <= cfg.missBound and (best == nil or b.wrongfulRate < best.wrongfulRate) then
+    if b.missUpper <= cfg.missBound and (best == nil or b.wrongfulRate < best.wrongfulRate
+        or (b.wrongfulRate == best.wrongfulRate and b.misses < best.misses)) then
       best, bestName = b, name
     end
   end
@@ -604,22 +647,74 @@ local function summary(name, s)
     s.wrongfulByFloor, s.nLate)
 end
 
-local function baselineSet(fitEpisodes, depth)
+-- The deterministic baselines, the fitted ones fit on fitEpisodes (dev).
+-- Returns them, the tree, and the ttx horizon.
+function M.baselineSet(fitEpisodes, depth)
   local tree = M.fitTree(fitEpisodes, depth or 3, 5)
+  local horizon = M.fitTtx(fitEpisodes)
   return {
     ["always-freeze"] = M.candidates["always-freeze"](),
     ["rule"] = M.candidates["rule"](),
-    ["ttx"] = M.candidates["ttx"](),
+    ["ttx"] = M.candidates["ttx"](horizon),
     ["tree"] = M.treeCandidate(tree),
-  }, tree
+  }, tree, horizon
 end
 
+-- The power control: a candidate a share of the way from the best baseline
+-- to the oracle (mixed by episode), gated on trials seeds. Returns how many
+-- passed.
+function M.powerControl(eps, baselines, bestName, trials, cfg)
+  cfg = cfg or M.cfg
+  local passes = 0
+  for seed = 1, trials do
+    local mix = M.mixedOracle(baselines[bestName], cfg.powerShare, seed)
+    if M.gate(eps, mix, baselines, cfg).pass then passes = passes + 1 end
+  end
+  return passes
+end
+
+-- A note for rows that carry no probability: the rail never honors their
+-- waits, so their candidate freezes there at every threshold.
+local function noProbabilityNote(n, noP)
+  if noP == 0 then return nil end
+  if noP == n then
+    return string.format("note: none of the %d rows carries a probability; the wait rail honors none of their waits, so no threshold changes the outcome", n)
+  end
+  return string.format("note: %d of %d rows carry no probability; the wait rail never honors their waits", noP, n)
+end
+
+local function sortedKeys(t)
+  local ks = {}
+  for k in pairs(t) do ks[#ks + 1] = k end
+  table.sort(ks)
+  return ks
+end
+
+-- A directory's physical path (symlinks and relative spellings resolved),
+-- or nil when it does not exist.
+function M.realDir(dir)
+  local p = io.popen("cd '" .. tostring(dir):gsub("'", "'\\''") .. "' 2>/dev/null && pwd -P")
+  local out = p and p:read("l")
+  if p then p:close() end
+  return out
+end
+
+-- Returns the exit status: 0, or 1 when the gate fails or a control does.
 function M.main(argv)
+  local status = 0
   local a = parse(argv)
   assert(a.dir, "--dir is required")
   local eps = M.loadDir(a.dir)
+  -- The tree baseline is fit on another split, never on the episodes it is
+  -- scored on: a gate or a control run must name it, and it must not be the
+  -- evaluated directory under another spelling.
+  if a.cmd == "gate" or a.cmd == "controls" then
+    assert(a.fitDir, "--fit-dir is required (the dev split the tree is fit on)")
+    local fitReal = assert(M.realDir(a.fitDir), "--fit-dir does not exist")
+    assert(fitReal ~= M.realDir(a.dir), "--fit-dir is the evaluated directory; fit the tree on another split")
+  end
   local fitEps = a.fitDir and M.loadDir(a.fitDir) or eps
-  local baselines, tree = baselineSet(fitEps, a.depth)
+  local baselines, tree, horizon = M.baselineSet(fitEps, a.depth)
   if a.cmd == "gate" then
     local name = a.candidate or "oracle"
     local decide
@@ -628,18 +723,21 @@ function M.main(argv)
     elseif name == "decisions" then
       assert(a.decisions, "--decisions is required for the decisions candidate")
       assert(a.tau, "--tau is required for the decisions candidate (choose it on dev)")
-      decide = M.decisionsCandidate((M.loadDecisions(a.decisions, a.key)), a.tau)
+      local decisions, n, noP = M.loadDecisions(a.decisions, a.key)
+      local note = noProbabilityNote(n, noP)
+      if note then print(note) end
+      decide = M.decisionsCandidate(decisions, a.tau)
     elseif M.candidates[name] then decide = M.candidates[name]()
     else error("unknown candidate " .. name) end
     local g = M.gate(eps, decide, baselines)
-    for bn, b in pairs(g.baselines) do print(summary("base:" .. bn, b)) end
+    for _, bn in ipairs(sortedKeys(g.baselines)) do print(summary("base:" .. bn, g.baselines[bn])) end
     print(summary("cand:" .. name, g.candidate))
     if a.prevalence then
       local pf = assert(io.open(a.prevalence, "r"))
       local weights = assert(lfm.jsonDecode(pf:read("a")), "bad --prevalence file")
       pf:close()
       local rows = { { "cand:" .. name, g.candidate } }
-      for bn, b in pairs(g.baselines) do rows[#rows + 1] = { "base:" .. bn, b } end
+      for _, bn in ipairs(sortedKeys(g.baselines)) do rows[#rows + 1] = { "base:" .. bn, g.baselines[bn] } end
       for _, r in ipairs(rows) do
         local pw = M.prevalenceWeighted(r[2], weights)
         print(string.format("%-16s field-weighted: miss %s  wrongful %s%s", r[1],
@@ -651,7 +749,9 @@ function M.main(argv)
     print(string.format("best baseline: %s  paired improvement point %.3f lower95 %s  ->  G7 %s",
       tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
       g.pass and "PASS" or "FAIL"))
+    status = g.pass and 0 or 1
     print("tree baseline (fit on " .. (a.fitDir or a.dir) .. "):\n" .. M.describeTree(tree, "  "))
+    print(string.format("ttx baseline horizon (fit on the same split): %d s", horizon))
     if a.out then
       local f = assert(io.open(a.out, "w"))
       f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
@@ -662,7 +762,9 @@ function M.main(argv)
     end
   elseif a.cmd == "tau" then
     assert(a.decisions, "--decisions is required")
-    local decisions = M.loadDecisions(a.decisions, a.key)
+    local decisions, n, noP = M.loadDecisions(a.decisions, a.key)
+    local note = noProbabilityNote(n, noP)
+    if note then print(note) end
     local grid = { 0, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 0.99, 1.01 }
     local best, rows = M.chooseTau(eps, decisions, grid)
     for _, r in ipairs(rows) do
@@ -676,25 +778,29 @@ function M.main(argv)
     local gO = M.gate(eps, M.candidates["oracle"](), baselines)
     print(string.format("control always-freeze must FAIL: %s", gF.pass and "FAILED (gate passed it)" or "ok (failed)"))
     print(string.format("control oracle must PASS: %s", gO.pass and "ok (passed)" or "FAILED (gate failed it)"))
+    if gF.pass or not gO.pass then status = 1 end
+    -- An undecidable set (no baseline meets the miss bound: too few
+    -- runaways, 59 at zero misses) or an underpowered one fails the run.
     if not gO.bestBaseline then
-      print("power: no baseline meets the miss bound on this set; the gate compares against nothing")
+      print("power: no baseline meets the miss bound on this set; the gate compares against nothing (UNDECIDABLE)")
+      status = 1
     else
-      local passes, trials = 0, 50
-      for seed = 1, trials do
-        local mix = M.mixedOracle(baselines[gO.bestBaseline], M.cfg.powerShare, seed)
-        if M.gate(eps, mix, baselines).pass then passes = passes + 1 end
-      end
+      local trials = 50
+      local passes = M.powerControl(eps, baselines, gO.bestBaseline, trials)
+      local powered = (passes / trials) >= M.cfg.powerTarget
       print(string.format("power: a candidate %.0f%% of the way from %s to the oracle passed %d/%d seeds (target >= %.0f%%): %s",
         M.cfg.powerShare * 100, gO.bestBaseline, passes, trials, M.cfg.powerTarget * 100,
-        (passes / trials) >= M.cfg.powerTarget and "ok" or "UNDERPOWERED"))
+        powered and "ok" or "UNDERPOWERED"))
+      if not powered then status = 1 end
     end
   else
-    error("usage: score-episodes.lua gate|controls --dir <episodes> [--fit-dir <dev>] [--candidate <name>]")
+    error("usage: score-episodes.lua gate|controls|tau --dir <episodes> [--fit-dir <dev>] [--candidate <name>]")
   end
+  return status
 end
 
 if arg and arg[0] and arg[0]:match("score%-episodes%.lua$") then
-  M.main(arg)
+  os.exit(M.main(arg))
 end
 
 return M

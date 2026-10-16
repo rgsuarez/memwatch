@@ -218,6 +218,23 @@ do
   check("sign-flip: and near the exact p", math.abs(p17 - 834 / 2 ^ 17) < 0.002, true)
   check("sign-flip: three improving templates are no beat, though the bootstrap's bound is above zero",
     (sc.pairedLowerBound(byTemplate({ 1, 1, 1 }))) > 0 and (sc.signFlipP(byTemplate({ 1, 1, 1 }))) > 0.05, true)
+  -- The size at the regenerated sets' shapes: candidates no better than the
+  -- baseline pass the beat at most 5% of the time (sealed: 17 templates of 5
+  -- savables; dev: 10 of 10). Fewer draws than the controls take, for speed.
+  local function shape(nTpl, per)
+    local eps = {}
+    for t = 1, nTpl do
+      for _ = 1, per do eps[#eps + 1] = { template = "T" .. t, labels = { class = "savable" } } end
+    end
+    return eps
+  end
+  local quick = setmetatable({ sizeDatasets = 200, flipDraws = 4000 }, { __index = sc.cfg })
+  local sp, sn, st = sc.nullSize(shape(17, 5), quick)
+  check("sign-flip: its size at sealed's shape is at most 5%", st == 17 and sp / sn <= 0.05, true)
+  local dp, dn, dt = sc.nullSize(shape(10, 10), quick)
+  check("sign-flip: and at dev's", dt == 10 and dp / dn <= 0.05, true)
+  check("sign-flip: the size check counts only savable templates",
+    select(3, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----
@@ -2302,10 +2319,16 @@ do
   sc.candidates["always-freeze"] = sc.candidates.oracle
   local okC1, c1 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.cfg.powerTarget, sc.candidates["always-freeze"] = savedTarget, savedFreeze
+  -- A beat test passing no-better candidates too often fails the controls.
+  local savedNull = sc.nullSize
+  sc.nullSize = function() return 400, 400, 10 end
+  local okCS, cs = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = savedNull
   print = quiet3
   check("decidable: controls that hold exit 0", okC0 and c0, 0)
   check("decidable: an underpowered set exits 2", okC2 and c2, 2)
   check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
+  check("decidable: so does a beat test that passes no-better candidates", okCS and cs, 1)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a failing gate exits 1", okFail and failStatus, 1)
   -- One runaway short of the floor, the same set decides nothing.

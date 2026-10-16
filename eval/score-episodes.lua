@@ -61,6 +61,8 @@ M.cfg = {
   bootSeed     = 20261015,
   flipExactMax = 16,     -- templates up to which the sign-flip test enumerates every flip
   flipDraws    = 20000,  -- seeded random flips past that
+  sizeDatasets = 400,    -- null datasets the controls' size check draws
+  sizeShare    = 0.3,    -- the share of a null template's savables that differ
   noisyFlip    = 0.10,
   powerShare   = 0.50,   -- the power control's share of the oracle's improvement
   powerTarget  = 0.80,
@@ -988,6 +990,38 @@ function M.powerControl(eps, baselines, bestName, trials, cfg)
   return passes
 end
 
+-- The beat test's size at a set's shape: candidates no better than the
+-- baseline pass it in what share of cfg.sizeDatasets null datasets. Each
+-- null template's savables differ from the baseline by one shared sign, a
+-- fair coin's, on cfg.sizeShare of them, so each template is a cluster, as
+-- the test treats it. The sign-flip test is exact, so the share is at most
+-- 1 - confidence but for sampling: a monitor of the test at the shape it is
+-- read at. Returns the passes, the datasets and the savable templates.
+function M.nullSize(eps, cfg)
+  cfg = cfg or M.cfg
+  local count, tpls = {}, {}
+  for _, ep in ipairs(eps) do
+    if ep.labels.class == "savable" then
+      if not count[ep.template] then count[ep.template] = 0; tpls[#tpls + 1] = ep.template end
+      count[ep.template] = count[ep.template] + 1
+    end
+  end
+  table.sort(tpls)
+  local r = rng(cfg.bootSeed + 1)
+  local passes = 0
+  for _ = 1, cfg.sizeDatasets do
+    local prs = {}
+    for _, t in ipairs(tpls) do
+      local sign = r() < 0.5 and 1 or -1
+      for _ = 1, count[t] do
+        prs[#prs + 1] = { template = t, d = (r() < cfg.sizeShare) and sign or 0 }
+      end
+    end
+    if M.signFlipP(prs, cfg) <= 1 - cfg.confidence then passes = passes + 1 end
+  end
+  return passes, cfg.sizeDatasets, #tpls
+end
+
 -- What a decisions file holds: rows the runner recorded as invalid replies
 -- (each stands as the deterministic freeze) are noted. A decision point it
 -- does not cover is refused: scored as the deterministic freeze it would
@@ -1280,6 +1314,16 @@ function M.main(argv)
         M.cfg.powerShare * 100, gO.bestBaseline, passes, trials, M.cfg.powerTarget * 100,
         powered and "ok" or "UNDERPOWERED"))
       if not powered and status == 0 then status = 2 end
+      -- The beat test's size at this set's shape. A share whose lower bound
+      -- is above 1 - confidence is a test passing no-better candidates too
+      -- often, a failed control.
+      local sizePasses, sizeN, sizeTpls = M.nullSize(eps)
+      local alpha = 1 - M.cfg.confidence
+      local sizeLower = 1 - M.cpUpper(sizeN - sizePasses, sizeN)
+      print(string.format("size: candidates no better than the best baseline passed the beat test in %d of %d null"
+        .. " datasets shaped like this set (%d savable templates): %.3f, at most %.3f expected: %s", sizePasses, sizeN,
+        sizeTpls, sizePasses / sizeN, alpha, sizeLower > alpha and "FAILED (anti-conservative)" or "ok"))
+      if sizeLower > alpha then status = 1 end
     end
   else
     error(USAGE, 0)

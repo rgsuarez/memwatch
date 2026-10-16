@@ -174,7 +174,8 @@ that decision.
   time at any template count, and four or fewer templates can never pass;
   the bootstrapped 95% lower bound is reported beside it as a diagnostic,
   since with few templates it passes such a candidate more often than its
-  nominal rate. The
+  nominal rate. `controls` also measures the test's size at the set's
+  shape, on null candidates, and fails if it is clearly above 5%. The
   baselines are always-freeze, a category rule, a time-to-exhaustion rule
   and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
   required, holding runaways and savables and none of the evaluated

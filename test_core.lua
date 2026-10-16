@@ -1284,7 +1284,8 @@ do
     check("cat: truncated and retitled names keep their family", table.concat(wrong, "; "), "")
     -- Apple's daemon families carry their token mid-name; they stay system.
     local daemons = { "managedcorespotlightd", "CoreSpotlightService", "RemindersSpotlightIndexExtension",
-                      "itunescloudd", "CloudDocsDaemon", "iCloudDelegate", "launchd_sim" }
+                      "itunescloudd", "CloudDocsDaemon", "iCloudDelegate", "iCloudDriveService",
+                      "icloudmailagent", "iCloudAccountsMigrator", "launchd_sim" }
     local notSystem = {}
     for _, n in ipairs(daemons) do
       if lfm.categorize(n) ~= "system" then notSystem[#notSystem + 1] = n .. " -> " .. lfm.categorize(n) end
@@ -1297,6 +1298,9 @@ do
       if lfm.categorize(n) == "system" then claimed[#claimed + 1] = n end
     end
     check("cat: a token mid-name does not make a process system", table.concat(claimed, "; "), "")
+    -- The iCloud prefix is claimed whole, a third-party lookalike with it:
+    -- a recorded breadth (see the system rule's comment).
+    check("cat: the iCloud prefix is claimed whole, icloudpd too", lfm.categorize("icloudpd"), "system")
   end
   -- Linear in the name: a process can give itself any name, of any length,
   -- and a backtracking pattern over a long run would stall the tick.

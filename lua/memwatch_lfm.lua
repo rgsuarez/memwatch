@@ -530,7 +530,13 @@ local CATEGORY_RULES = {
   -- families are named by their own starts (managedcorespotlightd,
   -- CoreSpotlightService, itunescloudd, CloudDocsDaemon, iCloudDelegate,
   -- launchd_sim), never by a token anywhere in the name, which would file a
-  -- user's clouddrive-sync as protected infrastructure.
+  -- user's clouddrive-sync as protected infrastructure. The iCloud family is
+  -- claimed by its prefix whole, on purpose: Apple ships dozens of
+  -- iCloud-named executables (iCloudDriveService, icloudmailagent,
+  -- iCloudAccountsMigrator, ...) and adds more with each release, so a
+  -- third-party icloudpd reads as system too. The category never gates a
+  -- kill; that misfile can only lean a model toward waiting until the
+  -- deferral bound, where the deterministic freeze still lands.
   { "system",          { "^com%.apple%.", "^windowserver$", "^launchd", "^kernel_task$", "^backupd",
                          "^time machine", "^mds_stores$", "^mdworker", "^mdbulkimport$", "^spotlight",
                          "^corespotlight", "^managedcorespotlight", "^remindersspotlight",

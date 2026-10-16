@@ -329,6 +329,28 @@ do
   gen.prepare(px)
   local xt = gen.track(px, gen.cfg, px.onsetAt - px.climbSec - gen.cfg.leadSec, 0)
   check("gate: a process that exits during the grace window never opens it", xt[0].gate, "closed")
+  -- Decision points as production re-arms them, on synthetic ticks: grace
+  -- expiry, then the first open tick a grace window or more after the last.
+  local function ticksOpen(openAt)
+    local tk = {}
+    for t = 0, 180, 5 do tk[t] = { alive = true, avail = 20, gate = openAt(t) and "open" or "closed" } end
+    return tk
+  end
+  local function times(tk) return table.concat(gen.decisionTimes(tk), ",") end
+  check("re-arm: an always-open gate decides at 0, 60 and 120", times(ticksOpen(function() return true end)), "0,60,120")
+  check("re-arm: a gate shut at 60 that reopens at 65 decides there, and a window after",
+    times(ticksOpen(function(t) return t ~= 60 end)), "0,65,125")
+  check("re-arm: no decision at grace expiry is no episode", times(ticksOpen(function(t) return t >= 5 end)), "")
+  local dead = ticksOpen(function() return true end)
+  for t = 60, 180, 5 do dead[t].alive = false end
+  check("re-arm: a process gone by the re-arm decides once", times(dead), "0")
+  -- Exhaustion at the release instant: the memory comes back at that
+  -- instant, so only a crossing strictly before it is exhaustion; a hold
+  -- crossing as its growth ends counts.
+  check("exhaustion: strictly before a release or exit", gen.exhaustsFirst(20, 20, true), false)
+  check("exhaustion: at or before a hold resolves", gen.exhaustsFirst(20, 20, false), true)
+  check("exhaustion: before a release counts", gen.exhaustsFirst(19.9, 20, true), true)
+  check("exhaustion: none found is none", gen.exhaustsFirst(nil, 20, false), false)
   -- A slow grower whose qualifying climb ended at the alert's onset: the
   -- 100 MB/s that follows renews the latch only while the climb is still
   -- in the tracker's 55 s ring (last at -10 s, so latched to 110 s); alone

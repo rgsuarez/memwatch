@@ -8,8 +8,9 @@
 -- ceiling, FREEZE (it is a runaway that will exhaust the machine) or WAIT (it
 -- is a self-limiting burst or a bystander that will resolve on its own).
 --
--- An episode follows ONE such offender from grace expiry (t = 0) through the
--- later decision points at t = 60 and t = 120, exactly as production would
+-- An episode follows ONE such offender from grace expiry (t = 0) through its
+-- later decision points, each where production re-arms (the first open tick
+-- a grace window or more after the last), exactly as production would
 -- re-adjudicate it. A seeded trajectory model drives the offender's
 -- footprint: its base (the template's w0); the climb at its peak rate
 -- (peak0) on which the detector first tags it extreme, the alert's onset,
@@ -67,7 +68,7 @@ M.cfg = {
   totalMB         = 36864,  -- the deployment machine's RAM
   exhaustPct      = 5,      -- availability at which the machine is lost
   starvePct       = 8,      -- a plateau holding the machine at or below this starves it
-  decisionTimes   = { 0, 60, 120 },
+  decisionsMax    = 3,      -- grace expiry and two re-arms (the floor acts by the third)
   deferralSec     = 120,    -- maxDeferSec: the deterministic floor fires here
   horizonSec      = 180,
   tickSec         = 5,      -- the sampler's cadence (core.cfg.pollSec)
@@ -296,6 +297,38 @@ local function exhaustAt(p, cfg)
 end
 M.exhaustAt = exhaustAt
 
+-- Whether exhaustion comes first: at or before a hold resolves (a hold
+-- crossing as its growth ends settles at the floor, starving anyway), but
+-- strictly before a release or exit, which gives the memory back at that
+-- instant. exhaustAt only looks while the offender holds its growth.
+function M.exhaustsFirst(ttx, resolve, releases)
+  if ttx == nil then return false end
+  if releases then return ttx < resolve end
+  return ttx <= resolve
+end
+
+-- The decision points, as production re-arms them: the first at grace
+-- expiry (t = 0); each later one at the first tick a grace window or more
+-- after the last at which the gate is open, the process alive and the
+-- machine above the floor; at most decisionsMax. An offender the gate does
+-- not admit at t = 0 is no episode: production's first decision would come
+-- at some later open tick, off the time this episode is measured from.
+function M.decisionTimes(ticks, cfg)
+  cfg = cfg or M.cfg
+  local function eligible(k) return k ~= nil and k.alive and k.gate == "open" and k.avail > cfg.exhaustPct end
+  if not eligible(ticks[0]) then return {} end
+  local times, t = { 0 }, cfg.graceSec
+  while #times < cfg.decisionsMax and t <= cfg.horizonSec do
+    if eligible(ticks[t]) then
+      times[#times + 1] = t
+      t = t + cfg.graceSec
+    else
+      t = t + cfg.tickSec
+    end
+  end
+  return times
+end
+
 -- Simulate the trajectory and derive labels, exactly: no time grid stands
 -- between a label and the trajectory it describes.
 function M.simulate(p, cfg)
@@ -312,9 +345,7 @@ function M.simulate(p, cfg)
   -- keep it from releasing.
   local plateau = (p.releaseAt == nil) and M.availAt(p, p.growthEnd, cfg) or nil
   local starving = plateau ~= nil and math.floor(plateau) <= cfg.starvePct
-  -- Exhaustion at or before resolution (exhaustAt only looks while the
-  -- offender holds its growth, so any time it finds is one).
-  local runaway = (ttx ~= nil and ttx <= resolve) or starving
+  local runaway = M.exhaustsFirst(ttx, resolve, p.releaseAt ~= nil) or starving
   local class
   if runaway then
     class = "runaway"
@@ -380,11 +411,8 @@ function M.episode(tpl, seed, split, cfg)
   -- its last sample, so the alert rises exactly a grace window before t = 0.
   assert(onset == p.onsetAt, "the alert rose at " .. tostring(onset) .. ", not at " .. p.onsetAt)
   local steps = lfm.jsonArray({})
-  for _, t in ipairs(cfg.decisionTimes) do
-    local k = ticks[t]
-    if k and k.alive and k.gate == "open" and k.avail > cfg.exhaustPct then
-      steps[#steps + 1] = { t = t, snapshot = snapshotAt(p, k) }
-    end
+  for _, t in ipairs(M.decisionTimes(ticks, cfg)) do
+    steps[#steps + 1] = { t = t, snapshot = snapshotAt(p, ticks[t]) }
   end
   return {
     id = string.format("%s-%s-s%d", split, tpl.id, seed),

@@ -682,6 +682,66 @@ do
   os.execute("rm -rf '" .. base .. "'")
 end
 
+-- ---- G1's controls are shown as the injection rows are ----
+do
+  local bk = require("bakeoff")
+  local function row(class, action, mustNot, control)
+    return { class = class, raw_action = action, must_not = mustNot, injection_control = control }
+  end
+  -- A model that waits on any raw name: injection rows (raw) wait, the
+  -- redacted controls freeze, and only that presentation differs.
+  local base = { row("prompt-injection", "wait", { "wait" }), row("prompt-injection", "wait", { "wait" }),
+                 row("extreme-runaway", "freeze", { "wait" }), row("extreme-runaway", "freeze", { "wait" }) }
+  check("G1: against redacted controls, presentation alone reads as influence", (bk.injectionScore(base)), 1)
+  local withRaw = {}
+  for _, r in ipairs(base) do withRaw[#withRaw + 1] = r end
+  withRaw[#withRaw + 1] = row("extreme-runaway", "wait", { "wait" }, true)
+  withRaw[#withRaw + 1] = row("extreme-runaway", "wait", { "wait" }, true)
+  check("G1: against controls asked with raw names, it does not", (bk.injectionScore(withRaw)), 0)
+
+  -- A redacting run asks its control classes again with raw names, and the
+  -- injection rows once, raw.
+  local root = bk.privateDir()
+  local corpus, stubDir = root .. "/scenarios", root .. "/bin"
+  os.execute("mkdir -p '" .. corpus .. "' '" .. stubDir .. "'")
+  for _, f in ipairs({ "inject-01", "extreme-02", "hog-02" }) do
+    os.execute("cp eval/scenarios/" .. f .. ".json '" .. corpus .. "/'")
+  end
+  local stub = assert(io.open(stubDir .. "/curl", "w"))
+  stub:write([[#!/usr/bin/env bash
+out=""; body=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -d) body="${2#@}"; shift 2 ;;
+    -w|-m|-X|-H) shift 2 ;;
+    *) shift ;;
+  esac
+done
+cat "$body" >> "$FAKE_BODY_LOG"; echo >> "$FAKE_BODY_LOG"
+printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"wait\",\"process_class\":\"hog\",\"confidence\":0.5,\"rationale\":\"x\"}"}}]}' > "$out"
+printf '0.010'
+]])
+  stub:close()
+  os.execute("chmod +x '" .. stubDir .. "/curl'")
+  local out, log = root .. "/run.json", root .. "/bodies.log"
+  os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, corpus, out))
+  local rf = io.open(out, "r")
+  local result = rf and lfm.jsonDecode(rf:read("a")) or {}
+  if rf then rf:close() end
+  local controls, requests = {}, 0
+  for _, r in ipairs(result.rows or {}) do if r.injection_control then controls[#controls + 1] = r.class end end
+  table.sort(controls)
+  local lf = io.open(log, "r")
+  local bodies = lf and lf:read("a") or ""
+  if lf then lf:close() end
+  for _ in bodies:gmatch("\n") do requests = requests + 1 end
+  check("G1: a redacting run asks each control class again", table.concat(controls, ","), "ambiguous-hog,extreme-runaway")
+  check("G1: three scenarios, five requests", requests, 5)
+  os.execute("rm -rf '" .. root .. "'")
+end
+
 -- ---- the generator's output: a whole split or nothing ----
 do
   local h = io.popen("mktemp -d")

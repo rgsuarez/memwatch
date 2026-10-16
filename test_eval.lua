@@ -430,6 +430,13 @@ do
   for _, st in ipairs(lost.steps) do lts[#lts + 1] = st.t end
   check("lost: a runaway released after exhausting the machine decides only before it",
     lost.labels.class .. ":" .. table.concat(lts, ","), "runaway:0")
+  -- A hold that grows for 20 s and then stays flat resolved at 20 s: the
+  -- flat phase after it is its plateau, not more growth.
+  local flatTail = gen.episode({ id = "T-flat-tail", names = { "python3" }, avail0 = 30, w0 = 3000, age0 = 600,
+    peak0 = 12000, compress = 2, graceRate = 0, phases = { { dur = 20, rate = 150 }, { dur = 160, rate = 0 } },
+    after = "hold" }, 1, "test")
+  check("labels: a flat phase after the growth is the plateau", flatTail.labels.class .. ":"
+    .. tostring(flatTail.labels.resolvesBySec), "savable:20")
   -- Production's policy gate never freezes another user's process: an
   -- offender macOS runs under its own service user is no episode, while the
   -- same trajectory under the user's own process is.

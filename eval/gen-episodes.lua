@@ -120,14 +120,17 @@ function M.sample(tpl, r)
     phases = {},
     after = tpl.after or "hold",
   }
-  local t = 0
+  -- Growth ends with the last phase that grows: a flat phase after it
+  -- (rate 0) is the plateau, not more growth.
+  local t, grownTo = 0, 0
   for _, ph in ipairs(tpl.phases or {}) do
     local dur = sampleRange(r, ph.dur)
     local rate = sampleRange(r, ph.rate)
     p.phases[#p.phases + 1] = { from = t, to = t + dur, rate = rate }
     t = t + dur
+    if rate > 0 then grownTo = t end
   end
-  p.growthEnd = t
+  p.growthEnd = grownTo
   if p.after == "exit" or p.after == "release" then
     p.releaseAt = math.max(p.growthEnd, sampleRange(r, tpl.releaseAt))
   end

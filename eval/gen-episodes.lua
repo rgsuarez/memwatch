@@ -636,6 +636,11 @@ function M.main(argv)
   -- template whose sample cannot exist) leaves no partial split behind.
   local counts = { runaway = 0, savable = 0, late = 0 }
   local eps, noStep, refused, seen = {}, 0, 0, {}
+  -- The scorer's own identity for an episode (everything its scoring reads),
+  -- so the generator refuses exactly the duplicates the scorer would.
+  package.path = "eval/?.lua;" .. package.path
+  local replayPrint = require("score-episodes").replayPrint
+  local seenPrint = {}
   for _, tpl in ipairs(templates) do
     if tpl.split == nil or tpl.split == a.split then
       -- A template none of whose names production's policy would freeze can
@@ -659,6 +664,13 @@ function M.main(argv)
           if seen[ep.id] then error(string.format("%s seed %d: episode id %s repeats (a template id used twice?)",
             tostring(tpl.id), seed, ep.id), 0) end
           seen[ep.id] = true
+          -- A template whose parameters do not vary yields the same episode
+          -- for every seed; the scorer refuses a split holding one twice, so
+          -- the split is refused here, where the template can be named.
+          local fp = replayPrint(ep)
+          if seenPrint[fp] then error(string.format("%s seed %d: episode %s would score exactly as %s (does the"
+            .. " template vary any parameter?)", tostring(tpl.id), seed, ep.id, seenPrint[fp]), 0) end
+          seenPrint[fp] = ep.id
           eps[#eps + 1] = { id = ep.id, enc = assert(lfm.jsonEncode(ep)) }
           counts[ep.labels.class] = counts[ep.labels.class] + 1
         end

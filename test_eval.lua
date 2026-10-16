@@ -1027,6 +1027,41 @@ do
   check("cli: so is the same episode under another id",
     okDupPrint == false and tostring(errDupPrint):find("the same episode twice", 1, true) ~= nil, true)
   check("cli: a split of distinct episodes still loads", #sc.loadDir(held) > 0, true)
+  local noIds = tmpDir()
+  for _, n in ipairs({ "a", "b" }) do
+    local e = lfm.jsonDecode(lfm.jsonEncode(one))
+    e.id = nil
+    local nf = assert(io.open(noIds .. "/" .. n .. ".json", "w"))
+    nf:write(lfm.jsonEncode(e), "\n")
+    nf:close()
+  end
+  local okNoIds, errNoIds = pcall(sc.loadDir, noIds)
+  check("cli: two episodes with no id that score alike are refused too",
+    okNoIds == false and tostring(errNoIds):find("the same episode twice", 1, true) ~= nil, true)
+  os.execute("rm -rf '" .. noIds .. "'")
+  -- The same snapshots over different raw headroom, or under another alert,
+  -- replay apart: both are kept.
+  local apart = tmpDir()
+  local base1 = lfm.jsonDecode(lfm.jsonEncode(one))
+  base1.floorTicks = lfm.jsonArray({ { t = 120, avail = 12, open = true } })
+  local twin1 = lfm.jsonDecode(lfm.jsonEncode(base1))
+  twin1.id = one.id .. "-headroom"
+  twin1.floorTicks = lfm.jsonArray({ { t = 120, avail = 12.1, open = true } })
+  local twin2 = lfm.jsonDecode(lfm.jsonEncode(base1))
+  twin2.id = one.id .. "-alert"
+  twin2.steps[1].alertSeq = (twin2.steps[1].alertSeq or 1) + 1
+  local twin3 = lfm.jsonDecode(lfm.jsonEncode(base1))
+  twin3.id = one.id .. "-template"
+  twin3.template = tostring(one.template) .. "-other"
+  for _, e in ipairs({ base1, twin1, twin2, twin3 }) do
+    local af = assert(io.open(apart .. "/" .. e.id .. ".json", "w"))
+    af:write(lfm.jsonEncode(e), "\n")
+    af:close()
+  end
+  local okApart, apartEps = pcall(sc.loadDir, apart)
+  check("cli: episodes alike but for their raw headroom, alert or template are all kept",
+    okApart == true and #apartEps == 4, true)
+  os.execute("rm -rf '" .. apart .. "'")
   -- As a script, the gate's exit status tells the outcomes apart: 2 for a
   -- set too small to decide, 3 for a refusal (never 1, a gate that failed),
   -- and 3 when the result file does not reach the disk.
@@ -1329,7 +1364,7 @@ do
   f:write([[
 return {
   { id = "T-fits", split = "test", class = "runaway", family = "script", names = { "python3" },
-    avail0 = 12, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
+    avail0 = { 11, 13 }, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
     phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "fits the machine" },
   { id = "T-overfull", split = "test", class = "runaway", family = "script", names = { "python3" },
     avail0 = 40, w0 = 30000, age0 = 150, peak0 = 12000, compress = 1,
@@ -1398,6 +1433,20 @@ return {
   fr:close()
   local okRoot, errRoot = pcall(gen.main, { "--templates", tr, "--split", "test", "--seed", "1",
                                            "--per-template", "1", "--out", base .. "/rootonly" })
+  -- A template whose parameters do not vary yields one episode for every
+  -- seed: refused here, naming the template, rather than at scoring.
+  local tc = base .. "/const.lua"
+  local fc = assert(io.open(tc, "w"))
+  fc:write([[
+return {
+  { id = "T-const", split = "test", class = "runaway", family = "script", names = { "python3" },
+    avail0 = 12, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
+    phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "no ranges" },
+}
+]])
+  fc:close()
+  local okConst, errConst = pcall(gen.main, { "--templates", tc, "--split", "test", "--seed", "1",
+                                             "--per-template", "2", "--out", base .. "/const" })
   print = quiet
   check("generator: a write that fails publishes nothing",
     okWrite == false and tostring(errWrite):find("nothing published", 1, true) ~= nil, true)
@@ -1407,6 +1456,9 @@ return {
     okDup == false and tostring(errDup):find("repeats", 1, true) ~= nil, true)
   check("generator: so is a template whose every name production never freezes",
     okRoot == false and tostring(errRoot):find("never freezes any of its names", 1, true) ~= nil, true)
+  check("generator: and one that yields the same episode for every seed, named",
+    okConst == false and tostring(errConst):find("would score exactly as", 1, true) ~= nil
+      and tostring(errConst):find("T-const", 1, true) ~= nil, true)
   local stray = {}
   for _, n in ipairs(listing(base)) do
     if n ~= "good" and not n:match("%.lua$") then stray[#stray + 1] = n end

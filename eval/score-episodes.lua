@@ -659,9 +659,26 @@ function M.fingerprint(ep)
                           ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
 end
 
+-- Everything the scoring reads from an episode: each step's time, alert and
+-- snapshot, the floor's ticks, the outcome labels, and the template the
+-- bootstrap groups it by. Two episodes alike in all of it score alike,
+-- whatever their ids; two that differ in any of it can score apart (the same
+-- snapshots over different raw headroom, say), so a split may hold both.
+function M.replayPrint(ep)
+  local L = ep.labels or {}
+  local steps = {}
+  for i, st in ipairs(ep.steps or {}) do steps[i] = { t = st.t, alertSeq = st.alertSeq, snapshot = st.snapshot } end
+  return lfm.jsonEncode({ steps = lfm.jsonArray(steps), floorTicks = lfm.jsonArray(ep.floorTicks or {}),
+                          template = ep.template, class = L.class, runaway = L.runaway, ttxSec = L.ttxSec,
+                          resolvesBySec = L.resolvesBySec })
+end
+
 -- Every episode in a directory, each once: a copied file (the same episode
 -- under another file name or id) would be scored twice, counting toward the
 -- decisive size and the miss bound, so a directory holding one is refused.
+-- Within a split, the same episode is the same id or the same replay inputs
+-- (M.replayPrint); across splits the overlap check reads the coarser
+-- M.fingerprint, which fails safe.
 function M.loadDir(dir)
   local eps = {}
   local byId, byPrint = {}, {}
@@ -671,7 +688,7 @@ function M.loadDir(dir)
       local f = assert(io.open(dir .. "/" .. name, "r"))
       local ep = assert(lfm.jsonDecode(f:read("a")))
       f:close()
-      local fp = M.fingerprint(ep)
+      local fp = M.replayPrint(ep)
       local first = (ep.id ~= nil and byId[ep.id]) or byPrint[fp]
       if first then
         p:close()

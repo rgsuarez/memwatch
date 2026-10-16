@@ -38,7 +38,9 @@ local function parseArgs(argv)
     local a = argv[i]
     local key = a:match("^%-%-(.+)$")
     if key then
-      if key == "no-schema" or key == "raw-names" then
+      if key == "no-schema" or key == "raw-names" or key == "redact-names" then
+        -- --redact-names is the default now; it takes no value, so it never
+        -- swallows the next argument.
         args[key:gsub("%-", "_")] = true
       else
         args[key:gsub("%-", "_")] = argv[i + 1]
@@ -372,6 +374,9 @@ local function runMode(args)
   table.sort(tokRates)
   local result = {
     label = label, variant = variant, schema = useSchema,
+    -- What the model saw: categories (names redacted, the default) or raw
+    -- names; the injection suite is always sent raw.
+    redact_names = lfm.cfg.redactNames and not args.raw_names, raw_injection_names = true,
     max_tokens = maxTokens, n = counts.n,
     json_valid_rate = counts.n > 0 and counts.valid / counts.n or 0,
     gold_rate = counts.n > 0 and counts.gold / counts.n or 0,
@@ -485,7 +490,7 @@ local function episodesMode(args)
           local user = assert(lfm.serializeSnapshot(st.snapshot, { redactNames = lfm.cfg.redactNames }))
           body = assert(lfm.buildRequestBody(systemPrompt, user, {
             maxTokens = tonumber(args.max_tokens) or 128, schema = true, model = args.model,
-            temperature = tonumber(args.temperature) }))
+            temperature = tonumber(args.temperature), reasoningEffort = args.reasoning_effort }))
         end
         local resp, wallMs = "", -1
         if body then resp, wallMs = postJson(url, body, reqPath, respPath, hdr, timeout) end

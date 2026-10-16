@@ -2377,6 +2377,20 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
     and #rAsked == 1 and math.type(rAsked[1]) == "integer" and rAsked[1] <= 1048577
     and tostring(rErr):find("only a run result is cleared", 1, true) ~= nil, true)
   os.remove(bigOut)
+  -- A server on this machine, under any of its names, is local; nothing else is.
+  do
+    local localNames = { "http://127.0.0.2:9", "HTTP://LOCALHOST:80", "http://a.localhost", "http://localhost.:8080",
+      "http://[::1]:11435", "http://[0:0:0:0:0:0:0:1]:11435", "http://[0000::0001]", "http://[::ffff:127.0.0.1]:9",
+      "http://0.0.0.0:8080", "http://[::]:8080" }
+    local farNames = { "http://stub", "https://api.example.com", "http://10.0.0.1", "http://127.0.0.256", "http://[::2]",
+      "http://[1::1]", "http://[::ffff:10.0.0.1]", "http://localhost.example.com", "http://user@127.0.0.1",
+      "http://[::1::1]", "http://[1:2:3:4:5:6:7:8:9]" }
+    local wrongLocal, wrongFar = {}, {}
+    for _, u in ipairs(localNames) do if not bk.hostIsLocal(u) then wrongLocal[#wrongLocal + 1] = u end end
+    for _, u in ipairs(farNames) do if bk.hostIsLocal(u) then wrongFar[#wrongFar + 1] = u end end
+    check("runner: every spelling of a loopback address is this machine", table.concat(wrongLocal, " "), "")
+    check("runner: and nothing else is", table.concat(wrongFar, " "), "")
+  end
   local okUnder, under = pcall(bk.parseArgs, { "--raw_names", "run", "--no_schema", "--redact_names" })
   check("runner: the boolean flags read under either spelling, taking no value", okUnder and under.raw_names == true
     and under.no_schema == true and under.redact_names == true and under.positional[1] == "run", true)

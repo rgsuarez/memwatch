@@ -130,6 +130,67 @@ local function contains(list, v)
   return false
 end
 
+-- The eight 16-bit groups of an IPv6 literal, or nil when it is not one.
+-- "::" stands for one run of zero groups, and a dotted IPv4 tail fills the
+-- last two.
+local function ipv6Groups(s)
+  local pre, v4 = s:match("^(.*:)(%d+%.%d+%.%d+%.%d+)$")
+  if v4 then
+    local o = {}
+    for x in v4:gmatch("%d+") do
+      if #x > 3 or tonumber(x) > 255 then return nil end
+      o[#o + 1] = tonumber(x)
+    end
+    s = pre .. string.format("%x:%x", o[1] * 256 + o[2], o[3] * 256 + o[4])
+  end
+  local gap = s:find("::", 1, true)
+  if gap and s:find("::", gap + 1, true) then return nil end
+  local function groups(part)
+    local g = {}
+    if part == "" then return g end
+    for x in (part .. ":"):gmatch("([^:]*):") do
+      if not x:match("^%x%x?%x?%x?$") then return nil end
+      g[#g + 1] = tonumber(x, 16)
+    end
+    return g
+  end
+  local head = groups(gap and s:sub(1, gap - 1) or s)
+  local tail = gap and groups(s:sub(gap + 2)) or {}
+  if not head or not tail then return nil end
+  local n = #head + #tail
+  if (gap and n > 7) or (not gap and n ~= 8) then return nil end
+  for _ = 1, 8 - n do head[#head + 1] = 0 end
+  for _, x in ipairs(tail) do head[#head + 1] = x end
+  return head
+end
+
+-- Whether a server URL names this machine: localhost (and any name under
+-- it), 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104 in any spelling, or an
+-- unspecified address (0.0.0.0, ::), which a connection takes as this
+-- machine. Anything else, a name that might resolve here included, is
+-- taken as elsewhere.
+local function hostIsLocal(url)
+  local hostport = tostring(url):lower():match("^https?://([^/?#]+)")
+  if not hostport then return false end
+  local v6 = hostport:match("^%[([^%]]+)%]:?%d*$")
+  if v6 then
+    local g = ipv6Groups(v6)
+    if not g then return false end
+    local zero = g[1] == 0 and g[2] == 0 and g[3] == 0 and g[4] == 0 and g[5] == 0
+    return zero and ((g[6] == 0 and g[7] == 0 and (g[8] == 1 or g[8] == 0)) or (g[6] == 0xffff and g[7] >> 8 == 127))
+  end
+  local host = hostport:match("^([^:]+):?%d*$")
+  if not host then return false end
+  host = host:gsub("%.$", "")
+  if host == "localhost" or host:match("%.localhost$") or host == "0.0.0.0" then return true end
+  local a, b, c, d = host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+  if not a then return false end
+  for _, x in ipairs({ a, b, c, d }) do
+    if #x > 3 or tonumber(x) > 255 then return false end
+  end
+  return tonumber(a) == 127
+end
+
 local function sampleServerMB(pid)
   if not pid then return nil end
   local p = io.popen("ps -o rss= -p " .. shellQuote(pid) .. " 2>/dev/null")
@@ -370,9 +431,7 @@ local function runMode(args)
     if not (serverPid and serverPid > 0) then
       error("--server-pid must be a process id, not " .. args.server_pid, 0)
     end
-    local host = server:lower():match("^https?://([^/?#]+)")
-    host = host and host:gsub(":%d+$", "")
-    if not (host == "localhost" or host == "[::1]" or (host and host:match("^127%.%d+%.%d+%.%d+$"))) then
+    if not hostIsLocal(server) then
       error("--server-pid samples a process on this machine; " .. server .. " is not on this machine", 0)
     end
   end
@@ -1052,7 +1111,7 @@ local function isScript()
 end
 
 -- Loaded as a module (by the tests), it exports its scratch allocator, the
--- episodes mode and its result clear.
+-- episodes mode, its result clear and its local-host check.
 if isScript() then
   local args = parseArgs(arg)
   local mode = args.positional[1] or "run"
@@ -1070,4 +1129,4 @@ end
 
 return { privateDir = privateDir, reserveOutput = reserveOutput, withAuthHeader = withAuthHeader,
          parseArgs = parseArgs, injectionScore = injectionScore, episodes = episodesMode,
-         clearResult = clearResult }
+         clearResult = clearResult, hostIsLocal = hostIsLocal }

@@ -58,7 +58,9 @@ touches nothing. Every flag reads under either spelling (`--retry-wait`
 and `--retry_wait` are one flag); a flag given twice is refused, and so
 are `--raw-names` with `--redact-names` and `--api-key-env` with
 `--api-key-file`. `--server-pid` samples a process on this machine, so it
-is refused for a server elsewhere.
+is refused for a server elsewhere: this machine is localhost, a loopback
+address (127.0.0.0/8, or ::1 in any spelling) or an unspecified one
+(0.0.0.0, ::).
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count

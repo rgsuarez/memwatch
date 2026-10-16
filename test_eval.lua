@@ -1048,6 +1048,30 @@ do
   check("cli: a copy with its alerts renumbered is the same episode, refused",
     okRenum == false and tostring(errRenum):find("the same episode twice", 1, true) ~= nil, true)
   os.execute("rm -rf '" .. renum .. "'")
+  -- Unevenly renumbered: alerts 1,2,1 and 5,7,9 change at the same steps
+  -- (the replay reads only the change), so they are one episode; 1,1,2 and
+  -- 1,2,2 change at different steps, so they are two.
+  local function alertEp(id, a, b, c)
+    return { id = id, template = "T-alerts", labels = { class = "savable", runaway = false, resolvesBySec = 100 },
+             steps = lfm.jsonArray({ { t = 0, alertSeq = a, snapshot = { availPct = 20 } },
+                                     { t = 60, alertSeq = b, snapshot = { availPct = 21 } },
+                                     { t = 120, alertSeq = c, snapshot = { availPct = 22 } } }) }
+  end
+  local function loadsAll(eps)
+    local dd = tmpDir()
+    for _, e in ipairs(eps) do
+      local ef2 = assert(io.open(dd .. "/" .. e.id .. ".json", "w"))
+      ef2:write(lfm.jsonEncode(e), "\n")
+      ef2:close()
+    end
+    local okL = pcall(sc.loadDir, dd)
+    os.execute("rm -rf '" .. dd .. "'")
+    return okL
+  end
+  check("cli: alerts renumbered unevenly but changing at the same steps are one episode",
+    loadsAll({ alertEp("a1", 1, 2, 1), alertEp("a2", 5, 7, 9) }), false)
+  check("cli: alerts changing at different steps are two",
+    loadsAll({ alertEp("b1", 1, 1, 2), alertEp("b2", 1, 2, 2) }), true)
   local okNoIds, errNoIds = pcall(sc.loadDir, noIds)
   check("cli: an episode with no id is refused, naming its file",
     okNoIds == false and tostring(errNoIds):find("carries no episode id", 1, true) ~= nil, true)
@@ -2095,6 +2119,11 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   local rComp, okComp = runSeq("scomp", "429 200 200", nil, "completion")
   check("runner: a completion row counts its template request's attempts with its own",
     okComp == true and rComp.attempts == 3, true)
+  os.remove(seqFile)
+  local rCompW = run("completion", chat, "scompwait", "--retry-wait 1",
+    "FAKE_STATUS_SEQ=" .. sq("429 200 200") .. " FAKE_SEQ_FILE=" .. sq(seqFile))
+  check("runner: and records its template request's wait apart, not as the model's time",
+    rCompW.attempts == 3 and (rCompW.wait_ms or 0) >= 1000 and (rCompW.wall_ms or 0) < 1000, true)
   local rTo, okTo = runSeq("stimeout", "timeout 200")
   check("runner: a timeout is tried again, and its time counts toward the answer's",
     okTo == true and rTo.attempts == 2 and (rTo.wall_ms or 0) >= 60000, true)

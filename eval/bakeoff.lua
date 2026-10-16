@@ -940,6 +940,8 @@ local function injectionScore(rows)
 end
 
 local function gatesMode(args)
+  -- Contradictions are refused here too, before the league is written.
+  refuseContradiction(args)
   local resultsDir = args.results or "eval/results"
   os.execute("mkdir -p " .. shellQuote(resultsDir))
   local measurePath = args.measure or (resultsDir .. "/measurements.json")

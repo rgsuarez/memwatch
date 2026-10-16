@@ -1489,6 +1489,22 @@ printf '0.010 %s' "$status"
   check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil, true)
   local otherSaid = runSaid("--server HTTP://127.0.0.2:9 --server-pid 1", pidOut)
   check("runner: under any loopback name, its scheme in capitals", otherSaid:find("exit=0", 1, true) ~= nil, true)
+  -- The gates refuse a contradiction too, before writing the league.
+  do
+    local gatesDir = root .. "/gates-results"
+    os.execute("mkdir -p '" .. gatesDir .. "'")
+    local lf = assert(io.open(gatesDir .. "/league.json", "w"))
+    lf:write('{"league":[],"earlier":true}\n')
+    lf:close()
+    local gh = io.popen(string.format("lua eval/bakeoff.lua gates --results '%s' --raw-names --redact-names 2>&1; echo \"exit=$?\"", gatesDir))
+    local gatesSaid = gh:read("a")
+    gh:close()
+    local lf2 = io.open(gatesDir .. "/league.json", "r")
+    local leagueNow = lf2 and lf2:read("a")
+    if lf2 then lf2:close() end
+    check("runner: the gates refuse a contradiction, the league untouched", gatesSaid:find("contradict each other", 1, true) ~= nil
+      and gatesSaid:find("exit=0", 1, true) == nil and leagueNow == '{"league":[],"earlier":true}\n', true)
+  end
   os.remove(pidOut)
   -- Only a run result is ever cleared: --out naming an input, a file that is
   -- not JSON, or a directory refuses the run and leaves it as it was.

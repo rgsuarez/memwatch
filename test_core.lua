@@ -1015,9 +1015,11 @@ do
   check("probe: a comm with a long whitespace run is read in linear time", os.clock() - t0 < 0.25, true)
   check("probe: and kept whole", long, "a" .. (" "):rep(40000) .. "b")
   check("probe: a comm's trailing whitespace is trimmed", commOf("node \t "), "node")
+  check("probe: every whitespace byte is trimmed, and only those", commOf("node\v\f\r") .. "|" .. commOf("node\xa0"), "node|node\xa0")
   check("probe: its leading whitespace is the separator's", commOf("   node"), "node")
-  check("probe: a row that ends after the start time has an empty comm",
-    (core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026 \n", SELF) or {})[4242].comm, "")
+  check("probe: a row that ends after the start time has an empty comm", commOf(""), "")
+  check("probe: one that ends at the year, with no separator, makes the reply unknown",
+    core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026\n", SELF), nil)
 end
 
 -- ---- identity: a recorded process may be signaled only while it holds ----

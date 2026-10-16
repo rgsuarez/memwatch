@@ -231,7 +231,7 @@ h2{font-size:13px;color:#9a9aa2;text-transform:uppercase;letter-spacing:1px;marg
 table{border-collapse:collapse;width:100%;font-size:11px}
 td,th{padding:5px 8px;text-align:left;border-bottom:1px solid #26262b;color:#c8c8cd}
 th{color:#9a9aa2;text-transform:uppercase;font-size:9px;letter-spacing:1px}
-tr.shipped td{background:#1a2636;color:#fff}
+tr.winner td{background:#1a2636;color:#fff}
 .rationale{color:#8ab4f8;font-style:italic}
 .label-unverified{font-size:9px;color:#77777e;text-transform:uppercase;letter-spacing:1px}
 .glossary{font-size:10px;color:#77777e;line-height:1.6}
@@ -255,6 +255,15 @@ end
 local function fmtMedian(list)
   local m = median(list)
   return m and string.format("%.1f min (n=%d)", m, #list) or "no data"
+end
+
+-- The league's winner is one row: a model under one prompt variant and one
+-- names condition (a league written before the condition was recorded
+-- names no condition, and its rows carry none).
+local function isWinner(row, league)
+  return row.label == league.winner
+    and (league.winner_variant == nil or row.variant == league.winner_variant)
+    and (league.winner_names == nil or row.names == league.winner_names)
 end
 
 -- opts: { public = bool, league = decoded league.json or nil,
@@ -332,16 +341,20 @@ function M.renderHTML(agg, opts)
     end
   end
 
-  -- Bake-off league.
+  -- Bake-off league. Its winner is chosen on the gates the league scores
+  -- (the league says which; one written before it did was chosen on G1 to
+  -- G6). G7 is scored separately and a model ships only with both, so the
+  -- winner is named as the bake-off's, never as the shipped model.
   if opts.league and opts.league.league then
+    local basis = type(opts.league.winner_gates) == "string" and opts.league.winner_gates or "G1-G6"
     if opts.public then
-      -- Public rendering: the shipped row's headline only.
-      w("<h2>Shipped model</h2>")
+      -- Public rendering: the winning row's headline only.
+      w("<h2>Bake-off winner</h2>")
       for _, row in ipairs(opts.league.league) do
-        if row.label == opts.league.winner then
+        if isWinner(row, opts.league) then
           w("<div class='card'>")
-          w(string.format("<div><span class='blue'>%s</span> <span class='sub'>prompt variant %s \u{00B7} selected by the gated bake-off</span></div>",
-            esc(row.label), esc(row.variant or "?")))
+          w(string.format("<div><span class='blue'>%s</span> <span class='sub'>prompt variant %s \u{00B7} selected by the gated bake-off on %s</span></div>",
+            esc(row.label), esc(row.variant or "?"), esc(basis)))
           w(string.format("<div class='sub'>gold %.0f%% \u{00B7} acceptable %.0f%% \u{00B7} constrained JSON %.1f%% \u{00B7} warm p95 %dms \u{00B7} footprint %sMB</div>",
             (row.gold or 0) * 100, (row.acceptable or 0) * 100, (row.json_valid or 0) * 100,
             row.warm_p95_ms or 0, tostring(row.footprint_mb or "?")))
@@ -354,9 +367,12 @@ function M.renderHTML(agg, opts)
       w("<!-- league:full -->")
       w("<div class='card'><table><tr><th>model</th><th>gold</th><th>acceptable</th><th>danger</th><th>inject</th><th>json</th><th>p95 warm</th><th>footprint</th><th>gates</th></tr>")
       for _, row in ipairs(opts.league.league) do
-        w(string.format("<tr class='%s'><td>%s%s</td><td>%.2f</td><td>%.2f</td><td>%.3f</td><td>%d</td><td>%.3f</td><td>%dms</td><td>%sMB</td><td>%s</td></tr>",
-          row.label == opts.league.winner and "shipped" or "",
-          esc(row.label), row.reference_only and " (ref)" or "",
+        -- One model can hold several rows (prompt variants, names
+        -- conditions); each says which it is.
+        local cond = esc(row.variant or "?") .. (row.names and (" \u{00B7} " .. esc(row.names)) or "")
+        w(string.format("<tr class='%s'><td>%s%s <span class='sub'>%s</span></td><td>%.2f</td><td>%.2f</td><td>%.3f</td><td>%d</td><td>%.3f</td><td>%dms</td><td>%sMB</td><td>%s</td></tr>",
+          isWinner(row, opts.league) and "winner" or "",
+          esc(row.label), row.reference_only and " (ref)" or "", cond,
           row.gold or 0, row.acceptable or 0, row.danger or 0,
           row.injection_compliance or 0, row.json_valid or 0,
           row.warm_p95_ms or 0, tostring(row.footprint_mb or "?"),

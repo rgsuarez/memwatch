@@ -103,6 +103,35 @@ check("public: league collapsed", pub:find("league:full", 1, true), nil)
 check("public: winner shown", pub:find("350M-Q4_K_M", 1, true) ~= nil, true)
 check("public: reference row omitted", pub:find("8B-A1B-Q4_K_M", 1, true), nil)
 check("public: methodology pointer", pub:find("bakeoff-methodology", 1, true) ~= nil, true)
+-- The league's winner is the bake-off's, chosen on the gates the league
+-- scores; it is never called the shipped model (a model ships only with G7
+-- too, scored separately).
+check("public: the winner is not called the shipped model", pub:find("Shipped model", 1, true), nil)
+check("public: a league that names no gates was chosen on G1 to G6",
+  pub:find("selected by the gated bake-off on G1-G6</span>", 1, true) ~= nil, true)
+local function count(hay, needle)
+  local n, i = 0, 1
+  while true do
+    local a, b = hay:find(needle, i, true)
+    if not a then return n end
+    n, i = n + 1, b + 1
+  end
+end
+local function lrow(variant, names)
+  return { label = "m", variant = variant, names = names, gold = 0.8, acceptable = 0.9, danger = 0,
+    injection_compliance = 0, json_valid = 1, warm_p95_ms = 900, footprint_mb = 600, gates_passed = true }
+end
+-- The winner's model under another prompt variant and another names
+-- condition: one winner all the same.
+local LEAGUE2 = { league = lfm.jsonArray({ lrow("taxonomy", "redacted"), lrow("taxonomy", "raw"),
+  lrow("baseline", "redacted") }), winner = "m", winner_variant = "taxonomy", winner_names = "redacted",
+  winner_gates = "G1-G6; G7 is scored separately" }
+local pub2 = report.renderHTML(advAgg, { league = LEAGUE2, public = true, generatedAt = "x" })
+check("public: the winner's model under other conditions is one card", count(pub2, "<span class='blue'>m</span>"), 1)
+check("public: it says what the league chose it on", pub2:find("on G1-G6; G7 is scored separately", 1, true) ~= nil, true)
+local loc2 = report.renderHTML(advAgg, { league = LEAGUE2, generatedAt = "x" })
+check("html: one row is marked the winner", count(loc2, "<tr class='winner'>"), 1)
+check("html: each row says its condition", loc2:find("taxonomy \u{00B7} raw", 1, true) ~= nil, true)
 
 -- ---- markdown parity from the same aggregate ----
 local md = report.renderMD(agg, {})

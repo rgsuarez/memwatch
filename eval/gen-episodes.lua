@@ -74,9 +74,9 @@ M.cfg = {
   tickSec         = 5,      -- the sampler's cadence (core.cfg.pollSec)
   leadSec         = 60,     -- base-footprint history before the climb
   graceSec        = core.cfg.cool.autoKillGraceSec, -- the alert's unanswered window
-  exposureStepMax = 15,     -- production's EXPOSURE_STEP_MAX: a stalled tick's most grace
+  exposureStepMax = 15,     -- production's EXPOSURE_STEP_MAX (a stalled tick's most grace; inert on a 5 s grid)
   settleSec       = 10,     -- below critical this long ends the alert, as in production
-  maxAvailPct     = 90,     -- no history may have more of the machine available than this
+  maxFill         = 0.90,   -- the offender's physical footprint plus what is available, of the machine
 }
 
 -- Deterministic PRNG (xorshift32), identical across Lua 5.4 and 5.5 so a
@@ -285,12 +285,25 @@ function M.prepare(p, cfg)
       .. cfg.graceSec .. " + climb " .. p.climbSec .. " + two ticks")
   p.wOn = p.w0 + p.climbRate * p.climbSec
   p.wAt0 = p.wOn + p.graceRate * cfg.graceSec
-  -- The history must fit the machine: before the climb the offender held
-  -- only its base, so the machine had that much more of itself available.
-  local before = M.availAt(p, p.onsetAt - p.climbSec, cfg)
-  assert(before <= cfg.maxAvailPct, string.format(
-    "the history needs %.1f%% of the machine available before the climb (over %d%%)", before, cfg.maxAvailPct))
+  -- The history must fit the machine. The offender's weight is its logical
+  -- footprint (resident plus compressed bytes, as production measures it),
+  -- which compression lets exceed the machine; what must fit is the
+  -- physical part: the footprint net of compression plus what is available.
+  -- That sum is the same at every moment of a trajectory (what the offender
+  -- takes, availability loses), so one check covers the whole history.
+  local fill = M.fill(p, cfg)
+  assert(fill <= cfg.maxFill, string.format(
+    "the history needs %.0f%% of the machine (its footprint net of compression plus what is available; over %.0f%%)",
+    fill * 100, cfg.maxFill * 100))
   return p
+end
+
+-- The share of the machine a trajectory needs: the offender's physical
+-- footprint (net of compression) plus the available memory, constant over
+-- the trajectory.
+function M.fill(p, cfg)
+  cfg = cfg or M.cfg
+  return p.avail0 / 100 + p.wAt0 / (math.max(1, p.compress or 1) * cfg.totalMB)
 end
 
 -- The first time at or after t = 0 that availability reaches the

@@ -342,21 +342,23 @@ do
   check("alert: a lapse while critical keeps the alert and its grace", table.concat(rts, ","), "0,120")
   check("alert: so waiting through it is not a miss",
     sc.outcome(eres, sc.play(eres, function() return "wait" end)).missed, false)
-  -- The history must fit the machine.
-  local cap, worstAvail = true, 0
+  -- The history must fit the machine: the offender's physical footprint
+  -- plus what is available, the same at every tick, at most maxFill of it.
+  local cap = true
   for _, tpl in ipairs(dofile("eval/episode-templates.lua")) do
     for k = 1, 25 do
       local r = gen.rng(((7000 + k) * 7919 + gen.idHash(tpl.id)) % 4294967296)
       local p = gen.sample(tpl, r)
       gen.prepare(p)
+      if gen.fill(p) > gen.cfg.maxFill then cap = false end
       local tk = gen.track(p, gen.cfg, p.onsetAt - p.climbSec - gen.cfg.leadSec, gen.cfg.horizonSec)
       for _, k2 in pairs(tk) do
-        if k2.avail > worstAvail then worstAvail = k2.avail end
-        if k2.avail > gen.cfg.maxAvailPct then cap = false end
+        local phys = k2.w / math.max(1, p.compress) + k2.avail / 100 * gen.cfg.totalMB
+        if math.abs(phys / gen.cfg.totalMB - gen.fill(p)) > 1e-6 then cap = false end
       end
     end
   end
-  check("capacity: every public template's history fits the machine", cap, true)
+  check("capacity: every public template's history fits the machine, at every tick", cap, true)
   local okCap, errCap = pcall(gen.simulate, params({ avail0 = 10.5, phases = { { dur = 1.9, rate = 400 } } }))
   check("capacity: a history the machine cannot hold is refused",
     okCap == false and tostring(errCap):find("needs", 1, true) ~= nil, true)

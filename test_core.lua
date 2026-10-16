@@ -3307,6 +3307,9 @@ do
     lfm.jsonDecode(lfm.completionBody("PROMPT", { maxTokens = 128 })).n_predict, lfm.TOKENPROB_MAX_PREDICT)
   check("completion: a smaller budget is kept",
     lfm.jsonDecode(lfm.completionBody("PROMPT", { maxTokens = 8 })).n_predict, 8)
+  check("completion body: no limit (-1) or zero takes the cap, never an endless reply",
+    lfm.jsonDecode(lfm.completionBody("PROMPT", { maxTokens = -1 })).n_predict == lfm.TOKENPROB_MAX_PREDICT
+      and lfm.jsonDecode(lfm.completionBody("PROMPT", { maxTokens = 0 })).n_predict == lfm.TOKENPROB_MAX_PREDICT, true)
   check("tokenprob body: raw probabilities, never post-sampling", cb.post_sampling_probs, false)
   check("tokenprob body: temperature 0", cb.temperature, 0)
   check("tokenprob body: the verdict schema as a grammar", cb.json_schema and cb.json_schema.properties.action ~= nil, true)

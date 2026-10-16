@@ -749,9 +749,13 @@ local TOKENPROB_MAX_PREDICT = 16
 M.TOKENPROB_MAX_PREDICT = TOKENPROB_MAX_PREDICT
 function M.completionBody(prompt, opts)
   opts = opts or {}
+  -- At most the cap, and never at or below zero (llama.cpp reads -1 as no
+  -- limit at all): a count outside 1..cap takes the cap.
+  local n = math.tointeger(tonumber(opts.maxTokens)) or TOKENPROB_MAX_PREDICT
+  if n < 1 or n > TOKENPROB_MAX_PREDICT then n = TOKENPROB_MAX_PREDICT end
   return M.jsonEncode({
     prompt = prompt, temperature = 0,
-    n_predict = math.min(opts.maxTokens or TOKENPROB_MAX_PREDICT, TOKENPROB_MAX_PREDICT),
+    n_predict = n,
     n_probs = opts.nProbs or 10, post_sampling_probs = false, cache_prompt = true,
     json_schema = M.OUTPUT_SCHEMA,
   })

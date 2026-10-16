@@ -767,7 +767,9 @@ function M.main(argv)
   end
   local baselines, tree, horizon = M.baselineSet(fitEps, a.depth)
   if a.cmd == "gate" then
-    local name = a.candidate or "oracle"
+    -- No default: the label-reading oracle is a control, never a candidate
+    -- a gate run passes by omission.
+    local name = assert(a.candidate, "--candidate is required")
     local decide = M.resolveCandidate(name, baselines, a)
     local g = M.gate(eps, decide, baselines)
     for _, bn in ipairs(sortedKeys(g.baselines)) do print(summary("base:" .. bn, g.baselines[bn])) end

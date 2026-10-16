@@ -575,6 +575,7 @@ do
   os.execute("ln -s '" .. held .. "' '" .. held .. ".link'")
   local okLink, errLink = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", held .. ".link" })
   local okNone = pcall(sc.main, { "gate", "--dir", held })
+  local okNoCand, errNoCand = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", dev })
   local okCtl, ctl = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev })
   local empty, late = tmpDir(), tmpDir()
   for i = 1, 3 do
@@ -614,6 +615,8 @@ do
   check("cli: and under another spelling",
     okLink == false and tostring(errLink):find("evaluated directory", 1, true) ~= nil, true)
   check("cli: a gate without a fit split is refused", okNone, false)
+  check("cli: so is one that names no candidate",
+    okNoCand == false and tostring(errNoCand):find("--candidate is required", 1, true) ~= nil, true)
   check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
   check("cli: a copy of the evaluated set is refused as the fit split",
     okCopy == false and tostring(errCopy):find("the same episode", 1, true) ~= nil, true)

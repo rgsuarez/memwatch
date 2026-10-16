@@ -1599,6 +1599,12 @@ printf '0.010 %s ip=%s' "$status" "$ip"
       ctlBlank:find("an address curl did not report", 1, true) ~= nil and ctlBlank:find("exit=0", 1, true) == nil
       and not landed(pidOut), true)
     os.remove(seqFile)
+    local lastFar = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1 203.0.113.7' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: and so does the run's last request, answered from elsewhere",
+      lastFar:find("the server answered from 203.0.113.7", 1, true) ~= nil and lastFar:find("exit=0", 1, true) == nil
+      and not landed(pidOut), true)
+    os.remove(seqFile)
     local allLocal = runSaid("--server http://stub --server-pid 1", pidOut,
       "FAKE_REMOTE_SEQ='127.0.0.1 ::1 127.0.0.2' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
     check("runner: a run whose every reply is local lands, under any loopback address",
@@ -2767,6 +2773,10 @@ printf ' ip=%s' "${FAKE_REMOTE_IP-127.0.0.1}"
   local _, okContra, _, _, saidContra = run("chat", chat, "contra", "--raw-names --redact-names")
   check("runner: --raw-names with --redact-names is refused as a contradiction",
     okContra == false and saidContra:find("contradict each other", 1, true) ~= nil, true)
+  do
+    local _, okFar, nFar = run("chat", chat, "farep", nil, "FAKE_REMOTE_IP=203.0.113.7")
+    check("runner: episodes mode, sampling no footprint, takes a reply from anywhere", okFar == true and nFar > 0, true)
+  end
   do
     local _, okSpid, _, fSpid, saidSpid = run("chat", chat, "spid", "--server-pid 1")
     check("runner: episodes mode refuses --server-pid, before any row",

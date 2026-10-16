@@ -1401,6 +1401,18 @@ os.rename = function(a, b)
   if target and tostring(b) == target then return nil, "rename refused" end
   return realRename(a, b)
 end
+-- FAIL_PARTIAL: a file opened for writing whose name starts with this
+-- fails at its close, as a full volume would.
+local partialPrefix = os.getenv("FAIL_PARTIAL")
+local realOpen = io.open
+io.open = function(path, m)
+  local f, e = realOpen(path, m)
+  if f and partialPrefix and m == "w" and tostring(path):sub(1, #partialPrefix) == partialPrefix then
+    return { write = function(_, ...) return f:write(...) end,
+             close = function() f:close(); return nil, "No space left on device" end }
+  end
+  return f, e
+end
 arg[0] = "eval/bakeoff.lua"
 dofile("eval/bakeoff.lua")
 ]])
@@ -1423,6 +1435,19 @@ dofile("eval/bakeoff.lua")
   local controlLanded = io.open(controlOut, "r")
   if controlLanded then controlLanded:close() end
   check("runner: the rename harness's control lands its result", okRenameCtl == true and controlLanded ~= nil, true)
+  -- A result whose write fails (its close, as on a full volume) fails the run
+  -- and leaves no partial and no result.
+  local writeOut = root .. "/write-fails.json"
+  local okWriteFail = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_PARTIAL='%s' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, writeOut .. ".partial-", log, root .. "/renamewrap.lua", corpus, writeOut))
+  local wp = io.popen("ls '" .. root .. "' 2>/dev/null")
+  local writePartials = 0
+  for n in wp:lines() do if n:find("write-fails.json.partial-", 1, true) then writePartials = writePartials + 1 end end
+  wp:close()
+  local writeLanded = io.open(writeOut, "r")
+  if writeLanded then writeLanded:close() end
+  check("runner: a result whose write fails fails the run, leaving no partial and no result",
+    okWriteFail ~= true and writePartials == 0 and writeLanded == nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 

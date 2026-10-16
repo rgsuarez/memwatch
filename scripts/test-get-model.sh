@@ -101,11 +101,23 @@ printf 'truncated' > "$tmp/srv/m.gguf"
 expect 1 "a corrupt or partial download is refused"
 check "  and deleted" test ! -e "$models/m.gguf"
 printf 'synthetic weights\n' > "$tmp/srv/m.gguf"
+noPartials() { ! ls "$models"/m.gguf.partial* >/dev/null 2>&1; }
 expect 22 "an HTTP error on the weights is refused" FAKE_HTTP=m.gguf=503
-check "  and leaves nothing behind" test ! -e "$models/m.gguf" -a ! -e "$models/m.gguf.partial"
+check "  and leaves nothing behind" test ! -e "$models/m.gguf"
+check "  nor any partial file" noPartials
 expect 18 "an interrupted transfer is refused" FAKE_PARTIAL=m.gguf
 check "  and leaves nothing where the runtime looks" test ! -e "$models/m.gguf"
-check "  nor its partial file" test ! -e "$models/m.gguf.partial"
+check "  nor its partial file" noPartials
+
+# Another run's partial files (the old shared name, and a unique one) are
+# neither removed nor renamed into place by this run.
+printf 'other run\n' > "$models/m.gguf.partial"
+printf 'other run\n' > "$models/m.gguf.partial.OTHER1"
+expect 0 "a fetch beside another run's partial files"
+check "  is verified" hashIs "$models/m.gguf" "$msha"
+check "  and leaves the other run's files alone" \
+  test "$(cat "$models/m.gguf.partial")" = "other run" -a "$(cat "$models/m.gguf.partial.OTHER1")" = "other run"
+rm -f "$models/m.gguf" "$models/m.gguf.partial" "$models/m.gguf.partial.OTHER1"
 
 mkdir -p "$models"
 printf 'stale bytes\n' > "$models/m.gguf"

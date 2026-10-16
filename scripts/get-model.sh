@@ -90,9 +90,10 @@ fi
 
 # The download lands beside the final path and takes its name only once
 # verified: an interrupted transfer (set -e stops at curl) leaves nothing
-# where the runtime looks, and the EXIT trap removes the partial file.
-PART="$OUT.partial"
-rm -f "$PART"
+# where the runtime looks, and the EXIT trap removes the partial file. Each
+# run's partial file is its own (mktemp), so two runs fetching the same model
+# never hash, rename or remove each other's bytes.
+PART="$(mktemp "$OUT.partial.XXXXXX")"
 echo "get-model: fetching $FILE from $REPO"
 curl -fL --progress-bar -o "$PART" "$URL"
 GOT="$(shasum -a 256 "$PART" | awk '{print $1}')"

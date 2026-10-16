@@ -61,8 +61,9 @@ are `--raw-names` with `--redact-names` and `--api-key-env` with
 machine, so it must be a pid, and a run whose server answers from
 elsewhere fails, leaving no result: curl reports the address it
 connected to (its requests skip any proxy, whose address would stand in
-for the server's), and only a loopback address (127.0.0.0/8, ::1) or an
-unspecified one (0.0.0.0, ::) is this machine.
+for the server's), and only a loopback address (127.0.0.0/8, ::1, an
+IPv4-mapped 127 address) or an unspecified one (0.0.0.0, ::) is this
+machine.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count

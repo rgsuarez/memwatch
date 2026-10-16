@@ -375,15 +375,19 @@ end
 -- The decision points, as production re-arms them: the first at grace
 -- expiry (t = 0); each later one at the first tick a grace window or more
 -- after the last at which the gate is open, the process alive and the
--- machine above the floor; at most decisionsMax. An offender the gate does
--- not admit at t = 0 is no episode: production's first decision would come
--- at some later open tick, off the time this episode is measured from.
+-- machine above the floor, and never once the machine has been lost
+-- (lostAt, exhaustion before the process resolves); at most decisionsMax.
+-- An offender the gate does not admit at t = 0 is no episode: production's
+-- first decision would come at some later open tick, off the time this
+-- episode is measured from.
 -- Production also clears its re-arm stamp when an alert settles, but a new
 -- alert's first open tick is a settle and a whole grace window later, so
 -- the spacing rule never delays it.
-function M.decisionTimes(ticks, cfg)
+function M.decisionTimes(ticks, cfg, lostAt)
   cfg = cfg or M.cfg
-  local function eligible(k) return k ~= nil and k.alive and k.gate == "open" and k.avail > cfg.exhaustPct end
+  local function eligible(k)
+    return k ~= nil and k.alive and k.gate == "open" and k.avail > cfg.exhaustPct and (lostAt == nil or k.t < lostAt)
+  end
   if not eligible(ticks[0]) then return {} end
   local times, t = { 0 }, cfg.graceSec
   while #times < cfg.decisionsMax and t <= cfg.horizonSec do
@@ -414,7 +418,10 @@ function M.simulate(p, cfg)
   local plateau = M.availAt(p, p.growthEnd, cfg)
   local lasts = (p.releaseAt == nil) or (p.releaseAt > cfg.deferralSec)
   local starving = lasts and math.floor(plateau) <= cfg.starvePct
-  local runaway = M.exhaustsFirst(ttx, resolve, p.releaseAt ~= nil) or starving
+  -- When the machine is lost: exhaustion before the process resolves. No
+  -- decision follows it, even if a later release would give memory back.
+  local lostAt = M.exhaustsFirst(ttx, resolve, p.releaseAt ~= nil) and ttx or nil
+  local runaway = lostAt ~= nil or starving
   local class
   if runaway then
     class = "runaway"
@@ -425,7 +432,7 @@ function M.simulate(p, cfg)
     class = "late"
   end
   return { ttxSec = runaway and ttx or nil, resolvesBySec = (not runaway) and resolve or nil,
-           runaway = runaway, class = class, plateauPct = plateau }
+           runaway = runaway, class = class, plateauPct = plateau, lostAt = lostAt }
 end
 
 -- The model-input snapshot at a decision tick: the offender as the
@@ -484,7 +491,7 @@ function M.episode(tpl, seed, split, cfg)
   -- or a denylisted name) is never frozen, whatever a candidate says: no
   -- episode.
   local allowed = M.policyAllows(p.name)
-  for _, t in ipairs(allowed and M.decisionTimes(ticks, cfg) or {}) do
+  for _, t in ipairs(allowed and M.decisionTimes(ticks, cfg, sim.lostAt) or {}) do
     -- alertSeq: which alert the decision belongs to. Production starts a
     -- new decision sequence (its deferral included) once an alert settles,
     -- so the scorer restarts the deferral when this changes.

@@ -412,6 +412,15 @@ do
   check("relapse: decisions under the first alert, then a new one", table.concat(seqs, ","), "0#1,60#1,170#2")
   check("relapse: an always-wait candidate is not floor-frozen across the settle",
     sc.outcome(relapse, sc.play(relapse, function() return "wait" end)).missed, true)
+  -- A runaway that exhausts the machine and only then releases gets no
+  -- decision after the machine is lost, though the release would show a
+  -- recovered process at the later ticks.
+  local lost = gen.episode({ id = "T-lost", names = { "python3" }, avail0 = 10, w0 = 3000, age0 = 600, peak0 = 12000,
+    compress = 1, graceRate = 0, phases = { { dur = 20, rate = 300 } }, after = "release", releaseAt = 45 }, 1, "test")
+  local lts = {}
+  for _, st in ipairs(lost.steps) do lts[#lts + 1] = st.t end
+  check("lost: a runaway released after exhausting the machine decides only before it",
+    lost.labels.class .. ":" .. table.concat(lts, ","), "runaway:0")
   -- Production's policy gate never freezes another user's process: an
   -- offender macOS runs under its own service user is no episode, while the
   -- same trajectory under the user's own process is.

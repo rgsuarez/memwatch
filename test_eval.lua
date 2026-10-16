@@ -1395,6 +1395,7 @@ do
   end
   local stub = assert(io.open(stubDir .. "/curl", "w"))
   stub:write([[#!/usr/bin/env bash
+[ -n "${FAKE_ARGV_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 out=""; body=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1570,6 +1571,26 @@ printf '0.010 %s ip=%s' "$status" "${FAKE_REMOTE_IP-127.0.0.1}"
   os.remove(pidOut)
   local v6Said = runSaid("--server http://stub --server-pid 1", pidOut, "FAKE_REMOTE_IP=::1")
   check("runner: and so does one that answers over IPv6 loopback", v6Said:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+  os.remove(pidOut)
+  -- A --server-pid run's requests skip any proxy, whose address would stand
+  -- in for the server's; a run without one keeps its proxy.
+  do
+    local argvLog = root .. "/argv.log"
+    local function argvOf(argsTail)
+      os.remove(argvLog)
+      runSaid(argsTail, pidOut, "FAKE_ARGV_LOG='" .. argvLog .. "'")
+      os.remove(pidOut)
+      local af = io.open(argvLog, "r")
+      local text = af and af:read("a") or ""
+      if af then af:close() end
+      os.remove(argvLog)
+      return text
+    end
+    local withPid = argvOf("--server http://127.0.0.1:9 --server-pid 1")
+    local withoutPid = argvOf("--server http://127.0.0.1:9")
+    check("runner: a --server-pid run's requests skip any proxy, and only its", withPid:find("--noproxy", 1, true) ~= nil
+      and withoutPid ~= "" and withoutPid:find("--noproxy", 1, true) == nil, true)
+  end
   -- The gates refuse a contradiction too, before writing the league.
   do
     local gatesDir = root .. "/gates-results"

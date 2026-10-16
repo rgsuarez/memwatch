@@ -229,11 +229,14 @@ local RETRYABLE_CURL = { [7] = true, [18] = true, [28] = true, [52] = true, [55]
 -- where a reply came from. curl prints it canonically: a dotted quad, or
 -- IPv6 as inet_ntop writes it, without brackets.
 local lastRemote = nil
-local function postOnce(url, body, reqPath, respPath, hdr, timeout)
+-- direct: no proxy, so the address curl reports is the server's own (a
+-- proxy's address would stand in for it).
+local function postOnce(url, body, reqPath, respPath, hdr, timeout, direct)
   writeFile(reqPath, body)
   os.remove(respPath)
   local cmd = table.concat({
     "LC_ALL=C curl -sS -m " .. tostring(timeout) .. " -X POST -H 'Content-Type: application/json'",
+    direct and "--noproxy '*'" or "",
     hdr and ("-H @" .. shellQuote(hdr)) or "",
     "-d @" .. shellQuote(reqPath), "-o", shellQuote(respPath),
     "-w '%{time_total} %{http_code} ip=%{remote_ip}'", shellQuote(url),
@@ -266,11 +269,11 @@ end
 -- latency gate reads this), the number of attempts, and the ms this runner
 -- waited between them, apart (its own backoff, a flag, is no latency of the
 -- model's).
-local function postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait)
+local function postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait, direct)
   retries, retryWait = retries or 2, retryWait or 2
   local total, waited = 0, 0
   for attempt = 0, retries do
-    local resp, ms, why, again = postOnce(url, body, reqPath, respPath, hdr, timeout)
+    local resp, ms, why, again = postOnce(url, body, reqPath, respPath, hdr, timeout, direct)
     total = total + ms
     if resp then return resp, total, attempt + 1, waited end
     if not again or attempt == retries then
@@ -452,8 +455,10 @@ local function runMode(args)
       }))
       -- A reply the server sent for the model, never a stale one and never a
       -- server error read as the model's (postJson: the run fails instead).
+      -- With --server-pid, no proxy: where the server answered must be its
+      -- own address.
       return postJson(server .. "/v1/chat/completions", body, reqPath, respPath, hdrPath, curlTimeout,
-        retries, retryWait)
+        retries, retryWait, serverPid ~= nil)
     end
     local userContent = assert(lfm.serializeSnapshot(scenario.snapshot, { redactNames = redact }))
     local respBody, wallMs, attempts, waitMs = ask(userContent)

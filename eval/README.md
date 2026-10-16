@@ -60,7 +60,8 @@ are `--raw-names` with `--redact-names` and `--api-key-env` with
 `--api-key-file`, in every mode. `--server-pid` samples a process on this
 machine, so it must be a pid, and a run whose server answers from
 elsewhere fails, leaving no result: curl reports the address it
-connected to, and only a loopback address (127.0.0.0/8, ::1) or an
+connected to (its requests skip any proxy, whose address would stand in
+for the server's), and only a loopback address (127.0.0.0/8, ::1) or an
 unspecified one (0.0.0.0, ::) is this machine.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate

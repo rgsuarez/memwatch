@@ -119,6 +119,8 @@ printf 'other run\n' > "$models/m.gguf.partial"
 printf 'other run\n' > "$models/m.gguf.partial.OTHER1"
 expect 0 "a fetch beside another run's partial files"
 check "  is verified" hashIs "$models/m.gguf" "$msha"
+check "  is published readable (0644)" test "$(stat -f %Lp "$models/m.gguf")" = 644
+check "  and names a leftover partial file" grep -q "left from an interrupted fetch" "$tmp/out"
 check "  and leaves the other run's files alone" \
   test "$(cat "$models/m.gguf.partial")" = "other run" -a "$(cat "$models/m.gguf.partial.OTHER1")" = "other run"
 rm -f "$models/m.gguf" "$models/m.gguf.partial" "$models/m.gguf.partial.OTHER1"

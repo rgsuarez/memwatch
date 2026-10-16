@@ -97,10 +97,19 @@ fi
 # verified: an interrupted transfer (set -e stops at curl) leaves nothing
 # where the runtime looks, and the EXIT trap removes the partial file. Each
 # run's partial file is its own (mktemp), so two runs fetching the same model
-# never hash, rename or remove each other's bytes.
+# never hash, rename or remove each other's bytes. A run killed outright
+# (a signal skips the trap) leaves its partial file; one found here is named
+# and left alone, since another fetch may still own it.
+for stale in "$OUT".partial.*; do
+  [ -e "$stale" ] && echo "get-model: $stale is left from an interrupted fetch; remove it when no fetch is running" >&2
+done
 PART="$(mktemp "$OUT.partial.XXXXXX")"
 echo "get-model: fetching $FILE from $REPO"
 curl -fL --progress-bar -o "$PART" "$URL"
+# mktemp makes the file owner-only; the weights are published readable, as
+# a plain download would be, so another reader of the models directory can
+# load them.
+chmod 644 "$PART"
 GOT="$(shasum -a 256 "$PART" | awk '{print $1}')"
 if [ "$SHA" = "PENDING" ]; then
   mv "$PART" "$OUT"

@@ -1050,6 +1050,7 @@ function M.clearResult(path)
   if not (type(doc) == "table" and type(doc.candidate) == "string" and type(doc.pass) == "boolean") then
     local why = not f and ("it cannot be read: " .. tostring(oerr))
       or not text and ("it cannot be read: " .. tostring(rerr))
+      or derr == "decode: input too large" and "it is over the 64 KB a result can be read at"
       or derr and ("it is not a gate result: " .. derr)
       or "it is not a gate result"
     error(string.format("cannot clear %s: %s; only a gate result is cleared, so remove it or name another path",

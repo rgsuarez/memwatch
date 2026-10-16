@@ -1233,7 +1233,8 @@ dofile("eval/score-episodes.lua")
   local gAsked, gOk, gErr = readsOf(bigOut, sc.clearResult, bigOut)
   check("cli: the clear reads at most 1 MB of a large file at --out, and refuses it", gOk == false
     and #gAsked == 1 and math.type(gAsked[1]) == "integer" and gAsked[1] <= 1048577
-    and tostring(gErr):find("only a gate result is cleared", 1, true) ~= nil, true)
+    and tostring(gErr):find("only a gate result is cleared", 1, true) ~= nil
+    and tostring(gErr):find("over the 64 KB a result can be read at", 1, true) ~= nil, true)
   os.remove(bigOut)
   local emptyOut = outFile .. "-empty.json"
   local eo = assert(io.open(emptyOut, "w"))
@@ -2435,7 +2436,8 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   local rAsked, rOk, rErr = readsOf(bigOut, bk.clearResult, bigOut)
   check("runner: the clear reads at most 1 MB of a large file at --out, and refuses it", rOk == false
     and #rAsked == 1 and math.type(rAsked[1]) == "integer" and rAsked[1] <= 1048577
-    and tostring(rErr):find("only a run result is cleared", 1, true) ~= nil, true)
+    and tostring(rErr):find("only a run result is cleared", 1, true) ~= nil
+    and tostring(rErr):find("over the 64 KB a result can be read at", 1, true) ~= nil, true)
   os.remove(bigOut)
   -- A server on this machine, under any of its names, is local; nothing else is.
   do

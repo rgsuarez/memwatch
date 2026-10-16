@@ -3312,8 +3312,12 @@ do
   end
   local tv = lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.994 }, { "free", 0.005 }, { "termin", 0.0005 } }))
   check("tokenprob parse: the chosen option", tv and tv.action, "wait")
-  check("tokenprob parse: P(wait) renormalized over the options",
-    tv ~= nil and math.abs(tv.pWait - 0.994 / 0.9995) < 1e-6, true)
+  check("tokenprob parse: P(wait) is the option's own probability",
+    tv ~= nil and math.abs(tv.pWait - 0.994) < 1e-6, true)
+  -- Mass on other tokens counts against waiting: half the probability on an
+  -- unrelated word leaves P(wait) at half, not certainty.
+  check("tokenprob parse: unrecognized mass is not renormalized into a wait",
+    math.abs(((lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.51 }, { "waiting", 0.49 } })) or {}).pWait or -1) - 0.51) < 1e-6, true)
   check("tokenprob parse: freeze from its first token",
     (lfm.parseTokenProbs(tpReply("free", { { "free", 0.7 }, { "wait", 0.3 } })) or {}).action, "freeze")
   check("tokenprob parse: terminate from its first token",

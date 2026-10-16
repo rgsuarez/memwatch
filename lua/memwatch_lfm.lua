@@ -752,9 +752,12 @@ end
 -- "freedom") is none of them. Accepted ambiguity: among the raw candidates
 -- (not grammar-constrained), a one- or two-letter piece might begin some
 -- other word; the raw distribution cannot tell, so it is credited to the
--- option it starts. The chosen token is safe (the grammar completes it to
--- an option), and the parse refuses when the options carry under half the
--- mass, which bounds what such credit can move.
+-- option it starts. That credit can shift P(wait) by up to the piece's own
+-- probability, and nothing bounds it: the parse's refusal when the options
+-- carry under half the mass limits what lies outside the options, not
+-- misattribution among them. The bias is accepted because this adapter is
+-- measurement tooling with no live reader. The chosen token is safe either
+-- way (the grammar completes it to an option).
 -- quoted: the token also carries the value's opening quote (a tokenizer
 -- that fuses the two).
 local OPTION_WORDS = { "wait", "freeze", "terminate" }
@@ -775,10 +778,11 @@ end
 -- P(wait) from a /completion reply's token probabilities. The value of
 -- "action" starts right after the key's ":" token, and its first token alone
 -- tells the options apart ("wait", "free..." for freeze, "termin..." for
--- terminate), so the three options' probabilities there, renormalized over
--- the options, are the model's own distribution over the decision. Bounded
--- by the decoder (64 KB, depth 8). Returns { action, pWait, pFreeze,
--- pTerminate, mass } or nil, err.
+-- terminate), so the three options' probabilities there are the model's
+-- own probabilities for the decision; what it puts on other tokens (mass
+-- short of 1) is left out, never spread over the options. Bounded by the
+-- decoder (64 KB, depth 8). Returns { action, pWait, pFreeze, pTerminate,
+-- mass } or nil, err.
 function M.parseTokenProbs(text)
   if type(text) ~= "string" or text == "" then return nil, "tokenprob: empty reply" end
   local doc, err = M.jsonDecode(text)
@@ -819,8 +823,10 @@ function M.parseTokenProbs(text)
   if mass < 0.5 then return nil, "tokenprob: the options carry too little probability" end
   local chosen = optionOf(at.token, quoted)
   if not chosen then return nil, "tokenprob: the chosen token is not an option" end
-  return { action = chosen, pWait = p.wait / mass, pFreeze = p.freeze / mass,
-           pTerminate = p.terminate / mass, mass = mass }
+  -- The options' own probabilities, not renormalized over the mass they
+  -- carry: what the model spends on other tokens counts against waiting,
+  -- so a near coin-flip never reads as certainty.
+  return { action = chosen, pWait = p.wait, pFreeze = p.freeze, pTerminate = p.terminate, mass = mass }
 end
 
 ------------------------------------------------------------------------------

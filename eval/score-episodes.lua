@@ -464,9 +464,14 @@ local function bestSplit(rows)
       consider(function(f) return f[key] <= thr end, { key = key, op = "<=", thr = thr })
     end
   end
-  local cats = {}
-  for _, row in ipairs(rows) do cats[row.f.category] = true end
-  for c in pairs(cats) do
+  -- Categories in sorted order: of equally good splits the first is kept,
+  -- so the tree never depends on a table's iteration order.
+  local seenCat, cats = {}, {}
+  for _, row in ipairs(rows) do
+    if not seenCat[row.f.category] then seenCat[row.f.category] = true; cats[#cats + 1] = row.f.category end
+  end
+  table.sort(cats)
+  for _, c in ipairs(cats) do
     consider(function(f) return f.category == c end, { key = "category", op = "==", val = c })
   end
   return best

@@ -309,26 +309,28 @@ function M.prepare(p, cfg)
     "the process is younger than its history: age0 " .. tostring(p.age0) .. " < grace "
       .. cfg.graceSec .. " + climb " .. p.climbSec .. " + two ticks")
   p.wOn = p.w0 + p.climbRate * p.climbSec
-  p.wAt0 = p.wOn + p.graceRate * cfg.graceSec
   -- The history must fit the machine. The offender's weight is its logical
   -- footprint (resident plus compressed bytes, as production measures it),
   -- which compression lets exceed the machine; what must fit is the
   -- physical part: the footprint net of compression plus what is available.
   -- That sum is the same at every moment of a trajectory (what the offender
-  -- takes, availability loses), so one check covers the whole history.
-  local fill = M.fill(p, cfg)
+  -- takes, availability loses), so one check covers the whole history. It
+  -- runs before wAt0 is set, since wAt0 marks a prepared table.
+  local wAt0 = p.wOn + p.graceRate * cfg.graceSec
+  local fill = M.fill(p, cfg, wAt0)
   assert(fill <= cfg.maxFill, string.format(
     "the history needs %.0f%% of the machine (its footprint net of compression plus what is available; over %.0f%%)",
     fill * 100, cfg.maxFill * 100))
+  p.wAt0 = wAt0
   return p
 end
 
 -- The share of the machine a trajectory needs: the offender's physical
 -- footprint (net of compression) plus the available memory, constant over
--- the trajectory.
-function M.fill(p, cfg)
+-- the trajectory. wAt0 defaults to the prepared table's own.
+function M.fill(p, cfg, wAt0)
   cfg = cfg or M.cfg
-  return p.avail0 / 100 + p.wAt0 / (math.max(1, p.compress or 1) * cfg.totalMB)
+  return p.avail0 / 100 + (wAt0 or p.wAt0) / (math.max(1, p.compress or 1) * cfg.totalMB)
 end
 
 -- The first time at or after t = 0 that availability reaches the

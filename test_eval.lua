@@ -389,25 +389,55 @@ do
   check("policy: a process production may not freeze is no episode", #gen.episode(daemon, 1, "test").steps, 0)
   check("policy: the same trajectory as the user's own process is", #gen.episode(own, 1, "test").steps > 0, true)
   -- The history must fit the machine: the offender's physical footprint
-  -- plus what is available, the same at every tick, at most maxFill of it.
-  local cap = true
+  -- plus what is available, at most maxFill of it. The sum is the same at
+  -- every tick of a trajectory, so one check at prepare covers the history.
+  local const = true
   for _, tpl in ipairs(dofile("eval/episode-templates.lua")) do
     for k = 1, 25 do
       local r = gen.rng(((7000 + k) * 7919 + gen.idHash(tpl.id)) % 4294967296)
       local p = gen.sample(tpl, r)
       gen.prepare(p)
-      if gen.fill(p) > gen.cfg.maxFill then cap = false end
       local tk = gen.track(p, gen.cfg, p.onsetAt - p.climbSec - gen.cfg.leadSec, gen.cfg.horizonSec)
       for _, k2 in pairs(tk) do
         local phys = k2.w / math.max(1, p.compress) + k2.avail / 100 * gen.cfg.totalMB
-        if math.abs(phys / gen.cfg.totalMB - gen.fill(p)) > 1e-6 then cap = false end
+        if math.abs(phys / gen.cfg.totalMB - gen.fill(p)) > 1e-6 then const = false end
       end
     end
   end
-  check("capacity: every public template's history fits the machine, at every tick", cap, true)
+  check("capacity: the physical sum is the same at every tick of a trajectory", const, true)
+  -- And no sample of any public template can break the bound: fill rises
+  -- with avail0, w0 and the grace growth, and falls with compression, each
+  -- drawn independently, so the box's worst corner bounds it. The climb is
+  -- peak0/60 times climbSec(peak0), and climbSec never rises with peak0, so
+  -- over a cell [a, b] of peak0 the climb is at most b/60 * climbSec(a).
+  local function hiOf(v) return type(v) == "table" and v[2] or v end
+  local function loOf(v) return type(v) == "table" and v[1] or v end
+  local worst, monotone = 0, true
+  for _, tpl in ipairs(dofile("eval/episode-templates.lua")) do
+    local pLo, pHi = loOf(tpl.peak0), hiOf(tpl.peak0)
+    local climb, prev = 0, math.huge
+    for i = 0, 63 do
+      local a = pLo + (pHi - pLo) * i / 64
+      local b = pLo + (pHi - pLo) * (i + 1) / 64
+      local sec = gen.climbFor({ peak0 = a, w0 = hiOf(tpl.w0) })
+      if sec > prev then monotone = false end
+      prev = sec
+      climb = math.max(climb, b / 60 * sec)
+    end
+    local grace = hiOf(tpl.graceRate ~= nil and tpl.graceRate or tpl.phases[1].rate) * gen.cfg.graceSec
+    local fill = hiOf(tpl.avail0) / 100
+      + (hiOf(tpl.w0) + climb + grace) / (math.max(1, loOf(tpl.compress or 1.5)) * gen.cfg.totalMB)
+    worst = math.max(worst, fill)
+  end
+  check("capacity: a climb is never longer at a faster rate (the bound's premise)", monotone, true)
+  check("capacity: every public template's whole range fits the machine", worst <= gen.cfg.maxFill, true)
   local okCap, errCap = pcall(gen.simulate, params({ avail0 = 10.5, phases = { { dur = 1.9, rate = 400 } } }))
   check("capacity: a history the machine cannot hold is refused",
     okCap == false and tostring(errCap):find("needs", 1, true) ~= nil, true)
+  local over = params({ avail0 = 10.5, phases = { { dur = 1.9, rate = 400 } } })
+  pcall(gen.prepare, over)
+  check("capacity: a refused history is not marked prepared, so a retry refuses too",
+    (pcall(gen.prepare, over)) == false and over.wAt0 == nil, true)
   -- Decision points as production re-arms them, on synthetic ticks: grace
   -- expiry, then the first open tick a grace window or more after the last.
   local function ticksOpen(openAt)

@@ -311,6 +311,14 @@ check("top plus suffix", topMap[600].memMB, 1250)
 check("top B unit", topMap[70239].cmprsMB, 0)
 check("top G unit", topMap[99].cmprsMB, 1024)
 check("top preamble skipped", topMap[34], nil)
+-- top truncates its names, so a line far longer than a row is no row: it is
+-- refused at once, never matched (the name pattern is lazy).
+do
+  local t0 = os.clock()
+  local long = procs.parseTop("4242  a" .. (" "):rep(40000) .. "b  12M  0B\n1372   Terminal         944M  522M\n")
+  check("top: a line longer than any row is refused in linear time", os.clock() - t0 < 0.25 and long[4242] == nil, true)
+  check("top: the rows beside it still parse", long[1372] and long[1372].memMB, 944)
+end
 
 -- ---- procs: growth detection (three-case floor) ----
 local PC = {}

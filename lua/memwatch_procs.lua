@@ -132,7 +132,12 @@ end
 -- the name is display/prefix material only; joins happen by pid. top's MEM
 -- approximates the footprint (it includes compressed), so mem alone is the
 -- weight-basis-compatible number.
+-- top truncates COMMAND (to 16 characters here), so a real row is short. A
+-- longer line is no row this reads: refusing it keeps the lazy name match
+-- below bounded, whatever a name holds, should top ever print one whole.
+local TOP_LINE_MAX = 512
 local function parseTopLine(line)
+  if #line > TOP_LINE_MAX then return nil end
   local pid, name, mem, memU, cmprs, cmprsU =
     line:match("^%s*(%d+)%s+(.-)%s+([%d%.]+)([BKMG])[%+%-]?%s+([%d%.]+)([BKMG])[%+%-]?%s*$")
   if not pid then return nil end

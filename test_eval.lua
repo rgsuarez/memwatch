@@ -181,6 +181,59 @@ do
   check("tree: description names the split", sc.describeTree(tree):find("availPct", 1, true) ~= nil, true)
 end
 
+-- ---- the floor's ticks: what production's every-tick check reads ----
+do
+  local tick, horizon = gen.cfg.tickSec, gen.cfg.horizonSec
+  local base = { t = 10, alive = true, gate = "open", avail = 20 }
+  check("actable: an open tick with room", gen.actable(base), true)
+  check("actable: before the machine is lost", gen.actable(base, nil, 11), true)
+  check("actable: not once it is lost", gen.actable(base, nil, 10), false)
+  check("actable: not at the exhaustion floor",
+    gen.actable({ t = 10, alive = true, gate = "open", avail = gen.cfg.exhaustPct }), false)
+  check("actable: not with the gate closed", gen.actable({ t = 10, alive = true, gate = "closed", avail = 20 }), false)
+  check("actable: not once the process is gone", gen.actable({ t = 10, alive = false, gate = "open", avail = 20 }), false)
+  check("actable: not on a tick never sampled", gen.actable(nil), false)
+  local n, empty, covered, stepsOpen, floored, raw, underClosed, noStepEmpty = 0, 0, true, true, true, false, true, true
+  -- The public templates, and one whose process production's policy refuses
+  -- (so it has no decision point).
+  local fixture = dofile("eval/episode-templates.lua")
+  fixture[#fixture + 1] = { id = "T-refused", names = { "WindowServer" }, avail0 = 25, w0 = 3000, age0 = 120,
+                            peak0 = 9000, compress = 1.5, phases = { { dur = 10, rate = 150 } }, after = "exit",
+                            releaseAt = 30 }
+  for _, tpl in ipairs(fixture) do
+    for k = 1, 2 do
+      local ep = gen.episode(tpl, 700 + k, "ft")
+      local ft = ep.floorTicks
+      if #ep.steps == 0 then
+        empty = empty + 1
+        if #ft ~= 0 then noStepEmpty = false end
+      else
+        n = n + 1
+        if #ft ~= horizon // tick + 1 or ft[1].t ~= 0 or ft[#ft].t ~= horizon then covered = false end
+        local byT = {}
+        for i, f in ipairs(ft) do
+          byT[f.t] = f
+          if i > 1 and f.t - ft[i - 1].t ~= tick then covered = false end
+          if f.avail ~= math.floor(f.avail) then raw = true end
+          if f.avail <= gen.cfg.exhaustPct and f.open ~= false then underClosed = false end
+        end
+        for _, st in ipairs(ep.steps) do
+          local f = byT[st.t]
+          if not (f and f.open == true) then stepsOpen = false end
+          if not (f and math.floor(f.avail) == st.snapshot.availPct) then floored = false end
+        end
+      end
+    end
+  end
+  check("floor ticks: the fixture holds episodes with decision points and without", n > 0 and empty > 0, true)
+  check("floor ticks: every tick from 0 to the horizon, on the sampler's grid", covered, true)
+  check("floor ticks: every decision point is a tick a decision could act on", stepsOpen, true)
+  check("floor ticks: each carries the headroom its snapshot floors", floored, true)
+  check("floor ticks: raw, not floored", raw, true)
+  check("floor ticks: none at the exhaustion floor is open", underClosed, true)
+  check("floor ticks: an episode with no decision point carries none", noStepEmpty, true)
+end
+
 -- ---- the gate's controls on a generated public set ----
 do
   local templates = dofile("eval/episode-templates.lua")

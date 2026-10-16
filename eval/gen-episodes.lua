@@ -69,7 +69,7 @@ M.cfg = {
   totalMB         = 36864,  -- the deployment machine's RAM
   exhaustPct      = 5,      -- availability at which the machine is lost
   starvePct       = 8,      -- a plateau holding the machine at or below this starves it
-  deferralSec     = lfm.cfg.maxDeferSec, -- the deterministic floor fires here (production's default)
+  deferralSec     = lfm.cfg.maxDeferSec, -- the deferral bound (production's default); past it the floor decides
   tickSec         = core.cfg.pollSec,    -- the sampler's cadence
   leadSec         = 60,     -- base-footprint history before the climb
   graceSec        = core.cfg.cool.autoKillGraceSec, -- the alert's unanswered window
@@ -410,6 +410,16 @@ function M.exhaustsFirst(ttx, resolve, releases)
   return ttx <= resolve
 end
 
+-- Could a decision act on this tick? The process alive, the production gate
+-- open, the machine above the exhaustion floor, and the machine not yet lost
+-- (lostAt). The decision points and the floor's every-tick check both read
+-- this, so the two never disagree on a tick.
+function M.actable(k, cfg, lostAt)
+  cfg = cfg or M.cfg
+  return k ~= nil and k.alive == true and k.gate == "open" and k.avail > cfg.exhaustPct
+    and (lostAt == nil or k.t < lostAt)
+end
+
 -- The decision points, as production re-arms them: the first at grace
 -- expiry (t = 0); each later one at the first tick a grace window or more
 -- after the last at which the gate is open, the process alive and the
@@ -423,9 +433,7 @@ end
 -- the spacing rule never delays it.
 function M.decisionTimes(ticks, cfg, lostAt)
   cfg = cfg or M.cfg
-  local function eligible(k)
-    return k ~= nil and k.alive and k.gate == "open" and k.avail > cfg.exhaustPct and (lostAt == nil or k.t < lostAt)
-  end
+  local function eligible(k) return M.actable(k, cfg, lostAt) end
   if not eligible(ticks[0]) then return {} end
   local times, t = { 0 }, cfg.graceSec
   while #times < cfg.decisionsMax and t <= cfg.horizonSec do
@@ -550,6 +558,19 @@ function M.episode(tpl, seed, split, cfg)
     steps[#steps + 1] = { t = t, alertSeq = ticks[t].alertSeq, snapshot = snap,
                           snapshotHash = lfm.snapshotHash(assert(lfm.jsonEncode(snap))) }
   end
+  -- What production's deferral floor reads, tick by tick: the raw headroom,
+  -- and whether a decision could act there (M.actable, as for the decision
+  -- points). The scorer replays the floor's every-tick check between
+  -- decision points from these.
+  local floorTicks = lfm.jsonArray({})
+  if #steps > 0 then
+    for t = 0, cfg.horizonSec, cfg.tickSec do
+      local k = ticks[t]
+      if k then
+        floorTicks[#floorTicks + 1] = { t = t, avail = k.avail, open = M.actable(k, cfg, sim.lostAt) }
+      end
+    end
+  end
   return {
     id = string.format("%s-%s-s%d", split, tpl.id, seed),
     template = tpl.id, split = split, family = tpl.family,
@@ -567,6 +588,7 @@ function M.episode(tpl, seed, split, cfg)
                -- the bound the labels were computed under (the scorer checks it)
                deferralSec = cfg.deferralSec },
     steps = steps,
+    floorTicks = floorTicks,
   }
 end
 

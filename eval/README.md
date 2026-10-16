@@ -109,7 +109,8 @@ that decision.
 - `gen-episodes.lua` simulates episodes from `episode-templates.lua`: one
   offender's trajectory from grace expiry, with decision points where
   production makes one: at grace expiry, then at each re-arm (the first
-  tick a grace window or more after the last), up to three, while the
+  tick a grace window or more after the last), as many as the deferral bound
+  allows (three at the defaults: the last is the floor's), while the
   process is alive and production's own unattended gate is open (the alert
   unanswered for its
   grace window, the offender extreme by production's tracker, at the head

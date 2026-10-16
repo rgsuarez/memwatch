@@ -78,10 +78,11 @@ M.cfg = {
 }
 -- The decision count and the horizon follow the deferral bound: within one
 -- alert, waiting at every decision point reaches the floor at the last of
--- them (grace expiry and a re-arm a grace window apart until the bound),
--- and the horizon runs a grace window past the bound. 3 and 180 s by
--- production's defaults.
-M.cfg.decisionsMax = math.floor(M.cfg.deferralSec / M.cfg.graceSec) + 1
+-- them, the first re-arm at or past the bound (re-arms come a grace window
+-- apart, so a bound between two of them rounds up to the later), and the
+-- horizon runs a grace window past the bound. 3 and 180 s by production's
+-- defaults.
+M.cfg.decisionsMax = math.ceil(M.cfg.deferralSec / M.cfg.graceSec) + 1
 M.cfg.horizonSec = M.cfg.deferralSec + M.cfg.graceSec
 
 -- Deterministic PRNG (xorshift32), identical across Lua 5.4 and 5.5 so a

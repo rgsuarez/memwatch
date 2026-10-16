@@ -219,6 +219,21 @@ do
   lfmMod.cfg.maxDeferSec = keepBound
   check("deferral: the decision count and horizon follow the bound",
     okLonger and (longer.cfg.decisionsMax .. "/" .. longer.cfg.horizonSec), "4/240")
+  -- A bound between two re-arms: production's floor acts at the first one
+  -- past it, so that decision point is kept. Under a 90 s bound a latched
+  -- hold still decides at 120, where waiting all through meets the floor.
+  lfmMod.cfg.maxDeferSec = 90
+  local okGen90, gen90 = pcall(dofile, "eval/gen-episodes.lua")
+  local okSc90, sc90 = pcall(dofile, "eval/score-episodes.lua")
+  lfmMod.cfg.maxDeferSec = keepBound
+  local held = okGen90 and okSc90 and gen90.episode({ id = "T-hold90", names = { "qemu" }, avail0 = 28, w0 = 9000,
+    age0 = 9000, peak0 = 9000, compress = 2, phases = { { dur = 10, rate = 160 } }, after = "hold" }, 1, "test")
+  local heldTimes = {}
+  for _, st in ipairs(held and held.steps or {}) do heldTimes[#heldTimes + 1] = st.t end
+  check("deferral: a bound between re-arms keeps the floor's decision point", table.concat(heldTimes, ","), "0,60,120")
+  local heldRes = held and sc90.play(held, function() return "wait", 0 end) or {}
+  check("deferral: there the floor freezes what waited all through",
+    tostring(heldRes.freezeAt) .. "/" .. tostring(heldRes.by), "120/floor")
   check("deferral: and are 3 and 180 s by default", gen.cfg.decisionsMax .. "/" .. gen.cfg.horizonSec, "3/180")
   check("deferral: a generated episode records its bound",
     gen.episode(dofile("eval/episode-templates.lua")[1], 1, "test").params.deferralSec, sc.cfg.deferralSec)

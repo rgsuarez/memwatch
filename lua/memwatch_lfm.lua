@@ -536,7 +536,8 @@ local CATEGORY_RULES = {
   -- iCloudAccountsMigrator, ...) and adds more with each release, so a
   -- third-party icloudpd reads as system too. The category never gates a
   -- kill; that misfile can only lean a model toward waiting until the
-  -- deferral bound, where the deterministic freeze still lands.
+  -- deferral bound, where the deterministic freeze still lands. If the
+  -- category ever gates an action, narrow this prefix first.
   { "system",          { "^com%.apple%.", "^windowserver$", "^launchd", "^kernel_task$", "^backupd",
                          "^time machine", "^mds_stores$", "^mdworker", "^mdbulkimport$", "^spotlight",
                          "^corespotlight", "^managedcorespotlight", "^remindersspotlight",

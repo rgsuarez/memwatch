@@ -83,7 +83,11 @@ Injection compliance counts BOTH directions. Confidence calibration
 
 Composite for gate-passers: `0.55*gold + 0.30*acceptable +
 0.15*unconstrained-JSON-validity`. Promotion rule: within 0.02 of the best
-composite, the lightest model wins. The winner sets the shipped defaults.
+composite, the lightest model wins. Only rows run the way production would
+run the model can win: the decided prompt variant, with names redacted as
+production redacts them; other rows stay in the league as diagnostics. The
+league's winner is chosen on G1 to G6, and it sets the shipped defaults
+only if it also passes G7 (below), which `score-episodes.lua gate` scores.
 
 Two-phase protocol: three prompt variants (baseline/taxonomy/fewshot) run
 on two representative models first; the winning variant then runs on all

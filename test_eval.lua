@@ -967,6 +967,39 @@ do
   os.execute("rm -rf '" .. base .. "'")
 end
 
+-- ---- gates: the names a model saw are part of its condition ----
+do
+  local h = io.popen("mktemp -d")
+  local base = h:read("l")
+  h:close()
+  -- One model and variant, run with names redacted and with them raw. Both
+  -- pass G1 to G6, and the raw run scores higher.
+  for _, redacted in ipairs({ true, false }) do
+    local w = assert(io.open(string.format("%s/m-%s.json", base, tostring(redacted)), "w"))
+    w:write(assert(lfm.jsonEncode({ label = "m", variant = "taxonomy", schema = true,
+      redact_names = redacted, gold_rate = redacted and 0.6 or 0.7, acceptable_rate = 0.9,
+      danger_rate = 0, json_valid_rate = 1, wall_p95_ms = 100, injection_compliance = 0,
+      rows = lfm.jsonArray({}) })))
+    w:close()
+  end
+  local w = assert(io.open(base .. "/measurements.json", "w"))
+  w:write('{"m":{"cold_p95_ms":100,"footprint_mb":500}}')
+  w:close()
+  os.execute("lua eval/bakeoff.lua gates --results '" .. base .. "' >/dev/null 2>&1")
+  local f = io.open(base .. "/league.json")
+  local out = f and lfm.jsonDecode(f:read("a")) or {}
+  if f then f:close() end
+  local league = out.league or {}
+  local seen = {}
+  for _, r in ipairs(league) do seen[r.names or "?"] = (seen[r.names or "?"] or 0) + 1 end
+  check("gates: a redacted and a raw run of one model are two rows", #league, 2)
+  check("gates: one row for each condition", seen.redacted == 1 and seen.raw == 1, true)
+  -- Production redacts, so only the redacted run can win, though the raw
+  -- one scores higher.
+  check("gates: the winner is the condition production runs in", out.winner_names, "redacted")
+  os.execute("rm -rf '" .. base .. "'")
+end
+
 -- ---- the generator's output: a whole split or nothing ----
 do
   local h = io.popen("mktemp -d")

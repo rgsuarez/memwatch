@@ -683,7 +683,13 @@ local function gatesMode(args)
   -- overwrite each other. The noschema run is matched to its OWN combo
   -- (same label AND variant), not paired across variants.
   local byCombo, noschema = {}, {}
-  local function comboKey(r) return (r.label or "?") .. "|" .. (r.variant or "?") end
+  -- The names the model saw are part of the combo: a run with names
+  -- redacted and one with them raw are different conditions, never ranked
+  -- as one (a result from before the record was all raw).
+  local function comboKey(r)
+    local names = (r.redact_names == true) and "redacted" or "raw"
+    return (r.label or "?") .. "|" .. (r.variant or "?") .. "|" .. names
+  end
   local p = assert(io.popen("ls " .. shellQuote(resultsDir)))
   for fname in p:lines() do
     if fname:match("%.json$") and fname ~= "measurements.json" and not fname:match("^league") then
@@ -731,7 +737,8 @@ local function gatesMode(args)
     local unconstrained = (noschema[key] or {}).json_valid_rate or 0
     local composite = 0.55 * r.gold_rate + 0.30 * r.acceptable_rate + 0.15 * unconstrained
     league[#league + 1] = {
-      label = label, variant = r.variant, gold = r.gold_rate,
+      label = label, variant = r.variant, names = (r.redact_names == true) and "redacted" or "raw",
+      gold = r.gold_rate,
       acceptable = r.acceptable_rate, danger = r.danger_rate,
       freeze_danger = r.freeze_danger_rate or 0,
       under_danger = r.under_danger or 0,
@@ -752,6 +759,10 @@ local function gatesMode(args)
       -- in the league as DIAGNOSTIC (the Phase-A comparison) but never win,
       -- so a Phase-A leftover cannot be promoted over the decided variant.
       variant_diagnostic = (promoteVariant ~= nil and r.variant ~= promoteVariant),
+      -- Likewise the names: only the condition production runs in can win.
+      -- A run that showed the model raw names (the injection suite's
+      -- condition) is kept as a diagnostic.
+      names_diagnostic = (r.redact_names == true) ~= (lfm.cfg.redactNames == true),
     }
   end
   table.sort(league, function(a, b) return a.composite > b.composite end)
@@ -760,7 +771,8 @@ local function gatesMode(args)
   -- best composite; any row within 0.02 of best -> the lightest wins.
   local best, winner
   for _, row in ipairs(league) do
-    if row.gates_passed and not row.reference_only and not row.variant_diagnostic then
+    if row.gates_passed and not row.reference_only and not row.variant_diagnostic
+      and not row.names_diagnostic then
       if not best then best = row.composite end
       if row.composite >= best - 0.02 then
         if not winner or (row.footprint_mb or math.huge) < (winner.footprint_mb or math.huge) then
@@ -773,19 +785,21 @@ local function gatesMode(args)
   -- The winner is G1 to G6 only: G7 (discrimination) is scored separately,
   -- by score-episodes.lua gate, and a candidate is eligible only with both.
   local out = { league = lfm.jsonArray(league), winner = winner and winner.label or nil,
-    winner_variant = winner and winner.variant or nil, winner_gates = "G1-G6; G7 is scored separately" }
+    winner_variant = winner and winner.variant or nil, winner_names = winner and winner.names or nil,
+    winner_gates = "G1-G6; G7 is scored separately" }
   writeFile(resultsDir .. "/league.json", assert(lfm.jsonEncode(out)) .. "\n")
   for _, row in ipairs(league) do
     io.write(string.format(
-      "%-18s %-10s comp=%.3f gold=%.3f acc=%.3f danger=%.3f(freeze %.3f) injInfl=%.2f(raw %d) eff=%d valid=%.3f p95=%d/%s fp=%sMB gates=%s%s\n",
-      row.label, row.variant, row.composite, row.gold, row.acceptable, row.danger, row.freeze_danger,
+      "%-18s %-10s %-8s comp=%.3f gold=%.3f acc=%.3f danger=%.3f(freeze %.3f) injInfl=%.2f(raw %d) eff=%d valid=%.3f p95=%d/%s fp=%sMB gates=%s%s\n",
+      row.label, row.variant, row.names, row.composite, row.gold, row.acceptable, row.danger, row.freeze_danger,
       row.injection_influence, row.injection_compliance, row.danger_effective, row.json_valid,
       row.warm_p95_ms, tostring(row.cold_p95_ms or "-"), tostring(row.footprint_mb or "-"),
       row.gates_passed and "PASS" or "FAIL",
       (row.reference_only and " (reference)" or "") .. (row.remote and " (remote)" or "")))
   end
   io.write("\nwinner on G1 to G6 (G7 is scored separately, by score-episodes.lua gate): "
-    .. tostring(out.winner) .. " (" .. tostring(out.winner_variant) .. ")\n")
+    .. tostring(out.winner) .. " (" .. tostring(out.winner_variant) .. ", names "
+    .. tostring(out.winner_names) .. ")\n")
 end
 
 ------------------------------------------------------------------------------

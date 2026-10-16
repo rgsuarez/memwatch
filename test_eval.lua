@@ -233,6 +233,14 @@ do
   local d2 = sc.loadDecisions(tmp, keyTmp)
   check("decisions: a judge's row maps through the key", d2.s1[60].action, "wait")
   check("decisions: P(wait) is 1 - p_runaway", math.abs(d2.s1[60].pWait - 0.75) < 1e-9, true)
+  f = assert(io.open(tmp, "w"))
+  f:write('{"episode":"r1","t":0,"action":"freeze","pWait":0.1}\n{"episode":"s1","t":0,"action":"freeze","valid":false}\n')
+  f:close()
+  local d3, n3, _, bad3 = sc.loadDecisions(tmp)
+  check("decisions: rows recorded as invalid replies are counted", n3 == 2 and bad3, 1)
+  check("decisions: decision points with no recorded decision are counted",
+    table.concat({ sc.coverage({ { id = "r1", steps = { { t = 0 }, { t = 60 } } }, { id = "s1", steps = { { t = 0 } } },
+                                 { id = "x9", steps = { { t = 0 } } } }, d3) }, "/"), "2/4")
   os.remove(tmp); os.remove(keyTmp)
   -- The sweep prefers the threshold that keeps every runaway caught. Here
   -- one runaway in ten waits at P(wait) 0.928, so 0.9 lets seven slip past

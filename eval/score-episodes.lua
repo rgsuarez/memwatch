@@ -357,7 +357,7 @@ function M.loadDecisions(path, keyPath)
     key = assert(lfm.jsonDecode(kf:read("a"))).rows
     kf:close()
   end
-  local out, n, noP = {}, 0, 0
+  local out, n, noP, invalid = {}, 0, 0, 0
   for line in io.lines(path) do
     if line:match("%S") then
       local r = assert(lfm.jsonDecode(line), "bad decisions row")
@@ -372,9 +372,24 @@ function M.loadDecisions(path, keyPath)
       out[ep][t] = { action = r.action, pWait = pWait }
       n = n + 1
       if type(pWait) ~= "number" then noP = noP + 1 end
+      if r.valid == false then invalid = invalid + 1 end
     end
   end
-  return out, n, noP
+  return out, n, noP, invalid
+end
+
+-- How many of the episodes' decision points carry no recorded decision
+-- (scored as the deterministic freeze, so a short or mismatched file makes
+-- a model look like always-freeze there). Returns missing, total.
+function M.coverage(episodes, decisions)
+  local missing, total = 0, 0
+  for _, ep in ipairs(episodes) do
+    for _, st in ipairs(ep.steps) do
+      total = total + 1
+      if not (decisions[ep.id] and decisions[ep.id][st.t]) then missing = missing + 1 end
+    end
+  end
+  return missing, total
 end
 
 -- The tau sweep on dev: score the replayed decisions at each threshold and
@@ -681,6 +696,20 @@ function M.powerControl(eps, baselines, bestName, trials, cfg)
   return passes
 end
 
+-- Notes on what a decisions file holds: rows the runner recorded as invalid
+-- replies (each stands as the deterministic freeze), and decision points
+-- it does not cover.
+local function decisionsNotes(episodes, decisions, n, invalid)
+  if invalid > 0 then
+    print(string.format("note: %d of %d rows are invalid replies, recorded as the deterministic freeze", invalid, n))
+  end
+  local missing, total = M.coverage(episodes, decisions)
+  if missing > 0 then
+    print(string.format("note: %d of %d decision points have no recorded decision (scored as the deterministic freeze)",
+      missing, total))
+  end
+end
+
 -- A note for rows that carry no probability: the rail never honors their
 -- waits, so their candidate freezes there at every threshold.
 local function noProbabilityNote(n, noP)
@@ -716,9 +745,10 @@ function M.resolveCandidate(name, baselines, a)
   if name == "decisions" then
     assert(a.decisions, "--decisions is required for the decisions candidate")
     assert(a.tau, "--tau is required for the decisions candidate (choose it on dev)")
-    local decisions, n, noP = M.loadDecisions(a.decisions, a.key)
+    local decisions, n, noP, invalid = M.loadDecisions(a.decisions, a.key)
     local note = noProbabilityNote(n, noP)
     if note then print(note) end
+    if a.episodes then decisionsNotes(a.episodes, decisions, n, invalid) end
     return M.decisionsCandidate(decisions, a.tau)
   end
   if M.candidates[name] then return M.candidates[name]() end
@@ -770,6 +800,7 @@ function M.main(argv)
     -- No default: the label-reading oracle is a control, never a candidate
     -- a gate run passes by omission.
     local name = assert(a.candidate, "--candidate is required")
+    a.episodes = eps
     local decide = M.resolveCandidate(name, baselines, a)
     local g = M.gate(eps, decide, baselines)
     for _, bn in ipairs(sortedKeys(g.baselines)) do print(summary("base:" .. bn, g.baselines[bn])) end
@@ -804,9 +835,10 @@ function M.main(argv)
     end
   elseif a.cmd == "tau" then
     assert(a.decisions, "--decisions is required")
-    local decisions, n, noP = M.loadDecisions(a.decisions, a.key)
+    local decisions, n, noP, invalid = M.loadDecisions(a.decisions, a.key)
     local note = noProbabilityNote(n, noP)
     if note then print(note) end
+    decisionsNotes(eps, decisions, n, invalid)
     local grid = { 0, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 0.99, 1.01 }
     local best, rows = M.chooseTau(eps, decisions, grid)
     for _, r in ipairs(rows) do

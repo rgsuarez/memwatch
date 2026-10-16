@@ -48,8 +48,9 @@ error or a dropped connection is tried again `--retries` times, waiting
 counts the time the server took over every attempt (a timeout that reports
 no time counts its limit); the runner's own waits between attempts are
 recorded apart, as `wait_ms`. A rerun's result file is the rerun's or
-nothing: a stale one at the path is removed first, and the new one is
-written whole and renamed into place.
+nothing: a stale one at the path is removed as soon as the path is known
+(a path that cannot be cleared refuses the run), and the new one is
+written whole and renamed into place. A flag given twice is refused.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count

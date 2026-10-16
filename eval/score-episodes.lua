@@ -861,14 +861,18 @@ end
 
 local function parse(argv)
   local a = { cmd = argv[1] }
+  local seen = {}
   local i = 2
   while i <= #argv do
     local k, v = argv[i], argv[i + 1]
     -- Every flag takes a value: one missing (the last argument, or another
-    -- flag in its place) is refused, never read as unset.
+    -- flag in its place) is refused, never read as unset. A flag given twice
+    -- is refused too: which value was meant is not this script's to guess.
     if type(k) == "string" and k:match("^%-%-") and (v == nil or v:match("^%-%-")) then
       error(k .. " needs a value", 0)
     end
+    if seen[k] then error(tostring(k) .. " given twice", 0) end
+    seen[k] = true
     local function number(x) return assert(tonumber(x), k .. " must be a number, not " .. tostring(x)) end
     if k == "--dir" then a.dir = v elseif k == "--fit-dir" then a.fitDir = v
     elseif k == "--candidate" then a.candidate = v elseif k == "--out" then a.out = v
@@ -1009,22 +1013,31 @@ function M.checkDeferral(episodes, cfg)
   end
 end
 
+-- Clear a result path before a run writes one: already absent is fine
+-- (errno 2, no such file), but a path that cannot be cleared (permissions,
+-- a directory) refuses the run, since an earlier result left there would
+-- read as this run's.
+function M.clearResult(path)
+  local ok, err, code = os.remove(path)
+  if not ok and code ~= 2 then
+    error(string.format("cannot clear %s (%s): an earlier result left there would read as this run's",
+      path, tostring(err)), 0)
+  end
+end
+
 -- The CLI. Returns the exit status: 0 when the gate passes or the controls
 -- hold, 1 when the gate fails or a control does, 2 when the set is too small
 -- to decide (for the controls, or too weak to show the gate's power). A
 -- refusal raises, and the script then exits 3, so a refusal is never read as
 -- a verdict.
 function M.main(argv)
-  -- A gate's result file is this run's or nothing. One left at the path by an
-  -- earlier run would read as this run's verdict if this one is refused or
-  -- fails to write, so the path is cleared first, before any refusal.
-  if argv[1] == "gate" then
-    for i = 2, #argv - 1 do
-      if argv[i] == "--out" and not tostring(argv[i + 1]):match("^%-%-") then os.remove(argv[i + 1]) end
-    end
-  end
   local status = 0
   local a = parse(argv)
+  -- A gate's result file is this run's or nothing. One left at the path by an
+  -- earlier run would read as this run's verdict if this one is refused or
+  -- fails to write, so once the arguments parse, the path is cleared before
+  -- anything else. (A command line that does not parse touches nothing.)
+  if a.cmd == "gate" and a.out then M.clearResult(a.out) end
   assert(a.dir, "--dir is required")
   local eps = M.loadDir(a.dir)
   assert(#eps > 0, "no episodes in " .. a.dir)

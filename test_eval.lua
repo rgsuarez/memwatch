@@ -1146,6 +1146,24 @@ dofile("eval/score-episodes.lua")
   local staleRef = io.open(outFile, "r")
   if staleRef then staleRef:close() end
   check("cli: nor a refusal", staleRef == nil, true)
+  local function exists(path) local f = io.open(path, "r"); if f then f:close() end; return f ~= nil end
+  local saved, current = outFile .. "-saved", outFile .. "-current"
+  writePass(saved); writePass(current)
+  local twice = exitOf(gateCmd .. " --candidate always-freeze --out " .. q(saved) .. " --out " .. q(current))
+  check("cli: an --out given twice is refused, clearing neither path",
+    twice == 3 and exists(saved) and exists(current), true)
+  os.remove(saved); os.remove(current)
+  local locked = outFile .. "-locked"
+  os.execute("mkdir -p " .. q(locked))
+  writePass(locked .. "/result.json")
+  os.execute("chmod 555 " .. q(locked))
+  local lh = io.popen(gateCmd .. " --candidate always-freeze --out " .. q(locked .. "/result.json") .. " 2>&1; echo \"exit=$?\"")
+  local lockedSaid = lh:read("a")
+  lh:close()
+  os.execute("chmod 755 " .. q(locked))
+  check("cli: a result that cannot be cleared refuses the run, and says so",
+    lockedSaid:find("exit=3", 1, true) ~= nil and lockedSaid:find("cannot clear", 1, true) ~= nil, true)
+  os.execute("rm -rf " .. q(locked))
   check("cli: the harness's control, writing elsewhere, exits 2",
     exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
       .. " --candidate always-freeze --out " .. q(outFile)), 2)
@@ -1288,6 +1306,15 @@ printf '0.010 %s' "$status"
   if errFile then errFile:close() end
   check("runner: in run mode a server error fails the run, leaving no result, not even a stale one",
     okErr ~= true and errFile == nil, true)
+  local outRef = root .. "/run-refused.json"
+  local staleR = assert(io.open(outRef, "w"))
+  staleR:write('{"label":"t","stale":true}\n')
+  staleR:close()
+  os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --scenarios '%s' --retries -1 --out '%s' >/dev/null 2>&1", stubDir, log, corpus, outRef))
+  local refFile = io.open(outRef, "r")
+  if refFile then refFile:close() end
+  check("runner: a refusal once the path is known leaves no stale result either", refFile == nil, true)
   local leftovers = 0
   for _, dirScan in ipairs({ cwdRoot .. "/eval/results", root }) do
     local lp = io.popen("ls '" .. dirScan .. "' 2>/dev/null")
@@ -1295,17 +1322,45 @@ printf '0.010 %s' "$status"
     lp:close()
   end
   check("runner: a run's result is renamed into place, leaving no partial file", leftovers, 0)
-  -- A rename that fails (the path is a directory with something in it) fails
-  -- the run and leaves no partial file beside it.
+  -- An output that cannot be cleared (a directory with something in it)
+  -- refuses the run, which writes nothing.
   local blocked = root .. "/blocked-out"
   os.execute("mkdir -p '" .. blocked .. "/x'")
-  local okBlocked = os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
-    .. "--label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, corpus, blocked))
+  local bh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --scenarios '%s' --out '%s' 2>&1; echo \"exit=$?\"", stubDir, log, corpus, blocked))
+  local blockedSaid = bh:read("a")
+  bh:close()
   local bp = io.popen("ls '" .. root .. "' 2>/dev/null")
   local blockedPartials = 0
   for n in bp:lines() do if n:find("blocked-out.partial-", 1, true) then blockedPartials = blockedPartials + 1 end end
   bp:close()
-  check("runner: a result whose rename fails fails the run, leaving no partial", okBlocked ~= true and blockedPartials == 0, true)
+  check("runner: an output that cannot be cleared refuses the run, writing nothing",
+    blockedSaid:find("cannot clear", 1, true) ~= nil and not blockedSaid:find("exit=0", 1, true) and blockedPartials == 0, true)
+  -- A rename that fails (injected) fails the run and leaves no partial and
+  -- no result.
+  local rw = assert(io.open(root .. "/renamewrap.lua", "w"))
+  rw:write([[
+local target = os.getenv("FAIL_RENAME")
+local realRename = os.rename
+os.rename = function(a, b)
+  if target and tostring(b):sub(-#target) == target then return nil, "rename refused" end
+  return realRename(a, b)
+end
+arg[0] = "eval/bakeoff.lua"
+dofile("eval/bakeoff.lua")
+]])
+  rw:close()
+  local renameOut = root .. "/rename-fails.json"
+  local okRename = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='rename-fails.json' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, root .. "/renamewrap.lua", corpus, renameOut))
+  local rp2 = io.popen("ls '" .. root .. "' 2>/dev/null")
+  local renamePartials = 0
+  for n in rp2:lines() do if n:find("rename-fails.json.partial-", 1, true) then renamePartials = renamePartials + 1 end end
+  rp2:close()
+  local renameLanded = io.open(renameOut, "r")
+  if renameLanded then renameLanded:close() end
+  check("runner: a result whose rename fails fails the run, leaving no partial and no result",
+    okRename ~= true and renamePartials == 0 and renameLanded == nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 

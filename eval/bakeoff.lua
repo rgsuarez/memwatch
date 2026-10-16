@@ -41,10 +41,15 @@ local lfm = require("memwatch_lfm")
 
 local function parseArgs(argv)
   local args = { positional = {} }
+  local seen = {}
   local i = 1
   while i <= #argv do
     local a = argv[i]
     local key = a:match("^%-%-(.+)$")
+    -- A flag given twice is refused: which value was meant is not this
+    -- script's to guess.
+    if key and seen[key] then error("--" .. key .. " given twice", 0) end
+    if key then seen[key] = true end
     if key then
       if key == "no-schema" or key == "raw-names" or key == "redact-names" then
         -- --redact-names is the default now; it takes no value, so it never
@@ -293,6 +298,16 @@ local function runMode(args)
   local redactRun = lfm.cfg.redactNames == true and not args.raw_names
   local out = args.out or string.format("eval/results/%s-%s%s%s.json",
     label, variant, useSchema and "" or "-noschema", redactRun and "" or "-rawnames")
+  -- A rerun's file is the rerun's or nothing: a stale result left at the path
+  -- would read as this run's if it failed, so the path is cleared as soon as
+  -- it is known (only the label and the variant name it). The new one is
+  -- written whole, then renamed into place. Already absent is fine (errno
+  -- 2); a path that cannot be cleared refuses the run.
+  local okRm, errRm, codeRm = os.remove(out)
+  if not okRm and codeRm ~= 2 then
+    error(string.format("cannot clear %s (%s): an earlier result left there would read as this run's",
+      out, tostring(errRm)), 0)
+  end
   local serverPid = tonumber(args.server_pid)
 
   os.execute("mkdir -p eval/results eval/tmp")
@@ -317,10 +332,6 @@ local function runMode(args)
   local apiKey = readKey(args)
   local curlTimeout = tonumber(args.timeout) or 60
   local retries, retryWait = retryArgs(args)
-  -- A rerun's file is the rerun's or nothing: a stale result left at the path
-  -- would read as this run's if it failed. The new one is written whole, then
-  -- renamed into place.
-  os.remove(out)
 
   local rows = {}
   local wallTimes, tokRates = {}, {}

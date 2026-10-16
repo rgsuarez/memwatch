@@ -818,11 +818,28 @@ function M.resolveCandidate(name, baselines, a)
 end
 
 -- Returns the exit status: 0, or 1 when the gate fails or a control does.
+-- Episodes carry the deferral bound their labels were computed under; a
+-- scorer playing the floor at another bound would score them by rules
+-- they were not labeled by. (An episode file without it predates the
+-- record and is not checked.)
+function M.checkDeferral(episodes, cfg)
+  cfg = cfg or M.cfg
+  for _, ep in ipairs(episodes) do
+    local d = ep.params and ep.params.deferralSec
+    if d ~= nil and d ~= cfg.deferralSec then
+      error(string.format("%s was labeled under a %s s deferral bound; this scorer plays the floor at %s s",
+        tostring(ep.id), tostring(d), tostring(cfg.deferralSec)), 0)
+    end
+  end
+end
+
 function M.main(argv)
   local status = 0
   local a = parse(argv)
   assert(a.dir, "--dir is required")
   local eps = M.loadDir(a.dir)
+  assert(#eps > 0, "no episodes in " .. a.dir)
+  M.checkDeferral(eps)
   -- The tree baseline is fit on another split, never on the episodes it is
   -- scored on: a gate or a control run must name it, and it must not be the
   -- evaluated directory under another spelling.
@@ -832,6 +849,7 @@ function M.main(argv)
     assert(fitReal ~= M.realDir(a.dir), "--fit-dir is the evaluated directory; fit the tree on another split")
   end
   local fitEps = a.fitDir and M.loadDir(a.fitDir) or eps
+  M.checkDeferral(fitEps)
   -- A split with no runaway or no savable episode fits nothing: the tree
   -- would be one leaf and the ttx horizon its default, weakening the gate.
   if a.cmd == "gate" or a.cmd == "controls" then

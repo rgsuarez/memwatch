@@ -190,6 +190,12 @@ do
   end
   local waitAll = function() return "wait" end
   check("play: one alert's waits reach the floor", sc.play(seqEp(1, 1, 1), waitAll).by, "floor")
+  check("deferral: an episode labeled under another bound is refused",
+    (pcall(sc.checkDeferral, { { id = "x", params = { deferralSec = sc.cfg.deferralSec - 30 } } })), false)
+  check("deferral: one labeled under this bound is scored",
+    (pcall(sc.checkDeferral, { { id = "x", params = { deferralSec = sc.cfg.deferralSec } } })), true)
+  check("deferral: a generated episode records its bound",
+    gen.episode(dofile("eval/episode-templates.lua")[1], 1, "test").params.deferralSec, sc.cfg.deferralSec)
   check("play: a new alert starts the deferral over", sc.play(seqEp(1, 1, 2), waitAll).freezeAt, nil)
   -- The power control mixes the oracle into a baseline by episode.
   local af = sc.candidates["always-freeze"]()

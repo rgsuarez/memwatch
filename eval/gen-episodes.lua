@@ -524,7 +524,9 @@ function M.episode(tpl, seed, split, cfg)
     params = { avail0 = math.floor(p.avail0 * 10) / 10, w0 = math.floor(p.w0),
                wAt0 = math.floor(p.wAt0), climbSec = p.climbSec,
                age0 = p.age0, after = p.after, growthEnd = math.floor(p.growthEnd * 10) / 10,
-               releaseAt = p.releaseAt and math.floor(p.releaseAt * 10) / 10 or nil },
+               releaseAt = p.releaseAt and math.floor(p.releaseAt * 10) / 10 or nil,
+               -- the bound the labels were computed under (the scorer checks it)
+               deferralSec = cfg.deferralSec },
     steps = steps,
   }
 end

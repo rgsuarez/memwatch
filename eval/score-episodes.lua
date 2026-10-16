@@ -11,7 +11,9 @@
 --
 --   missed runaway   a runaway whose first freeze lands after ttxSec (or never)
 --   wrongful freeze  any freeze on a savable episode (it would have resolved)
---   late episodes    excluded from both (the floor catches them regardless)
+--   late episodes    excluded from both: they resolve on their own, but only
+--                    after the deferral bound, so neither answer is clearly
+--                    right (a starving plateau is a runaway, never late)
 --
 -- G7 passes when the miss rate's one-sided 95% Clopper-Pearson upper bound
 -- is at most 5% AND the candidate's wrongful-freeze rate beats the best

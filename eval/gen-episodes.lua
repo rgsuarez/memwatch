@@ -23,18 +23,18 @@
 --
 --   runaway       the trajectory exhausts the machine (availability <= the
 --                 exhaustion floor) at or before it resolves, or it is a
---                 hold that settles at or below the starvation line, read
---                 as the snapshot reports availability (whole percent,
---                 floored). A plateau that releases within the deferral
---                 bound is not starving: it resolves on its own
+--                 plateau at or below the starvation line that lasts past
+--                 the deferral bound, read as the snapshot reports
+--                 availability (whole percent, floored). A plateau that
+--                 releases within the bound is not starving: it resolves
 --   ttxSec        seconds from t = 0 to exhaustion (runaways); a starving
 --                 plateau is given the deferral bound (it must be frozen by
 --                 then)
 --   resolvesBySec seconds until the offender exits, releases, or stops
 --                 growing (non-runaways)
 --   class         runaway | savable (resolves within the deferral bound
---                 without exhausting) | late (resolves after it; excluded
---                 from the wrongful-freeze count)
+--                 without exhausting) | late (resolves after it, never at
+--                 the starvation line; excluded from both counts)
 --
 -- Decision points exist only where production would make one: the process
 -- is alive, availability is above the exhaustion floor, and PRODUCTION's
@@ -391,14 +391,15 @@ function M.simulate(p, cfg)
   local ttx = exhaustAt(p, cfg)
   -- Resolution: exit/release time, else the end of growth for a hold.
   local resolve = p.releaseAt or p.growthEnd
-  -- A hold that settles at or below the starvation line starves the
-  -- machine for good. The line is read as the snapshot reports
-  -- availability (whole percent, floored), so a plateau the model sees at
-  -- the line is labeled at the line. A plateau that releases within the
-  -- deferral bound is not starving: it resolves, and freezing it would only
-  -- keep it from releasing.
-  local plateau = (p.releaseAt == nil) and M.availAt(p, p.growthEnd, cfg) or nil
-  local starving = plateau ~= nil and math.floor(plateau) <= cfg.starvePct
+  -- A plateau at or below the starvation line that lasts past the deferral
+  -- bound (a hold, or a release or exit after the bound) starves the
+  -- machine. The line is read as the snapshot reports availability (whole
+  -- percent, floored), so a plateau the model sees at the line is labeled
+  -- at the line. A plateau that releases within the bound is not starving:
+  -- it resolves, and freezing it would only keep it from releasing.
+  local plateau = M.availAt(p, p.growthEnd, cfg)
+  local lasts = (p.releaseAt == nil) or (p.releaseAt > cfg.deferralSec)
+  local starving = lasts and math.floor(plateau) <= cfg.starvePct
   local runaway = M.exhaustsFirst(ttx, resolve, p.releaseAt ~= nil) or starving
   local class
   if runaway then

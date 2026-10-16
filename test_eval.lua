@@ -301,6 +301,9 @@ do
   check("labels: a plateau under the line that releases in time resolves",
     gen.simulate(params({ avail0 = 8.5, phases = { { dur = 2, rate = 150 } },
                           after = "release", releaseAt = 60 })).class, "savable")
+  check("labels: one that releases only after the deferral bound starves the machine past it",
+    gen.simulate(params({ avail0 = 8.5, phases = { { dur = 2, rate = 150 } },
+                          after = "release", releaseAt = 150 })).class, "runaway")
 end
 
 -- ---- eligibility, state and footprint, from production's own logic ----

@@ -138,6 +138,14 @@ local function privateDir()
   return dir
 end
 
+-- Reserve an output file atomically: create it only if it does not exist
+-- (the shell's noclobber opens with O_EXCL), so of two runs racing for one
+-- path exactly one wins and the other never truncates its rows. Returns
+-- true, or false when the file exists or cannot be created.
+local function reserveOutput(path)
+  return os.execute("{ set -C; : > " .. shellQuote(path) .. "; } 2>/dev/null") == true
+end
+
 local function withAuthHeader(key, fn)
   if not key then return fn(nil) end
   local dir = privateDir()
@@ -418,9 +426,11 @@ local function episodesMode(args)
     "--api must be chat, systemone or completion")
   local variant = args.variant or "discriminate"
   local out = args.out or string.format("eval/results/episodes-%s-%s.jsonl", label, api)
-  -- One run's decisions per file: another run's file is never truncated.
-  local prior = io.open(out, "r")
-  if prior then prior:close(); error(out .. " exists; name another --out or remove it", 0) end
+  -- One run's decisions per file, reserved atomically: another run's file
+  -- is never truncated, even by a run racing for the same path.
+  if not reserveOutput(out) then
+    error(out .. " exists or cannot be created; name another --out or remove it", 0)
+  end
   local timeout = tonumber(args.timeout) or 60
   os.execute("mkdir -p eval/results eval/tmp")
   local files = listScenarios(dir)
@@ -717,4 +727,4 @@ if arg and arg[0] and arg[0]:match("bakeoff%.lua$") then
   end
 end
 
-return { privateDir = privateDir, episodes = episodesMode }
+return { privateDir = privateDir, reserveOutput = reserveOutput, episodes = episodesMode }

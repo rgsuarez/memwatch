@@ -554,6 +554,14 @@ do
   os.remove(out)
   check("runner output: an existing file is refused", ok == false and tostring(err):find("exists", 1, true) ~= nil, true)
   check("runner output: and left as it was", body, "another run's rows\n")
+  -- The reservation is atomic: the first claim on a path wins, a second
+  -- (a racing run) is refused, and a path that cannot be created is too.
+  local dir = bk.privateDir()
+  local path = dir .. "/rows.jsonl"
+  check("runner output: a fresh path is reserved", bk.reserveOutput(path), true)
+  check("runner output: a second claim on it is refused", bk.reserveOutput(path), false)
+  check("runner output: an uncreatable path is refused", bk.reserveOutput(dir .. "/missing/rows.jsonl"), false)
+  os.execute("rm -rf '" .. dir .. "'")
 end
 
 if fails == 0 then

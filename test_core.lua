@@ -3311,6 +3311,13 @@ do
     (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.05 }, { "waiting", 0.94 }, { "free", 0.01 } }))), nil)
   check("tokenprob parse: a word only beginning like freeze is not freeze",
     (lfm.parseTokenProbs(tpReply("freedom", { { "freedom", 0.6 }, { "wait", 0.4 } }))), nil)
+  -- A tokenizer may cut the value's first piece to one or two characters.
+  check("tokenprob parse: a one-character first piece",
+    (lfm.parseTokenProbs(tpReply("w", { { "w", 0.7 }, { "fr", 0.3 } })) or {}).action, "wait")
+  check("tokenprob parse: its alternatives count by the option they start",
+    math.abs(((lfm.parseTokenProbs(tpReply("w", { { "w", 0.7 }, { "fr", 0.3 } })) or {}).pWait or -1) - 0.7) < 1e-6, true)
+  check("tokenprob parse: a two-character fused piece",
+    (lfm.parseTokenProbs(tpReply('"te', { { '"te', 0.6 }, { '"w', 0.4 } }, { '{"', "action", '":' })) or {}).action, "terminate")
   check("tokenprob parse: the option closed by its quote in one token",
     (lfm.parseTokenProbs(tpReply('wait"', { { 'wait"', 0.9 }, { "free", 0.1 } })) or {}).action, "wait")
   check("tokenprob parse: a tokenizer fusing the opening quote with the value",

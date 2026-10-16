@@ -739,8 +739,10 @@ end
 
 -- Which option a candidate token at the action value starts: the whole
 -- option word, alone or closed by the value's quote (JSON may follow), or
--- the start of the word a tokenizer cut (at least 3 characters). A longer
--- word that merely begins like one ("waiting", "freedom") is none of them.
+-- the start of the word a tokenizer cut. Any cut start names exactly one
+-- option, since their first letters differ (w, f, t), so even a one-letter
+-- piece decides. A longer word that merely begins like one ("waiting",
+-- "freedom") is none of them.
 -- quoted: the token also carries the value's opening quote (a tokenizer
 -- that fuses the two).
 local OPTION_WORDS = { "wait", "freeze", "terminate" }
@@ -753,7 +755,7 @@ local function optionOf(tok, quoted)
   end
   for _, word in ipairs(OPTION_WORDS) do
     if tok == word or tok:sub(1, #word + 1) == word .. '"' then return word end
-    if #tok >= 3 and #tok < #word and word:sub(1, #tok) == tok then return word end
+    if #tok >= 1 and #tok < #word and word:sub(1, #tok) == tok then return word end
   end
   return nil
 end

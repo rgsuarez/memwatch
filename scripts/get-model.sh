@@ -6,8 +6,8 @@
 #
 # Every download goes through the registry: repo, filename, and pinned
 # sha256 come from the row, never from arguments. A hash mismatch deletes
-# the download and fails. The license text is fetched alongside the first
-# model and verified against its pinned hash.
+# the download and fails. The license text is fetched and verified against
+# its pinned hash on every run, before anything is downloaded.
 set -euo pipefail
 
 LABEL="${1:?usage: get-model.sh <label> [dest-dir]}"

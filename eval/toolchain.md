@@ -54,7 +54,8 @@ end-to-end).
 - Dev model `LFM2.5-230M-Q4_K_M.gguf`: 153,406,304 bytes, sha256
   `7bbd90384d3deffe4c646ec9643b212802d32d4ce417c90a1ec9282100650062`,
   pinned in `scripts/models.tsv` (fetched via its registry row).
-- All eight registry resolve URLs verified HTTP 200 before pinning.
+- Every registry row's resolve URL verified HTTP 200 before pinning (eight
+  rows then; ten now).
 - License text (`licenses/LFM-Open-License-v1.0.txt`, 71 lines) fetched
   from the model repo; sha256 pinned per registry row.
 - Ephemeral-port spawn + listener-pid ownership check verified: `lsof

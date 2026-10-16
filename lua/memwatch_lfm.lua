@@ -357,8 +357,9 @@ function M.jsonDecode(s)
 end
 
 ------------------------------------------------------------------------------
--- System prompt: three variants share the same pinned safety clauses (the
--- injection-wording regression test asserts each clause verbatim).
+-- System prompt: four variants share the same pinned safety clauses (the
+-- injection-wording regression test asserts each clause verbatim);
+-- discriminate replaces the plateau clause with its own.
 ------------------------------------------------------------------------------
 
 local CLAUSE_ONE_TARGET = "You adjudicate exactly ONE pre-selected process; you cannot choose a different target."

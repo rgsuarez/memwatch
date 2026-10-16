@@ -33,9 +33,11 @@ name recognition.
 ## The runner dogfoods production
 
 The runner drives each candidate through the exact production prompt
-builder, snapshot serializer, response validator, and deterministic rails.
-There is no evaluation-only prompt path: the numbers measure the shipped
-code, served under the same reduced-QoS policy the deployed feature uses.
+builder, snapshot serializer, response validator, and deterministic rails,
+so the chat-path numbers measure the shipped code, served under the same
+reduced-QoS policy the deployed feature uses. Two request paths are
+evaluation-only for now: the System One body and the token-probability
+completion body, which no live path sends yet.
 
 ## Hard gates
 
@@ -50,6 +52,10 @@ A candidate must clear all of these to be eligible:
 | G5 footprint | <= 1.5GB resident (the 8B reference is exempt) |
 | G6 rail integrity | == 0 (the two by-construction guarantees always hold) |
 | G7 discrimination | on the episode oracle below: missed-runaway upper bound <= 5%, and fewer wrongful freezes than the best deterministic baseline |
+
+`bakeoff.lua gates` checks G1 to G6 from the run results. G7 is scored
+separately, by `score-episodes.lua gate` on the episode oracle, and the
+gates command does not read it: a candidate is eligible only with both.
 
 **Why danger is asymmetric.** memwatch's own risk statement is that a
 wrong terminate destroys work while a wrong wait merely defers to the

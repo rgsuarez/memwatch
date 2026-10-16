@@ -537,10 +537,24 @@ local CATEGORY_RULES = {
                          "^notion" } },
 }
 
+-- A name's lowercased basename (trailing slashes dropped, whitespace
+-- trimmed), by byte scans: linear in the name, whatever it holds. A process
+-- can give itself any name of any length, and a backtracking pattern over a
+-- long run without a slash costs time quadratic in it, on the tick. No
+-- known family has a long basename, so past MAX_BASENAME nothing is claimed.
+local MAX_BASENAME = 256
+local function isSpace(c) return c == 32 or (c >= 9 and c <= 13) end
 local function basenameLower(s)
   if type(s) ~= "string" then return "" end
-  s = s:match("([^/]*)/*$") or s
-  return (s:lower():gsub("^%s+", ""):gsub("%s+$", ""))
+  local e = #s
+  while e > 0 and s:byte(e) == 47 do e = e - 1 end
+  local b = e
+  while b > 0 and s:byte(b) ~= 47 do b = b - 1 end
+  local i, j = b + 1, e
+  while i <= j and isSpace(s:byte(i)) do i = i + 1 end
+  while j >= i and isSpace(s:byte(j)) do j = j - 1 end
+  if j - i + 1 > MAX_BASENAME then return "" end
+  return s:sub(i, j):lower()
 end
 
 local function ruleCategory(base)

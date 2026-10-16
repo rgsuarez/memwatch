@@ -318,6 +318,24 @@ do
   local long = procs.parseTop("4242  a" .. (" "):rep(40000) .. "b  12M  0B\n1372   Terminal         944M  522M\n")
   check("top: a line longer than any row is refused in linear time", os.clock() - t0 < 0.25 and long[4242] == nil, true)
   check("top: the rows beside it still parse", long[1372] and long[1372].memMB, 944)
+  -- The cap's edge: a row of exactly 512 bytes parses, name whole; 513 does not.
+  local function rowOf(n)
+    local head, tail = "4242  ", "  12M  0B"
+    return head .. ("x"):rep(n - #head - #tail) .. tail
+  end
+  local at512 = procs.parseTop(rowOf(512) .. "\n")[4242]
+  check("top: a row of 512 bytes parses, its name whole", at512 and #at512.name, 512 - 6 - 9)
+  check("top: one of 513 is refused", procs.parseTop(rowOf(513) .. "\n")[4242], nil)
+  -- The live path is the stream: a block holding the long line between two
+  -- rows publishes promptly, without it, and keeps its neighbors.
+  local st = procs.newTopStream()
+  local t1 = os.clock()
+  procs.feedTopStream(st, "PID    COMMAND          MEM   CMPRS\n1372   Terminal         944M  522M\n")
+  local pub = procs.feedTopStream(st, "4242  a" .. (" "):rep(40000) .. "b  12M  0B\n600    WindowServer     1250M+ 206M\n"
+    .. "PID    COMMAND          MEM   CMPRS\n")
+  check("top stream: a block with a line longer than any row publishes in linear time", os.clock() - t1 < 0.25, true)
+  check("top stream: without it, keeping its neighbors",
+    pub ~= nil and pub[4242] == nil and pub[1372] ~= nil and pub[600] ~= nil, true)
 end
 
 -- ---- procs: growth detection (three-case floor) ----
@@ -1015,7 +1033,8 @@ do
   check("probe: a comm with a long whitespace run is read in linear time", os.clock() - t0 < 0.25, true)
   check("probe: and kept whole", long, "a" .. (" "):rep(40000) .. "b")
   check("probe: a comm's trailing whitespace is trimmed", commOf("node \t "), "node")
-  check("probe: every whitespace byte is trimmed, and only those", commOf("node\v\f\r") .. "|" .. commOf("node\xa0"), "node|node\xa0")
+  check("probe: every whitespace byte is trimmed", commOf("node\v\f\r"), "node")
+  check("probe: and only those", commOf("node\xa0"), "node\xa0")
   check("probe: its leading whitespace is the separator's", commOf("   node"), "node")
   check("probe: a row that ends after the start time has an empty comm", commOf(""), "")
   check("probe: one that ends at the year, with no separator, makes the reply unknown",

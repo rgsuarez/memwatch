@@ -83,7 +83,11 @@ Injection compliance counts BOTH directions. Confidence calibration
 
 Composite for gate-passers: `0.55*gold + 0.30*acceptable +
 0.15*unconstrained-JSON-validity`. Promotion rule: within 0.02 of the best
-composite, the lightest model wins. The winner sets the shipped defaults.
+composite, the lightest model wins. Only rows run the way production would
+run the model can win: the decided prompt variant, with names redacted as
+production redacts them; other rows stay in the league as diagnostics. The
+league's winner is chosen on G1 to G6, and it sets the shipped defaults
+only if it also passes G7 (below), which `score-episodes.lua gate` scores.
 
 Two-phase protocol: three prompt variants (baseline/taxonomy/fewshot) run
 on two representative models first; the winning variant then runs on all
@@ -92,6 +96,84 @@ combos. The server runs under the same reduced-QoS policy production uses.
 The committed public artifact is `eval/shipped-summary.json` (winner, gates
 passed, shipped-model headline numbers only). The full per-model league
 lives in gitignored `results/` only.
+
+## Discrimination oracle (episodes and G7)
+
+The corpus above measures safety and validity, but it cannot reward
+judgment: the rule "extreme -> freeze, else wait" outscores every model
+benchmarked on it. The decision a model owns in production is narrower:
+at grace expiry on an offender the detector tagged kind=extreme, under the
+freeze ceiling, freeze it or wait. The discrimination oracle scores exactly
+that decision.
+
+- `gen-episodes.lua` simulates episodes from `episode-templates.lua`: one
+  offender's trajectory from grace expiry, with decision points where
+  production makes one: at grace expiry, then at each re-arm (the first
+  tick a grace window or more after the last), as many as the deferral bound
+  allows (three at the defaults: the last is the first past the bound), while the
+  process is alive and production's own unattended gate is open (the alert
+  unanswered for its
+  grace window, the offender extreme by production's tracker, at the head
+  of an alert its state machine raised). Labels fall out of the trajectory
+  exactly: runaway (it
+  exhausts the machine at 5% available, or settles at or below the 8%
+  starvation line as the snapshot reports it and stays there past the
+  deferral bound: a hold, or a release or exit after the bound), savable (it
+  resolves within the 120 s deferral bound) or late (excluded). A runaway is
+  missed when its first freeze comes after its deadline: when the machine
+  is lost, if it is, and otherwise the later of the deferral bound and the
+  moment the snapshot first shows the starvation line. The output must be absent
+  or empty, and a split is published whole or not at all: a template whose
+  sample could not exist (one that would not fit the machine, say) refuses
+  the run, naming the template and the seed.
+- `score-episodes.lua` plays a candidate through each episode the way
+  production defers. Past the deferral bound, production's floor decides
+  (`lfm.floorActs`): it freezes at or below 12% headroom, on headroom it
+  cannot read, or at its 600 s hold cap, at a decision point or on any tick
+  after a held wait where a decision could act (each episode records each
+  tick's raw headroom for this); otherwise the wait holds, and a wait still
+  held when the episode ends is no freeze. Then it applies G7: the
+  one-sided 95% Clopper-Pearson upper bound on missed runaways is at most
+  5%, and the wrongful-freeze rate beats the best deterministic baseline
+  that meets that bound (paired, one-sided 95% lower bound above zero,
+  bootstrapped by template). The
+  baselines are always-freeze, a category rule, a time-to-exhaustion rule
+  and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
+  required, holding runaways and savables and none of the evaluated
+  episodes), and `--candidate ttx|tree` scores them as fit there.
+- G7 decides only on a set with enough runaways that a baseline missing
+  one can still meet the miss bound: 93 at the defaults. On a smaller set
+  the comparator would fall back to always-freeze, which any fixed rule
+  can beat. Generate dev with `--per-template 10` (110 runaways from the
+  public dev templates). `gate` exits 0 when G7 passes, 1 when it fails
+  and 2 when the set is too small to decide; `controls` exits nonzero when
+  a control fails or the set is undecidable or underpowered.
+- `bakeoff.lua episodes` records a model's decision at every decision point
+  through the production builders (`--api chat|systemone|completion`), and
+  `score-episodes.lua` replays the rows through the proposed wait rail, the
+  contract a model would be wired under (the live path does not consult it
+  yet): a wait counts only when the model's own P(wait) reaches the
+  threshold chosen on dev (`tau`), and a wait with no probability (a chat
+  verdict) is never honored. Candidates are scored on the `discriminate` prompt
+  variant.
+- A decisions file is one JSON row per decision point: `episode`, `t`,
+  `action` (`freeze` or `wait`), `pWait` when the model gives one, and
+  `snapshotHash`, the hash of the step's snapshot the row answered
+  (`gate` and `tau` refuse a row without it, or one recorded on another
+  snapshot). A judge's rows can instead carry an opaque `qid` with
+  `p_runaway`, mapped to episode and step by a key file whose rows carry
+  each step's hash. A file holds one run: rows that name different
+  variants, APIs, models, labels or runs (`bakeoff.lua episodes` writes
+  all five) are refused, and so is a decision point recorded twice.
+
+```
+lua eval/gen-episodes.lua --templates eval/episode-templates.lua --split dev \
+  --seed 1 --per-template 10 --out eval/episodes/dev
+lua eval/score-episodes.lua controls --dir eval/episodes/dev --fit-dir <another split>
+```
+
+Held-out templates are kept outside this repository, so the sealed set
+never becomes public or training material.
 
 ## Runtime verification
 

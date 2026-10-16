@@ -14,9 +14,13 @@ reports/
 
 # Evaluation artifacts: full results and panel workspaces stay local.
 eval/results/
+eval/episodes/
 eval/tmp/
 eval/panel/
 eval/checks/internal-terms.txt
 
+# Per-repo license copies fetched by scripts/get-model.sh (the tracked
+# LFM Open License text stays canonical).
+licenses/*.LICENSE
 # Scratch homes the fake Hammerspoon creates when /tmp is not writable.
 .hsfake.*

@@ -159,7 +159,10 @@ that decision.
   2 when the set is too small to decide, and 3 when it refuses its input
   (a bad flag, a set it cannot read, decisions that do not answer the
   episodes); `controls` exits nonzero when a control fails or the set is
-  undecidable or underpowered.
+  undecidable or underpowered. A split holds each episode once: a
+  directory with the same episode twice (a copied file, or the episode
+  under another id) is refused, since a copy would count twice toward the
+  decisive size.
 - `bakeoff.lua episodes` records a model's decision at every decision point
   through the production builders (`--api chat|systemone|completion`), and
   `score-episodes.lua` replays the rows through the proposed wait rail, the

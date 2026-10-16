@@ -647,14 +647,39 @@ end
 -- scoring and the gate
 ------------------------------------------------------------------------------
 
+-- An episode's identity, for the duplicate and overlap checks: its inputs
+-- (each step's time and snapshot) and its outcome labels. The inputs alone,
+-- so a field a later generator adds to a step (alertSeq, say) cannot make an
+-- older copy of the same episode look new.
+function M.fingerprint(ep)
+  local L = ep.labels or {}
+  local inputs = {}
+  for i, st in ipairs(ep.steps or {}) do inputs[i] = { t = st.t, snapshot = st.snapshot } end
+  return lfm.jsonEncode({ steps = lfm.jsonArray(inputs), class = L.class, runaway = L.runaway,
+                          ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
+end
+
+-- Every episode in a directory, each once: a copied file (the same episode
+-- under another file name or id) would be scored twice, counting toward the
+-- decisive size and the miss bound, so a directory holding one is refused.
 function M.loadDir(dir)
   local eps = {}
+  local byId, byPrint = {}, {}
   local p = io.popen("ls '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
   for name in p:lines() do
     if name:match("%.json$") then
       local f = assert(io.open(dir .. "/" .. name, "r"))
-      eps[#eps + 1] = assert(lfm.jsonDecode(f:read("a")))
+      local ep = assert(lfm.jsonDecode(f:read("a")))
       f:close()
+      local fp = M.fingerprint(ep)
+      local first = (ep.id ~= nil and byId[ep.id]) or byPrint[fp]
+      if first then
+        p:close()
+        error(string.format("%s holds the same episode twice (%s and %s): score each episode once", dir, first, name), 0)
+      end
+      if ep.id ~= nil then byId[ep.id] = name end
+      byPrint[fp] = name
+      eps[#eps + 1] = ep
     end
   end
   p:close()
@@ -987,20 +1012,11 @@ function M.main(argv)
     -- label, or a copy with only its descriptive fields edited. Episodes
     -- are compared by their inputs and outcome labels, and by id, which
     -- fails safe.
-    -- The inputs alone (each step's time and snapshot), so a field a later
-    -- generator adds to a step (alertSeq, say) cannot make an older copy of
-    -- the same episode look new.
-    local function fingerprint(ep)
-      local L = ep.labels or {}
-      local inputs = {}
-      for i, st in ipairs(ep.steps or {}) do inputs[i] = { t = st.t, snapshot = st.snapshot } end
-      return lfm.jsonEncode({ steps = lfm.jsonArray(inputs), class = L.class, runaway = L.runaway,
-                              ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
-    end
+    -- (M.fingerprint: the inputs and the outcome labels.)
     local scored, scoredIds = {}, {}
-    for _, ep in ipairs(eps) do scored[fingerprint(ep)] = ep.id; scoredIds[ep.id] = true end
+    for _, ep in ipairs(eps) do scored[M.fingerprint(ep)] = ep.id; scoredIds[ep.id] = true end
     for _, ep in ipairs(fitEps) do
-      local twin = scored[fingerprint(ep)]
+      local twin = scored[M.fingerprint(ep)]
       assert(not twin and not scoredIds[ep.id], "--fit-dir holds " .. tostring(ep.id) .. ", the same episode as "
         .. tostring(twin or ep.id) .. " in the evaluated set")
     end

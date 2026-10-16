@@ -936,7 +936,7 @@ do
     local lf = assert(io.open(late .. "/late-" .. i .. ".json", "w"))
     lf:write(lfm.jsonEncode({ id = "late-" .. i, template = "T", family = "f",
       labels = { class = "late", runaway = false, resolvesBySec = 150 },
-      steps = lfm.jsonArray({ { t = 0, snapshot = { availPct = 20 } } }) }), "\n")
+      steps = lfm.jsonArray({ { t = 0, snapshot = { availPct = 20 + i } } }) }), "\n")
     lf:close()
   end
   local copy = tmpDir()
@@ -1004,6 +1004,29 @@ do
     okEmpty == false and tostring(errEmpty):find("cannot be fit", 1, true) ~= nil, true)
   check("cli: so is one with only late episodes",
     okLate == false and tostring(errLate):find("cannot be fit", 1, true) ~= nil, true)
+  -- A split holds each episode once: a copied file (the same id) or the same
+  -- episode under another id is refused, naming both files, rather than
+  -- scored twice toward the decisive size.
+  local dupId, dupPrint = tmpDir(), tmpDir()
+  os.execute("cp '" .. held .. "'/*.json '" .. dupId .. "'/")
+  os.execute("cp '" .. held .. "'/*.json '" .. dupPrint .. "'/")
+  local one = sc.loadDir(held)[1]
+  local cf = assert(io.open(dupId .. "/" .. one.id .. " copy.json", "w"))
+  cf:write(lfm.jsonEncode(one), "\n")
+  cf:close()
+  local other = lfm.jsonDecode(lfm.jsonEncode(one))
+  other.id = one.id .. "-again"
+  local of = assert(io.open(dupPrint .. "/" .. other.id .. ".json", "w"))
+  of:write(lfm.jsonEncode(other), "\n")
+  of:close()
+  local okDupId, errDupId = pcall(sc.loadDir, dupId)
+  local okDupPrint, errDupPrint = pcall(sc.loadDir, dupPrint)
+  check("cli: a split holding a copied episode file is refused",
+    okDupId == false and tostring(errDupId):find("the same episode twice", 1, true) ~= nil
+      and tostring(errDupId):find(one.id .. " copy.json", 1, true) ~= nil, true)
+  check("cli: so is the same episode under another id",
+    okDupPrint == false and tostring(errDupPrint):find("the same episode twice", 1, true) ~= nil, true)
+  check("cli: a split of distinct episodes still loads", #sc.loadDir(held) > 0, true)
   -- As a script, the gate's exit status tells the outcomes apart: 2 for a
   -- set too small to decide, 3 for a refusal (never 1, a gate that failed),
   -- and 3 when the result file does not reach the disk.
@@ -1015,6 +1038,8 @@ do
   local gateCmd = "lua eval/score-episodes.lua gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
   check("cli: as a script, a set too small to decide exits 2", exitOf(gateCmd .. " --candidate always-freeze"), 2)
   check("cli: and a refusal exits 3", exitOf(gateCmd .. " --candidate no-such-candidate"), 3)
+  check("cli: so does a split holding an episode twice",
+    exitOf("lua eval/score-episodes.lua gate --dir " .. q(dupId) .. " --fit-dir " .. q(dev) .. " --candidate oracle"), 3)
   local fwrap = os.tmpname()
   local fw = assert(io.open(fwrap, "w"))
   fw:write([[
@@ -1040,6 +1065,7 @@ dofile("eval/score-episodes.lua")
     exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
       .. " --candidate always-freeze --out " .. q(outFile)), 2)
   os.remove(fwrap); os.remove(outFile)
+  os.execute("rm -rf '" .. dupId .. "' '" .. dupPrint .. "'")
   os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "' '" .. relabeled .. "' '" .. edited .. "' '" .. older .. "'")
 end
 

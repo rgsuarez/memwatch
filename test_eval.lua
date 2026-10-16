@@ -1004,6 +1004,42 @@ do
     okEmpty == false and tostring(errEmpty):find("cannot be fit", 1, true) ~= nil, true)
   check("cli: so is one with only late episodes",
     okLate == false and tostring(errLate):find("cannot be fit", 1, true) ~= nil, true)
+  -- As a script, the gate's exit status tells the outcomes apart: 2 for a
+  -- set too small to decide, 3 for a refusal (never 1, a gate that failed),
+  -- and 3 when the result file does not reach the disk.
+  local function exitOf(cmd)
+    local ok2, _, code = os.execute(cmd .. " >/dev/null 2>&1")
+    return ok2 and 0 or code
+  end
+  local function q(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
+  local gateCmd = "lua eval/score-episodes.lua gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+  check("cli: as a script, a set too small to decide exits 2", exitOf(gateCmd .. " --candidate always-freeze"), 2)
+  check("cli: and a refusal exits 3", exitOf(gateCmd .. " --candidate no-such-candidate"), 3)
+  local fwrap = os.tmpname()
+  local fw = assert(io.open(fwrap, "w"))
+  fw:write([[
+local target = os.getenv("FAIL_OUT")
+local realOpen = io.open
+io.open = function(path, m)
+  local f, e = realOpen(path, m)
+  if f and path == target and m == "w" then
+    return { write = function() return true end,
+             close = function() f:close(); return nil, "No space left on device" end }
+  end
+  return f, e
+end
+arg[0] = "eval/score-episodes.lua"
+dofile("eval/score-episodes.lua")
+]])
+  fw:close()
+  local outFile = os.tmpname()
+  check("cli: a result file whose close fails exits 3",
+    exitOf("FAIL_OUT=" .. q(outFile) .. " lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+      .. " --candidate always-freeze --out " .. q(outFile)), 3)
+  check("cli: the harness's control, writing elsewhere, exits 2",
+    exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+      .. " --candidate always-freeze --out " .. q(outFile)), 2)
+  os.remove(fwrap); os.remove(outFile)
   os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "' '" .. relabeled .. "' '" .. edited .. "' '" .. older .. "'")
 end
 
@@ -1139,16 +1175,16 @@ do
   for _, f in ipairs({ "bakeoff", "gen-episodes", "score-episodes" }) do
     os.execute(string.format("ln -s '%s/eval/%s.lua' '%s/%s-renamed.lua'", here, f, base, f))
   end
-  -- Each refuses a run with no arguments (exit 1); a CLI that ran nothing
-  -- would exit 0.
+  -- Each refuses a run with no arguments (the runner and the generator exit
+  -- 1, the scorer 3, its refusal status); a CLI that ran nothing would exit 0.
   check("cli: the runner under another name still runs", status("lua '" .. base .. "/bakeoff-renamed.lua'"), 1)
   check("cli: so does the generator", status("lua '" .. base .. "/gen-episodes-renamed.lua'"), 1)
-  check("cli: and the scorer", status("lua '" .. base .. "/score-episodes-renamed.lua'"), 1)
+  check("cli: and the scorer", status("lua '" .. base .. "/score-episodes-renamed.lua'"), 3)
   -- The other spellings of the same script: a ./ path, and a symlinked
-  -- directory (each refuses an empty run, so exit 1 means it ran).
+  -- directory (each refuses an empty run, so exit 3 means it ran).
   os.execute(string.format("ln -s '%s/eval' '%s/evlink'", here, base))
-  check("cli: a ./ path runs the scorer", status("lua ./eval/score-episodes.lua"), 1)
-  check("cli: so does a path through a symlinked directory", status("lua '" .. base .. "/evlink/score-episodes.lua'"), 1)
+  check("cli: a ./ path runs the scorer", status("lua ./eval/score-episodes.lua"), 3)
+  check("cli: so does a path through a symlinked directory", status("lua '" .. base .. "/evlink/score-episodes.lua'"), 3)
   -- A script whose own name ends like the scorer's only requires it.
   local w = assert(io.open(base .. "/my-score-episodes.lua", "w"))
   w:write('package.path = "eval/?.lua;" .. package.path\nrequire("score-episodes")\nprint("required")\n')

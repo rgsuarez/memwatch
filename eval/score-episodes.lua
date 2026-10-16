@@ -939,7 +939,6 @@ function M.resolveCandidate(name, baselines, a)
   error("unknown candidate " .. name)
 end
 
--- Returns the exit status: 0, or 1 when the gate fails or a control does.
 -- Episodes carry the deferral bound their labels were computed under; a
 -- scorer playing the floor at another bound would score them by rules
 -- they were not labeled by. (An episode file without it predates the
@@ -955,6 +954,10 @@ function M.checkDeferral(episodes, cfg)
   end
 end
 
+-- The CLI. Returns the exit status: 0 when the gate passes or the controls
+-- hold, 1 when the gate fails or a control does, 2 when the set is too small
+-- to decide. A refusal raises, and the script then exits 3, so a refusal is
+-- never read as a verdict.
 function M.main(argv)
   local status = 0
   local a = parse(argv)
@@ -1040,12 +1043,14 @@ function M.main(argv)
       or " (no horizon can meet the miss bound on a split this small: fit on its fewest misses)"))
     if a.out then
       local f = assert(io.open(a.out, "w"))
-      f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
+      -- A result that did not reach the disk (a full volume) fails the run:
+      -- the flush surfaces only at close, so both are checked.
+      assert(f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
         bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
         missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
         nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
-        decisive = g.decisive, minRunaways = g.minRunaways })), "\n")
-      f:close()
+        decisive = g.decisive, minRunaways = g.minRunaways })), "\n"))
+      assert(f:close())
     end
   elseif a.cmd == "tau" then
     assert(a.decisions, "--decisions is required")
@@ -1102,7 +1107,14 @@ local function isScript()
 end
 
 if isScript() then
-  os.exit(M.main(arg))
+  -- A refusal (a bad flag, a set that cannot be read, decisions that do not
+  -- answer these episodes) exits 3, never 1, which is a gate that failed.
+  local ok, status = pcall(M.main, arg)
+  if not ok then
+    io.stderr:write("score-episodes: " .. tostring(status) .. "\n")
+    os.exit(3)
+  end
+  os.exit(status)
 end
 
 return M

@@ -155,9 +155,11 @@ that decision.
   one can still meet the miss bound: 93 at the defaults. On a smaller set
   the comparator would fall back to always-freeze, which any fixed rule
   can beat. Generate dev with `--per-template 10` (110 runaways from the
-  public dev templates). `gate` exits 0 when G7 passes, 1 when it fails
-  and 2 when the set is too small to decide; `controls` exits nonzero when
-  a control fails or the set is undecidable or underpowered.
+  public dev templates). `gate` exits 0 when G7 passes, 1 when it fails,
+  2 when the set is too small to decide, and 3 when it refuses its input
+  (a bad flag, a set it cannot read, decisions that do not answer the
+  episodes); `controls` exits nonzero when a control fails or the set is
+  undecidable or underpowered.
 - `bakeoff.lua episodes` records a model's decision at every decision point
   through the production builders (`--api chat|systemone|completion`), and
   `score-episodes.lua` replays the rows through the proposed wait rail, the

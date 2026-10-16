@@ -499,7 +499,7 @@ local function episodesMode(args)
   local tmplPath = scratch .. "/tmpl.json"
   local url = server .. ((api == "systemone") and "/v1/systemone"
     or (api == "completion") and "/completion" or "/v1/chat/completions")
-  local n, valid = 0, 0
+  local n, valid, firstErr = 0, 0, nil
   -- This invocation's own name, on every row: the scorer refuses a file
   -- whose rows come from more than one run (two partial runs put together,
   -- of one model or of two). It is the start time and this run's private
@@ -555,7 +555,7 @@ local function episodesMode(args)
           if v then action = (v.action == "wait") and "wait" or "freeze" else err = perr or "invalid verdict" end
         end
         n = n + 1
-        if action then valid = valid + 1 end
+        if action then valid = valid + 1 else firstErr = firstErr or err end
         -- Each row says what asked it (the prompt variant, the API, the
         -- model and the label) and which run wrote it, so rows from two runs
         -- are never scored as one. snapshotHash binds the row to the input
@@ -571,6 +571,13 @@ local function episodesMode(args)
     -- A row that did not reach the disk (a full volume) fails the run, which
     -- then removes its claimed file, rather than leaving a torn one behind.
     assert(of:close())
+    -- A run with no valid reply measured the server, not the model (an
+    -- endpoint that is down, a refused key, the wrong --api): every row would
+    -- stand as the deterministic freeze. It fails, which removes its file.
+    if n > 0 and valid == 0 then
+      error(string.format("none of the %d replies was valid (the first error: %s); check the server, the key"
+        .. " and --api", n, tostring(firstErr):sub(1, 120)), 0)
+    end
   end)
   os.remove(reqPath)
   os.remove(respPath)

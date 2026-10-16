@@ -1654,6 +1654,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ -n "${FAKE_BODY_LOG:-}" ] && [ -n "${body:-}" ]; then cat "$body" >> "$FAKE_BODY_LOG"; echo >> "$FAKE_BODY_LOG"; fi
+# FAKE_BAD_FIRST names a counter file: the first chat reply is garbage.
+if [ -n "${FAKE_BAD_FIRST:-}" ]; then
+  n=$(cat "$FAKE_BAD_FIRST" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_BAD_FIRST"
+  [ "$n" -eq 1 ] && FAKE_CHAT="not json"
+fi
 case "$url" in
   */v1/chat/completions) body="$FAKE_CHAT" ;;
   */v1/systemone) body='{"model":"d1","answers":{"action":{"type":"choice","choice":"freeze","probabilities":{"freeze":0.8,"wait":0.2},"confidence":0.4}}}' ;;
@@ -1684,25 +1689,38 @@ printf '0.010'
   local completion = lfm.jsonEncode({ content = 'wait"', completion_probabilities = lfm.jsonArray({
     pos("wait", { { "wait", 0.7 }, { "free", 0.3 } }), pos('"', { { '"', 1 } }) }) })
   local function sq(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
-  local function run(api, chatBody, tag, extra)
+  local function run(api, chatBody, tag, extra, env, dir)
     local out = root .. "/rows-" .. tag .. ".jsonl"
-    os.execute(string.format("PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_COMPLETION=%s FAKE_BODY_LOG=%s lua eval/bakeoff.lua "
+    local ok = os.execute(string.format("%s PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_COMPLETION=%s FAKE_BODY_LOG=%s lua eval/bakeoff.lua "
       .. "episodes --server http://stub --label t --dir %s --api %s --out %s %s >/dev/null 2>&1",
-      sq(stubDir), sq(chatBody), sq(completion), sq(root .. "/bodies-" .. tag .. ".log"), sq(epDir), api, sq(out),
-      extra or ""))
+      env or "", sq(stubDir), sq(chatBody), sq(completion), sq(root .. "/bodies-" .. tag .. ".log"), sq(dir or epDir),
+      api, sq(out), extra or ""))
     local rows = {}
     local rf = io.open(out, "r")
     if rf then
       for line in rf:lines() do rows[#rows + 1] = lfm.jsonDecode(line) end
       rf:close()
     end
-    return rows[1] or {}
+    return rows[1] or {}, ok == true, #rows, rf ~= nil
+  end
+  -- Two decision points (the episode twice, under two ids), for runs where
+  -- one reply is garbage.
+  local mixDir = root .. "/eps-mix"
+  os.execute("mkdir -p '" .. mixDir .. "'")
+  for _, suffix in ipairs({ "a", "b" }) do
+    local copy = lfm.jsonDecode(lfm.jsonEncode(ep))
+    copy.id = ep.id .. "-" .. suffix
+    local mf = assert(io.open(mixDir .. "/" .. copy.id .. ".json", "w"))
+    mf:write(lfm.jsonEncode(copy), "\n")
+    mf:close()
   end
   check("runner: --redact-names takes no value, so the next flag keeps its own",
     bk.parseArgs({ "episodes", "--redact-names", "--dir", "X" }).dir, "X")
   check("runner: a value flag missing its value is refused", (pcall(bk.parseArgs, { "episodes", "--out" })), false)
   local rc, rs = run("chat", chat, "chat"), run("systemone", chat, "systemone")
-  local rp, rbad = run("completion", chat, "completion"), run("chat", "not json", "bad")
+  local rp = run("completion", chat, "completion")
+  local rbad, okBad, nBad = run("chat", chat, "bad", nil, "FAKE_BAD_FIRST=" .. sq(root .. "/bad-count"), mixDir)
+  local _, okNone, nNone, fileNone = run("chat", "not json", "none", nil, nil, mixDir)
   check("runner: a chat verdict is recorded as the model's action", rc.action, "wait")
   check("runner: with no probability (a chat verdict carries none)", rc.action ~= nil and rc.pWait == nil, true)
   check("runner: a decision model's option probability is kept", rs.action == "freeze" and rs.pWait, 0.2)
@@ -1722,6 +1740,9 @@ printf '0.010'
     creq ~= nil and creq.grammar == lfm.TOKENPROB_VALUE_GRAMMAR and creq.json_schema == nil, true)
   check("runner: an invalid reply is recorded as the deterministic freeze, marked invalid",
     rbad.action == "freeze" and rbad.valid == false and rbad.error ~= nil, true)
+  check("runner: beside a valid reply, the run stands with both rows", okBad == true and nBad == 2, true)
+  check("runner: a run with no valid reply fails, leaving no rows",
+    okNone == false and nNone == 0 and fileNone == false, true)
   check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)
   check("runner: and binds the input it answered, as the scorer hashes it",
     rc.snapshotHash ~= nil and rc.snapshotHash == sc.stepHash(ep.steps[1]), true)

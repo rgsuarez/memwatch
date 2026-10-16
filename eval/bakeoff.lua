@@ -162,8 +162,10 @@ local function withAuthHeader(key, fn)
   -- keyless path.
   local r = table.pack(pcall(function()
     local f = assert(io.open(hdr, "w"))
-    f:write("Authorization: Bearer " .. key .. "\n")
-    f:close()
+    -- A header that did not reach the disk (a full volume) would send no
+    -- key, and every reply would be recorded as invalid: fail the run.
+    assert(f:write("Authorization: Bearer " .. key .. "\n"))
+    assert(f:close())
     os.execute("chmod 600 " .. shellQuote(hdr))
     return fn(hdr)
   end))

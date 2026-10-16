@@ -1496,6 +1496,54 @@ printf '0.010'
   local rtypo = run("chat", chat, "typo", "--variant Discriminate")
   check("runner: a mistyped variant is refused, before any row", rtypo.action == nil
     and io.open(root .. "/rows-typo.jsonl", "r") == nil, true)
+  -- A write that does not reach the disk fails the run and leaves no rows:
+  -- the runner, wrapped so the matching file's write or close fails as on
+  -- a full volume.
+  local wrap = assert(io.open(root .. "/failwrap.lua", "w"))
+  wrap:write([[
+local match, mode = os.getenv("FAIL_MATCH"), os.getenv("FAIL_MODE")
+local realOpen = io.open
+io.open = function(path, m)
+  local f, e = realOpen(path, m)
+  if f and m == "w" and match and tostring(path):find(match) then
+    local proxy = {}
+    function proxy:write(...)
+      if mode == "write" then return nil, "No space left on device" end
+      return f:write(...)
+    end
+    function proxy:close()
+      local ok, err = f:close()
+      if mode == "close" then return nil, "No space left on device" end
+      return ok, err
+    end
+    return proxy
+  end
+  return f, e
+end
+arg[0] = "eval/bakeoff.lua"
+dofile("eval/bakeoff.lua")
+]])
+  wrap:close()
+  local function failRun(match, mode, tag)
+    local out = root .. "/rows-fail-" .. tag .. ".jsonl"
+    local ok = os.execute(string.format("PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_KEY=sk-fail FAIL_MATCH=%s FAIL_MODE=%s "
+      .. "lua %s episodes --server http://stub --label t --dir %s --api chat --api-key-env FAKE_KEY --out %s >/dev/null 2>&1",
+      sq(stubDir), sq(chat), sq(match), mode, sq(root .. "/failwrap.lua"), sq(epDir), sq(out)))
+    local f = io.open(out, "r")
+    local rows = f and f:read("a") or nil
+    if f then f:close() end
+    return ok == true, rows
+  end
+  local okCtl, rowsCtl = failRun("rows%-fail", "none", "control")
+  check("runner: the failure harness runs the runner (its control)", okCtl and rowsCtl ~= nil and rowsCtl:find('"action"', 1, true) ~= nil, true)
+  local okW, rowsW = failRun("rows%-fail", "write", "write")
+  check("runner: a row that does not reach the disk fails the run, leaving no rows", okW == false and rowsW == nil, true)
+  local okC, rowsC = failRun("rows%-fail", "close", "close")
+  check("runner: so does a rows file whose close fails", okC == false and rowsC == nil, true)
+  local okH, rowsH = failRun("/auth$", "write", "header")
+  check("runner: and an auth header that does not reach the disk", okH == false and rowsH == nil, true)
+  local okHC, rowsHC = failRun("/auth$", "close", "header-close")
+  check("runner: or whose close fails", okHC == false and rowsHC == nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 

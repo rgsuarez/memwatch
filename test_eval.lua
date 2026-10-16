@@ -1089,6 +1089,28 @@ printf '0.010'
   for _ in bodies:gmatch("\n") do requests = requests + 1 end
   check("G1: a redacting run asks each control class again", table.concat(controls, ","), "ambiguous-hog,extreme-runaway")
   check("G1: three scenarios, five requests", requests, 5)
+  -- The default output names the names condition: a redacted run and a
+  -- raw-names run of one model and variant write two files. (Run from a
+  -- scratch directory, so the default eval/results is the scratch's own.)
+  local ph = io.popen("pwd -P")
+  local here = ph:read("l")
+  ph:close()
+  local cwdRoot = root .. "/cwd"
+  os.execute(string.format("mkdir -p '%s/eval' && ln -s '%s/lua' '%s/lua' && ln -s '%s/eval/bakeoff.lua' '%s/eval/bakeoff.lua'",
+    cwdRoot, here, cwdRoot, here, cwdRoot))
+  for _, extra in ipairs({ "", "--raw-names" }) do
+    os.execute(string.format("cd '%s' && PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --variant taxonomy --scenarios '%s' %s >/dev/null 2>&1", cwdRoot, stubDir, log, corpus, extra))
+  end
+  local function resultAt(path)
+    local f = io.open(path, "r")
+    local doc = f and lfm.jsonDecode(f:read("a")) or {}
+    if f then f:close() end
+    return doc
+  end
+  local red, raw = resultAt(cwdRoot .. "/eval/results/t-taxonomy.json"), resultAt(cwdRoot .. "/eval/results/t-taxonomy-rawnames.json")
+  check("runner: a redacted run writes its default file", red.redact_names, true)
+  check("runner: a raw-names run writes its own beside it, naming its condition", raw.redact_names, false)
   os.execute("rm -rf '" .. root .. "'")
 end
 

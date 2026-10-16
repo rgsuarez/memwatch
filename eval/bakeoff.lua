@@ -4,7 +4,8 @@
 -- Run mode (one model combo, one prompt variant):
 --   lua eval/bakeoff.lua run --server http://127.0.0.1:PORT --label 230M-Q4_K_M \
 --     --variant taxonomy [--max-tokens 128] [--no-schema] [--server-pid N] \
---     [--scenarios eval/scenarios] [--out eval/results/<label>-<variant>.json]
+--     [--scenarios eval/scenarios] [--raw-names]
+--     [--out eval/results/<label>-<variant>[-noschema][-rawnames].json]
 --
 -- Remote mode (same runner, an OpenAI-compatible cloud endpoint; the corpus
 -- is synthetic, so nothing private egresses):
@@ -16,7 +17,9 @@
 --   signal skips that cleanup); --api-key-env VAR reads it from
 --   the environment instead of a file. No server pid means footprint reads
 --   0, which is honest for a remote brain. Names are redacted as production
---   redacts them, except in the injection suite (--raw-names: all raw).
+--   redacts them, except in the injection suite (--raw-names: all raw; the
+--   default --out then ends -rawnames, so it never replaces the redacted
+--   run's file).
 --
 -- Episodes mode (per-step decisions for score-episodes.lua): see episodesMode.
 --
@@ -216,8 +219,13 @@ local function runMode(args)
   local maxTokens = tonumber(args.max_tokens) or 128
   local scenariosDir = args.scenarios or "eval/scenarios"
   local useSchema = not args.no_schema
-  local out = args.out or string.format("eval/results/%s-%s%s.json",
-    label, variant, useSchema and "" or "-noschema")
+  -- Whether the model sees names as production redacts them. The default
+  -- output names the condition, so a raw-names run and a redacted run of
+  -- one model and variant write two files rather than one replacing the
+  -- other.
+  local redactRun = lfm.cfg.redactNames == true and not args.raw_names
+  local out = args.out or string.format("eval/results/%s-%s%s%s.json",
+    label, variant, useSchema and "" or "-noschema", redactRun and "" or "-rawnames")
   local serverPid = tonumber(args.server_pid)
 
   os.execute("mkdir -p eval/results eval/tmp")
@@ -267,7 +275,7 @@ local function runMode(args)
     -- Names are redacted as production redacts them (lfm.cfg.redactNames),
     -- except for the injection suite, which exists to test raw attacker
     -- names; --raw-names reproduces the older all-raw runs.
-    local redact = lfm.cfg.redactNames and scenario.class ~= "prompt-injection" and not args.raw_names
+    local redact = redactRun and scenario.class ~= "prompt-injection"
     -- One request for a serialized state: the reply body, and its wall ms.
     local function ask(userContent)
       local body = assert(lfm.buildRequestBody(systemPrompt, userContent, {
@@ -407,7 +415,7 @@ local function runMode(args)
     label = label, variant = variant, schema = useSchema,
     -- What the model saw: categories (names redacted, the default) or raw
     -- names; the injection suite is always sent raw.
-    redact_names = lfm.cfg.redactNames and not args.raw_names, raw_injection_names = true,
+    redact_names = redactRun, raw_injection_names = true,
     max_tokens = maxTokens, n = counts.n,
     json_valid_rate = counts.n > 0 and counts.valid / counts.n or 0,
     gold_rate = counts.n > 0 and counts.gold / counts.n or 0,

@@ -83,12 +83,12 @@ elif [ "$NOANSWER" = 0 ]; then
 elif [ -f "$LIC" ] && [ "$(shasum -a 256 "$LIC" | awk '{print $1}')" = "$LICSHA" ]; then
   echo "get-model: no usable answer from upstream for the $REPO license (HTTP $CODE, curl exit $RC); using the verified local copy" >&2
 else
-  echo "get-model: cannot fetch or verify the $REPO license; refusing" >&2
+  echo "get-model: cannot fetch or verify the $REPO license (HTTP $CODE, curl exit $RC, and no verified local copy); refusing" >&2
   exit 1
 fi
 
 OUT="$DEST/$FILE"
-# A run killed outright (a signal skips the EXIT trap) leaves its partial
+# A run killed outright (SIGKILL, which no trap catches) leaves its partial
 # file. One found here is named, even beside a verified model, and left
 # alone: it may be another fetch's, still running. This run's own is made
 # below, after the scan.

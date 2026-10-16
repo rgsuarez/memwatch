@@ -711,8 +711,8 @@ end
 -- Bounded parse of a /v1/systemone reply. The decoder bounds size and depth;
 -- the answer must carry exactly the offered options, each a probability,
 -- summing to about 1. Returns { action, pWait, pFreeze, confidence } with
--- action the more probable option (a tie reads as wait, which the wait rail
--- then refuses), or nil, err.
+-- action the more probable option (a tie reads as freeze, the deterministic
+-- action, so no threshold can honor an even split as a wait), or nil, err.
 function M.parseSystemOne(text)
   if type(text) ~= "string" or text == "" then return nil, "systemone: empty reply" end
   if #text > 65536 then return nil, "systemone: reply too large" end
@@ -731,7 +731,7 @@ function M.parseSystemOne(text)
   if not (pf >= 0 and pf <= 1 and pw >= 0 and pw <= 1) or math.abs(pf + pw - 1) > 0.02 then
     return nil, "systemone: probabilities do not sum to 1"
   end
-  return { action = (pf > pw) and "freeze" or "wait", pFreeze = pf, pWait = pw,
+  return { action = (pf >= pw) and "freeze" or "wait", pFreeze = pf, pWait = pw,
            confidence = type(answer.confidence) == "number" and answer.confidence or nil }
 end
 

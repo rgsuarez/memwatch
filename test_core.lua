@@ -3285,7 +3285,8 @@ do
   check("systemone parse: P(wait)", v and v.pWait, 0.2)
   check("systemone parse: confidence carried", v and v.confidence, 0.4)
   check("systemone parse: wait", (lfm.parseSystemOne(reply({ freeze = 0.3, wait = 0.7 })) or {}).action, "wait")
-  check("systemone parse: a tie reads as wait", (lfm.parseSystemOne(reply({ freeze = 0.5, wait = 0.5 })) or {}).action, "wait")
+  check("systemone parse: a tie reads as freeze, the deterministic action",
+    (lfm.parseSystemOne(reply({ freeze = 0.5, wait = 0.5 })) or {}).action, "freeze")
   check("systemone parse: an extra option is refused", (lfm.parseSystemOne(reply({ freeze = 0.5, wait = 0.3, terminate = 0.2 }))), nil)
   check("systemone parse: a missing option is refused", (lfm.parseSystemOne(reply({ freeze = 1 }))), nil)
   check("systemone parse: a bad sum is refused", (lfm.parseSystemOne(reply({ freeze = 0.7, wait = 0.7 }))), nil)

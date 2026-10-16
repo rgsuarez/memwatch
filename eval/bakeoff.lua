@@ -130,91 +130,13 @@ local function contains(list, v)
   return false
 end
 
--- The eight 16-bit groups of an IPv6 literal, or nil when it is not one.
--- "::" stands for one run of zero groups, and a dotted IPv4 tail fills the
--- last two.
-local function ipv6Groups(s)
-  local pre, v4 = s:match("^(.*:)(%d+%.%d+%.%d+%.%d+)$")
-  if v4 then
-    local o = {}
-    for x in v4:gmatch("%d+") do
-      if #x > 3 or tonumber(x) > 255 then return nil end
-      o[#o + 1] = tonumber(x)
-    end
-    s = pre .. string.format("%x:%x", o[1] * 256 + o[2], o[3] * 256 + o[4])
-  end
-  local gap = s:find("::", 1, true)
-  if gap and s:find("::", gap + 1, true) then return nil end
-  local function groups(part)
-    local g = {}
-    if part == "" then return g end
-    for x in (part .. ":"):gmatch("([^:]*):") do
-      if not x:match("^%x%x?%x?%x?$") then return nil end
-      g[#g + 1] = tonumber(x, 16)
-    end
-    return g
-  end
-  local head = groups(gap and s:sub(1, gap - 1) or s)
-  local tail = gap and groups(s:sub(gap + 2)) or {}
-  if not head or not tail then return nil end
-  local n = #head + #tail
-  if (gap and n > 7) or (not gap and n ~= 8) then return nil end
-  for _ = 1, 8 - n do head[#head + 1] = 0 end
-  for _, x in ipairs(tail) do head[#head + 1] = x end
-  return head
-end
-
--- The 32-bit address an IPv4 literal names, in any form curl reads (as
--- inet_aton does: 127.1, 0x7f.1, 0177.0.0.1, 2130706433), or nil when it
--- is not one. Each part is decimal, octal (a leading 0) or hex (0x); the
--- last part fills the bytes that remain.
-local function ipv4Address(s)
-  local parts = {}
-  for part in (s .. "."):gmatch("([^.]*)%.") do parts[#parts + 1] = part end
-  if #parts > 4 then return nil end
-  local vals = {}
-  for i, part in ipairs(parts) do
-    local v
-    if part:match("^0[x]%x?%x?%x?%x?%x?%x?%x?%x?$") then v = #part > 2 and tonumber(part:sub(3), 16) or 0
-    elseif part:match("^0[0-7]*$") and #part <= 12 then v = tonumber(part, 8)
-    elseif part:match("^[1-9]%d*$") and #part <= 10 then v = tonumber(part)
-    else return nil end
-    vals[i] = v
-  end
-  local n, addr = #vals, 0
-  for i = 1, n - 1 do
-    if vals[i] > 255 then return nil end
-    addr = addr | (vals[i] << (8 * (4 - i)))
-  end
-  if vals[n] >= (1 << (8 * (5 - n))) then return nil end
-  return addr | vals[n]
-end
-
--- Whether a server URL names this machine, read as curl reads it (no
--- scheme means http; userinfo is not the host): localhost (and any name
--- under it), 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104, each in any
--- spelling, or an unspecified address (0.0.0.0, ::), which a connection
--- takes as this machine. Anything else, a name that might resolve here
--- included, is taken as elsewhere.
-local function hostIsLocal(url)
-  local u = tostring(url):lower()
-  local scheme, rest = u:match("^(%a[%w+.-]*)://(.*)$")
-  if scheme and scheme ~= "http" and scheme ~= "https" then return false end
-  local authority = (rest or u):match("^([^/?#]*)")
-  authority = authority:match("^.*@(.*)$") or authority
-  local v6 = authority:match("^%[([^%]]+)%]:?%d*$")
-  if v6 then
-    local g = ipv6Groups(v6)
-    if not g then return false end
-    local zero = g[1] == 0 and g[2] == 0 and g[3] == 0 and g[4] == 0 and g[5] == 0
-    return zero and ((g[6] == 0 and g[7] == 0 and (g[8] == 1 or g[8] == 0)) or (g[6] == 0xffff and g[7] >> 8 == 127))
-  end
-  local host = authority:match("^([^:]+):?%d*$")
-  if not host then return false end
-  host = host:gsub("%.$", "")
-  if host == "localhost" or host:match("%.localhost$") then return true end
-  local addr = ipv4Address(host)
-  return addr ~= nil and (addr >> 24 == 127 or addr == 0)
+-- Whether an address as curl reports it is this machine: 127.0.0.0/8,
+-- ::1, an IPv4-mapped 127 address, or an unspecified one (0.0.0.0, ::),
+-- which a connection takes as this machine.
+local function isLoopbackIp(ip)
+  if type(ip) ~= "string" then return false end
+  return ip == "::1" or ip == "::" or ip == "0.0.0.0" or ip:match("^127%.%d+%.%d+%.%d+$") ~= nil
+    or ip:match("^::ffff:127%.%d+%.%d+%.%d+$") ~= nil
 end
 
 local function sampleServerMB(pid)
@@ -303,6 +225,10 @@ end
 -- an empty body is no reply either. curl runs in the C locale, so its timing
 -- never prints with a decimal comma.
 local RETRYABLE_CURL = { [7] = true, [18] = true, [28] = true, [52] = true, [55] = true, [56] = true }
+-- The address curl last connected to (its remote_ip), so a caller can ask
+-- where a reply came from. curl prints it canonically: a dotted quad, or
+-- IPv6 as inet_ntop writes it, without brackets.
+local lastRemote = nil
 local function postOnce(url, body, reqPath, respPath, hdr, timeout)
   writeFile(reqPath, body)
   os.remove(respPath)
@@ -310,12 +236,13 @@ local function postOnce(url, body, reqPath, respPath, hdr, timeout)
     "LC_ALL=C curl -sS -m " .. tostring(timeout) .. " -X POST -H 'Content-Type: application/json'",
     hdr and ("-H @" .. shellQuote(hdr)) or "",
     "-d @" .. shellQuote(reqPath), "-o", shellQuote(respPath),
-    "-w '%{time_total} %{http_code}'", shellQuote(url),
+    "-w '%{time_total} %{http_code} ip=%{remote_ip}'", shellQuote(url),
     "; printf ' exit=%s' \"$?\"",
   }, " ")
   local p = assert(io.popen(cmd))
   local line = p:read("a") or ""
   p:close()
+  lastRemote = line:match("ip=(%S*)")
   local exit = tonumber(line:match("exit=(%d+)"))
   local wall, code = line:match("^%s*([%d%.,]+)%s+(%d%d%d)")
   local ms = wall and math.floor((tonumber((wall:gsub(",", "."))) or 0) * 1000) or 0
@@ -456,17 +383,14 @@ local function runMode(args)
   -- (A default path is cleared here, once the label and variant that name it
   -- are known; an explicit --out was cleared before anything else.)
   if not args.out then clearResult(out) end
-  -- --server-pid samples a process on this machine, so it is refused for a
-  -- server elsewhere (its footprint would be another process's), and when
-  -- it is not a pid (the footprint would read as none).
+  -- --server-pid samples a process on this machine, so it must be a pid
+  -- (the footprint would read as none), and a reply from elsewhere fails
+  -- the run (see the sampling below).
   local pidNumber = tonumber(args.server_pid)
   local serverPid = pidNumber and math.tointeger(pidNumber)
   if args.server_pid then
     if not (serverPid and serverPid > 0) then
       error("--server-pid must be a process id, not " .. args.server_pid, 0)
-    end
-    if not hostIsLocal(server) then
-      error("--server-pid samples a process on this machine; " .. server .. " is not on this machine", 0)
     end
   end
 
@@ -601,6 +525,13 @@ local function runMode(args)
     local timings = (lfm.jsonDecode(respBody) or {}).timings
     if type(timings) == "table" and type(timings.predicted_per_second) == "number" then
       tokRates[#tokRates + 1] = timings.predicted_per_second
+    end
+    -- The footprint sampled is a process on this machine's, so a reply from
+    -- anywhere else, by the address curl connected to, fails the run: that
+    -- footprint would stand as the server's.
+    if serverPid and not isLoopbackIp(lastRemote) then
+      error("--server-pid samples a process on this machine, but the server answered from "
+        .. ((lastRemote or "") ~= "" and lastRemote or "an address curl did not report"), 0)
     end
     local mb = sampleServerMB(serverPid)
     if mb and mb > counts.serverMBMax then counts.serverMBMax = mb end
@@ -1147,7 +1078,7 @@ local function isScript()
 end
 
 -- Loaded as a module (by the tests), it exports its scratch allocator, the
--- episodes mode, its result clear and its local-host check.
+-- episodes mode, its result clear and its loopback check.
 if isScript() then
   local args = parseArgs(arg)
   local mode = args.positional[1] or "run"
@@ -1165,4 +1096,4 @@ end
 
 return { privateDir = privateDir, reserveOutput = reserveOutput, withAuthHeader = withAuthHeader,
          parseArgs = parseArgs, injectionScore = injectionScore, episodes = episodesMode,
-         clearResult = clearResult, hostIsLocal = hostIsLocal }
+         clearResult = clearResult, isLoopbackIp = isLoopbackIp }

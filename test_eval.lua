@@ -1405,7 +1405,8 @@ if [ -n "${FAKE_STATUS_SEQ:-}" ]; then
   n=$(cat "$FAKE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_SEQ_FILE"
   i=0; for s in $FAKE_STATUS_SEQ; do i=$((i + 1)); status=$s; [ "$i" -ge "$n" ] && break; done
 fi
-printf '0.010 %s' "$status"
+# The address curl connected to, as its remote_ip prints it.
+printf '0.010 %s ip=%s' "$status" "${FAKE_REMOTE_IP-127.0.0.1}"
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -1524,19 +1525,29 @@ printf '0.010 %s' "$status"
   end
   check("runner: a flag given twice touches nothing", untouchedAfter("--label t --label u"), true)
   check("runner: nor does a flag missing its value", untouchedAfter("--label"), true)
-  -- --server-pid samples a process on this machine: refused for a server
-  -- elsewhere and for a value that is not a pid, taken for one here.
-  local function runSaid(argsTail, outPath)
-    local h = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --label t "
-      .. "--scenarios '%s' %s --out '%s' 2>&1; echo \"exit=$?\"", stubDir, log, corpus, argsTail, outPath))
+  -- --server-pid samples a process on this machine: it must be a pid, and
+  -- a reply from elsewhere (by the address curl reports) fails the run.
+  local function runSaid(argsTail, outPath, env)
+    local h = io.popen(string.format("%s PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --label t "
+      .. "--scenarios '%s' %s --out '%s' 2>&1; echo \"exit=$?\"", env or "", stubDir, log, corpus, argsTail, outPath))
     local said = h:read("a")
     h:close()
     return said
   end
   local pidOut = root .. "/pid.json"
-  local farSaid = runSaid("--server http://stub --server-pid 1", pidOut)
-  check("runner: --server-pid is refused for a server elsewhere",
-    farSaid:find("is not on this machine", 1, true) ~= nil and farSaid:find("exit=0", 1, true) == nil, true)
+  local function landed(path)
+    local f = io.open(path, "r")
+    if f then f:close() end
+    return f ~= nil
+  end
+  local farSaid = runSaid("--server http://stub --server-pid 1", pidOut, "FAKE_REMOTE_IP=203.0.113.7")
+  check("runner: a reply from elsewhere fails a --server-pid run, leaving no result",
+    farSaid:find("the server answered from 203.0.113.7", 1, true) ~= nil and farSaid:find("exit=0", 1, true) == nil
+    and not landed(pidOut), true)
+  local blankSaid = runSaid("--server http://stub --server-pid 1", pidOut, "FAKE_REMOTE_IP=")
+  check("runner: and so does a reply whose address curl did not report",
+    blankSaid:find("an address curl did not report", 1, true) ~= nil and blankSaid:find("exit=0", 1, true) == nil
+    and not landed(pidOut), true)
   local badPidSaid = runSaid("--server http://127.0.0.1:9 --server-pid abc", pidOut)
   check("runner: and when it is not a process id",
     badPidSaid:find("must be a process id", 1, true) ~= nil and badPidSaid:find("exit=0", 1, true) == nil, true)
@@ -1549,9 +1560,10 @@ printf '0.010 %s' "$status"
     check("runner: nor 0, a negative or a fraction", table.concat(notPids, " "), "")
   end
   local nearSaid = runSaid("--server http://127.0.0.1:9 --server-pid 1", pidOut)
-  check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil, true)
-  local otherSaid = runSaid("--server HTTP://127.0.0.2:9 --server-pid 1", pidOut)
-  check("runner: under any loopback name, its scheme in capitals", otherSaid:find("exit=0", 1, true) ~= nil, true)
+  check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+  os.remove(pidOut)
+  local v6Said = runSaid("--server http://stub --server-pid 1", pidOut, "FAKE_REMOTE_IP=::1")
+  check("runner: and so does one that answers over IPv6 loopback", v6Said:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
   -- The gates refuse a contradiction too, before writing the league.
   do
     local gatesDir = root .. "/gates-results"
@@ -2418,6 +2430,7 @@ esac
 printf '%s' "$body" > "$out"
 # FAKE_COMMA: curl's timing as a comma-decimal locale would print it.
 if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.010 %s' "$status"; fi
+printf ' ip=%s' "${FAKE_REMOTE_IP-127.0.0.1}"
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -2479,22 +2492,18 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
     and tostring(rErr):find("only a run result is cleared", 1, true) ~= nil
     and tostring(rErr):find("over the 64 KB a result can be read at", 1, true) ~= nil, true)
   os.remove(bigOut)
-  -- A server on this machine, under any of its names, is local; nothing else is.
+  -- An address as curl reports it is this machine when it is a loopback or
+  -- an unspecified one; nothing else is.
   do
-    local localNames = { "http://127.0.0.2:9", "HTTP://LOCALHOST:80", "http://a.localhost", "http://localhost.:8080",
-      "http://[::1]:11435", "http://[0:0:0:0:0:0:0:1]:11435", "http://[0000::0001]", "http://[::ffff:127.0.0.1]:9",
-      "http://0.0.0.0:8080", "http://[::]:8080", "127.0.0.1:11435", "localhost:8080", "http://127.1:11435",
-      "http://0x7f.1", "http://0177.0.0.1", "http://2130706433", "http://user@127.0.0.1:11435", "http://u:p@[::1]:9" }
-    local farNames = { "http://stub", "https://api.example.com", "http://10.0.0.1", "http://127.0.0.256", "http://[::2]",
-      "http://[1::1]", "http://[::ffff:10.0.0.1]", "http://localhost.example.com", "http://[::1::1]",
-      "http://[1:2:3:4:5:6:7:8:9]", "http://128.1", "http://evil.example#@127.0.0.1", "http://127.0.0.1:1@evil.example",
-      "ftp://127.0.0.1", "http://0x1000000007f000001", "http://02000000000017700000001", "http://08.0.0.1", "http://4294967296", "http://127..1", "stub",
-      "http://127.16777216", "http://127.256.0.1" }
-    local wrongLocal, wrongFar = {}, {}
-    for _, u in ipairs(localNames) do if not bk.hostIsLocal(u) then wrongLocal[#wrongLocal + 1] = u end end
-    for _, u in ipairs(farNames) do if bk.hostIsLocal(u) then wrongFar[#wrongFar + 1] = u end end
-    check("runner: every spelling of a loopback address is this machine", table.concat(wrongLocal, " "), "")
-    check("runner: and nothing else is", table.concat(wrongFar, " "), "")
+    local here = { "127.0.0.1", "127.255.0.9", "::1", "::", "0.0.0.0", "::ffff:127.0.0.1" }
+    local elsewhere = { "", "203.0.113.7", "10.0.0.1", "128.0.0.1", "1127.0.0.1", "127.0.0.1x", "::2", "fe80::1",
+      "::ffff:10.0.0.1", "[::1]" }
+    local wrongHere, wrongElsewhere = {}, {}
+    -- (Quoted, so that an empty address shows.)
+    for _, ip in ipairs(here) do if not bk.isLoopbackIp(ip) then wrongHere[#wrongHere + 1] = string.format("%q", ip) end end
+    for _, ip in ipairs(elsewhere) do if bk.isLoopbackIp(ip) then wrongElsewhere[#wrongElsewhere + 1] = string.format("%q", ip) end end
+    check("runner: a loopback or unspecified address is this machine", table.concat(wrongHere, " "), "")
+    check("runner: and no other address is", table.concat(wrongElsewhere, " ") .. (bk.isLoopbackIp(nil) and " nil" or ""), "")
   end
   -- A run result whose removal fails (injected) refuses the clear, the result
   -- kept, whoever runs it (root can remove from a read-only directory).

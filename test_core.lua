@@ -3330,6 +3330,11 @@ do
   -- unrelated word leaves P(wait) at half, not certainty.
   check("tokenprob parse: unrecognized mass is not renormalized into a wait",
     math.abs(((lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.51 }, { "waiting", 0.49 } })) or {}).pWait or -1) - 0.51) < 1e-6, true)
+  -- Inside the string a leading space is part of the value: " wait" is no
+  -- option, so its mass does not count toward waiting.
+  check("tokenprob parse: a space-led piece inside the value is no option",
+    math.abs(((lfm.parseTokenProbs(tpReply("wait", { { " wait", 0.5 }, { "wait", 0.3 }, { "free", 0.2 } })) or {}).pWait
+      or -1) - 0.3) < 1e-6, true)
   check("tokenprob parse: freeze from its first token",
     (lfm.parseTokenProbs(tpReply("free", { { "free", 0.7 }, { "wait", 0.3 } })) or {}).action, "freeze")
   check("tokenprob parse: terminate from its first token",

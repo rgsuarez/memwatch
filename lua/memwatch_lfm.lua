@@ -776,8 +776,11 @@ end
 local OPTION_WORDS = { "wait", "freeze", "terminate" }
 local function optionOf(tok, quoted)
   if type(tok) ~= "string" then return nil end
-  tok = tok:gsub("^%s+", "")
   if quoted then
+    -- JSON allows whitespace before the value's opening quote, so a fused
+    -- token may lead with it. Inside the string it is part of the value:
+    -- an unquoted piece that leads with a space (" wait") is no option.
+    tok = tok:gsub("^%s+", "")
     if tok:sub(1, 1) ~= '"' then return nil end
     tok = tok:sub(2)
   end

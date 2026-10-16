@@ -48,9 +48,14 @@ PART=""
 trap 'rm -f "$LICTMP" ${PART:+"$PART"}' EXIT
 # The HTTP status tells an answer from no network: only no response at all
 # (000) falls back to the verified local copy. Any other status (a license
-# removed, renamed or gated upstream) is a refusal.
+# removed, renamed or gated upstream; curl reports the last one it received,
+# so a redirect to a failing host shows the redirect's) is a refusal, and so
+# is no status at all, which means curl itself did not run.
 CODE="$(curl -sSL -o "$LICTMP" -w '%{http_code}' "https://huggingface.co/$REPO/resolve/main/LICENSE" 2>/dev/null || true)"
-if [ "$CODE" = "200" ]; then
+if [ -z "$CODE" ]; then
+  echo "get-model: curl did not run for the $REPO license (no status at all); refusing" >&2
+  exit 1
+elif [ "$CODE" = "200" ]; then
   GOTLICSHA="$(shasum -a 256 "$LICTMP" | awk '{print $1}')"
   if [ "$GOTLICSHA" != "$LICSHA" ]; then
     echo "get-model: $REPO license text hash mismatch (expected $LICSHA, got $GOTLICSHA)" >&2
@@ -58,8 +63,8 @@ if [ "$CODE" = "200" ]; then
     exit 1
   fi
   if [ "$LIC" != "$CANON" ]; then cp "$LICTMP" "$LIC"; fi
-elif [ "$CODE" != "000" ] && [ -n "$CODE" ]; then
-  echo "get-model: upstream answered HTTP $CODE for the $REPO license; refusing - re-review it" >&2
+elif [ "$CODE" != "000" ]; then
+  echo "get-model: the last answer upstream gave for the $REPO license was HTTP $CODE; refusing - re-review it" >&2
   exit 1
 elif [ -f "$LIC" ] && [ "$(shasum -a 256 "$LIC" | awk '{print $1}')" = "$LICSHA" ]; then
   echo "get-model: could not reach upstream for the $REPO license; using the verified local copy" >&2

@@ -7,7 +7,8 @@
 # The stub answers as curl does: FAKE_FAIL (part of a URL) is no network at
 # all (status 000); FAKE_HTTP=<file>=<code> is an HTTP answer without the
 # file (with -f, exit 22); FAKE_PARTIAL=<file> breaks the transfer after a
-# few bytes (exit 18). The first case is the positive control: the same
+# few bytes (exit 18); FAKE_NORUN (part of a URL) prints no status at all,
+# as when curl itself cannot run. The first case is the positive control: the same
 # setup that must refuse in the later cases fetches and verifies when
 # nothing is wrong.
 #
@@ -46,6 +47,7 @@ done
 name="${url##*/}"
 status() { [ -n "$wfmt" ] && printf '%s' "$1"; return 0; }
 if [ -n "${FAKE_FAIL:-}" ] && [[ "$url" == *"$FAKE_FAIL"* ]]; then status 000; exit 6; fi
+if [ -n "${FAKE_NORUN:-}" ] && [[ "$url" == *"$FAKE_NORUN"* ]]; then exit 127; fi
 if [ -n "${FAKE_HTTP:-}" ] && [ "${FAKE_HTTP%%=*}" = "$name" ]; then
   status "${FAKE_HTTP#*=}"; [ "$fail" = 1 ] && exit 22; exit 0
 fi
@@ -93,6 +95,8 @@ printf 'synthetic license text\n' > "$tmp/srv/LICENSE"
 
 expect 0 "offline, a previously verified local license stands" FAKE_FAIL=LICENSE
 expect 1 "an HTTP answer without the license is refused, not taken for offline" FAKE_HTTP=LICENSE=404
+expect 1 "a curl that did not run is refused, not taken for offline" FAKE_NORUN=LICENSE
+check "  and says curl did not run" grep -q "curl did not run" "$tmp/out"
 rm -f "$localLic" "$models/m.gguf"
 expect 1 "offline with no verified local license, refused" FAKE_FAIL=LICENSE
 check "  before any download" test ! -e "$models/m.gguf"

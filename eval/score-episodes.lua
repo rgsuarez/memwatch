@@ -385,7 +385,8 @@ function M.loadDecisions(path, keyPath)
         -- in only for a row that has none.
         ep, t = k.episode, k.t
         if hash ~= nil and k.snapshotHash ~= nil and hash ~= k.snapshotHash then
-          error(string.format("row %s answered snapshot %s but the key maps it to %s; it answered other inputs",
+          error(string.format("row %s carries snapshot %s but the key gives %s for its step: the rows and the key"
+            .. " were made from different episodes; rebuild the key, or record the rows again, from the episodes scored",
             tostring(r.qid), tostring(hash), tostring(k.snapshotHash)), 0)
         end
         hash = hash or k.snapshotHash

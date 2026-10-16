@@ -288,7 +288,7 @@ do
   f:close()
   local okConflict, errConflict = pcall(sc.loadDecisions, tmp, keyTmp)
   check("decisions: a row whose hash the key contradicts is refused",
-    okConflict == false and tostring(errConflict):find("answered other inputs", 1, true) ~= nil, true)
+    okConflict == false and tostring(errConflict):find("made from different episodes", 1, true) ~= nil, true)
   -- One run per file: a decision point twice, or rows two runs wrote.
   f = assert(io.open(tmp, "w"))
   f:write('{"episode":"r1","t":0,"action":"freeze"}\n{"episode":"r1","t":0,"action":"wait"}\n')

@@ -220,7 +220,7 @@ sample; for a process only the streaming top has named (the process
 sampler stalled), the start time the alert bound to it, unless that time
 falls in the hour a daylight-saving fold repeats. Each row says which in
 `identityBasis` (`window`, `lstart`, or `none`, when it had neither or its
-start lies in wall time a clock step back is still replaying, marked
+start lies in wall time a clock step back replayed, marked
 `identityReplayed`, so its follow-ups can only read `unknown` or `exited`). A process table counts as whole, so that a
 process missing from it has exited, only when the sampler
 exited cleanly and the table lists memwatch's own process.

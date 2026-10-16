@@ -251,28 +251,15 @@ end
 -- lives. Past `max`, the two oldest are merged into the stretch that spans
 -- both: wider, so it refuses more, never less. Returns a new list. Pure.
 function M.addReplay(spans, span, max)
+  local function ok(r) return type(r) == "table" and type(r.lo) == "number" and type(r.hi) == "number" end
   local out = {}
-  for _, r in ipairs(spans or {}) do out[#out + 1] = r end
-  if type(span) == "table" then out[#out + 1] = span end
+  for _, r in ipairs(spans or {}) do if ok(r) then out[#out + 1] = r end end
+  if ok(span) then out[#out + 1] = span end
   max = tonumber(max) or 16
   while #out > max and #out >= 2 do
     local a, b = out[1], out[2]
     table.remove(out, 1)
     out[1] = { lo = math.min(a.lo, b.lo), hi = math.max(a.hi, b.hi) }
-  end
-  return out
-end
-
--- The stretches that still matter at raw instant `at`: those the clock has
--- not yet run past (with slackSec for whole-second starts). A process born
--- after the clock passes a stretch starts after it. Pure.
-function M.replaysAt(spans, at, slackSec)
-  local out = {}
-  for _, r in ipairs(spans or {}) do
-    if type(r) == "table" and type(r.hi) == "number"
-       and (type(at) ~= "number" or r.hi >= at - (tonumber(slackSec) or 0)) then
-      out[#out + 1] = r
-    end
   end
   return out
 end
@@ -287,6 +274,12 @@ function M.startReplayed(w, spans)
        and w.hi >= r.lo and w.lo <= r.hi then return true end
   end
   return false
+end
+
+-- A start epoch (as ps prints whole seconds: [epoch, epoch + 1]) in one of
+-- these stretches. Pure.
+function M.epochReplayed(epoch, spans)
+  return type(epoch) == "number" and M.startReplayed({ lo = epoch, hi = epoch + 1 }, spans)
 end
 
 -- Is a process with this start epoch (and comm) the observed one?
@@ -409,6 +402,9 @@ function M.foldSignal(ev, sig)
   if ev.clockStep then return end
   local m = M.matchStart(ev.start0, ev.comm0, sig.startEpoch, sig.comm)
   if m == "different" then return end
+  -- A target started in wall time a step back replayed cannot be told from
+  -- the observed process (see epochReplayed): uncertain, never the same.
+  if m == "same" and M.epochReplayed(sig.startEpoch, ev.replays) then m = "unknown" end
   ev.signals[#ev.signals + 1] = { action = sig.action, at = sig.at, uncertain = (m ~= "same") or nil }
 end
 
@@ -420,6 +416,7 @@ function M.foldTouch(ev, t)
   if ev.clockStep then return end
   local m = M.matchStart(ev.start0, ev.comm0, t and t.startEpoch, t and t.comm)
   if m == "different" then return end
+  if m == "same" and M.epochReplayed(t and t.startEpoch, ev.replays) then m = "unknown" end
   local uncertain = m ~= "same"
   if uncertain then ev.touchesUncertain = ev.touchesUncertain + 1 else ev.touches = ev.touches + 1 end
   ev.touchLog[#ev.touchLog + 1] = { at = t and t.at, uncertain = uncertain or nil }
@@ -604,11 +601,14 @@ end
 -- Does a frozen-ledger entry hold the observed process? From the entry's
 -- bound start time against the observation's start window; nil when that
 -- cannot be told.
-function M.frozenMatches(entry, start0, comm0)
+function M.frozenMatches(entry, start0, comm0, replays)
   if type(entry) ~= "table" then return false end
   -- An entry started in a daylight-saving fold names two epochs: it cannot
-  -- be placed, so it is nil (uncertain), never a confident false.
-  local m = M.matchStart(start0, nil, M.lstartEpochUnambiguous(entry.lstart), nil)
+  -- be placed, so it is nil (uncertain), never a confident false. So is one
+  -- started in wall time a step back replayed (see epochReplayed).
+  local epoch = M.lstartEpochUnambiguous(entry.lstart)
+  local m = M.matchStart(start0, nil, epoch, nil)
+  if m == "same" and M.epochReplayed(epoch, replays) then m = "unknown" end
   if m == "unknown" then return nil end
   return m == "same"
 end

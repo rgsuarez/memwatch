@@ -125,25 +125,26 @@ runs after its record stopped collecting still reads its own horizon.
   start time the alert bound (on decision and advisory rows alike), unless
   it falls in a daylight-saving fold (`lstart`); otherwise `none`, and its
   follow-ups can only read `unknown` or `exited`.
-- A start in wall time a step back is still replaying is `none` too
-  (`identityReplayed`). A process that started inside that stretch carries
-  a start time a process born since the step can carry as well, since the
+- A start in wall time a step back replayed is `none` too
+  (`identityReplayed`). A process that started inside that stretch carries a
+  start time a process born during the replay can carry as well, since the
   stepped clock reaches the same instants a second time, so it cannot tell
-  the observed process from its pid's next one.
+  the observed process from its pid's next one. With ps stalled, the pid may
+  even hold such a process already, under the window of the one it
+  followed, and its start stays in the stretch while it lives.
   - Each step keeps its own stretch: from the stepped clock as it read at
     the reading before the step (the step fell after it) to the old clock as
     it would read at the reading that saw the step. Without a monotonic
     clock the stretch cannot be bounded, so it is unbounded: identity is
-    refused from then on, until a reload.
-  - The observation's own start is refused only while the clock has not yet
-    run past the stretch. A process born after that starts after it.
-  - A sample's window is checked against every stretch recorded so far, run
-    past or not. With ps stalled, the pid may already hold a process born in
-    a stretch, under the window of the one it followed, and that process's
-    start stays in the stretch while it lives. Such a sample reads as
-    `identity-uncertain`, never as a sighting.
+    refused from then on, until a reload, and the log says so once.
+  - Every stretch recorded since load counts, whether or not the clock has
+    run past it: for the observation's own start, for each later sample's
+    window (no evidence, `identity-uncertain`), and for the start of a
+    signal's or touch's target and of a frozen-ledger entry (uncertain).
+  - At most 16 stretches are kept; past that the two oldest merge into one
+    that spans both, so a start in the gap between them is refused too.
   - A process that started before every stretch keeps its identity, and so
-    does one that started between two of them.
+    does one that started between two of them, unless the cap merged them.
 - A sample: the same program in an overlapping window that rules out a
   successor is a sighting; another program or a disjoint window is a reuse
   (the observed process is gone); anything else is `identity-uncertain`.

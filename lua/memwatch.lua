@@ -217,7 +217,7 @@ function obs.noteFrozen()
   local ok, err = pcall(function()
     local now = clock.now()
     for _, ev in pairs(obs.pending) do
-      observe.foldFrozen(ev, now, observe.frozenMatches(frozen[ev.pid], ev.start0))
+      observe.foldFrozen(ev, now, observe.frozenMatches(frozen[ev.pid], ev.start0, nil, ev.replays))
     end
   end)
   if not ok then M.logSnapshot("observe-frozen-error:" .. tostring(err):sub(1, 80):gsub("%s+", " ")) end
@@ -2193,6 +2193,10 @@ function clock.now()
     -- unbounded (it fails closed).
     local span = observe.replaySpan(prevWall, prevMono, wall, mono, delta)
     if span then clock.replays = observe.addReplay(clock.replays, span, 16) end
+    if span and span.lo == -math.huge and not clock.replayBlind then
+      clock.replayBlind = true
+      M.logSnapshot("replay-unbounded:identity-refused-until-reload")
+    end
     if clock.depth > 0 then
       clock.pending = clock.pending + delta
       -- The stamps wait for the frame's end, but what must take no evidence
@@ -3583,11 +3587,9 @@ end
 -- grace expiry) or "synthetic" (memwatch.testObserve). Never forks: the
 -- snapshot is built from tick state, fates come from the latest ps sample
 -- and the frozen ledger, exit-cause evidence from a directory listing.
--- The stretches of wall time a step back makes the clock run through again
--- (clock.replays) that still matter at raw instant `at`
--- (observe.replaysAt), and whether a start window overlaps one of them
--- (observe.startReplayed): such a start identifies nothing.
-function obs.replaysAt(at) return observe.replaysAt(clock.replays, at, clock.stepSec) end
+-- Whether a start window overlaps a stretch of wall time a step back made
+-- the clock run through again (clock.replays; observe.startReplayed): such a
+-- start identifies nothing.
 function obs.startReplayed(w, spans) return observe.startReplayed(w, spans) end
 
 obs.writeObservation = function(point, offender, now, extra)
@@ -3624,10 +3626,15 @@ obs.writeObservation = function(point, offender, now, extra)
     start0 = observe.startFromLstart(extra.lstart, now + clock.pending)
     identityBasis = start0 and "lstart" or "none"
   end
-  -- A start in wall time a step back replays identifies nothing: a process
-  -- born since can carry the same start (obs.startReplayed). The stretches
-  -- that matter now are kept with the record, for its samples.
-  local replayed = start0 and obs.startReplayed(start0, obs.replaysAt(now + clock.pending)) or false
+  -- A start in wall time a step back replayed identifies nothing: a process
+  -- born during the replay can carry the same start, and with ps stalled the
+  -- pid may already hold one under the window of the process it followed
+  -- (obs.startReplayed). Every stretch recorded so far counts, whether or
+  -- not the clock has run past it, and the record keeps them for its
+  -- samples, signals, touches and frozen-ledger reads.
+  local replays = {}
+  for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end
+  local replayed = start0 and obs.startReplayed(start0, replays) or false
   if replayed then start0, identityBasis = nil, "none" end
   local row = observe.row({
     at = obsIso, session = obs.session, seq = seq, point = point, synthetic = extra.synthetic,
@@ -3663,14 +3670,8 @@ obs.writeObservation = function(point, offender, now, extra)
   local ev = observe.newEvidence({ pid = pid, comm0 = e0 and e0.comm or nil,
                                    start0 = start0, obsAt = now, weightMB = weight0,
                                    minSeq = sampler.nextSeq + 1, horizons = horizons })
-  -- Its samples' windows are checked against every stretch recorded so far,
-  -- whether or not the clock has run past it: with ps stalled, the pid may
-  -- already hold a process born in one, under the window of the one it
-  -- followed, and that process's start stays in the stretch while it lives.
-  local replays = {}
-  for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end
   ev.replays = replays
-  observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))
+  observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0, nil, replays))
   -- Its life is a duration (on the monotonic clock): a step back, which
   -- closes the record, never lengthens it.
   ev.expiresMono = clock.mono() + (horizons[#horizons] or 0) + 600

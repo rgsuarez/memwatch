@@ -890,14 +890,19 @@ function M.parseTokenProbs(text, opts)
   if type(at) ~= "table" then return nil, "tokenprob: no action value" end
   local cands = at.top_logprobs or at.top_probs
   if type(cands) ~= "table" then return nil, "tokenprob: no candidates at the action value" end
-  local p = { wait = 0, freeze = 0, terminate = 0 }
+  local p, listed = { wait = 0, freeze = 0, terminate = 0 }, 0
   for _, c in ipairs(cands) do
     local op = type(c) == "table" and optionOf(c.token, quoted) or nil
     local pr = readProb(c)
     -- A probability outside [0, 1] (or not a number) is malformed.
     if pr == false then return nil, "tokenprob: a probability out of range" end
+    if pr then listed = listed + pr end
     if op and pr then p[op] = p[op] + pr end
   end
+  -- The candidates listed at the value are distinct tokens of one
+  -- distribution, options or not: more than 1 among them is malformed,
+  -- whatever the options alone add up to.
+  if listed > 1 + PROB_SLACK then return nil, "tokenprob: the probabilities at the value sum past 1" end
   -- The value's first token came after the quote as a token of its own.
   -- What the value's position gives is conditional on the path the model
   -- took, through the quote it sampled, so it is weighted by that quote's

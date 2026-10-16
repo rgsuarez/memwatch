@@ -3636,6 +3636,17 @@ do
     check("tokenprob parse: and the rail honors it", sure ~= nil and lfm.waitHonored(sure, 0.9), true)
     check("tokenprob parse: options past 1 beyond rounding are refused",
       (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.7 }, { "wa", 0.5 } }))), nil)
+    -- Each position's listed candidates are one distribution: one that sums
+    -- past 1 is malformed, however the options' share comes out.
+    check("tokenprob parse: a value position listing past 1 is refused",
+      (lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.8 }, { "free", 0.8 } }))), nil)
+    check("tokenprob parse: unrelated tokens count toward that sum",
+      (lfm.parseTokenProbs(lfm.jsonEncode({ content = "x", completion_probabilities = lfm.jsonArray({
+        pos("wait", { { "wait", 0.95 }, { "maybe", 0.95 } }), pos('"', { { '"', 1 } }) }) }), { prefill = lfm.TOKENPROB_PREFILL })), nil)
+    check("tokenprob parse: weighting by the quote does not launder it",
+      (lfm.parseTokenProbs(lfm.jsonEncode({ content = "x", completion_probabilities = lfm.jsonArray({
+        pos('{"', { { '{"', 1 } }), pos("action", { { "action", 1 } }), pos('":', { { '":', 1 } }),
+        pos('"', { { '"', 0.6 } }, 0.6), pos("wait", { { "wait", 0.8 }, { "free", 0.8 } }) }) }))), nil)
     local hair = lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray({
       pos('{"', { { '{"', 1 } }), pos("action", { { "action", 1 } }), pos('":"', { { '":"', 1 } }),
       { token = "wait", logprob = 0, top_logprobs = lfm.jsonArray({ { token = "wait", logprob = 1e-8 } }) } }) })

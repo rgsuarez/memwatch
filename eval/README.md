@@ -104,9 +104,11 @@ that decision.
 
 - `gen-episodes.lua` simulates episodes from `episode-templates.lua`: one
   offender's trajectory from grace expiry, with decision points where
-  production makes one (+0, +60 and +120 s, while the process is alive,
-  production's own tracker reads kind=extreme, and its state machine is
-  critical). Labels fall out of the trajectory exactly: runaway (it
+  production makes one: +0, +60 and +120 s, while the process is alive and
+  production's own unattended gate is open (the alert unanswered for its
+  grace window, the offender extreme by production's tracker, at the head
+  of an alert its state machine raised). Labels fall out of the trajectory
+  exactly: runaway (it
   exhausts the machine at 5% available, or settles at or below the 8%
   starvation line as the snapshot reports it), savable (it resolves within
   the 120 s deferral bound) or late (excluded).

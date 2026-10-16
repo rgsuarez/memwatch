@@ -1245,6 +1245,7 @@ do
   local lfm = require("memwatch_lfm")
   check("cat: browser helper",    lfm.categorize("Google Chrome Helper (Renderer)"), "browser")
   check("cat: vm host",           lfm.categorize("com.apple.Virtualization.VirtualMachine"), "vm")
+  check("cat: the QEMU launcher is a vm", lfm.categorize("QEMULauncher"), "vm")
   check("cat: search tool",       lfm.categorize("ugrep"), "search-tool")
   check("cat: dev server",        lfm.categorize("next-server (v16.2.4)"), "build-tool")
   check("cat: model server",      lfm.categorize("llama-server"), "model-server")

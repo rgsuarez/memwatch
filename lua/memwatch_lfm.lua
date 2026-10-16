@@ -503,8 +503,8 @@ local CATEGORY_RULES = {
   { "browser",         { "^google chrome", "^chromium", "^safari$", "^firefox", "^brave browser",
                          "^arc$", "^microsoft edge", "^com%.apple%.webkit%.", "^[%w ]+ helper %(renderer%)$",
                          "^[%w ]+ helper %(gpu%)$" } },
-  { "vm",              { "^com%.apple%.virtualization%.", "^qemu%-system%-", "^vmware", "^parallels",
-                         "^virtualbox", "^com%.docker%.", "^colima$", "^utm$", "^limactl$" } },
+  { "vm",              { "^com%.apple%.virtualization%.", "^qemu%-system%-", "^qemulauncher$", "^vmware",
+                         "^parallels", "^virtualbox", "^com%.docker%.", "^colima$", "^colima%-", "^utm$", "^limactl$" } },
   { "model-server",    { "^llama%-server$", "^llama%-cli$", "^ollama", "^mlx", "^vllm", "^lm%-studio",
                          "^text%-generation" } },
   { "database",        { "^postgres", "^mysqld$", "^redis%-server$", "^mongod$", "^clickhouse",
@@ -552,10 +552,22 @@ local function ruleCategory(base)
   return nil
 end
 
+-- A name written "base (detail)" (a tool running under its runtime, such as
+-- "node (npm install)"): when the whole name matches no rule, the detail is
+-- tried, then the base. The vocabulary stays closed, and the name is still
+-- the process's own, so this spoofs nothing a name could not already claim.
+local function nameCategory(base)
+  local c = ruleCategory(base)
+  if c then return c end
+  local head, detail = base:match("^(.-)%s*%((.-)%)$")
+  if head then return ruleCategory(detail) or ruleCategory(head) end
+  return nil
+end
+
 -- Exported for tests and the report. Pure; returns a fixed-vocabulary token.
 -- The name's basename decides; the path's basename is the fallback.
 function M.categorize(name, path)
-  return ruleCategory(basenameLower(name)) or ruleCategory(basenameLower(path)) or "unknown"
+  return nameCategory(basenameLower(name)) or nameCategory(basenameLower(path)) or "unknown"
 end
 
 -- opts.redactNames: when true, the model never receives the raw process

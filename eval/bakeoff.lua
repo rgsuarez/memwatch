@@ -352,7 +352,21 @@ local function runMode(args)
   -- (A default path is cleared here, once the label and variant that name it
   -- are known; an explicit --out was cleared before anything else.)
   if not args.out then clearResult(out) end
-  local serverPid = tonumber(args.server_pid)
+  -- --server-pid samples a process on this machine, so it is refused for a
+  -- server elsewhere (its footprint would be another process's), and when
+  -- it is not a pid (the footprint would read as none).
+  local pidNumber = tonumber(args.server_pid)
+  local serverPid = pidNumber and math.tointeger(pidNumber)
+  if args.server_pid then
+    if not (serverPid and serverPid > 0) then
+      error("--server-pid must be a process id, not " .. args.server_pid, 0)
+    end
+    local host = server:match("^https?://([^/?#]+)")
+    host = host and host:gsub(":%d+$", ""):lower()
+    if not (host == "127.0.0.1" or host == "localhost" or host == "[::1]") then
+      error("--server-pid samples a process on this machine; " .. server .. " is not on this machine", 0)
+    end
+  end
 
   os.execute("mkdir -p eval/results eval/tmp")
   local systemPrompt = lfm.buildSystemPrompt({ variant = variant })

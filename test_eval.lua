@@ -1408,6 +1408,25 @@ printf '0.010 %s' "$status"
   end
   check("runner: a flag given twice touches nothing", untouchedAfter("--label t --label u"), true)
   check("runner: nor does a flag missing its value", untouchedAfter("--label"), true)
+  -- --server-pid samples a process on this machine: refused for a server
+  -- elsewhere and for a value that is not a pid, taken for one here.
+  local function runSaid(argsTail, outPath)
+    local h = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --label t "
+      .. "--scenarios '%s' %s --out '%s' 2>&1; echo \"exit=$?\"", stubDir, log, corpus, argsTail, outPath))
+    local said = h:read("a")
+    h:close()
+    return said
+  end
+  local pidOut = root .. "/pid.json"
+  local farSaid = runSaid("--server http://stub --server-pid 1", pidOut)
+  check("runner: --server-pid is refused for a server elsewhere",
+    farSaid:find("is not on this machine", 1, true) ~= nil and farSaid:find("exit=0", 1, true) == nil, true)
+  local badPidSaid = runSaid("--server http://127.0.0.1:9 --server-pid abc", pidOut)
+  check("runner: and when it is not a process id",
+    badPidSaid:find("must be a process id", 1, true) ~= nil and badPidSaid:find("exit=0", 1, true) == nil, true)
+  local nearSaid = runSaid("--server http://127.0.0.1:9 --server-pid 1", pidOut)
+  check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil, true)
+  os.remove(pidOut)
   -- Only a run result is ever cleared: --out naming an input, a file that is
   -- not JSON, or a directory refuses the run and leaves it as it was.
   local keptSaid

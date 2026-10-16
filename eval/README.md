@@ -57,7 +57,8 @@ does a result that cannot be removed. A command line that does not parse
 touches nothing. Every flag reads under either spelling (`--retry-wait`
 and `--retry_wait` are one flag); a flag given twice is refused, and so
 are `--raw-names` with `--redact-names` and `--api-key-env` with
-`--api-key-file`.
+`--api-key-file`. `--server-pid` samples a process on this machine, so it
+is refused for a server elsewhere.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count

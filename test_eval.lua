@@ -75,6 +75,15 @@ do
   local asLabeled = { labels = { class = "runaway", ttxSec = rg.ttxSec } }
   check("sim regrow: a freeze before the onset is in time", sc.outcome(asLabeled, { freezeAt = 135 }).missed, false)
   check("sim regrow: one after it misses", sc.outcome(asLabeled, { freezeAt = rg.ttxSec + 5 }).missed, true)
+  -- A plateau sitting exactly on 9% shows 9, not the line: the onset is
+  -- where availability drops below it, not where it first reached 9.
+  local need9 = 21 * gen.cfg.totalMB / 100
+  local onNine = { avail0 = 30, w0 = 6000, wAt0 = 6000, compress = 1,
+    phases = { { from = 0, to = 10, rate = need9 / 10 }, { from = 10, to = 130, rate = 0 }, { from = 130, to = 160, rate = 100 } } }
+  check("onset: a plateau exactly on 9% then a decline starts at the decline", gen.starveAt(onNine), 130)
+  local holdsNine = { avail0 = 30, w0 = 6000, wAt0 = 6000, compress = 1,
+    phases = { { from = 0, to = 10, rate = need9 / 10 } } }
+  check("onset: one that holds exactly on 9% never shows the line", gen.starveAt(holdsNine), nil)
   -- A bounded pass that resolves only after the deferral bound: late.
   local sz = gen.simulate(params({ avail0 = 30, compress = 3, phases = { { dur = 150, rate = 100 } },
                                    after = "release", releaseAt = 160 }))

@@ -367,18 +367,21 @@ end
 
 -- The first time at or after t = 0 that availability reaches pct while
 -- the offender still holds its growth, exactly (growth is piecewise
--- linear), or nil before limit.
-local function crossAt(p, cfg, pct, limit)
+-- linear), or nil before limit. below: the first time it drops below pct
+-- instead, so a plateau sitting exactly at pct has not crossed it (it
+-- crosses where the next growth begins).
+local function crossAt(p, cfg, pct, limit, below)
   local needMB = (p.avail0 - pct) / fracOf(p, cfg)
-  if needMB <= 0 then return 0 end
+  if needMB < 0 or (needMB == 0 and not below) then return 0 end
   local grown = 0
   for _, ph in ipairs(p.phases) do
     if ph.from >= limit then break end
     local span = math.min(ph.to, limit) - ph.from
-    if ph.rate > 0 and grown + ph.rate * span >= needMB then
+    local reach = grown + ph.rate * span
+    if ph.rate > 0 and (reach > needMB or (not below and reach == needMB)) then
       return ph.from + (needMB - grown) / ph.rate
     end
-    grown = grown + ph.rate * span
+    grown = reach
   end
   return nil
 end
@@ -391,10 +394,10 @@ M.exhaustAt = exhaustAt
 
 -- When the snapshot first shows the starvation line: availability is
 -- reported floored to a whole percent, so the line shows once it drops
--- below the next whole percent above it.
+-- below the next whole percent above it, never while it sits on it.
 function M.starveAt(p, cfg)
   cfg = cfg or M.cfg
-  return crossAt(p, cfg, cfg.starvePct + 1, math.huge)
+  return crossAt(p, cfg, cfg.starvePct + 1, math.huge, true)
 end
 
 -- Whether exhaustion comes first: at or before a hold resolves (a hold

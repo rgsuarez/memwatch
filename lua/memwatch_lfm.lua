@@ -767,18 +767,32 @@ end
 -- and be refused.
 local TOKENPROB_MAX_PREDICT = 16
 M.TOKENPROB_MAX_PREDICT = TOKENPROB_MAX_PREDICT
+-- The key and the value's opening quote, written into the prompt so the
+-- model's first token is the value itself. A tokenizer can spell the key's
+-- end several ways ('":"' as one token, or '":' then ' "'), and the value's
+-- probabilities differ by spelling; read after a fixed prefix, they are
+-- read on one path, the same at every decision point. The grammar then
+-- completes the value to an option.
+M.TOKENPROB_PREFILL = '{"action":"'
+M.TOKENPROB_VALUE_GRAMMAR = 'root ::= ("wait" | "freeze" | "terminate") "\\""'
 function M.completionBody(prompt, opts)
   opts = opts or {}
   -- At most the cap, and never at or below zero (llama.cpp reads -1 as no
   -- limit at all): a count outside 1..cap takes the cap.
   local n = math.tointeger(tonumber(opts.maxTokens)) or TOKENPROB_MAX_PREDICT
   if n < 1 or n > TOKENPROB_MAX_PREDICT then n = TOKENPROB_MAX_PREDICT end
-  return M.jsonEncode({
+  local body = {
     prompt = prompt, temperature = 0,
     n_predict = n,
     n_probs = opts.nProbs or 10, post_sampling_probs = false, cache_prompt = true,
-    json_schema = M.OUTPUT_SCHEMA,
-  })
+  }
+  if type(opts.prefill) == "string" then
+    body.prompt = prompt .. opts.prefill
+    body.grammar = M.TOKENPROB_VALUE_GRAMMAR
+  else
+    body.json_schema = M.OUTPUT_SCHEMA
+  end
+  return M.jsonEncode(body)
 end
 
 -- Which option a candidate token at the action value starts: the whole
@@ -820,10 +834,14 @@ end
 -- tells the options apart ("wait", "free..." for freeze, "termin..." for
 -- terminate), so the three options' probabilities there are the model's
 -- own probabilities for the decision; what it puts on other tokens (mass
--- short of 1) is left out, never spread over the options. Where the quote
--- is a token of its own, the value's reading is weighted by the quote's own
--- probability, and an option fused with the quote at that position counts
--- too (below). Bounded by the decoder (64 KB, depth 8).
+-- short of 1) is left out, never spread over the options. The runner
+-- prefills the key and the value's quote (TOKENPROB_PREFILL), so its replies
+-- start at the value and are read on one path. For a reply that writes the
+-- key itself, where the quote is a token of its own, the value's reading is
+-- weighted by the quote's own probability, and an option fused with the
+-- quote at that position counts too (below): a lower bound, since the paths
+-- the model did not take are not read. Bounded by the decoder (64 KB,
+-- depth 8).
 -- Returns { action, pWait, pFreeze, pTerminate, mass } or nil, err.
 -- Probabilities come from float32 arithmetic upstream, so a token's can read
 -- a hair over 1 (a logprob of 1e-8), and a confident distribution's top
@@ -839,14 +857,19 @@ local function readProb(c)
   return math.min(pr, 1)
 end
 
-function M.parseTokenProbs(text)
+-- opts.prefill: the text written into the prompt before the reply (the
+-- body's prefill). When it ends at the value's opening quote, the reply's
+-- first token is the value, read there, with no quote of the model's own.
+function M.parseTokenProbs(text, opts)
   if type(text) ~= "string" or text == "" then return nil, "tokenprob: empty reply" end
   local doc, err = M.jsonDecode(text)
   if type(doc) ~= "table" then return nil, "tokenprob: " .. tostring(err) end
   local positions = doc.completion_probabilities
   if type(positions) ~= "table" then return nil, "tokenprob: no token probabilities" end
-  local seen, at, quoted, quotePos, before = "", nil, false, nil, ""
-  for i, pos in ipairs(positions) do
+  local prefill = (type(opts) == "table" and type(opts.prefill) == "string") and opts.prefill or ""
+  local seen, at, quoted, quotePos, before = prefill, nil, false, nil, prefill
+  if seen:find('"action"%s*:%s*"$') then at = positions[1] end
+  for i, pos in ipairs(at == nil and positions or {}) do
     if type(pos) ~= "table" or type(pos.token) ~= "string" then
       return nil, "tokenprob: malformed position"
     end

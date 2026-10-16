@@ -3523,6 +3523,13 @@ do
   check("tokenprob body: temperature 0", cb.temperature, 0)
   check("tokenprob body: the verdict schema as a grammar", cb.json_schema and cb.json_schema.properties.action ~= nil, true)
   check("tokenprob body: top probabilities requested", cb.n_probs, 10)
+  -- Prefilled, the body asks after the key and the value's quote, and its
+  -- grammar completes the value alone.
+  local pb = lfm.jsonDecode(lfm.completionBody("PROMPT", { prefill = lfm.TOKENPROB_PREFILL }))
+  check("tokenprob body: prefilled, it asks after the key and the value's quote", pb.prompt, "PROMPT" .. lfm.TOKENPROB_PREFILL)
+  check("tokenprob body: and constrains only the value, with no verdict schema",
+    pb.grammar == lfm.TOKENPROB_VALUE_GRAMMAR and pb.json_schema == nil, true)
+  check("tokenprob body: the value grammar ends with an escaped quote", lfm.TOKENPROB_VALUE_GRAMMAR:sub(-4), [["\""]])
   -- own: the sampled token's own probability (1 unless given).
   local function pos(tok, cands, own)
     local tl = {}
@@ -3536,6 +3543,17 @@ do
     ps[#ps + 1] = pos('","', { { '","', 0.99 } })
     return lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray(ps) })
   end
+  -- After the prefill, the reply's first token is the value, read there.
+  local function prefilled(first)
+    return lfm.jsonEncode({ content = "x", completion_probabilities = lfm.jsonArray({ first, pos('"', { { '"', 1 } }) }) })
+  end
+  local pv = lfm.parseTokenProbs(prefilled(pos("wait", { { "wait", 0.7 }, { "free", 0.3 } })), { prefill = lfm.TOKENPROB_PREFILL })
+  check("tokenprob parse: after the prefill, the first token is the value",
+    pv ~= nil and pv.action == "wait" and math.abs(pv.pWait - 0.7) < 1e-9, true)
+  check("tokenprob parse: the same reply read without it holds no action value",
+    (lfm.parseTokenProbs(prefilled(pos("wait", { { "wait", 0.7 }, { "free", 0.3 } })))), nil)
+  check("tokenprob parse: after the prefill, a quote of the model's own is no option",
+    (lfm.parseTokenProbs(prefilled(pos('"', { { '"', 0.9 }, { "wait", 0.1 } })), { prefill = lfm.TOKENPROB_PREFILL })), nil)
   local tv = lfm.parseTokenProbs(tpReply("wait", { { "wait", 0.994 }, { "free", 0.005 }, { "termin", 0.0005 } }))
   check("tokenprob parse: the chosen option", tv and tv.action, "wait")
   check("tokenprob parse: P(wait) is the option's own probability",

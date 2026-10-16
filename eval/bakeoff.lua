@@ -522,7 +522,8 @@ local function episodesMode(args)
           tmpl, tmplMs = postJson(server .. "/apply-template", msgs, reqPath, tmplPath, hdr, timeout)
           local doc = lfm.jsonDecode(tmpl)
           body = (type(doc) == "table" and type(doc.prompt) == "string")
-            and assert(lfm.completionBody(doc.prompt, { maxTokens = tonumber(args.max_tokens) or 128 }))
+            and assert(lfm.completionBody(doc.prompt, { maxTokens = tonumber(args.max_tokens) or 128,
+              prefill = lfm.TOKENPROB_PREFILL }))
             or nil
         else
           local user = assert(lfm.serializeSnapshot(st.snapshot, { redactNames = lfm.cfg.redactNames }))
@@ -540,7 +541,7 @@ local function episodesMode(args)
           if not body then
             err = "apply-template failed"
           else
-            local v, perr = lfm.parseTokenProbs(resp)
+            local v, perr = lfm.parseTokenProbs(resp, { prefill = lfm.TOKENPROB_PREFILL })
             if v then
               action, pWait = (v.action == "wait") and "wait" or "freeze", v.pWait
             else

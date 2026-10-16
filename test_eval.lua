@@ -1518,9 +1518,10 @@ printf '0.010'
     for _, c in ipairs(cands) do tl[#tl + 1] = { token = c[1], logprob = math.log(c[2]) } end
     return { token = tok, logprob = 0, top_logprobs = lfm.jsonArray(tl) }
   end
-  local completion = lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray({
-    pos('{"', { { '{"', 0.99 } }), pos("action", { { "action", 0.99 } }), pos('":"', { { '":"', 0.99 } }),
-    pos("wait", { { "wait", 0.7 }, { "free", 0.3 } }) }) })
+  -- The runner writes the key and the value's quote into the prompt, so a
+  -- server's reply starts at the value.
+  local completion = lfm.jsonEncode({ content = 'wait"', completion_probabilities = lfm.jsonArray({
+    pos("wait", { { "wait", 0.7 }, { "free", 0.3 } }), pos('"', { { '"', 1 } }) }) })
   local function sq(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
   local function run(api, chatBody, tag, extra)
     local out = root .. "/rows-" .. tag .. ".jsonl"
@@ -1546,6 +1547,18 @@ printf '0.010'
   check("runner: a decision model's option probability is kept", rs.action == "freeze" and rs.pWait, 0.2)
   check("runner: a local model's token probability is kept",
     rp.action == "wait" and math.abs((rp.pWait or -1) - 0.7) < 1e-6, true)
+  local cl = io.open(root .. "/bodies-completion.log", "r")
+  local cbodies = cl and cl:read("a") or ""
+  if cl then cl:close() end
+  local creq
+  for line in cbodies:gmatch("[^\n]+") do
+    local b = lfm.jsonDecode(line)
+    if type(b) == "table" and b.n_probs then creq = b end
+  end
+  check("runner: the completion asks after the key and the value's quote",
+    creq ~= nil and type(creq.prompt) == "string" and creq.prompt:sub(-#lfm.TOKENPROB_PREFILL) == lfm.TOKENPROB_PREFILL, true)
+  check("runner: with a grammar that completes the value, not the whole verdict",
+    creq ~= nil and creq.grammar == lfm.TOKENPROB_VALUE_GRAMMAR and creq.json_schema == nil, true)
   check("runner: an invalid reply is recorded as the deterministic freeze, marked invalid",
     rbad.action == "freeze" and rbad.valid == false and rbad.error ~= nil, true)
   check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)

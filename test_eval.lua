@@ -1563,6 +1563,14 @@ printf '0.010 %s ip=%s' "$status" "$ip"
   check("runner: and so does a reply whose address curl did not report",
     blankSaid:find("an address curl did not report", 1, true) ~= nil and blankSaid:find("exit=0", 1, true) == nil
     and not landed(pidOut), true)
+  -- Only a --server-pid run is held to this machine: a remote run takes a
+  -- reply from anywhere.
+  do
+    local cloudSaid = runSaid("--server http://stub", pidOut, "FAKE_REMOTE_IP=203.0.113.7")
+    check("runner: a run without --server-pid takes a reply from anywhere",
+      cloudSaid:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+    os.remove(pidOut)
+  end
   local badPidSaid = runSaid("--server http://127.0.0.1:9 --server-pid abc", pidOut)
   check("runner: and when it is not a process id",
     badPidSaid:find("must be a process id", 1, true) ~= nil and badPidSaid:find("exit=0", 1, true) == nil, true)

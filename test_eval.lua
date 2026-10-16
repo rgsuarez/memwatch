@@ -265,6 +265,20 @@ do
   check("decisions: a judge's row maps through the key", d2.s1[60].action, "wait")
   check("decisions: P(wait) is 1 - p_runaway", math.abs(d2.s1[60].pWait - 0.75) < 1e-9, true)
   check("decisions: a key's snapshot hash binds the judge's row", d2.s1[60].hash, "abcd1234")
+  -- A row's own hash is evidence: the key agrees with it, fills in for a row
+  -- without one, and never overwrites one that disagrees.
+  f = assert(io.open(tmp, "w"))
+  f:write('{"qid":"q1","action":"freeze","snapshotHash":"0000aaaa"}\n{"qid":"q2","action":"wait","snapshotHash":"abcd1234"}\n')
+  f:close()
+  local d4 = sc.loadDecisions(tmp, keyTmp)
+  check("decisions: a row's own hash stands where the key has none", d4.r1[0].hash, "0000aaaa")
+  check("decisions: and agrees with the key's where both are given", d4.s1[60].hash, "abcd1234")
+  f = assert(io.open(tmp, "w"))
+  f:write('{"qid":"q2","action":"wait","snapshotHash":"ffff0000"}\n')
+  f:close()
+  local okConflict, errConflict = pcall(sc.loadDecisions, tmp, keyTmp)
+  check("decisions: a row whose hash the key contradicts is refused",
+    okConflict == false and tostring(errConflict):find("answered other inputs", 1, true) ~= nil, true)
   -- One run per file: a decision point twice, or rows two runs wrote.
   f = assert(io.open(tmp, "w"))
   f:write('{"episode":"r1","t":0,"action":"freeze"}\n{"episode":"r1","t":0,"action":"wait"}\n')

@@ -379,8 +379,16 @@ function M.loadDecisions(path, keyPath)
       local hash = r.snapshotHash
       if key then
         local k = assert(key[r.qid], "decision for an unknown qid")
-        -- A key carries each step's snapshot hash, as a runner's row does.
-        ep, t, hash = k.episode, k.t, k.snapshotHash
+        -- A key carries each step's snapshot hash, as a runner's row does. A
+        -- row that carries its own is evidence of what it answered, so the
+        -- key never overwrites it: the two must agree, and the key's fills
+        -- in only for a row that has none.
+        ep, t = k.episode, k.t
+        if hash ~= nil and k.snapshotHash ~= nil and hash ~= k.snapshotHash then
+          error(string.format("row %s answered snapshot %s but the key maps it to %s; it answered other inputs",
+            tostring(r.qid), tostring(hash), tostring(k.snapshotHash)), 0)
+        end
+        hash = hash or k.snapshotHash
         pWait = type(r.p_runaway) == "number" and (1 - r.p_runaway) or nil
       end
       assert(r.action == "freeze" or r.action == "wait", "decision action must be freeze or wait")

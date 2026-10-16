@@ -39,11 +39,13 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -w) wfmt="$2"; shift 2 ;;
+    --connect-timeout|--max-time) shift 2 ;;
     --*) shift ;;
     -*) [[ "$1" == *f* ]] && fail=1; shift ;;
     *) url="$1"; shift ;;
   esac
 done
+printf '%s\n' "$url" >> "$FAKE_SRV/requests.log"
 name="${url##*/}"
 status() { [ -n "$wfmt" ] && printf '%s' "$1"; return 0; }
 if [ -n "${FAKE_FAIL:-}" ] && [[ "$url" == *"$FAKE_FAIL"* ]]; then status 000; exit 6; fi
@@ -54,7 +56,8 @@ fi
 src="$FAKE_SRV/$name"
 if [ ! -f "$src" ]; then status 404; [ "$fail" = 1 ] && exit 22; exit 0; fi
 if [ -n "${FAKE_PARTIAL:-}" ] && [ "$FAKE_PARTIAL" = "$name" ]; then
-  head -c 9 "$src" > "$out"; exit 18
+  # A transfer cut after the headers: curl still reports the 200 it got.
+  head -c 9 "$src" > "$out"; status 200; exit 18
 fi
 cp "$src" "$out"
 status 200
@@ -65,6 +68,7 @@ fails=0
 expect() {  # expect <want-exit> <name> [VAR=value ...]
   local want="$1" name="$2" got=0
   shift 2
+  : > "$tmp/srv/requests.log"
   (cd "$tmp/root" && env PATH="$tmp/bin:$PATH" FAKE_SRV="$tmp/srv" ${1+"$@"} bash "$gm" T "$models") \
     >"$tmp/out" 2>&1 || got=$?
   if [ "$got" -eq "$want" ]; then
@@ -81,6 +85,10 @@ check() {  # check <name> <command...>: the command must succeed
   if "$@"; then echo "ok    $name"; else echo "FAIL  $name"; fails=$((fails + 1)); fi
 }
 hashIs() { [ -f "$1" ] && [ "$(shasum -a 256 "$1" | awk '{print $1}')" = "$2" ]; }
+# No request for the weights reached the server (a fetch that downloaded
+# them and then cleaned up would leave nothing on disk to show it).
+noWeightsAsked() { ! grep -q 'm.gguf' "$tmp/srv/requests.log"; }
+saysNot() { ! grep -q "$1" "$tmp/out"; }
 
 expect 0 "a license and model matching their pins are fetched and verified"
 check "  the model is in place, with its pinned hash" hashIs "$models/m.gguf" "$msha"
@@ -90,16 +98,21 @@ expect 0 "a present, verified model is not fetched again" FAKE_FAIL=m.gguf
 rm -f "$models/m.gguf"
 printf 'synthetic license text, amended\n' > "$tmp/srv/LICENSE"
 expect 1 "a license that changed upstream is refused"
-check "  before any download" test ! -e "$models/m.gguf"
+check "  before any download" noWeightsAsked
 printf 'synthetic license text\n' > "$tmp/srv/LICENSE"
 
 expect 0 "offline, a previously verified local license stands" FAKE_FAIL=LICENSE
 expect 1 "an HTTP answer without the license is refused, not taken for offline" FAKE_HTTP=LICENSE=404
+check "  before any download" noWeightsAsked
+expect 0 "a server error on the license is no answer: the verified local copy stands" FAKE_HTTP=LICENSE=503
+expect 0 "so is rate limiting" FAKE_HTTP=LICENSE=429
+expect 0 "and a license transfer cut short after its 200" FAKE_PARTIAL=LICENSE
+check "  not read as a changed license" saysNot "license changed"
 expect 1 "a curl that did not run is refused, not taken for offline" FAKE_NORUN=LICENSE
 check "  and says curl did not run" grep -q "curl did not run" "$tmp/out"
 rm -f "$localLic" "$models/m.gguf"
 expect 1 "offline with no verified local license, refused" FAKE_FAIL=LICENSE
-check "  before any download" test ! -e "$models/m.gguf"
+check "  before any download" noWeightsAsked
 
 printf 'truncated' > "$tmp/srv/m.gguf"
 expect 1 "a corrupt or partial download is refused"
@@ -133,7 +146,7 @@ check "  and verified" hashIs "$models/m.gguf" "$msha"
 rm -f "$models/m.gguf"
 row PENDING
 expect 1 "a row with no pinned hash is refused"
-check "  before any download" test ! -e "$models/m.gguf"
+check "  before any download" noWeightsAsked
 
 if [ "$fails" -eq 0 ]; then
   echo

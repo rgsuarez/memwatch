@@ -505,7 +505,11 @@ local function episodesMode(args)
   os.remove(respPath)
   os.remove(tmplPath)
   os.execute("rmdir " .. shellQuote(scratch))
-  if not ok then error(runErr, 0) end
+  if not ok then
+    -- This run's own partial rows would mislead a replay and block a retry.
+    os.remove(out)
+    error(runErr, 0)
+  end
   io.write(string.format("%s/%s: %d decision points, %d valid -> %s\n", label, api, n, valid, out))
 end
 

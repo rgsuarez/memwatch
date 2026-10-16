@@ -590,7 +590,25 @@ do
   check("runner output: a fresh path is reserved", bk.reserveOutput(path), true)
   check("runner output: a second claim on it is refused", bk.reserveOutput(path), false)
   check("runner output: an uncreatable path is refused", bk.reserveOutput(dir .. "/missing/rows.jsonl"), false)
-  os.execute("rm -rf '" .. dir .. "'")
+  -- Eight claimants racing for one path: exactly one wins.
+  local race = dir .. "/race.jsonl"
+  local h = io.popen("for i in 1 2 3 4 5 6 7 8; do ( { set -C; : > '" .. race .. "'; } 2>/dev/null && echo won ) & done; wait")
+  local winners = 0
+  for line in h:lines() do if line == "won" then winners = winners + 1 end end
+  h:close()
+  check("runner output: of eight racing claims exactly one wins", winners, 1)
+  -- A run that fails mid-way removes its own partial rows.
+  local bad = bk.privateDir()
+  local bf = assert(io.open(bad .. "/a.json", "w"))
+  bf:write("not json\n")
+  bf:close()
+  local partial = dir .. "/partial.jsonl"
+  local okRun = pcall(bk.episodes, { positional = {}, label = "x", dir = bad, out = partial })
+  local left = io.open(partial, "r")
+  if left then left:close() end
+  check("runner output: a failed run raises", okRun, false)
+  check("runner output: and leaves no partial rows", left == nil, true)
+  os.execute("rm -rf '" .. dir .. "' '" .. bad .. "'")
 end
 
 if fails == 0 then

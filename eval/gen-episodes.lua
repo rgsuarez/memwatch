@@ -552,6 +552,12 @@ local function parseArgs(argv)
   local i = 1
   while i <= #argv do
     local k = argv[i]
+    -- Every flag takes a value: one missing (the last argument, or another
+    -- flag in its place) is refused, never read as unset.
+    local v = argv[i + 1]
+    if type(k) == "string" and k:match("^%-%-") and (v == nil or v:match("^%-%-")) then
+      error(k .. " needs a value", 0)
+    end
     if k == "--templates" then a.templates = argv[i + 1]; i = i + 2
     elseif k == "--split" then a.split = argv[i + 1]; i = i + 2
     -- Integers only: a float seed ("1.0") would run the stream's arithmetic

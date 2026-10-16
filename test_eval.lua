@@ -1025,6 +1025,9 @@ return {
   check("generator: an existing empty directory is published into", okEmptyOut and emptyFiles > 0, true)
   check("generator: a seed that is not a whole number is refused",
     okFrac == false and tostring(errFrac):find("integer", 1, true) ~= nil, true)
+  local okBareGen, errBareGen = pcall(gen.main, { "--templates", "eval/episode-templates.lua", "--split", "--seed", "1" })
+  check("generator: a flag missing its value is refused, not read as unset",
+    okBareGen == false and tostring(errBareGen):find("--split needs a value", 1, true) ~= nil, true)
   check("generator: an output that is not empty is refused",
     okAgain == false and tostring(errAgain):find("name a fresh directory", 1, true) ~= nil, true)
   check("generator: and is left as it was", #listing(good), #files)

@@ -2250,6 +2250,9 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   end
   check("runner: --redact-names takes no value, so the next flag keeps its own",
     bk.parseArgs({ "episodes", "--redact-names", "--dir", "X" }).dir, "X")
+  local okUnder, under = pcall(bk.parseArgs, { "--raw_names", "run", "--no_schema", "--redact_names" })
+  check("runner: the boolean flags read under either spelling, taking no value", okUnder and under.raw_names == true
+    and under.no_schema == true and under.redact_names == true and under.positional[1] == "run", true)
   check("runner: a value flag missing its value is refused", (pcall(bk.parseArgs, { "episodes", "--out" })), false)
   local rc, rs = run("chat", chat, "chat"), run("systemone", chat, "systemone")
   local rp = run("completion", chat, "completion")

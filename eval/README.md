@@ -54,9 +54,10 @@ variant naming it are known; the new result is written whole and renamed
 into place. Only a run result is ever cleared: a path holding anything
 else (a scenario, a script, a directory) refuses the run untouched, and so
 does a result that cannot be removed. A command line that does not parse
-touches nothing. A flag given twice is refused, under either spelling
-(`--retry-wait` and `--retry_wait` are one flag), and so are `--raw-names`
-with `--redact-names` and `--api-key-env` with `--api-key-file`.
+touches nothing. Every flag reads under either spelling (`--retry-wait`
+and `--retry_wait` are one flag); a flag given twice is refused, and so
+are `--raw-names` with `--redact-names` and `--api-key-env` with
+`--api-key-file`.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count

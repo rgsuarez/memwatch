@@ -46,23 +46,23 @@ local function parseArgs(argv)
   while i <= #argv do
     local a = argv[i]
     local key = a:match("^%-%-(.+)$")
-    -- A flag given twice is refused, under either spelling (--retry-wait
-    -- and --retry_wait are one flag): which value was meant is not this
-    -- script's to guess.
+    -- Every flag has two spellings (--retry-wait and --retry_wait are one
+    -- flag), and is read under either. A flag given twice is refused, under
+    -- either spelling: which value was meant is not this script's to guess.
     local norm = key and key:gsub("%-", "_")
     if norm and seen[norm] then error("--" .. key .. " given twice", 0) end
     if norm then seen[norm] = true end
-    if key then
-      if key == "no-schema" or key == "raw-names" or key == "redact-names" then
+    if norm then
+      if norm == "no_schema" or norm == "raw_names" or norm == "redact_names" then
         -- --redact-names is the default now; it takes no value, so it never
         -- swallows the next argument.
-        args[key:gsub("%-", "_")] = true
+        args[norm] = true
       else
         -- A value flag needs its value: one missing (the last argument, or
         -- another flag in its place) is refused, never read as unset.
         local v = argv[i + 1]
         if v == nil or v:match("^%-%-") then error("--" .. key .. " needs a value", 0) end
-        args[key:gsub("%-", "_")] = v
+        args[norm] = v
         i = i + 1
       end
     else

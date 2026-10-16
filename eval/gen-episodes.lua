@@ -50,10 +50,11 @@
 --
 -- Usage (from the repo root):
 --   lua eval/gen-episodes.lua --templates eval/episode-templates.lua \
---       --split dev --seed 1 --per-template 8 --out eval/episodes/dev
--- A set decides gate G7 only with enough runaways: 59 at zero misses, 93 at
--- one (the one-sided Clopper-Pearson bound); 8 per template gives the
--- public dev templates 88. A sealed set is generated the same way from
+--       --split dev --seed 1 --per-template 10 --out eval/episodes/dev
+-- Gate G7 decides only on a set with enough runaways that a baseline
+-- missing one can meet the miss bound: 93 at the defaults (the one-sided
+-- Clopper-Pearson bound); 10 per template gives the public dev templates
+-- 110. A sealed set is generated the same way from
 -- templates kept OUTSIDE this repository, so its templates never become
 -- public or training material.
 

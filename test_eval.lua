@@ -838,7 +838,8 @@ do
   local okLate, errLate = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", late })
   print = quiet
   sc.cfg.bootstrap = 2000
-  check("cli: a failing gate exits nonzero", ok and status, 1)
+  -- One episode per template: too few runaways for G7 to decide on.
+  check("cli: a gate on a set too small to decide exits 2, neither pass nor fail", ok and status, 2)
   check("cli: fitting on the evaluated directory is refused",
     okSame == false and tostring(errSame):find("evaluated directory", 1, true) ~= nil, true)
   check("cli: and under another spelling",
@@ -1189,7 +1190,7 @@ do
   local dev, fit = {}, {}
   for _, tpl in ipairs(templates) do
     if tpl.split == "dev" then
-      for k = 1, 8 do
+      for k = 1, 10 do
         local ep = gen.episode(tpl, 2000 + k, "dec")
         if #ep.steps > 0 then dev[#dev + 1] = ep end
         local ef = gen.episode(tpl, 3000 + k, "fit")
@@ -1199,7 +1200,8 @@ do
   end
   local nR = 0
   for _, ep in ipairs(dev) do if ep.labels.class == "runaway" then nR = nR + 1 end end
-  check("decidable: at least 59 runaways, the zero-miss bound", nR >= 59, true)
+  check("decidable: enough runaways for a one-miss baseline to qualify", nR >= sc.decisiveRunaways(), true)
+  check("decidable: that is 93 at the defaults", sc.decisiveRunaways(), 93)
   sc.cfg.bootstrap = 400
   local baselines = sc.baselineSet(fit, 3)
   -- A fit split too small to certify the miss bound at any horizon is fit on
@@ -1242,8 +1244,20 @@ do
   print = function() end
   local okPass, passStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "oracle" })
   print = quiet3
-  os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a passing gate exits 0", okPass and passStatus, 0)
+  print = function() end
+  local okFail, failStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "always-freeze" })
+  print = quiet3
+  os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
+  check("decidable: a failing gate exits 1", okFail and failStatus, 1)
+  -- One runaway short of the floor, the same set decides nothing.
+  local short, keepR = {}, sc.decisiveRunaways() - 1
+  for _, ep in ipairs(dev) do
+    if ep.labels.class ~= "runaway" then short[#short + 1] = ep
+    elseif keepR > 0 then short[#short + 1] = ep; keepR = keepR - 1 end
+  end
+  local gShort = sc.gate(short, sc.candidates.oracle(), baselines)
+  check("decidable: one runaway under the floor, the oracle is not passed", gShort.decisive == false and gShort.pass == false, true)
   check("decidable: always-freeze fails it", sc.gate(dev, sc.candidates["always-freeze"](), baselines).pass, false)
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)

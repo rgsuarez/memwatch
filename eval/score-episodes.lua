@@ -683,6 +683,17 @@ function M.compare(cand, base, cfg)
   return M.pairedLowerBound(prs, cfg)
 end
 
+-- The fewest runaways a set must hold for G7 to decide on it: enough that a
+-- baseline missing one can still meet the miss bound, so the comparator is a
+-- real rule rather than always-freeze by default (93 at the defaults).
+function M.decisiveRunaways(cfg)
+  cfg = cfg or M.cfg
+  assert(cfg.missBound > 0, "the miss bound must be positive")
+  local n = 1
+  while M.cpUpper(1, n, cfg.confidence) > cfg.missBound do n = n + 1 end
+  return n
+end
+
 function M.gate(episodes, candDecide, baselines, cfg)
   cfg = cfg or M.cfg
   local cand = M.score(episodes, candDecide, cfg)
@@ -706,10 +717,15 @@ function M.gate(episodes, candDecide, baselines, cfg)
   if best then lower, point = M.compare(cand, best, cfg) end
   local passMiss = cand.missUpper <= cfg.missBound
   local passBeat = (lower ~= nil) and lower > 0
+  -- A set too small to let a one-miss baseline qualify decides nothing: it
+  -- neither passes nor fails a candidate.
+  local minRunaways = M.decisiveRunaways(cfg)
+  local decisive = cand.nRunaway >= minRunaways
   return {
     candidate = cand, bestBaseline = bestName, baselines = baseScores,
     improvementLower = lower, improvementPoint = point,
-    passMiss = passMiss, passBeat = passBeat, pass = passMiss and passBeat,
+    passMiss = passMiss, passBeat = passBeat, decisive = decisive, minRunaways = minRunaways,
+    pass = decisive and passMiss and passBeat,
   }
 end
 
@@ -941,8 +957,13 @@ function M.main(argv)
     end
     print(string.format("best baseline: %s  paired improvement point %.3f lower95 %s  ->  G7 %s",
       tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
-      g.pass and "PASS" or "FAIL"))
-    status = g.pass and 0 or 1
+      (not g.decisive) and "UNDECIDABLE" or g.pass and "PASS" or "FAIL"))
+    if not g.decisive then
+      print(string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a baseline"
+        .. " missing one can be the comparator: generate more episodes per template", g.candidate.nRunaway, g.minRunaways))
+    end
+    -- 0 pass, 1 fail, 2 a set too small to decide.
+    status = (not g.decisive) and 2 or g.pass and 0 or 1
     print("tree baseline (fit on " .. (a.fitDir or a.dir) .. "):\n" .. M.describeTree(tree, "  "))
     print(string.format("ttx baseline horizon (fit on the same split): %d s%s", horizon, certified and ""
       or " (no horizon can meet the miss bound on a split this small: fit on its fewest misses)"))
@@ -974,9 +995,14 @@ function M.main(argv)
     print(string.format("control always-freeze must FAIL: %s", gF.pass and "FAILED (gate passed it)" or "ok (failed)"))
     print(string.format("control oracle must PASS: %s", gO.pass and "ok (passed)" or "FAILED (gate failed it)"))
     if gF.pass or not gO.pass then status = 1 end
-    -- An undecidable set (no baseline meets the miss bound: too few
-    -- runaways, 59 at zero misses) or an underpowered one fails the run.
-    if not gO.bestBaseline then
+    -- An undecidable set (too few runaways for a one-miss baseline to
+    -- qualify, or no baseline meeting the bound) or an underpowered one
+    -- fails the run.
+    if not gO.decisive then
+      print(string.format("power: this set holds %d runaways, under the %d G7 decides on (UNDECIDABLE)",
+        gO.candidate.nRunaway, gO.minRunaways))
+      status = 1
+    elseif not gO.bestBaseline then
       print("power: no baseline meets the miss bound on this set; the gate compares against nothing (UNDECIDABLE)")
       status = 1
     else

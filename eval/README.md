@@ -132,11 +132,13 @@ that decision.
   and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
   required, holding runaways and savables and none of the evaluated
   episodes), and `--candidate ttx|tree` scores them as fit there.
-- A set decides the gate only with enough runaways: 59 at zero misses, 93
-  at one. Generate dev with `--per-template 8` or more (88 runaways from
-  the public dev templates). `gate` exits nonzero when G7 fails, and
-  `controls` exits nonzero when a control fails or the set is undecidable
-  or underpowered.
+- G7 decides only on a set with enough runaways that a baseline missing
+  one can still meet the miss bound: 93 at the defaults. On a smaller set
+  the comparator would fall back to always-freeze, which any fixed rule
+  can beat. Generate dev with `--per-template 10` (110 runaways from the
+  public dev templates). `gate` exits 0 when G7 passes, 1 when it fails
+  and 2 when the set is too small to decide; `controls` exits nonzero when
+  a control fails or the set is undecidable or underpowered.
 - `bakeoff.lua episodes` records a model's decision at every decision point
   through the production builders (`--api chat|systemone|completion`), and
   `score-episodes.lua` replays the rows through the proposed wait rail, the
@@ -157,7 +159,7 @@ that decision.
 
 ```
 lua eval/gen-episodes.lua --templates eval/episode-templates.lua --split dev \
-  --seed 1 --per-template 8 --out eval/episodes/dev
+  --seed 1 --per-template 10 --out eval/episodes/dev
 lua eval/score-episodes.lua controls --dir eval/episodes/dev --fit-dir <another split>
 ```
 

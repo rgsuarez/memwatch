@@ -736,13 +736,30 @@ end
 
 -- The fewest runaways a set must hold for G7 to decide on it: enough that a
 -- baseline missing one can still meet the miss bound, so the comparator is a
--- real rule rather than always-freeze by default (93 at the defaults).
+-- real rule rather than always-freeze by default (93 at the defaults). The
+-- bound with one miss falls as the set grows, and sits above the bound with
+-- none, so the search starts under the zero-miss size, doubles until a size
+-- meets the bound, then bisects: a small bound costs a few dozen steps, not
+-- one per runaway.
 function M.decisiveRunaways(cfg)
   cfg = cfg or M.cfg
-  assert(cfg.missBound > 0, "the miss bound must be positive")
-  local n = 1
-  while M.cpUpper(1, n, cfg.confidence) > cfg.missBound do n = n + 1 end
-  return n
+  local bound, conf = cfg.missBound, cfg.confidence
+  assert(type(bound) == "number" and bound > 0 and bound < 1, "the miss bound must be between 0 and 1")
+  assert(type(conf) == "number" and conf > 0 and conf < 1, "the confidence must be between 0 and 1")
+  local function meets(n) return M.cpUpper(1, n, conf) <= bound end
+  -- lo never meets the bound: under the zero-miss size (less two, for
+  -- rounding) not even a set with no miss does. hi will.
+  local lo = math.max(0, math.ceil(math.log(1 - conf) / math.log(1 - bound)) - 2)
+  local hi = lo + 1
+  while not meets(hi) do
+    assert(hi < 2 ^ 24, "the miss bound is too small: no set of up to 2^24 runaways meets it with a miss")
+    lo, hi = hi, hi * 2
+  end
+  while hi - lo > 1 do
+    local mid = (lo + hi) // 2
+    if meets(mid) then hi = mid else lo = mid end
+  end
+  return hi
 end
 
 function M.gate(episodes, candDecide, baselines, cfg)

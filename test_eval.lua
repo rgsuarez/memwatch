@@ -1323,6 +1323,32 @@ do
   for _, ep in ipairs(dev) do if ep.labels.class == "runaway" then nR = nR + 1 end end
   check("decidable: enough runaways for a one-miss baseline to qualify", nR >= sc.decisiveRunaways(), true)
   check("decidable: that is 93 at the defaults", sc.decisiveRunaways(), 93)
+  -- The search agrees with a scan one size at a time, and a small bound
+  -- costs a few dozen steps rather than one per runaway.
+  local function scan(bound, conf)
+    local n = 1
+    while sc.cpUpper(1, n, conf) > bound do n = n + 1 end
+    return n
+  end
+  local agree = true
+  for _, bc in ipairs({ { 0.05, 0.95 }, { 0.10, 0.95 }, { 0.05, 0.99 }, { 0.02, 0.90 }, { 0.30, 0.80 }, { 0.6, 0.5 } }) do
+    if sc.decisiveRunaways({ missBound = bc[1], confidence = bc[2] }) ~= scan(bc[1], bc[2]) then agree = false end
+  end
+  check("decidable: the search agrees with a one-at-a-time scan", agree, true)
+  local realCp, calls = sc.cpUpper, 0
+  sc.cpUpper = function(...)
+    calls = calls + 1
+    if calls > 200 then error("scanned, not searched") end
+    return realCp(...)
+  end
+  local okSmall, nSmall = pcall(sc.decisiveRunaways, { missBound = 1e-5, confidence = 0.95 })
+  sc.cpUpper = realCp
+  check("decidable: a small bound is searched, not scanned", okSmall, true)
+  check("decidable: and its size is the first to meet the bound", okSmall
+    and sc.cpUpper(1, nSmall, 0.95) <= 1e-5 and sc.cpUpper(1, nSmall - 1, 0.95) > 1e-5, true)
+  check("decidable: a bound outside (0, 1) is refused",
+    (pcall(sc.decisiveRunaways, { missBound = 0, confidence = 0.95 }))
+      or (pcall(sc.decisiveRunaways, { missBound = 1, confidence = 0.95 })), false)
   sc.cfg.bootstrap = 400
   local baselines = sc.baselineSet(fit, 3)
   -- A fit split too small to certify the miss bound at any horizon is fit on

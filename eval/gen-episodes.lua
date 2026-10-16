@@ -68,7 +68,7 @@ M.cfg = {
   totalMB         = 36864,  -- the deployment machine's RAM
   exhaustPct      = 5,      -- availability at which the machine is lost
   starvePct       = 8,      -- a plateau holding the machine at or below this starves it
-  decisionsMax    = 3,      -- grace expiry and two re-arms (the floor acts by the third)
+  decisionsMax    = 3,      -- grace expiry and two re-arms (within one alert, the floor acts by the third)
   deferralSec     = lfm.cfg.maxDeferSec, -- the deterministic floor fires here (production's default)
   horizonSec      = 180,
   tickSec         = core.cfg.pollSec,    -- the sampler's cadence
@@ -205,8 +205,9 @@ local function pressureOf(avail, slopeMBmin)
 end
 
 -- One tick of the alert, as production runs it (pure). st: { active,
--- exposureSec, prevT, headed, belowSince }. While critical: the alert rises
--- (grace starting over) when the process is alive to head it, and grace
+-- exposureSec, prevT, headed, belowSince, seq }. While critical: the alert
+-- rises (grace starting over, seq counting the rise) when the process is
+-- alive to head it, and grace
 -- accrues over the last interval if the offender headed it as extreme
 -- (a stalled interval counts at most exposureStepMax). Below critical: no
 -- grace accrues, and the alert ends once the state has stayed below for
@@ -215,7 +216,10 @@ function M.alertStep(st, t, critical, alive, extreme, cfg)
   cfg = cfg or M.cfg
   if critical then
     st.belowSince = nil
-    if not st.active and alive then st.active, st.exposureSec, st.prevT, st.headed = true, 0, nil, false end
+    if not st.active and alive then
+      st.active, st.exposureSec, st.prevT, st.headed = true, 0, nil, false
+      st.seq = (st.seq or 0) + 1
+    end
     if st.headed and st.prevT then
       st.exposureSec = st.exposureSec + math.min(math.max(t - st.prevT, 0), cfg.exposureStepMax)
     end
@@ -267,7 +271,8 @@ function M.track(p, cfg, first, last)
       })
     end
     ticks[t] = { t = t, alive = alive, w = w, avail = avail, run = run, state = sm.state,
-                 kern = kern, rates = rates, pressure = pressure, exposureSec = alert.exposureSec, gate = gate }
+                 kern = kern, rates = rates, pressure = pressure, exposureSec = alert.exposureSec, gate = gate,
+                 alertSeq = alert.active and alert.seq or nil }
   end
   return ticks, onset
 end
@@ -369,6 +374,9 @@ end
 -- machine above the floor; at most decisionsMax. An offender the gate does
 -- not admit at t = 0 is no episode: production's first decision would come
 -- at some later open tick, off the time this episode is measured from.
+-- Production also clears its re-arm stamp when an alert settles, but a new
+-- alert's first open tick is a settle and a whole grace window later, so
+-- the spacing rule never delays it.
 function M.decisionTimes(ticks, cfg)
   cfg = cfg or M.cfg
   local function eligible(k) return k ~= nil and k.alive and k.gate == "open" and k.avail > cfg.exhaustPct end
@@ -473,7 +481,10 @@ function M.episode(tpl, seed, split, cfg)
   -- episode.
   local allowed = core.killAllowed({ pid = PID, uid = M.ownerOf(p.name), comm = p.name }, OWN_UID, 1)
   for _, t in ipairs(allowed and M.decisionTimes(ticks, cfg) or {}) do
-    steps[#steps + 1] = { t = t, snapshot = snapshotAt(p, ticks[t]) }
+    -- alertSeq: which alert the decision belongs to. Production starts a
+    -- new decision sequence (its deferral included) once an alert settles,
+    -- so the scorer restarts the deferral when this changes.
+    steps[#steps + 1] = { t = t, alertSeq = ticks[t].alertSeq, snapshot = snapshotAt(p, ticks[t]) }
   end
   return {
     id = string.format("%s-%s-s%d", split, tpl.id, seed),

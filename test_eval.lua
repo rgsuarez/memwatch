@@ -182,6 +182,15 @@ do
   check("gate: the oracle never misses", s.misses, 0)
   check("gate: the oracle itself never freezes a savable", s.wrongful - s.wrongfulByFloor, 0)
   check("gate: the floor's own freezes are counted as the floor's", s.wrongfulByFloor > 0, true)
+  -- The floor's deferral runs per alert: the same three waits fire it when
+  -- they share an alert, and do not when the third is under a new one.
+  local function seqEp(a, b, c)
+    return { id = "q", labels = { class = "runaway", ttxSec = 999 },
+             steps = { { t = 0, alertSeq = a }, { t = 60, alertSeq = b }, { t = 130, alertSeq = c } } }
+  end
+  local waitAll = function() return "wait" end
+  check("play: one alert's waits reach the floor", sc.play(seqEp(1, 1, 1), waitAll).by, "floor")
+  check("play: a new alert starts the deferral over", sc.play(seqEp(1, 1, 2), waitAll).freezeAt, nil)
   -- The power control mixes the oracle into a baseline by episode.
   local af = sc.candidates["always-freeze"]()
   local none, all = sc.mixedOracle(af, 0, 1), sc.mixedOracle(af, 1, 1)
@@ -372,6 +381,7 @@ do
   check("alert: below critical for the settle ends it", al.active, false)
   gen.alertStep(al, 95, true, true, true)
   check("alert: the next rise starts grace over", al.exposureSec, 0)
+  check("alert: and is counted as a new alert", al.seq, 2)
   -- A process that exits while the state settles is not alerted again when
   -- the state returns to critical: nothing heads the alert, so no grace runs.
   local gone = { active = false, exposureSec = 0 }
@@ -390,6 +400,18 @@ do
     if t > 40 and k.state ~= "critical" then calmed = true end
   end
   check("state: the machine leaves critical once the offender is gone and the room is back", calmed, true)
+  -- A runaway that pauses long enough for the machine to calm, then grows
+  -- again: its third decision belongs to a new alert, and production's
+  -- deferral starts over there, so an always-wait candidate is not frozen
+  -- by the floor at it and misses the runaway (it exhausts at 177.8 s).
+  local relapse = gen.episode({ id = "T-relapse", names = { "python3" }, avail0 = 30, w0 = 1000, age0 = 600,
+    peak0 = 15000, compress = 2, graceRate = 0, phases = { { dur = 90, rate = 0 }, { dur = 90, rate = 210 } },
+    after = "hold" }, 1, "test")
+  local seqs = {}
+  for _, s in ipairs(relapse.steps) do seqs[#seqs + 1] = s.t .. "#" .. tostring(s.alertSeq) end
+  check("relapse: decisions under the first alert, then a new one", table.concat(seqs, ","), "0#1,60#1,170#2")
+  check("relapse: an always-wait candidate is not floor-frozen across the settle",
+    sc.outcome(relapse, sc.play(relapse, function() return "wait" end)).missed, true)
   -- Production's policy gate never freezes another user's process: an
   -- offender macOS runs under its own service user is no episode, while the
   -- same trajectory under the user's own process is.

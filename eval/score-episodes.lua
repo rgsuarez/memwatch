@@ -80,9 +80,13 @@ M.rng = rng
 -- decide(step, ep) -> "freeze" | "wait", pFreeze (optional number)
 function M.play(ep, decide, cfg)
   cfg = cfg or M.cfg
-  local firstWaitT = nil
+  local firstWaitT, seq = nil, nil
   local trace = {}
-  for _, st in ipairs(ep.steps) do
+  for i, st in ipairs(ep.steps) do
+    -- A decision under a new alert starts a new sequence, as production's
+    -- episode reset does once an alert settles: the deferral starts over.
+    if i > 1 and st.alertSeq ~= seq then firstWaitT = nil end
+    seq = st.alertSeq
     local act, p = decide(st, ep)
     if act == "freeze" then
       trace[#trace + 1] = { t = st.t, act = act, p = p }

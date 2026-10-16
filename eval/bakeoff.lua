@@ -551,14 +551,16 @@ local function episodesMode(args)
         -- model, so rows from two runs can never be mistaken for one.
         -- snapshotHash binds the row to the input it answered (the scorer
         -- computes the same: score-episodes.lua, M.stepHash).
-        of:write(assert(lfm.jsonEncode({ episode = ep.id, t = st.t, action = action or "freeze",
+        assert(of:write(assert(lfm.jsonEncode({ episode = ep.id, t = st.t, action = action or "freeze",
           pWait = pWait, valid = action ~= nil, wall_ms = wallMs,
           variant = variant, api = api, model = args.model,
           snapshotHash = lfm.snapshotHash(assert(lfm.jsonEncode(st.snapshot))),
-          error = err and tostring(err):sub(1, 120) or nil })), "\n")
+          error = err and tostring(err):sub(1, 120) or nil })), "\n"))
       end
     end
-    of:close()
+    -- A row that did not reach the disk (a full volume) fails the run, which
+    -- then removes its claimed file, rather than leaving a torn one behind.
+    assert(of:close())
   end)
   os.remove(reqPath)
   os.remove(respPath)

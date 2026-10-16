@@ -427,6 +427,14 @@ do
   check("relapse: decisions under the first alert, then a new one", table.concat(seqs, ","), "0#1,60#1,170#2")
   check("relapse: an always-wait candidate is not floor-frozen across the settle",
     sc.outcome(relapse, sc.play(relapse, function() return "wait" end)).missed, true)
+  -- The same on a savable: a burst after a calm spell decides under a new
+  -- alert, and a wait there is not frozen by the first alert's deferral.
+  local relapseS = gen.episode({ id = "T-relapse-s", names = { "python3" }, avail0 = 40, w0 = 1000, age0 = 600,
+    peak0 = 15000, compress = 2, graceRate = 0, phases = { { dur = 100, rate = 0 }, { dur = 10, rate = 650 } },
+    after = "hold" }, 1, "test")
+  check("relapse: nor is a savable one, so no wrongful freeze is scored",
+    relapseS.labels.class .. ":" .. tostring(sc.outcome(relapseS, sc.play(relapseS, function() return "wait" end)).wrongful),
+    "savable:false")
   -- A runaway that exhausts the machine and only then releases gets no
   -- decision after the machine is lost, though the release would show a
   -- recovered process at the later ticks.
@@ -522,6 +530,9 @@ do
       + (hiOf(tpl.w0) + climb + grace) / (math.max(1, loOf(tpl.compress or 1.5)) * gen.cfg.totalMB)
     worst = math.max(worst, fill)
   end
+  -- (The premise is checked at the 64 cell edges, not proven between them;
+  -- climbSec steps down in whole ticks, so a violation would have to fall
+  -- between two edges a template's range apart by under 2%.)
   check("capacity: a climb is never longer at a faster rate (the bound's premise)", monotone, true)
   check("capacity: every public template's whole range fits the machine", worst <= gen.cfg.maxFill, true)
   local okCap, errCap = pcall(gen.simulate, params({ avail0 = 10.5, phases = { { dur = 1.9, rate = 400 } } }))
@@ -878,6 +889,15 @@ return {
   gen.main({ "--templates", "eval/episode-templates.lua", "--split", "dev", "--seed", "1",
              "--per-template", "1", "--out", good })
   local wrote = tonumber(tostring(said):match("^wrote (%d+) episodes"))
+  -- An existing empty directory is published into (the rename replaces it).
+  local empty = base .. "/empty"
+  os.execute("mkdir '" .. empty .. "'")
+  local okEmptyOut = pcall(gen.main, { "--templates", "eval/episode-templates.lua", "--split", "dev", "--seed", "3",
+                                       "--per-template", "1", "--out", empty })
+  local emptyFiles = #listing(empty)
+  os.execute("rm -rf '" .. empty .. "'")
+  local okFrac, errFrac = pcall(gen.main, { "--templates", "eval/episode-templates.lua", "--split", "dev",
+                                           "--seed", "1.5", "--out", base .. "/frac" })
   local okAgain, errAgain = pcall(gen.main, { "--templates", "eval/episode-templates.lua", "--split", "dev",
                                              "--seed", "2", "--per-template", "1", "--out", good })
   -- A write that fails partway (an id naming no file) publishes nothing and
@@ -938,6 +958,9 @@ return {
   check("generator: and none of them leaves anything behind, published or staged", table.concat(stray, ","), "")
   local files = listing(good)
   check("generator: a finished split is published whole", wrote ~= nil and #files == wrote, true)
+  check("generator: an existing empty directory is published into", okEmptyOut and emptyFiles > 0, true)
+  check("generator: a seed that is not a whole number is refused",
+    okFrac == false and tostring(errFrac):find("integer", 1, true) ~= nil, true)
   check("generator: an output that is not empty is refused",
     okAgain == false and tostring(errAgain):find("name a fresh directory", 1, true) ~= nil, true)
   check("generator: and is left as it was", #listing(good), #files)
@@ -986,6 +1009,25 @@ do
   local gO = sc.gate(dev, sc.candidates.oracle(), baselines)
   check("decidable: some baseline meets the miss bound", gO.bestBaseline ~= nil, true)
   check("decidable: the label oracle passes the gate", gO.pass, true)
+  -- And the CLI says so in its exit status, as it does for a failure.
+  local function writeSplit(eps)
+    local h = io.popen("mktemp -d")
+    local d = h:read("l")
+    h:close()
+    for _, ep in ipairs(eps) do
+      local f = assert(io.open(d .. "/" .. ep.id .. ".json", "w"))
+      f:write(lfm.jsonEncode(ep), "\n")
+      f:close()
+    end
+    return d
+  end
+  local devDir, fitDir = writeSplit(dev), writeSplit(fit)
+  local quiet3 = print
+  print = function() end
+  local okPass, passStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "oracle" })
+  print = quiet3
+  os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
+  check("decidable: a passing gate exits 0", okPass and passStatus, 0)
   check("decidable: always-freeze fails it", sc.gate(dev, sc.candidates["always-freeze"](), baselines).pass, false)
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)

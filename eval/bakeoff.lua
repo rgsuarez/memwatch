@@ -158,18 +158,19 @@ local function withAuthHeader(key, fn)
   local dir = privateDir()
   local hdr = dir .. "/auth"
   -- Everything after the directory exists, the header write included, runs
-  -- inside the cleanup, and fn's results come back as on the keyless path.
-  local ok, a, b = pcall(function()
+  -- inside the cleanup, and all of fn's results come back, as on the
+  -- keyless path.
+  local r = table.pack(pcall(function()
     local f = assert(io.open(hdr, "w"))
     f:write("Authorization: Bearer " .. key .. "\n")
     f:close()
     os.execute("chmod 600 " .. shellQuote(hdr))
     return fn(hdr)
-  end)
+  end))
   os.remove(hdr)
   os.execute("rmdir " .. shellQuote(dir))
-  if not ok then error(a, 0) end
-  return a, b
+  if not r[1] then error(r[2], 0) end
+  return table.unpack(r, 2, r.n)
 end
 
 -- One POST with curl, gated on curl's own exit status so a failed request

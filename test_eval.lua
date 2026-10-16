@@ -1148,7 +1148,7 @@ do
   -- The header file exists, private, only while the run does; it goes on
   -- return and on error, and the run's own results come back either way.
   local seen = {}
-  local r1, r2 = bk.withAuthHeader("sk-test-123", function(hdr)
+  local r1, r2, r3 = bk.withAuthHeader("sk-test-123", function(hdr)
     local hf = assert(io.open(hdr, "r"))
     seen.line = hf:read("l")
     hf:close()
@@ -1156,12 +1156,12 @@ do
     seen.mode = st:read("l")
     st:close()
     seen.path = hdr
-    return "a", "b"
+    return "a", "b", "c"
   end)
   check("auth: the header carries the key, during the run", seen.line, "Authorization: Bearer sk-test-123")
   check("auth: private to its owner", seen.mode, "600")
   check("auth: removed after the run", io.open(seen.path, "r") == nil, true)
-  check("auth: the run's results come back", r1 .. r2, "ab")
+  check("auth: all of the run's results come back", r1 .. r2 .. tostring(r3), "abc")
   local errPath
   local okErr = pcall(bk.withAuthHeader, "sk-test-123", function(hdr) errPath = hdr; error("boom") end)
   check("auth: an error still removes it", okErr == false and io.open(errPath, "r") == nil, true)

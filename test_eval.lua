@@ -41,13 +41,14 @@ local function params(over)
   return p
 end
 do
-  -- Unbounded leak: (12 - 5)% of 36864 MB = 2580.48 MB at 200 MB/s -> 12.9 s.
+  -- Unbounded leak: (12 - 5)% of 36864 MB = 2580.48 MB at 200 MB/s -> 12.9024 s,
+  -- exactly (no time grid stands between the label and the trajectory).
   local sim = gen.simulate(params({ phases = { { dur = 180, rate = 200 } } }))
   check("sim leak: runaway", sim.class, "runaway")
-  check("sim leak: ttx matches the closed form", sim.ttxSec, 13)
-  -- Compression stretches the same leak: x2 -> 25.8 s.
+  check("sim leak: ttx matches the closed form", near(sim.ttxSec, 12.9024, 1e-9), true)
+  -- Compression stretches the same leak: x2 -> 25.8048 s.
   local simC = gen.simulate(params({ compress = 2, phases = { { dur = 180, rate = 200 } } }))
-  check("sim leak: compression stretches ttx", simC.ttxSec, 26)
+  check("sim leak: compression stretches ttx", near(simC.ttxSec, 25.8048, 1e-9), true)
   -- A burst that finishes with headroom: savable, resolves at its exit.
   local sb = gen.simulate(params({ avail0 = 25, phases = { { dur = 20, rate = 150 } },
                                    after = "exit", releaseAt = 45 }))
@@ -74,10 +75,11 @@ do
                 compress = 1.5, phases = { { dur = 10, rate = 150 } }, after = "exit", releaseAt = 30 }
   local ep = gen.episode(tpl, 1, "test")
   check("episode: exit before 60 leaves one decision point", #ep.steps, 1)
-  check("episode: the step is grace expiry", ep.steps[1].t, 0)
-  check("episode: snapshot is extreme at t=0", ep.steps[1].snapshot.offender.kind, "extreme")
-  check("episode: snapshot carries age", ep.steps[1].snapshot.offender.ageSec, 100)
-  check("episode: snapshot has no pid", ep.steps[1].snapshot.offender.pid, nil)
+  local s1 = ep.steps[1] or { snapshot = { offender = {} } }
+  check("episode: the step is grace expiry", s1.t, 0)
+  check("episode: snapshot is extreme at t=0", s1.snapshot.offender.kind, "extreme")
+  check("episode: snapshot carries age", s1.snapshot.offender.ageSec, 100)
+  check("episode: snapshot has no pid", s1.snapshot.offender.pid, nil)
   local hold = { id = "T-hold", names = { "qemu" }, avail0 = 28, w0 = 9000, age0 = 9000, peak0 = 9000,
                  compress = 2, phases = { { dur = 10, rate = 160 } }, after = "hold" }
   local eh = gen.episode(hold, 1, "test")
@@ -275,6 +277,75 @@ do
   check("prevalence: a category with no episodes is reported uncovered", pw.uncovered[1], "editor")
 end
 
+-- ---- labels at their exact boundaries (no time grid) ----
+do
+  -- A fractional burst: 400 MB/s for 1.9 s from 10.5% settles at
+  -- 10.5 - 760 MB / 368.64 MB per point = 8.44%, which the snapshot shows as
+  -- 8: at the line, so starving. Read a whole second early (9.41%, shown 9)
+  -- it would pass for savable.
+  check("labels: a fractional burst settling at the line starves",
+    gen.simulate(params({ avail0 = 10.5, phases = { { dur = 1.9, rate = 400 } } })).class, "runaway")
+  -- The line is read as the snapshot reports availability (floored).
+  check("labels: a plateau shown at 8 (8.3%) is at the line",
+    gen.simulate(params({ avail0 = 8.3, phases = {} })).class, "runaway")
+  check("labels: a plateau exactly at 8% is at the line",
+    gen.simulate(params({ avail0 = 8, phases = {} })).class, "runaway")
+  check("labels: a plateau above the line resolves",
+    gen.simulate(params({ avail0 = 9, phases = {} })).class, "savable")
+  -- A plateau under the line that releases within the bound resolves:
+  -- freezing it would only keep it from releasing.
+  check("labels: a plateau under the line that releases in time resolves",
+    gen.simulate(params({ avail0 = 8.5, phases = { { dur = 2, rate = 150 } },
+                          after = "release", releaseAt = 60 })).class, "savable")
+end
+
+-- ---- eligibility, state and footprint, from production's own logic ----
+do
+  -- The climb the detector qualified the offender on: 250 MB/s qualifies on
+  -- the streak route in four ticks; 150 MB/s needs the net route (6000 MB,
+  -- 40 s); 100 MB/s never qualifies within the tracker's 55 s ring.
+  check("climb: a fast climb qualifies in four ticks", gen.climbFor({ w0 = 1000, peak0 = 15000 }), 20)
+  check("climb: 150 MB/s qualifies on the net route", gen.climbFor({ w0 = 1000, peak0 = 9000 }), 40)
+  check("climb: 100 MB/s never qualifies", gen.climbFor({ w0 = 1000, peak0 = 6000 }), nil)
+  -- A slow grower whose qualifying climb ended 30 s before grace expiry is
+  -- latched to 90 s, and the 100 MB/s that follows never renews it: the
+  -- tracker's 12 samples span 55 s, so it reads 5500 MB < 6000 (a 60 s
+  -- window would read 6000). It reads sustained at 120: no decision point.
+  local slow = { id = "T-slow", names = { "java" }, avail0 = 40, w0 = 6000, age0 = 600, peak0 = 12000,
+                 compress = 1, phases = { { dur = 180, rate = 100 } }, after = "hold", stoppedBefore = 30 }
+  local esl = gen.episode(slow, 1, "test")
+  check("tracker: a lapsed latch leaves no decision point at 120", #esl.steps, 2)
+  check("tracker: the slow grower is still a runaway", esl.labels.class, "runaway")
+  check("tracker: waiting through 60 s misses it",
+    sc.outcome(esl, sc.play(esl, function() return "wait" end)).missed, true)
+  -- An extreme runaway puts production's state machine at critical, with
+  -- headroom or without it.
+  local hold = { id = "T-hold2", names = { "qemu-system-aarch64" }, avail0 = 28, w0 = 9000, age0 = 9000,
+                 peak0 = 9000, compress = 2, phases = { { dur = 10, rate = 160 } }, after = "hold" }
+  local eh = gen.episode(hold, 1, "test")
+  local allCrit = #eh.steps == 3
+  for _, st in ipairs(eh.steps) do if st.snapshot.state ~= "critical" then allCrit = false end end
+  check("state: every decision point is critical, headroom or not", allCrit, true)
+  -- A release gives the burst back: a later decision sees the base footprint.
+  local rel = { id = "T-release", names = { "mds_stores" }, avail0 = 20, w0 = 4000, age0 = 3600, peak0 = 9000,
+                compress = 2, phases = { { dur = 20, rate = 160 } }, after = "release", releaseAt = 40 }
+  local at60 = gen.episode(rel, 1, "test").steps[2]
+  check("release: a latched process decides after it releases", at60 and at60.t, 60)
+  check("release: its footprint is back to the base", at60 and at60.snapshot.offender.weightMB, 4000)
+  check("release: it is no longer growing", at60 and at60.snapshot.offender.slopeMBmin, 0)
+  check("release: the burst's memory is back", at60 and at60.snapshot.availPct, 28)
+  -- A template's draws follow its content, not its id's length.
+  local a = { id = "AAAA", names = { "rg" }, avail0 = { 10, 30 }, w0 = 3000, age0 = 100, peak0 = 9000,
+              phases = {}, after = "hold" }
+  local b = {}
+  for k, v in pairs(a) do b[k] = v end
+  b.id = "BBBB"
+  check("seed: templates with equal-length ids draw their own streams",
+    gen.episode(a, 1, "t").params.avail0 ~= gen.episode(b, 1, "t").params.avail0, true)
+  check("seed: one template and seed always yield the same episode",
+    lfm.jsonEncode(gen.episode(a, 3, "t")) == lfm.jsonEncode(gen.episode(a, 3, "t")), true)
+end
+
 -- ---- replay, attribution and ties ----
 do
   local function mk1(id, class, ttx, resolves, times)
@@ -350,6 +421,37 @@ do
   check("cli: a gate without a fit split is refused", okNone, false)
   check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
   os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link'")
+end
+
+-- ---- on a set large enough to decide the gate (the documented dev size) ----
+do
+  local templates = dofile("eval/episode-templates.lua")
+  local dev, fit = {}, {}
+  for _, tpl in ipairs(templates) do
+    if tpl.split == "dev" then
+      for k = 1, 8 do
+        local ep = gen.episode(tpl, 2000 + k, "dec")
+        if #ep.steps > 0 then dev[#dev + 1] = ep end
+        local ef = gen.episode(tpl, 3000 + k, "fit")
+        if #ef.steps > 0 then fit[#fit + 1] = ef end
+      end
+    end
+  end
+  local nR = 0
+  for _, ep in ipairs(dev) do if ep.labels.class == "runaway" then nR = nR + 1 end end
+  check("decidable: at least 59 runaways, the zero-miss bound", nR >= 59, true)
+  sc.cfg.bootstrap = 400
+  local baselines = sc.baselineSet(fit, 3)
+  local gO = sc.gate(dev, sc.candidates.oracle(), baselines)
+  check("decidable: some baseline meets the miss bound", gO.bestBaseline ~= nil, true)
+  check("decidable: the label oracle passes the gate", gO.pass, true)
+  check("decidable: always-freeze fails it", sc.gate(dev, sc.candidates["always-freeze"](), baselines).pass, false)
+  check("decidable: the power control passes at its target",
+    sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)
+  check("ttx: the fitted horizon makes fewer wrongful freezes than always-freeze",
+    gO.baselines.ttx.wrongful < gO.baselines["always-freeze"].wrongful
+      and gO.baselines.ttx.missUpper <= sc.cfg.missBound, true)
+  sc.cfg.bootstrap = 2000
 end
 
 -- ---- every corpus and template name keeps its category ----

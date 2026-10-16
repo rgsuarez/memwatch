@@ -10,36 +10,52 @@
 --
 -- An episode follows ONE such offender from grace expiry (t = 0) through the
 -- later decision points at t = 60 and t = 120, exactly as production would
--- re-adjudicate it. A seeded trajectory model (the offender's growth phases,
--- then hold / exit / release) drives the machine's availability, and the
--- labels fall out of the simulation mechanically:
+-- re-adjudicate it. A seeded trajectory model drives the offender's
+-- footprint: its base (the template's w0), the climb at its peak rate
+-- (peak0) that the detector last qualified it on, ending stoppedBefore
+-- seconds before t = 0, then the template's growth phases and hold / exit /
+-- release. The machine's availability follows (avail0 is its value at
+-- t = 0), and the labels fall out of the trajectory mechanically and
+-- exactly, with no time grid between a label and its trajectory:
 --
 --   runaway       the trajectory exhausts the machine (availability <= the
---                 exhaustion floor) before it resolves, or it plateaus while
---                 holding the machine at or below the starvation line
+--                 exhaustion floor) at or before it resolves, or it is a
+--                 hold that settles at or below the starvation line, read
+--                 as the snapshot reports availability (whole percent,
+--                 floored). A plateau that releases within the deferral
+--                 bound is not starving: it resolves on its own
 --   ttxSec        seconds from t = 0 to exhaustion (runaways); a starving
 --                 plateau is given the deferral bound (it must be frozen by
---                 then, and the deterministic floor guarantees it is)
+--                 then)
 --   resolvesBySec seconds until the offender exits, releases, or stops
 --                 growing (non-runaways)
 --   class         runaway | savable (resolves within the deferral bound
 --                 without exhausting) | late (resolves after it; excluded
---                 from the wrongful-freeze count, the deterministic floor
---                 catches it regardless)
+--                 from the wrongful-freeze count)
 --
 -- Decision points exist only where production would make one: the process
--- is alive, availability is above the exhaustion floor, and the detector
--- still reads kind=extreme (its latch runs 120 s past the last qualifying
--- growth sample). Each step carries the full model-input snapshot.
+-- is alive, PRODUCTION's tracker (memwatch_procs, fed one ps row per 5 s
+-- sampler tick) reads kind=extreme, PRODUCTION's pressure state machine
+-- (memwatch_core) is critical, and availability is above the exhaustion
+-- floor. The tracker's latch, its 55 s ring and its two qualifying routes
+-- therefore decide when an offender stops being eligible, as they do live.
+-- Each step carries the full model-input snapshot: the offender as the
+-- tracker reports it (weight, rising-tail slope, peak, age) and the state
+-- machine's state.
 --
 -- Usage (from the repo root):
 --   lua eval/gen-episodes.lua --templates eval/episode-templates.lua \
---       --split dev --seed 1 --per-template 4 --out eval/episodes/dev
--- A sealed set is generated the same way from templates kept OUTSIDE this
--- repository, so its templates never become public or training material.
+--       --split dev --seed 1 --per-template 8 --out eval/episodes/dev
+-- A set decides gate G7 only with enough runaways: 59 at zero misses, 93 at
+-- one (the one-sided Clopper-Pearson bound); 8 per template gives the
+-- public dev templates 88. A sealed set is generated the same way from
+-- templates kept OUTSIDE this repository, so its templates never become
+-- public or training material.
 
 package.path = "lua/?.lua;" .. package.path
 local lfm = require("memwatch_lfm")
+local procs = require("memwatch_procs")
+local core = require("memwatch_core")
 
 local M = {}
 
@@ -50,9 +66,8 @@ M.cfg = {
   decisionTimes   = { 0, 60, 120 },
   deferralSec     = 120,    -- maxDeferSec: the deterministic floor fires here
   horizonSec      = 180,
-  latchSec        = 120,    -- the detector's extreme latch
-  extremeRateMBs  = 150,    -- 9000 MB/min streak route
-  extremeNetMB    = 6000,   -- +6 GB across the 60 s window route
+  tickSec         = 5,      -- the sampler's cadence (core.cfg.pollSec)
+  leadSec         = 60,     -- base-footprint history before the climb
 }
 
 -- Deterministic PRNG (xorshift32), identical across Lua 5.4 and 5.5 so a
@@ -78,7 +93,9 @@ local function sampleRange(r, v)
   return v
 end
 
--- Sample one parameter vector from a template.
+-- Sample one parameter vector from a template. w0 is the base footprint
+-- before the climb that qualified the offender (see prepare); avail0 is the
+-- availability at t = 0, after it.
 function M.sample(tpl, r)
   local p = {
     name = r.pick(tpl.names),
@@ -86,8 +103,8 @@ function M.sample(tpl, r)
     avail0 = sampleRange(r, tpl.avail0),
     w0 = sampleRange(r, tpl.w0),
     age0 = math.floor(sampleRange(r, tpl.age0)),
-    peak0 = sampleRange(r, tpl.peak0 or 0),     -- MB/min peak observed before t = 0
-    stoppedBefore = sampleRange(r, tpl.stoppedBefore or 0), -- s before t = 0 growth last qualified
+    peak0 = sampleRange(r, tpl.peak0 or 0),     -- the climb's rate before t = 0, MB/min
+    stoppedBefore = sampleRange(r, tpl.stoppedBefore or 0), -- s before t = 0 the climb ended
     frozenCount = tpl.frozenCount or 0,
     -- How much of the growth the kernel absorbs by compression before it
     -- costs availability (1 = incompressible data, 2-3 = typical heaps).
@@ -109,63 +126,156 @@ function M.sample(tpl, r)
   return p
 end
 
--- Offender weight at time t (MB) and its growth rate (MB/s), from params.
-local function rateAt(p, t)
-  for _, ph in ipairs(p.phases) do
-    if t >= ph.from and t < ph.to then return ph.rate end
-  end
-  return 0
-end
+local PID = 4242
 
-local function weightAt(p, t)
-  local w = p.w0
+-- Footprint at time t (MB). Before t = 0: the base, then the climb at the
+-- template's peak rate that the detector last qualified, ending
+-- stoppedBefore seconds before t = 0, then flat. From t = 0: the
+-- template's phases. A release gives the whole burst back (the base); an
+-- exit leaves nothing.
+function M.weightAt(p, t)
+  if p.releaseAt and t >= p.releaseAt then
+    return (p.after == "exit") and 0 or p.w0
+  end
+  if t < 0 then
+    local cEnd = -(p.stoppedBefore or 0)
+    local cStart = cEnd - p.climbSec
+    if t <= cStart then return p.w0 end
+    if t <= cEnd then return p.w0 + p.climbRate * (t - cStart) end
+    return p.wAt0
+  end
+  local w = p.wAt0
   for _, ph in ipairs(p.phases) do
-    if t > ph.from then
-      w = w + ph.rate * (math.min(t, ph.to) - ph.from)
-    end
+    if t > ph.from then w = w + ph.rate * (math.min(t, ph.to) - ph.from) end
   end
   return w
 end
 
--- Simulate the whole trajectory at 1 s resolution and derive labels.
+local function fracOf(p, cfg) return 100 / cfg.totalMB / math.max(1, p.compress or 1) end
+
+-- Availability at time t (percent): avail0 at t = 0, less what the
+-- offender's footprint has grown since (net of compression).
+function M.availAt(p, t, cfg)
+  cfg = cfg or M.cfg
+  return p.avail0 - (M.weightAt(p, t) - p.wAt0) * fracOf(p, cfg)
+end
+
+-- Sampler ticks from first to last (multiples of tickSec), feeding the
+-- PRODUCTION tracker (memwatch_procs) one ps row per tick while the process
+-- exists, and the production pressure state machine (memwatch_core) the
+-- same tick's signals. Returns ticks[t] = { alive, w, avail, run (the
+-- tracker's runaway row for the offender, or nil), state, kern, rates }.
+local function pressureOf(avail, slopeMBmin)
+  local pressure = (20 - avail) / 20
+  if pressure < 0 then pressure = 0 end
+  return avail <= 10 and 4 or 2,
+    { swapOut = math.floor(200 + pressure * 2200 + slopeMBmin / 8),
+      comp = math.floor(500 + pressure * 4800 + slopeMBmin / 3) }, pressure
+end
+
+function M.track(p, cfg, first, last)
+  cfg = cfg or M.cfg
+  local tr = procs.newTracker()
+  local sm = core.newSMState(first)
+  local ticks = {}
+  local born = -p.age0
+  -- On the sampler's grid, from the later of the first tick and the birth.
+  local t0 = math.floor(math.max(first, born) / cfg.tickSec) * cfg.tickSec
+  if t0 < born then t0 = t0 + cfg.tickSec end
+  for t = t0, last, cfg.tickSec do
+    local alive = not (p.after == "exit" and p.releaseAt and t >= p.releaseAt)
+    local w = M.weightAt(p, t)
+    local rows = {}
+    if alive then
+      rows[1] = { pid = PID, uid = 501, comm = p.name, rssMB = w, etimeSec = p.age0 + t }
+    end
+    procs.update(tr, rows, t, nil)
+    local avail = M.availAt(p, t, cfg)
+    local run
+    for _, r in ipairs(procs.runaways(tr, t, sm.state, cfg.totalMB, t)) do
+      if r.pid == PID then run = r end
+    end
+    local kern, rates, pressure = pressureOf(avail, run and run.slopeMBmin or 0)
+    local sig = core.signals({ availPct = avail }, rates, kern, run ~= nil and run.kind == "extreme")
+    core.smStep(sm, sig, t)
+    ticks[t] = { t = t, alive = alive, w = w, avail = avail, run = run, state = sm.state,
+                 kern = kern, rates = rates, pressure = pressure }
+  end
+  return ticks
+end
+
+-- The climb the detector qualified the offender on: at the template's peak
+-- rate, the shortest whole number of ticks (at least the streak route's
+-- four rises) after which the production tracker reads kind=extreme at the
+-- climb's last sample. nil when no climb that fits the tracker's ring does.
+function M.climbFor(p, cfg)
+  cfg = cfg or M.cfg
+  local rate = (p.peak0 or 0) / 60
+  if rate <= 0 then return nil end
+  local maxSec = (procs.cfg.windowSamples - 1) * cfg.tickSec
+  for sec = 4 * cfg.tickSec, maxSec, cfg.tickSec do
+    local q = { w0 = p.w0, climbRate = rate, climbSec = sec, stoppedBefore = 0,
+                wAt0 = p.w0 + rate * sec, avail0 = 50, compress = 1, phases = {},
+                age0 = sec + cfg.leadSec, after = "hold" }
+    local ticks = M.track(q, cfg, -(sec + cfg.leadSec), 0)
+    local k = ticks[0]
+    if k and k.run and k.run.kind == "extreme" then return sec end
+  end
+  return nil
+end
+
+-- Derived fields, idempotent: the climb, and the footprint at t = 0.
+function M.prepare(p, cfg)
+  cfg = cfg or M.cfg
+  if p.wAt0 then return p end
+  p.climbRate = (p.peak0 or 0) / 60
+  p.climbSec = M.climbFor(p, cfg)
+  assert(p.climbSec, "no climb at peak0 " .. tostring(p.peak0) .. " MB/min qualifies kind=extreme")
+  assert(p.age0 >= (p.stoppedBefore or 0) + p.climbSec,
+    "the process is younger than its climb (age0 " .. tostring(p.age0) .. ")")
+  p.wAt0 = p.w0 + p.climbRate * p.climbSec
+  return p
+end
+
+-- The first time at or after t = 0 that availability reaches the
+-- exhaustion floor while the offender still holds its growth, exactly
+-- (growth is piecewise linear), or nil within the horizon.
+local function exhaustAt(p, cfg)
+  local needMB = (p.avail0 - cfg.exhaustPct) / fracOf(p, cfg)
+  if needMB <= 0 then return 0 end
+  local limit = math.min(cfg.horizonSec, p.releaseAt or math.huge)
+  local grown = 0
+  for _, ph in ipairs(p.phases) do
+    if ph.from >= limit then break end
+    local span = math.min(ph.to, limit) - ph.from
+    if ph.rate > 0 and grown + ph.rate * span >= needMB then
+      return ph.from + (needMB - grown) / ph.rate
+    end
+    grown = grown + ph.rate * span
+  end
+  return nil
+end
+M.exhaustAt = exhaustAt
+
+-- Simulate the trajectory and derive labels, exactly: no time grid stands
+-- between a label and the trajectory it describes.
 function M.simulate(p, cfg)
   cfg = cfg or M.cfg
-  local frac = 100 / cfg.totalMB / math.max(1, p.compress or 1)
-  local tl = {}
-  local ttx = nil
-  local lastQualify = -p.stoppedBefore
-  local peak = p.peak0
-  local exited = false
-  for t = 0, cfg.horizonSec do
-    local rate = rateAt(p, t)
-    local w = weightAt(p, t)
-    local released = (p.releaseAt ~= nil) and t >= p.releaseAt
-    local avail = p.avail0 - (w - p.w0) * frac
-    if released then
-      avail = p.avail0  -- the burst's memory comes back (exit or release)
-      exited = exited or (p.after == "exit")
-    end
-    if not released then
-      local back = t >= 60 and weightAt(p, t - 60) or nil
-      if rate >= cfg.extremeRateMBs or (back and (w - back) >= cfg.extremeNetMB) then
-        lastQualify = t
-      end
-      if rate * 60 > peak then peak = rate * 60 end
-    end
-    tl[t] = { w = w, rate = released and 0 or rate, avail = avail, alive = not (released and p.after == "exit"),
-              released = released, kindExtreme = (t - lastQualify) < cfg.latchSec, peak = peak }
-    if ttx == nil and avail <= cfg.exhaustPct and not released then ttx = t end
-  end
+  M.prepare(p, cfg)
+  local ttx = exhaustAt(p, cfg)
   -- Resolution: exit/release time, else the end of growth for a hold.
-  local resolve
-  if p.releaseAt then
-    resolve = p.releaseAt
-  else
-    resolve = p.growthEnd
-  end
-  local holdAvail = tl[math.min(cfg.horizonSec, math.max(0, math.floor(resolve)))].avail
-  local starving = (p.releaseAt == nil) and holdAvail <= cfg.starvePct
-  local runaway = (ttx ~= nil and ttx < resolve) or starving
+  local resolve = p.releaseAt or p.growthEnd
+  -- A hold that settles at or below the starvation line starves the
+  -- machine for good. The line is read as the snapshot reports
+  -- availability (whole percent, floored), so a plateau the model sees at
+  -- the line is labeled at the line. A plateau that releases within the
+  -- deferral bound is not starving: it resolves, and freezing it would only
+  -- keep it from releasing.
+  local plateau = (p.releaseAt == nil) and M.availAt(p, p.growthEnd, cfg) or nil
+  local starving = plateau ~= nil and math.floor(plateau) <= cfg.starvePct
+  -- Exhaustion at or before resolution (exhaustAt only looks while the
+  -- offender holds its growth, so any time it finds is one).
+  local runaway = (ttx ~= nil and ttx <= resolve) or starving
   local class
   if runaway then
     class = "runaway"
@@ -175,49 +285,64 @@ function M.simulate(p, cfg)
   else
     class = "late"
   end
-  return { timeline = tl, ttxSec = runaway and ttx or nil, resolvesBySec = (not runaway) and resolve or nil,
-           runaway = runaway, class = class }
+  return { ttxSec = runaway and ttx or nil, resolvesBySec = (not runaway) and resolve or nil,
+           runaway = runaway, class = class, plateauPct = plateau }
 end
 
--- Correlated pressure fields so the numbers read like a real machine.
-local function snapshotAt(p, step, sim, t)
-  local avail = step.avail
-  local pressure = (20 - avail) / 20
-  if pressure < 0 then pressure = 0 end
-  local slopeMBmin = math.floor(step.rate * 60)
+-- The model-input snapshot at a decision tick: the offender as the
+-- production tracker reports it (kind, weight, rising-tail slope, peak,
+-- age), the production state machine's state, and pressure fields
+-- correlated with availability so the numbers read like a real machine.
+local function snapshotAt(p, k)
+  local run = k.run
   local offender = {
-    name = p.name, kind = step.kindExtreme and "extreme" or "hog",
-    weightMB = math.floor(step.w), slopeMBmin = slopeMBmin,
-    peakSlopeMBmin = math.floor(step.peak),
-    ageSec = p.age0 + t, foreground = p.foreground or nil,
+    name = p.name, kind = run.kind,
+    weightMB = math.floor(run.weightMB), slopeMBmin = math.floor(run.slopeMBmin),
+    peakSlopeMBmin = math.floor(run.peakSlopeMBmin),
+    ageSec = run.ageSec, foreground = p.foreground or nil,
   }
   return {
-    state = avail <= 12 and "critical" or "elevated",
-    kern = avail <= 10 and 4 or 2,
-    availPct = math.floor(avail),
-    swapGB = math.floor((6 + pressure * 10) * 10) / 10,
-    compressorGB = math.floor((24 + pressure * 8) * 10) / 10,
-    swapoutRate = math.floor(200 + pressure * 2200 + slopeMBmin / 8),
-    compRate = math.floor(500 + pressure * 4800 + slopeMBmin / 3),
+    state = k.state,
+    kern = k.kern,
+    availPct = math.floor(k.avail),
+    swapGB = math.floor((6 + k.pressure * 10) * 10) / 10,
+    compressorGB = math.floor((24 + k.pressure * 8) * 10) / 10,
+    swapoutRate = k.rates.swapOut,
+    compRate = k.rates.comp,
     frozenCount = p.frozenCount,
     offender = offender,
     runaways = lfm.jsonArray({ { name = p.name, kind = offender.kind, weightMB = offender.weightMB,
-                                 slopeMBmin = slopeMBmin, peakSlopeMBmin = offender.peakSlopeMBmin,
+                                 slopeMBmin = offender.slopeMBmin, peakSlopeMBmin = offender.peakSlopeMBmin,
                                  ageSec = offender.ageSec } }),
   }
 end
 
--- Build one episode from a template and a seed.
+-- A template's own stream: seeded by the id's content (FNV-1a), so two
+-- templates never share draws.
+local function idHash(s)
+  local h = 2166136261
+  for i = 1, #s do h = ((h ~ s:byte(i)) * 16777619) & 0xFFFFFFFF end
+  return h
+end
+M.idHash = idHash
+
+-- Build one episode from a template and a seed. Decision points are where
+-- production makes one: the process is alive, the production tracker reads
+-- kind=extreme, the production state machine is critical, and the machine
+-- is above the exhaustion floor.
 function M.episode(tpl, seed, split, cfg)
   cfg = cfg or M.cfg
-  local r = M.rng(seed * 7919 + (#tpl.id * 131))
+  local r = M.rng((seed * 7919 + idHash(tpl.id)) % 4294967296)
   local p = M.sample(tpl, r)
   local sim = M.simulate(p, cfg)
+  local first = -((p.stoppedBefore or 0) + p.climbSec + cfg.leadSec)
+  local ticks = M.track(p, cfg, first, cfg.horizonSec)
   local steps = lfm.jsonArray({})
   for _, t in ipairs(cfg.decisionTimes) do
-    local st = sim.timeline[t]
-    if st and st.alive and st.kindExtreme and st.avail > cfg.exhaustPct then
-      steps[#steps + 1] = { t = t, snapshot = snapshotAt(p, st, sim, t) }
+    local k = ticks[t]
+    if k and k.alive and k.run and k.run.kind == "extreme" and k.state == "critical"
+       and k.avail > cfg.exhaustPct then
+      steps[#steps + 1] = { t = t, snapshot = snapshotAt(p, k) }
     end
   end
   return {
@@ -230,8 +355,9 @@ function M.episode(tpl, seed, split, cfg)
       source = "simulator", rationale = tpl.rationale,
     },
     params = { avail0 = math.floor(p.avail0 * 10) / 10, w0 = math.floor(p.w0),
-               age0 = p.age0, after = p.after, growthEnd = math.floor(p.growthEnd),
-               releaseAt = p.releaseAt and math.floor(p.releaseAt) or nil },
+               wAt0 = math.floor(p.wAt0), climbSec = p.climbSec,
+               age0 = p.age0, after = p.after, growthEnd = math.floor(p.growthEnd * 10) / 10,
+               releaseAt = p.releaseAt and math.floor(p.releaseAt * 10) / 10 or nil },
     steps = steps,
   }
 end

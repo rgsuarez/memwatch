@@ -16,6 +16,28 @@ local function check(name, got, want)
   end
 end
 local function near(a, b, tol) return type(a) == "number" and math.abs(a - b) <= tol end
+-- What each read of one file asked for while fn ran: a harness for the
+-- result clears' read bound.
+local function readsOf(path, fn, ...)
+  local asked, realOpen = {}, io.open
+  io.open = function(p, m)
+    local f, e, c = realOpen(p, m)
+    if f and p == path then
+      local real = getmetatable(f).__index
+      return setmetatable({ read = function(_, ...) asked[#asked + 1] = (...); return f:read(...) end },
+        { __index = function(_, k) return function(_, ...) return real[k](f, ...) end end })
+    end
+    return f, e, c
+  end
+  local ok, err = pcall(fn, ...)
+  io.open = realOpen
+  return asked, ok, err
+end
+local function bigFile(path)
+  local f = assert(io.open(path, "w"))
+  f:write(string.rep("x", 2 * 1048576))
+  f:close()
+end
 
 -- ---- PRNG: deterministic and identical across runs ----
 do
@@ -1205,6 +1227,23 @@ dofile("eval/score-episodes.lua")
     epSaid:find("exit=3", 1, true) ~= nil and epNow == epText, true)
   check("cli: and the refusal says only a gate result is cleared",
     epSaid:find("only a gate result is cleared", 1, true) ~= nil, true)
+  -- A large file named by mistake is read no further than a result could be.
+  local bigOut = outFile .. "-big.bin"
+  bigFile(bigOut)
+  local gAsked, gOk, gErr = readsOf(bigOut, sc.clearResult, bigOut)
+  check("cli: the clear reads at most 1 MB of a large file at --out, and refuses it", gOk == false
+    and #gAsked == 1 and math.type(gAsked[1]) == "integer" and gAsked[1] <= 1048577
+    and tostring(gErr):find("only a gate result is cleared", 1, true) ~= nil, true)
+  os.remove(bigOut)
+  local emptyOut = outFile .. "-empty.json"
+  local eo = assert(io.open(emptyOut, "w"))
+  eo:close()
+  local okEmpty, errEmpty = pcall(sc.clearResult, emptyOut)
+  local stillThere = io.open(emptyOut, "r")
+  if stillThere then stillThere:close() end
+  check("cli: an empty file at --out is named as no gate result, and kept", okEmpty == false
+    and tostring(errEmpty):find("it is not a gate result", 1, true) ~= nil and stillThere ~= nil, true)
+  os.remove(emptyOut)
   os.remove(epAtOut)
   -- --out names a gate's result; the controls and tau write none.
   local okCtlOut, errCtlOut = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev, "--out", outFile })
@@ -1476,6 +1515,11 @@ printf '0.010 %s' "$status"
   nf2:write("not a result\n")
   nf2:close()
   check("runner: so is --out naming a file that is not JSON", keptAfter(notes, "not a result\n"), true)
+  local emptyFile = root .. "/empty.json"
+  local ef = assert(io.open(emptyFile, "w"))
+  ef:close()
+  check("runner: and an empty file, named as no run result", keptAfter(emptyFile, "")
+    and keptSaid:find("it is not a run result", 1, true) ~= nil, true)
   local emptyDir = root .. "/empty-dir"
   os.execute("mkdir -p '" .. emptyDir .. "'")
   check("runner: and --out naming a directory, even an empty one", keptAfter(emptyDir, nil), true)
@@ -2323,6 +2367,14 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   end
   check("runner: --redact-names takes no value, so the next flag keeps its own",
     bk.parseArgs({ "episodes", "--redact-names", "--dir", "X" }).dir, "X")
+  -- A large file named by mistake is read no further than a result could be.
+  local bigOut = root .. "/big.bin"
+  bigFile(bigOut)
+  local rAsked, rOk, rErr = readsOf(bigOut, bk.clearResult, bigOut)
+  check("runner: the clear reads at most 1 MB of a large file at --out, and refuses it", rOk == false
+    and #rAsked == 1 and math.type(rAsked[1]) == "integer" and rAsked[1] <= 1048577
+    and tostring(rErr):find("only a run result is cleared", 1, true) ~= nil, true)
+  os.remove(bigOut)
   local okUnder, under = pcall(bk.parseArgs, { "--raw_names", "run", "--no_schema", "--redact_names" })
   check("runner: the boolean flags read under either spelling, taking no value", okUnder and under.raw_names == true
     and under.no_schema == true and under.redact_names == true and under.positional[1] == "run", true)

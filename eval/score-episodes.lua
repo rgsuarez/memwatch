@@ -1024,16 +1024,25 @@ end
 -- directory, a file that is not JSON or cannot be read) refuses the run
 -- untouched. A result that cannot be removed refuses it too, since an earlier
 -- result left there would read as this run's.
+-- A result is a few hundred bytes and the decoder takes at most 64 KB, so
+-- the clear reads at most 1 MB of what --out names: a large file named by
+-- mistake costs that much, never its size.
+local CLEAR_READ_MAX = 1048576
 function M.clearResult(path)
   local f, oerr, ocode = io.open(path, "r")
   if not f and ocode == 2 then return end
-  local text = f and f:read("a") or nil
-  if f then f:close() end
+  local text, rerr
+  if f then
+    text, rerr = f:read(CLEAR_READ_MAX + 1)
+    -- (An empty file gives nothing at its end, and no error.)
+    if text == nil and rerr == nil then text = "" end
+    f:close()
+  end
   local doc, derr = nil, nil
   if text then doc, derr = lfm.jsonDecode(text) end
   if not (type(doc) == "table" and type(doc.candidate) == "string" and type(doc.pass) == "boolean") then
     local why = not f and ("it cannot be read: " .. tostring(oerr))
-      or not text and "it is a directory, or cannot be read"
+      or not text and ("it cannot be read: " .. tostring(rerr))
       or derr and ("it is not a gate result: " .. derr)
       or "it is not a gate result"
     error(string.format("cannot clear %s: %s; only a gate result is cleared, so remove it or name another path",

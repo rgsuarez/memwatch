@@ -291,17 +291,26 @@ end
 -- directory, a file that is not JSON or cannot be read) refuses the run
 -- untouched. A result that cannot be removed refuses it too, since an earlier
 -- result left there would read as this run's.
+-- A result is a few dozen KB and the decoder takes at most 64 KB, so the
+-- clear reads at most 1 MB of what --out names: a large file named by
+-- mistake costs that much, never its size.
+local CLEAR_READ_MAX = 1048576
 local function isRunResult(doc) return type(doc.label) == "string" and type(doc.rows) == "table" end
 local function clearResult(path)
   local f, oerr, ocode = io.open(path, "r")
   if not f and ocode == 2 then return end
-  local text = f and f:read("a") or nil
-  if f then f:close() end
+  local text, rerr
+  if f then
+    text, rerr = f:read(CLEAR_READ_MAX + 1)
+    -- (An empty file gives nothing at its end, and no error.)
+    if text == nil and rerr == nil then text = "" end
+    f:close()
+  end
   local doc, derr = nil, nil
   if text then doc, derr = lfm.jsonDecode(text) end
   if not (type(doc) == "table" and isRunResult(doc)) then
     local why = not f and ("it cannot be read: " .. tostring(oerr))
-      or not text and "it is a directory, or cannot be read"
+      or not text and ("it cannot be read: " .. tostring(rerr))
       or derr and ("it is not a run result: " .. derr)
       or "it is not a run result"
     error(string.format("cannot clear %s: %s; only a run result is cleared, so remove it or name another path",
@@ -1042,8 +1051,8 @@ local function isScript()
   return arg ~= nil and arg[0] ~= nil and debug.getinfo(1, "S").source == "@" .. arg[0]
 end
 
--- Loaded as a module (by the tests), it exports its scratch allocator and
--- the episodes mode.
+-- Loaded as a module (by the tests), it exports its scratch allocator, the
+-- episodes mode and its result clear.
 if isScript() then
   local args = parseArgs(arg)
   local mode = args.positional[1] or "run"
@@ -1060,4 +1069,5 @@ if isScript() then
 end
 
 return { privateDir = privateDir, reserveOutput = reserveOutput, withAuthHeader = withAuthHeader,
-         parseArgs = parseArgs, injectionScore = injectionScore, episodes = episodesMode }
+         parseArgs = parseArgs, injectionScore = injectionScore, episodes = episodesMode,
+         clearResult = clearResult }

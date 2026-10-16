@@ -2,7 +2,7 @@
 -- apply the discrimination gate (G7).
 --
 -- A candidate is played through each episode the way production defers:
--- at each decision point (grace expiry +0/+60/+120 s) it says freeze or
+-- at each decision point (grace expiry, then each re-arm) it says freeze or
 -- wait; the first freeze ends the episode; a wait defers, but once the
 -- deferral bound has elapsed since the first wait the deterministic floor
 -- supersedes a wait with its freeze. As in production, the candidate is

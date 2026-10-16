@@ -1015,6 +1015,14 @@ end
 -- refusal raises, and the script then exits 3, so a refusal is never read as
 -- a verdict.
 function M.main(argv)
+  -- A gate's result file is this run's or nothing. One left at the path by an
+  -- earlier run would read as this run's verdict if this one is refused or
+  -- fails to write, so the path is cleared first, before any refusal.
+  if argv[1] == "gate" then
+    for i = 2, #argv - 1 do
+      if argv[i] == "--out" and not tostring(argv[i + 1]):match("^%-%-") then os.remove(argv[i + 1]) end
+    end
+  end
   local status = 0
   local a = parse(argv)
   assert(a.dir, "--dir is required")

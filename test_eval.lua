@@ -1130,6 +1130,22 @@ dofile("eval/score-episodes.lua")
   for n in pp:lines() do if n:find(outFile:match("([^/]*)$") .. ".partial-", 1, true) then partials = partials + 1 end end
   pp:close()
   check("cli: and leaves no result at the path, and no partial beside it", torn == nil and partials == 0, true)
+  local function writePass(path)
+    local pf = assert(io.open(path, "w"))
+    pf:write('{"candidate":"oracle","pass":true}\n')
+    pf:close()
+  end
+  writePass(outFile)
+  exitOf("FAIL_OUT=" .. q(outFile) .. " lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+    .. " --candidate always-freeze --out " .. q(outFile))
+  local stalePass = io.open(outFile, "r")
+  if stalePass then stalePass:close() end
+  check("cli: an earlier passing result at the path does not survive a failed write", stalePass == nil, true)
+  writePass(outFile)
+  exitOf(gateCmd .. " --candidate no-such-candidate --out " .. q(outFile))
+  local staleRef = io.open(outFile, "r")
+  if staleRef then staleRef:close() end
+  check("cli: nor a refusal", staleRef == nil, true)
   check("cli: the harness's control, writing elsewhere, exits 2",
     exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
       .. " --candidate always-freeze --out " .. q(outFile)), 2)

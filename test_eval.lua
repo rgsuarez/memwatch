@@ -342,6 +342,16 @@ do
   check("alert: a lapse while critical keeps the alert and its grace", table.concat(rts, ","), "0,120")
   check("alert: so waiting through it is not a miss",
     sc.outcome(eres, sc.play(eres, function() return "wait" end)).missed, false)
+  -- Production's policy gate never freezes another user's process: an
+  -- offender macOS runs under its own service user is no episode, while the
+  -- same trajectory under the user's own process is.
+  local daemon = { id = "T-daemon", names = { "mds_stores" }, avail0 = 12, w0 = 4000, age0 = 3600, peak0 = 9000,
+                   compress = 1.5, phases = { { dur = 180, rate = 150 } }, after = "hold" }
+  local own = {}
+  for k, v in pairs(daemon) do own[k] = v end
+  own.id, own.names = "T-own", { "mdworker" }
+  check("policy: a process production may not freeze is no episode", #gen.episode(daemon, 1, "test").steps, 0)
+  check("policy: the same trajectory as the user's own process is", #gen.episode(own, 1, "test").steps > 0, true)
   -- The history must fit the machine: the offender's physical footprint
   -- plus what is available, the same at every tick, at most maxFill of it.
   local cap = true
@@ -410,7 +420,7 @@ do
   for _, st in ipairs(eh.steps) do if st.snapshot.state ~= "critical" then allCrit = false end end
   check("state: every decision point is critical, headroom or not", allCrit, true)
   -- A release gives the burst back: a later decision sees the base footprint.
-  local rel = { id = "T-release", names = { "mds_stores" }, avail0 = 20, w0 = 4000, age0 = 3600, peak0 = 9000,
+  local rel = { id = "T-release", names = { "mdworker" }, avail0 = 20, w0 = 4000, age0 = 3600, peak0 = 9000,
                 compress = 2, phases = { { dur = 20, rate = 160 } }, after = "release", releaseAt = 40 }
   local at60 = gen.episode(rel, 1, "test").steps[2]
   check("release: a latched process decides after it releases", at60 and at60.t, 60)

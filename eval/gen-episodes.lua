@@ -138,6 +138,13 @@ function M.sample(tpl, r)
 end
 
 local PID = 4242
+local OWN_UID = 501
+-- Template names macOS runs under another user (as observed: mds_stores
+-- under its own service user, backupd and mds as root, WindowServer under
+-- its own). Production's policy gate (core.killAllowed: same uid only)
+-- never freezes them, so no decision of a candidate's changes their fate.
+local SYSTEM_OWNED = { mds_stores = 308, mds = 0, backupd = 0, ["backupd-helper"] = 0, logd = 0, WindowServer = 88 }
+function M.ownerOf(name) return SYSTEM_OWNED[procs.friendlyName(name)] or OWN_UID end
 
 -- Footprint at time t (MB). Before t = 0: the base, then the climb at the
 -- template's peak rate on which the detector first tags the offender
@@ -209,7 +216,7 @@ function M.track(p, cfg, first, last)
     local w = M.weightAt(p, t)
     local rows = {}
     if alive then
-      rows[1] = { pid = PID, uid = 501, comm = p.name, rssMB = w, etimeSec = p.age0 + t }
+      rows[1] = { pid = PID, uid = M.ownerOf(p.name), comm = p.name, rssMB = w, etimeSec = p.age0 + t }
     end
     procs.update(tr, rows, t, nil)
     local avail = M.availAt(p, t, cfg)
@@ -440,7 +447,11 @@ function M.episode(tpl, seed, split, cfg)
   -- its last sample, so the alert rises exactly a grace window before t = 0.
   assert(onset == p.onsetAt, "the alert rose at " .. tostring(onset) .. ", not at " .. p.onsetAt)
   local steps = lfm.jsonArray({})
-  for _, t in ipairs(M.decisionTimes(ticks, cfg)) do
+  -- An offender production's policy gate refuses (another user's process,
+  -- or a denylisted name) is never frozen, whatever a candidate says: no
+  -- episode.
+  local allowed = core.killAllowed({ pid = PID, uid = M.ownerOf(p.name), comm = p.name }, OWN_UID, 1)
+  for _, t in ipairs(allowed and M.decisionTimes(ticks, cfg) or {}) do
     steps[#steps + 1] = { t = t, snapshot = snapshotAt(p, ticks[t]) }
   end
   return {

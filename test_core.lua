@@ -3337,6 +3337,20 @@ do
   check("tokenprob parse: the chosen option", tv and tv.action, "wait")
   check("tokenprob parse: P(wait) is the option's own probability",
     tv ~= nil and math.abs(tv.pWait - 0.994) < 1e-6, true)
+  -- An option split across two tokenizations: the quote sampled alone (0.55)
+  -- with '"free' (0.40) and '"wait' (0.05) fused at its position. P(wait) is
+  -- 0.05 + 0.55 * 0.99, not the 0.99 the value's position gives on its path.
+  do
+    local ps = {}
+    for _, t in ipairs({ '{"', "action", '":' }) do ps[#ps + 1] = pos(t, { { t, 0.99 } }) end
+    ps[#ps + 1] = pos('"', { { '"', 0.55 }, { '"free', 0.40 }, { '"wait', 0.05 } })
+    ps[#ps + 1] = pos("wait", { { "wait", 0.99 }, { "free", 0.01 } })
+    ps[#ps + 1] = pos('","', { { '","', 0.99 } })
+    local split = lfm.parseTokenProbs(lfm.jsonEncode({ content = "{}", completion_probabilities = lfm.jsonArray(ps) }))
+    check("tokenprob parse: an option split across two tokenizations is read whole",
+      split ~= nil and split.action == "wait" and math.abs(split.pWait - (0.05 + 0.55 * 0.99)) < 1e-9
+        and math.abs(split.pFreeze - (0.40 + 0.55 * 0.01)) < 1e-9, true)
+  end
   -- Mass on other tokens counts against waiting: half the probability on an
   -- unrelated word leaves P(wait) at half, not certainty.
   check("tokenprob parse: unrecognized mass is not renormalized into a wait",

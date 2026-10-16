@@ -803,22 +803,24 @@ end
 -- tells the options apart ("wait", "free..." for freeze, "termin..." for
 -- terminate), so the three options' probabilities there are the model's
 -- own probabilities for the decision; what it puts on other tokens (mass
--- short of 1) is left out, never spread over the options. Bounded by the
--- decoder (64 KB, depth 8). Returns { action, pWait, pFreeze, pTerminate,
--- mass } or nil, err.
+-- short of 1) is left out, never spread over the options. Where an option
+-- is split between the quote fused with it and the quote alone, both
+-- positions are read (below). Bounded by the decoder (64 KB, depth 8).
+-- Returns { action, pWait, pFreeze, pTerminate, mass } or nil, err.
 function M.parseTokenProbs(text)
   if type(text) ~= "string" or text == "" then return nil, "tokenprob: empty reply" end
   local doc, err = M.jsonDecode(text)
   if type(doc) ~= "table" then return nil, "tokenprob: " .. tostring(err) end
   local positions = doc.completion_probabilities
   if type(positions) ~= "table" then return nil, "tokenprob: no token probabilities" end
-  local seen, at, quoted = "", nil, false
+  local seen, at, quoted, quotePos, before = "", nil, false, nil, ""
   for i, pos in ipairs(positions) do
     if type(pos) ~= "table" or type(pos.token) ~= "string" then
       return nil, "tokenprob: malformed position"
     end
+    before = seen
     seen = seen .. pos.token
-    if seen:find('"action"%s*:%s*"$') then at = positions[i + 1]; break end
+    if seen:find('"action"%s*:%s*"$') then at, quotePos = positions[i + 1], pos; break end
     -- A tokenizer that fuses the value's opening quote with the value. A
     -- bare quote token is the quote alone: the value follows it, and the
     -- line above finds it on the next position.
@@ -841,6 +843,38 @@ function M.parseTokenProbs(text)
     -- A probability outside [0, 1] (or not a number) is malformed.
     if pr ~= nil and not (pr >= 0 and pr <= 1) then return nil, "tokenprob: a probability out of range" end
     if op and pr then p[op] = p[op] + pr end
+  end
+  -- The value's first token came after the quote as a token of its own.
+  -- Where the model also put probability, at the quote's position, on the
+  -- quote fused with an option ('"wait' as one token), the option's
+  -- probability is split across the two positions: the fused mass, plus the
+  -- probability of the path that reached the quote times what the value's
+  -- position gives on that path. Read from one position alone, the second
+  -- overstates it (a bare quote at 0.55 and '"wait' at 0.05 would read 0.99
+  -- for a wait the model gives 0.59).
+  if quotePos then
+    local qc = quotePos.top_logprobs or quotePos.top_probs
+    local fused, onPath = { wait = 0, freeze = 0, terminate = 0 }, 0
+    if type(qc) == "table" then
+      for _, c in ipairs(qc) do
+        local pr = type(c) == "table" and (type(c.prob) == "number" and c.prob
+          or (type(c.logprob) == "number" and math.exp(c.logprob))) or nil
+        if type(c) == "table" and type(c.token) == "string" and pr then
+          if not (pr >= 0 and pr <= 1) then return nil, "tokenprob: a probability out of range" end
+          local text = before .. c.token
+          local rest = text:match('"action"%s*:%s*"(.+)$')
+          if text:find('"action"%s*:%s*"$') then
+            onPath = onPath + pr
+          elseif rest then
+            local op = optionOf(rest, false)
+            if op then fused[op] = fused[op] + pr end
+          end
+        end
+      end
+    end
+    if fused.wait + fused.freeze + fused.terminate > 0 then
+      for k in pairs(p) do p[k] = fused[k] + onPath * p[k] end
+    end
   end
   local mass = p.wait + p.freeze + p.terminate
   if mass < 0.5 then return nil, "tokenprob: the options carry too little probability" end

@@ -311,6 +311,32 @@ check("top plus suffix", topMap[600].memMB, 1250)
 check("top B unit", topMap[70239].cmprsMB, 0)
 check("top G unit", topMap[99].cmprsMB, 1024)
 check("top preamble skipped", topMap[34], nil)
+-- top truncates its names, so a line far longer than a row is no row: it is
+-- refused at once, never matched (the name pattern is lazy).
+do
+  local t0 = os.clock()
+  local long = procs.parseTop("4242  a" .. (" "):rep(40000) .. "b  12M  0B\n1372   Terminal         944M  522M\n")
+  check("top: a line longer than any row is refused in linear time", os.clock() - t0 < 0.25 and long[4242] == nil, true)
+  check("top: the rows beside it still parse", long[1372] and long[1372].memMB, 944)
+  -- The cap's edge: a row of exactly 512 bytes parses, name whole; 513 does not.
+  local function rowOf(n)
+    local head, tail = "4242  ", "  12M  0B"
+    return head .. ("x"):rep(n - #head - #tail) .. tail
+  end
+  local at512 = procs.parseTop(rowOf(512) .. "\n")[4242]
+  check("top: a row of 512 bytes parses, its name whole", at512 and #at512.name, 512 - 6 - 9)
+  check("top: one of 513 is refused", procs.parseTop(rowOf(513) .. "\n")[4242], nil)
+  -- The live path is the stream: a block holding the long line between two
+  -- rows publishes promptly, without it, and keeps its neighbors.
+  local st = procs.newTopStream()
+  local t1 = os.clock()
+  procs.feedTopStream(st, "PID    COMMAND          MEM   CMPRS\n1372   Terminal         944M  522M\n")
+  local pub = procs.feedTopStream(st, "4242  a" .. (" "):rep(40000) .. "b  12M  0B\n600    WindowServer     1250M+ 206M\n"
+    .. "PID    COMMAND          MEM   CMPRS\n")
+  check("top stream: a block with a line longer than any row publishes in linear time", os.clock() - t1 < 0.25, true)
+  check("top stream: without it, keeping its neighbors",
+    pub ~= nil and pub[4242] == nil and pub[1372] ~= nil and pub[600] ~= nil, true)
+end
 
 -- ---- procs: growth detection (three-case floor) ----
 local PC = {}
@@ -574,6 +600,38 @@ check("kill: uid reason", whyUid, "not your process")
 local _, whyDeny = core.killAllowed({ pid = 500, uid = UID, comm = "Finder" }, UID, 999)
 check("kill: denylist reason", whyDeny, "protected process")
 check("kill: nil proc denied", (core.killAllowed(nil, UID, 999)), false)
+-- Linear in the name: a process can give itself any comm, of any length,
+-- and a backtracking pattern over a long run would stall the tick.
+do
+  local t0 = os.clock()
+  check("friendlyName: a long run before the last slash", procs.friendlyName(("a"):rep(40000) .. "/x"), "x")
+  check("shortName: a long whitespace run", core.shortName("a" .. (" "):rep(40000) .. "b"),
+    "a" .. (" "):rep(12) .. "\u{2026}")
+  local okK, whyK = core.killAllowed({ pid = 4242, uid = UID, comm = ("a"):rep(40000) .. "/WindowServer" }, UID, 999)
+  check("kill: a long path's basename is still the one denied", okK == false and whyK == "protected process", true)
+  check("name helpers: read in linear time", os.clock() - t0 < 0.25, true)
+  -- The same answers as before on ordinary names.
+  check("friendlyName: a comm ending in a slash is kept whole", procs.friendlyName("dir/"), "dir/")
+  check("shortName: a helper suffix after any whitespace is stripped", core.shortName("Slack \t Helper (GPU)"), "Slack")
+  check("shortName: Helper not after whitespace is kept", core.shortName("xHelper y"), "xHelper y")
+  check("kill: a comm ending in a slash names no denied process",
+    (core.killAllowed({ pid = 4243, uid = UID, comm = "/System/WindowServer/" }, UID, 999)), true)
+  -- And at the edges: empty, a lone slash, Helper first, whitespace other
+  -- than a space or tab, and bytes past ASCII.
+  check("friendlyName: an empty comm is unnamed", procs.friendlyName(""), "?")
+  check("friendlyName: a lone slash is kept whole", procs.friendlyName("/"), "/")
+  check("friendlyName: a multibyte basename is whole", procs.friendlyName("/opt/caf\xc3\xa9"), "caf\xc3\xa9")
+  check("shortName: a name that starts with Helper is kept", core.shortName("Helper"), "Helper")
+  check("shortName: whitespace then Helper at the start leaves nothing", core.shortName(" Helper"), "")
+  check("shortName: Helper after a newline is stripped", core.shortName("Slack\nHelper"), "Slack")
+  check("shortName: Helper after a vertical tab or form feed is stripped",
+    core.shortName("Slack\vHelper") .. "|" .. core.shortName("Zoom\f\rHelper (GPU)"), "Slack|Zoom")
+  check("shortName: a multibyte name keeps its bytes", core.shortName("Caf\xc3\xa9 Helper"), "Caf\xc3\xa9")
+  check("kill: an empty comm, a lone slash or no comm names no denied process",
+    (core.killAllowed({ pid = 4244, uid = UID, comm = "" }, UID, 999))
+      and (core.killAllowed({ pid = 4245, uid = UID, comm = "/" }, UID, 999))
+      and (core.killAllowed({ pid = 4246, uid = UID }, UID, 999)), true)
+end
 
 -- ---- LFM: JSON codec (trust-boundary parser; adversarial floor) ----
 local lfm = require("memwatch_lfm")
@@ -977,6 +1035,24 @@ do
   local selfOnly = core.parseProbeRows(
     "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n", SELF)
   check("probe: memwatch's own pid probed is present", (core.probeResult(selfOnly, SELF)), "present")
+  -- The comm is the process's own claim, of any length: it is read in
+  -- linear time, whole, with only its trailing whitespace trimmed.
+  local ctl = "  777   501 Ss   Mon Oct 12 09:00:00 2026 /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon\n"
+  local function commOf(tail)
+    local r = core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026 " .. tail .. "\n", SELF)
+    return r and r[4242] and r[4242].comm
+  end
+  local t0 = os.clock()
+  local long = commOf("a" .. (" "):rep(40000) .. "b")
+  check("probe: a comm with a long whitespace run is read in linear time", os.clock() - t0 < 0.25, true)
+  check("probe: and kept whole", long, "a" .. (" "):rep(40000) .. "b")
+  check("probe: a comm's trailing whitespace is trimmed", commOf("node \t "), "node")
+  check("probe: every whitespace byte is trimmed", commOf("node\v\f\r"), "node")
+  check("probe: and only those", commOf("node\xa0"), "node\xa0")
+  check("probe: its leading whitespace is the separator's", commOf("   node"), "node")
+  check("probe: a row that ends after the start time has an empty comm", commOf(""), "")
+  check("probe: one that ends at the year, with no separator, makes the reply unknown",
+    core.parseProbeRows(ctl .. " 4242   501 S    Mon Oct  5 10:00:01 2026\n", SELF), nil)
 end
 
 -- ---- identity: a recorded process may be signaled only while it holds ----
@@ -2027,6 +2103,101 @@ do
     observe.liveStamp(stamp, { comm = "/bin/x", startLo = 1500, startHi = 1502, etimeSec = 60 }), nil)
   local youngStamp = { at = 100, comm = "/bin/x", start = { lo = 999, hi = 1003, etimeSec = 1 } }
   check("liveStamp: an undecidable identity keeps it", observe.liveStamp(youngStamp, live), youngStamp)
+  do
+  -- A step back replays a stretch of wall time (observe.replaySpan): from
+  -- the stepped clock as it read at the previous reading to the old clock as
+  -- it would read now. Read at 1000 (mono 500), next at 905 (mono 510): a
+  -- 105 s step somewhere in those 10 s.
+  local span = observe.replaySpan(1000, 500, 905, 510, -105)
+  check("replaySpan: from the stepped clock at the previous reading", span.lo, 895)
+  check("replaySpan: to the old clock now", span.hi, 1010)
+  check("replaySpan: a start born 3 s after the previous reading lies in it",
+    observe.startReplayed({ lo = 897, hi = 898 }, { span }), true)
+  check("replaySpan: anchored at the detecting reading instead, it would escape (control)",
+    observe.startReplayed({ lo = 897, hi = 898 }, { { lo = 905 - 2, hi = 1010 } }), false)
+  local blind = observe.replaySpan(1000, nil, 900, nil, -100)
+  check("replaySpan: without a monotonic clock it fails closed (unbounded)",
+    blind.lo == -math.huge and blind.hi == math.huge, true)
+  check("replaySpan: nothing without a previous reading", observe.replaySpan(nil, nil, 900, 5, -100), nil)
+  check("replaySpan: nothing without a previous wall reading, whatever the monotonic one",
+    observe.replaySpan(nil, 500, 900, 510, -100), nil)
+  -- Each step keeps its own stretch; a start between two is untouched.
+  local spans = { { lo = 100, hi = 200 }, { lo = 500, hi = 600 } }
+  check("startReplayed: a start in a stretch", observe.startReplayed({ lo = 150, hi = 151 }, spans), true)
+  check("startReplayed: a start in the second stretch", observe.startReplayed({ lo = 550, hi = 551 }, spans), true)
+  check("startReplayed: a window ending at a stretch's start overlaps it",
+    observe.startReplayed({ lo = 98, hi = 100 }, spans), true)
+  check("startReplayed: one starting at a stretch's end overlaps it",
+    observe.startReplayed({ lo = 200, hi = 202 }, spans), true)
+  check("startReplayed: a malformed stretch is skipped", observe.startReplayed({ lo = 150, hi = 151 }, { {} }), false)
+  check("startReplayed: a start between two stretches is untouched",
+    observe.startReplayed({ lo = 300, hi = 301 }, spans), false)
+  check("startReplayed: a start before every stretch is untouched",
+    observe.startReplayed({ lo = 50, hi = 51 }, spans), false)
+  check("startReplayed: no window, no stretches", observe.startReplayed(nil, spans) or observe.startReplayed({ lo = 150, hi = 151 }, nil), false)
+  -- A start epoch (whole seconds) in a stretch, for signals, touches and
+  -- frozen-ledger entries.
+  check("epochReplayed: an epoch in a stretch", observe.epochReplayed(150, spans), true)
+  check("epochReplayed: one between stretches", observe.epochReplayed(300, spans), false)
+  check("epochReplayed: no epoch", observe.epochReplayed(nil, spans), false)
+  do
+    local ev = observe.newEvidence({ pid = 9, comm0 = "/bin/x", start0 = { lo = 149, hi = 150, etimeSec = 500 }, obsAt = 1000 })
+    ev.replays = spans
+    observe.foldSignal(ev, { action = "freeze", at = 1001, comm = "/bin/x", startEpoch = 150 })
+    check("foldSignal: a signal to a start a step replayed is uncertain, never the same",
+      ev.signals[1] ~= nil and ev.signals[1].uncertain == true, true)
+    local evOk = observe.newEvidence({ pid = 9, comm0 = "/bin/x", start0 = { lo = 299, hi = 300, etimeSec = 500 }, obsAt = 1000 })
+    evOk.replays = spans
+    observe.foldSignal(evOk, { action = "freeze", at = 1001, comm = "/bin/x", startEpoch = 300 })
+    check("foldSignal: one to a start between stretches is the same (control)",
+      evOk.signals[1] ~= nil and evOk.signals[1].uncertain == nil, true)
+    observe.foldTouch(ev, { at = 1002, comm = "/bin/x", startEpoch = 150 })
+    check("foldTouch: a touch on a replayed start is uncertain", ev.touchesUncertain == 1 and ev.touches == 0, true)
+    observe.foldTouch(evOk, { at = 1002, comm = "/bin/x", startEpoch = 300 })
+    check("foldTouch: one on a start between stretches is certain (control)",
+      evOk.touches == 1 and evOk.touchesUncertain == 0, true)
+    check("newEvidence: the stretches it was given",
+      observe.newEvidence({ pid = 9, replays = spans }).replays, spans)
+    check("newEvidence: none given is an empty list", #observe.newEvidence({ pid = 9 }).replays, 0)
+  end
+  -- Kept stretches: none is dropped (a process born in one starts there
+  -- while it lives); past the cap the two oldest merge, wider, never less.
+  -- A 500 s step at 1300 (replaying 800..1300), then sixteen more a second
+  -- apart.
+  local kept = observe.addReplay({}, { lo = 800, hi = 1300 }, 16)
+  for i = 1, 16 do kept = observe.addReplay(kept, { lo = 900 + i, hi = 1200 + i }, 16) end
+  check("addReplay: the cap holds", #kept, 16)
+  check("addReplay: seventeen steps on, a start only the first stretch covers is still refused",
+    observe.startReplayed({ lo = 850, hi = 851 }, kept), true)
+  local passed = observe.addReplay({ { lo = 100, hi = 200 } }, { lo = 500, hi = 600 }, 16)
+  check("addReplay: a stretch the clock has run past is kept", #passed, 2)
+  -- Seventeen disjoint stretches: the merge keeps both oldest, and refuses
+  -- the gap between them too (the price of the cap).
+  local disjoint = {}
+  for i = 1, 17 do disjoint = observe.addReplay(disjoint, { lo = i * 100, hi = i * 100 + 10 }, 16) end
+  check("addReplay: past the cap, a start only the first stretch covered is still refused",
+    observe.startReplayed({ lo = 105, hi = 106 }, disjoint), true)
+  check("addReplay: and one only the second covered", observe.startReplayed({ lo = 205, hi = 206 }, disjoint), true)
+  check("addReplay: the merged stretch spans the gap between them", observe.startReplayed({ lo = 150, hi = 151 }, disjoint), true)
+  check("addReplay: a stretch the merge did not touch keeps its gaps (control)",
+    observe.startReplayed({ lo = 350, hi = 351 }, disjoint), false)
+  check("addReplay: a malformed stretch is skipped", #observe.addReplay({ {}, { lo = 1 } }, { lo = 5, hi = 6 }, 16), 1)
+  check("addReplay: an empty list takes the new stretch", #observe.addReplay(nil, { lo = 1, hi = 2 }, 16), 1)
+  check("frozenMatches: an entry started in a replayed stretch is uncertain",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000150) }, { lo = 1700000149, hi = 1700000150, etimeSec = 500 },
+      nil, { { lo = 1700000100, hi = 1700000200 } }), nil)
+  check("frozenMatches: an entry between stretches is the same, stretches present",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000300) }, { lo = 1700000299, hi = 1700000300, etimeSec = 500 },
+      nil, { { lo = 1700000100, hi = 1700000200 }, { lo = 1700000500, hi = 1700000600 } }), true)
+  check("frozenMatches: one outside the window is another process, stretches present",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000400) }, { lo = 1700000299, hi = 1700000300, etimeSec = 500 },
+      nil, { { lo = 1700000100, hi = 1700000200 } }), false)
+  check("frozenMatches: the same entry with no stretch is the same (control)",
+    observe.frozenMatches({ lstart = os.date("%a %b %e %H:%M:%S %Y", 1700000150) }, { lo = 1700000149, hi = 1700000150, etimeSec = 500 },
+      nil, {}), true)
+  check("row: a refused start says so", observe.row({ identityReplayed = true }).identityReplayed, true)
+  check("row: otherwise the field is absent", observe.row({}).identityReplayed, nil)
+  end
   check("liveStamp: no tracker entry keeps it", observe.liveStamp(stamp, nil), stamp)
   check("liveStamp: no stamp is nil", observe.liveStamp(nil, live), nil)
 
@@ -2519,7 +2690,7 @@ do
   check("observe glue: the resettable HUD flag is not the operator signal",
     body:find("hudInteracted", 1, true), nil)
   check("observe glue: the frozen ledger counts only for the observed process, as of the horizon",
-    body:find("observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0))", 1, true) ~= nil
+    body:find("observe.foldFrozen(ev, now, observe.frozenMatches(frozen[pid], start0, nil, replays))", 1, true) ~= nil
       and body:find("frozenNow = observe.frozenAt(ev, tH)", 1, true) ~= nil
       and body:find("frozenLedger = frozenNow,", 1, true) ~= nil
       and body:find("frozen[pid], ev.start0", 1, true) == nil, true)
@@ -2649,6 +2820,21 @@ do
     src:find("procs.update(tracker, lastPsList, now, topCache.map, launchedAt, rawDeliveredAt, widenSec)", 1, true) ~= nil, true)
   -- (round 11) A table whose launch record is gone widens the tracker's
   -- windows by every step back so far: a bound on the steps since its launch.
+  -- Each step back keeps its replayed stretch; observations refuse a start in
+  -- one that still matters, and keep them for their samples' windows.
+  check("replay glue: each step records its stretch",
+    src:find("observe.replaySpan(prevWall, prevMono, wall, mono, delta)", 1, true) ~= nil, true)
+  check("replay glue: the kept stretches go through addReplay",
+    src:find("clock.replays = observe.addReplay(clock.replays, span, 16)", 1, true) ~= nil, true)
+  check("replay glue: an observation's own start is checked against every stretch recorded so far",
+    src:find("for _, r in ipairs(clock.replays) do replays[#replays + 1] = r end", 1, true) ~= nil
+      and src:find("local replayed = start0 and obs.startReplayed(start0, replays) or false", 1, true) ~= nil, true)
+  check("replay glue: and its record keeps them for its samples and frozen-ledger reads",
+    src:find("replays = replays })", 1, true) ~= nil
+      and src:find("observe.frozenMatches(frozen[pid], start0, nil, replays)", 1, true) ~= nil
+      and src:find("observe.frozenMatches(frozen[ev.pid], ev.start0, nil, ev.replays)", 1, true) ~= nil, true)
+  check("replay glue: a sample's window is checked against its record's stretches",
+    src:find("if start1 and obs.startReplayed(start1, ev.replays) then start1 = nil end", 1, true) ~= nil, true)
   check("sampler glue: a table without its launch record widens by every step back so far",
     src:find("local widenSec = steppedSec or -(clock.stepTotal + clock.pending)", 1, true) ~= nil, true)
   -- (round 11) Ages read the raw clock, at the runaways and from lstart.
@@ -2756,9 +2942,20 @@ do
     local z = a and src:find("\nend\n", a, true)
     return (a and z) and src:sub(a, z) or ""
   end
-  local resolveBody = fnBody("resolveUnattendedAction = function(mode, offender, now)")
+  local resolveBody = fnBody("resolveUnattendedAction = function(mode, offender, now, floorWhy)")
   check("glue: resolveUnattendedAction takes the tick's clock", #resolveBody > 500, true)
-  check("glue: the decision passes the tick's clock", count(src, "resolveUnattendedAction(mode, offender, now)"), 1)
+  check("glue: the decision passes the tick's clock", count(src, "resolveUnattendedAction(mode, offender, now, floorWhy)"), 1)
+  -- (floor round 3) The floor's reason is read before the step consumes its
+  -- check, so a decision it brought forward records why even without a
+  -- verdict at hand.
+  do
+    local a = src:find("local floorWhy = obs.floorActDue(offender, now)", 1, true)
+    local b = src:find("if type(w) == \"table\" then w.exhausted = nil end", 1, true)
+    check("glue: the floor's reason is read before its check is consumed", a ~= nil and b ~= nil and a < b, true)
+  end
+  -- (round 4) The floor brings nothing forward once the grace has run.
+  check("glue: the floor predicate says nothing once the grace has run",
+    src:find("and (now - fired.at) >= core.cfg.cool.autoKillGraceSec then return nil end", 1, true) ~= nil, true)
   check("glue: that decision is the only caller", count(src, "resolveUnattendedAction("), 1)
   check("glue: the decision never re-reads the clock", count(resolveBody, "secondsSinceEpoch"), 0)
   -- Absent pids are pruned only on a complete table taken after the pid
@@ -3457,6 +3654,107 @@ do
   check("tokenprob parse: no probabilities is refused", (lfm.parseTokenProbs('{"content":"x"}')), nil)
   check("tokenprob parse: non-JSON is refused", (lfm.parseTokenProbs("nope")), nil)
   check("tokenprob parse: oversized is refused", (lfm.parseTokenProbs(("x"):rep(70000))), nil)
+end
+
+-- ---- the deferral floor, gated on headroom ----
+do
+  local lfm = require("memwatch_lfm")
+  check("floor: above the threshold it holds", lfm.floorFires(30, 12), false)
+  check("floor: at the threshold it acts", lfm.floorFires(12, 12), true)
+  check("floor: below it acts", lfm.floorFires(8, 12), true)
+  check("floor: unknown headroom acts (fails closed)", lfm.floorFires(nil, 12), true)
+  check("floor: a threshold of 0 turns the gate off (acts at the bound)", lfm.floorFires(90, 0), true)
+  check("floor: the default threshold is 12%", lfm.cfg.floorAvailPct, 12)
+  check("floor: a NaN reading acts (unknown)", lfm.floorFires(0 / 0, 12), true)
+  check("floor: no threshold falls back to the default (30 holds)", lfm.floorFires(30, nil), false)
+  check("floor: and acts at the default (12)", lfm.floorFires(12, nil), true)
+  check("floor: a negative threshold acts at once", lfm.floorFires(90, -5), true)
+  -- Monotone in headroom: once it acts at a reading, it acts at every lower one.
+  local monotone, seen = true, false
+  for a = 100, 0, -0.5 do
+    local f = lfm.floorFires(a, 12)
+    if seen and not f then monotone = false end
+    seen = seen or f
+  end
+  check("floor: monotone in headroom", monotone, true)
+  -- The headroom the floor may read: none unless the memory size was known.
+  check("floor headroom: a known reading", lfm.floorHeadroom({ availPct = 30, availKnown = true }), 30)
+  check("floor headroom: an unknown size reads nil, not its 100", lfm.floorHeadroom({ availPct = 100, availKnown = false }), nil)
+  check("floor headroom: no flag at all is unknown (memwatch's first reading)", lfm.floorHeadroom({ availPct = 100 }), nil)
+  check("floor headroom: a NaN reading is unknown", lfm.floorHeadroom({ availPct = 0 / 0, availKnown = true }), nil)
+  check("floor headroom: no metrics is unknown", lfm.floorHeadroom(nil), nil)
+  check("metrics: a known size says so", core.metrics({}, 0, 8 * 2^30, 16384).availKnown, true)
+  check("metrics: an unknown size reads 100 but says unknown",
+    core.metrics({}, 0, 0, 16384).availKnown == false and core.metrics({}, 0, 0, 16384).availPct == 100, true)
+  check("metrics (native): an unknown size says unknown", core.metricsFromVmStat({ pageSize = 16384 }, 0).availKnown, false)
+  check("metrics (native): a known size says known",
+    core.metricsFromVmStat({ pageSize = 16384, memSize = 8 * 2^30 }, 0).availKnown, true)
+  -- Why the floor acts past the bound, or nil while it holds.
+  local cfg = { floorAvailPct = 12, maxHoldSec = 600, enabled = true }
+  local st = { firstAt = 1000, count = 3 }
+  local known = function(a) return { availPct = a, availKnown = true } end
+  check("floorActs: headroom above the floor holds", lfm.floorActs(st, known(30), 1130, cfg), nil)
+  check("floorActs: at the floor it acts on headroom", lfm.floorActs(st, known(12), 1130, cfg), "headroom")
+  check("floorActs: unreadable headroom acts (fails closed)",
+    lfm.floorActs(st, { availPct = 100, availKnown = false }, 1130, cfg), "unknown-headroom")
+  check("floorActs: the hold cap acts whatever the headroom", lfm.floorActs(st, known(90), 1600, cfg), "hold-cap")
+  check("floorActs: just under the cap it holds", lfm.floorActs(st, known(90), 1599, cfg), nil)
+  check("floorActs: a first wait stamped after now acts (no step holds the policy off)",
+    lfm.floorActs(st, known(90), 999, cfg), "hold-cap")
+  check("floorActs: no first wait acts", lfm.floorActs({}, known(90), 1130, cfg), "hold-cap")
+  check("floorActs: a threshold of 0 acts at the bound, as before",
+    lfm.floorActs(st, known(90), 1130, { floorAvailPct = 0, maxHoldSec = 600 }), "no-floor")
+  check("floorActs: a cap at or under the bound acts at the bound",
+    lfm.floorActs(st, known(90), 1120, { floorAvailPct = 12, maxHoldSec = 120 }), "hold-cap")
+  check("floorActs: the defaults hold 30% at the bound", lfm.floorActs(st, known(30), 1120), nil)
+  -- (round 3) A hold cap of 0 holds nothing past the bound: it acts there,
+  -- as a cap under the bound does.
+  check("floorActs: a hold cap of 0 acts at the bound",
+    lfm.floorActs(st, known(90), 1120, { floorAvailPct = 12, maxHoldSec = 0 }), "hold-cap")
+  -- (round 3) What a floor decision records, held or acting.
+  local rec = lfm.floorRecord(st, known(30), 1130, cfg)
+  check("floorRecord: the threshold and cap in force", rec.floorAvailPct == 12 and rec.maxHoldSec == 600, true)
+  check("floorRecord: the headroom it read", rec.headroomPct == 30 and rec.headroomKnown == true, true)
+  check("floorRecord: the waits so far", rec.deferrals, 3)
+  check("floorRecord: how long the first wait has held", rec.deferredSec, 130)
+  check("floorRecord: a first wait stamped now has held 0", lfm.floorRecord(st, known(30), 1000, cfg).deferredSec, 0)
+  check("floorRecord: one stamped after now has held 0, never less",
+    lfm.floorRecord(st, known(30), 990, cfg).deferredSec, 0)
+  local unk = lfm.floorRecord(st, { availPct = 100, availKnown = false }, 1130, cfg)
+  check("floorRecord: unreadable headroom says so, and records no reading",
+    unk.headroomKnown == false and unk.headroomPct == nil, true)
+  check("floorRecord: no wait state records no wait", lfm.floorRecord(nil, known(30), 1130, cfg).deferredSec, nil)
+  -- (round 4) Every decision the floor brought forward says so.
+  local r0, x0 = { "lfm", "freeze-ok" }, { model = "m", confidence = 0.9, deferrals = 7 }
+  local r1, x1 = lfm.withFloorRecord(r0, x0, "headroom", rec)
+  check("withFloorRecord: the floor's rail is added", r1[#r1], "deferral-floor-fired-by-headroom")
+  check("withFloorRecord: beside the decision's own rails", r1[1] == "lfm" and r1[2] == "freeze-ok", true)
+  check("withFloorRecord: and the floor's fields", x1.floorAvailPct == 12 and x1.headroomPct == 30, true)
+  check("withFloorRecord: the decision's own fields win", x1.deferrals == 7 and x1.model == "m", true)
+  check("withFloorRecord: its arguments are untouched", #r0 == 2 and x0.floorAvailPct == nil, true)
+  local r2 = lfm.withFloorRecord(r1, x1, "headroom", rec)
+  check("withFloorRecord: never twice", #r2, #r1)
+  check("withFloorRecord: no rail when the floor is off", #lfm.withFloorRecord({ "x" }, nil, "no-floor", rec), 1)
+  -- The every-tick check: only a held wait, only with the adjudicator on.
+  local held = { firstAt = 1000, count = 3, exhausted = true }
+  check("floorDue: a held wait at the floor is due", lfm.floorDue(held, known(10), 1130, cfg), true)
+  check("floorDue: a held wait above it is not", lfm.floorDue(held, known(30), 1130, cfg), false)
+  check("floorDue: a held wait at the hold cap is due whatever the headroom", lfm.floorDue(held, known(90), 1600, cfg), true)
+  check("floorDue: a wait the last decision did not hold is not",
+    lfm.floorDue({ firstAt = 1000, count = 3 }, known(10), 1130, cfg), false)
+  check("floorDue: with the adjudicator off it never is",
+    lfm.floorDue(held, known(10), 1130, { floorAvailPct = 12, maxHoldSec = 600, enabled = false }), false)
+  check("floorDue: no wait state is not", lfm.floorDue(nil, known(10), 1130, cfg), false)
+  -- The observation row for a floor act: forced, but only through an open gate.
+  local observe = require("memwatch_observe")
+  check("decisionDue: a floor act is due inside the grace window",
+    observe.decisionDue({ enabled = true, gate = "open", sinceLastSec = 10, graceSec = 60, forced = true }), true)
+  check("decisionDue: not through a closed gate",
+    observe.decisionDue({ enabled = true, gate = "closed", sinceLastSec = 10, graceSec = 60, forced = true }), false)
+  check("decisionDue: nor with the ledger off",
+    observe.decisionDue({ enabled = false, gate = "open", sinceLastSec = 10, graceSec = 60, forced = true }), false)
+  check("decisionDue: unforced inside the window is not due (control)",
+    observe.decisionDue({ enabled = true, gate = "open", sinceLastSec = 10, graceSec = 60 }), false)
 end
 
 if fails == 0 then

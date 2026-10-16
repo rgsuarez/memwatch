@@ -105,11 +105,18 @@ function M.parsePsList(text)
   return list
 end
 
--- Human name for a comm path: the basename. Title compaction beyond that is
--- core.shortName's job.
+-- Human name for a comm path: the basename (a comm that ends in "/" is kept
+-- whole). Title compaction beyond that is core.shortName's job. Found by a
+-- backward byte scan, linear in the comm: a process can give itself any comm
+-- of any length, and a backtracking pattern over a long run without a slash
+-- costs time quadratic in it, on the tick that names the pid.
 function M.friendlyName(comm)
   if not comm or comm == "" then return "?" end
-  return comm:match("([^/]+)$") or comm
+  local n = #comm
+  if comm:byte(n) == 47 then return comm end
+  local b = n
+  while b > 0 and comm:byte(b) ~= 47 do b = b - 1 end
+  return comm:sub(b + 1)
 end
 
 local function memValMB(num, unit)
@@ -125,7 +132,12 @@ end
 -- the name is display/prefix material only; joins happen by pid. top's MEM
 -- approximates the footprint (it includes compressed), so mem alone is the
 -- weight-basis-compatible number.
+-- top truncates COMMAND (to 16 characters here), so a real row is short. A
+-- longer line is no row this reads: refusing it keeps the lazy name match
+-- below bounded, whatever a name holds, should top ever print one whole.
+local TOP_LINE_MAX = 512
 local function parseTopLine(line)
+  if #line > TOP_LINE_MAX then return nil end
   local pid, name, mem, memU, cmprs, cmprsU =
     line:match("^%s*(%d+)%s+(.-)%s+([%d%.]+)([BKMG])[%+%-]?%s+([%d%.]+)([BKMG])[%+%-]?%s*$")
   if not pid then return nil end

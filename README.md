@@ -179,8 +179,9 @@ metric operationally defined:
 
 Independently of adjudication, memwatch keeps a passive observation ledger,
 `memwatch-observe.jsonl` (local and gitignored). It writes a row at each
-grace-expiry decision point, and every 45 s while pressure is up and an
-offender is named. A decision point is a tick where the live unattended gate
+grace-expiry decision point, on the tick the deferral floor acts on a held
+wait (which can fall inside the grace window), and every 45 s while
+pressure is up and an offender is named. A decision point is a tick where the live unattended gate
 stands open, whatever the unattended mode: an extreme runaway, surfaced by
 the alert, unanswered for its grace window, and not frozen, gone or ignored.
 
@@ -219,9 +220,10 @@ The observed process's identity is the start window of its latest process
 sample; for a process only the streaming top has named (the process
 sampler stalled), the start time the alert bound to it, unless that time
 falls in the hour a daylight-saving fold repeats. Each row says which in
-`identityBasis` (`window`, `lstart`, or `none`, when it had neither, so its
-follow-ups can only read `unknown` or `exited`). A process table counts as
-whole, so that a process missing from it has exited, only when the sampler
+`identityBasis` (`window`, `lstart`, or `none`, when it had neither or its
+start lies in wall time a clock step back replayed, marked
+`identityReplayed`, so its follow-ups can only read `unknown` or `exited`). A process table counts as whole, so that a
+process missing from it has exited, only when the sampler
 exited cleanly and the table lists memwatch's own process.
 
 The fate is one of:

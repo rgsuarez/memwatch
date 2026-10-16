@@ -87,13 +87,18 @@ function F.new()
   -- at birth, and etime is the wall clock now minus it, so a wall-clock
   -- step moves etime and launch times together and the start stays put.
   local function wallNow() return W.now + (W.wallOffset or 0) end
-  local function startStamp(bornWall)
-    return os.date("%a %b %e %H:%M:%S %Y", math.floor(bornWall) - 120)
+  -- extra.bornAgoSec: how much older than its birth the process is reported
+  -- (default 120); 0 is a process born this instant, such as one that takes a
+  -- pid after a clock step back.
+  local function startStamp(bornWall, ago)
+    return os.date("%a %b %e %H:%M:%S %Y", math.floor(bornWall) - (ago or 120))
   end
   function W.addProc(pid, name, rssMB, extra)
+    local ago = (extra and extra.bornAgoSec) or 120
     local p = { pid = pid, uid = 501, comm = "/usr/local/bin/" .. name, rssKB = math.floor(rssMB * 1024),
-                lstart = startStamp(wallNow()), state = "S", bornAt = W.now, bornWall = wallNow() }
+                lstart = startStamp(wallNow(), ago), state = "S", bornAt = W.now, bornWall = wallNow() }
     for k, v in pairs(extra or {}) do p[k] = v end
+    p.bornAgoSec = ago
     W.procs[pid] = p
     return p
   end
@@ -102,9 +107,9 @@ function F.new()
   W.selfProc = { pid = SELF_PID, uid = 501, comm = "/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon",
                  rssKB = 300 * 1024, state = "S", bornAt = W.now - 86400, bornWall = W.now - 86400 }
   -- A same-name process taking over a pid that just exited.
-  function W.reusePid(pid, name, rssMB)
+  function W.reusePid(pid, name, rssMB, extra)
     W.procs[pid] = nil
-    return W.addProc(pid, name, rssMB)
+    return W.addProc(pid, name, rssMB, extra)
   end
   -- Grow a process by mbPerSec while it runs (a stopped process holds still).
   function W.grow(pid, mbPerSec)
@@ -117,7 +122,7 @@ function F.new()
   end
 
   local function etime(p)
-    local s = math.max(0, math.floor(wallNow() - p.bornWall) + 120)
+    local s = math.max(0, math.floor(wallNow() - p.bornWall) + (p.bornAgoSec or 120))
     return string.format("%02d:%02d", s // 60, s % 60)
   end
   local function samplerBlob()
@@ -378,7 +383,10 @@ function F.new()
       -- (a wall clock step in the middle of a tick).
       if W.onVmStat then W.onVmStat() end
       local total = MEM_BYTES // PAGE
-      return { pageSize = PAGE, memSize = MEM_BYTES, pagesFree = math.floor(total * W.availPct / 100),
+      -- memSizeUnknown: the native table without the memory size (memwatch
+      -- then cannot compute headroom; its availPct reads 100).
+      return { pageSize = PAGE, memSize = (not W.memSizeUnknown) and MEM_BYTES or nil,
+               pagesFree = math.floor(total * W.availPct / 100),
                pagesSpeculative = 0, pagesPurgeable = 0, fileBackedPages = 0, uncompressedPages = 0,
                swapOuts = 0, pagesCompressed = 0, pageOuts = 0 }
     end },

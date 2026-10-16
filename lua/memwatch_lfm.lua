@@ -45,6 +45,16 @@ M.cfg = {
   -- (see deferralExhausted). 120 s = two further grace windows at the 60 s
   -- default, the same reach the old three-wait count had at that cadence.
   maxDeferSec = 120,
+  -- Once the deferral has run its maxDeferSec, the floor decides (floorActs):
+  -- the deterministic policy acts at or below this much available memory (a
+  -- percentage), on headroom it cannot read, or once maxHoldSec has run,
+  -- checked every tick; otherwise a model's wait keeps standing. 0 turns the
+  -- gate off (the policy then acts at the bound, as before).
+  floorAvailPct = 12,
+  -- ...but never past this long from the first wait, whatever the headroom:
+  -- a model holds the decision for a while, never for good. At or below
+  -- maxDeferSec it acts at the bound.
+  maxHoldSec = 600,
   maxServerMB = 2048,       -- self-police circuit: server above this is killed
   spawnMinAvailPct = 10,    -- spawn floor: no server spawn below this
   -- Remote adjudicator (an OpenAI-compatible cloud endpoint). When
@@ -1142,7 +1152,8 @@ end
 -- The wait-deferral bound, in SECONDS since the first model wait at grace
 -- expiry. A model wait defers the deterministic policy (protecting a
 -- false-positive extreme such as a build burst), but must never capture the
--- decision indefinitely while a true runaway grinds the machine down. The
+-- decision indefinitely while a true runaway grinds the machine down: past
+-- the bound the floor decides (floorActs: headroom, then maxHoldSec). The
 -- old bound counted waits; with verdicts cached for 90 s against a 60 s
 -- grace cadence, one cached wait could count twice and stretch the bound to
 -- about 240 s. Elapsed time cannot double-count. A first wait stamped
@@ -1155,8 +1166,98 @@ function M.deferralExhausted(firstWaitAt, now, maxDeferSec)
   return (now - firstWaitAt) >= (maxDeferSec or M.cfg.maxDeferSec)
 end
 
+-- Does the deferral floor act now? Once the bound has run, it acts at or
+-- below floorAvailPct of available memory, and when the headroom is not
+-- known (it fails closed). A floor of 0 or less acts at once, as before.
+function M.floorFires(availPct, floorAvailPct)
+  local floor = tonumber(floorAvailPct)
+  if floor == nil then floor = M.cfg.floorAvailPct end
+  if floor <= 0 then return true end
+  if type(availPct) ~= "number" or availPct ~= availPct then return true end
+  return availPct <= floor
+end
+
+-- The headroom the floor may read from a metrics table: nil (unknown) unless
+-- the memory size was known when it was read (availKnown), since availPct
+-- reads 100 when it was not. No reading yet is unknown too.
+function M.floorHeadroom(metrics)
+  if type(metrics) ~= "table" or metrics.availKnown ~= true then return nil end
+  local a = metrics.availPct
+  if type(a) ~= "number" or a ~= a then return nil end
+  return a
+end
+
+-- Why the floor acts on a wait past its bound, or nil while it may hold:
+--   "no-floor"          floorAvailPct is 0 or less: act at the bound, as before;
+--   "hold-cap"          maxHoldSec has run since the first wait, or the first
+--                       wait is stamped after now (a step that cannot be
+--                       measured never holds the policy off);
+--   "unknown-headroom"  the headroom cannot be read (fails closed);
+--   "headroom"          available memory is at or below floorAvailPct.
+-- state is the deferral { firstAt, count }; cfg defaults to M.cfg.
+function M.floorActs(state, metrics, now, cfg)
+  cfg = cfg or M.cfg
+  local floor = tonumber(cfg.floorAvailPct) or M.cfg.floorAvailPct
+  if floor <= 0 then return "no-floor" end
+  local first = type(state) == "table" and state.firstAt or nil
+  local cap = tonumber(cfg.maxHoldSec) or M.cfg.maxHoldSec
+  if type(first) ~= "number" or type(now) ~= "number" or now < first or (now - first) >= cap then
+    return "hold-cap"
+  end
+  local headroom = M.floorHeadroom(metrics)
+  if headroom == nil then return "unknown-headroom" end
+  if M.floorFires(headroom, floor) then return "headroom" end
+  return nil
+end
+
+-- What a floor decision records, held or acting: the threshold and the hold
+-- cap in force, the headroom read (headroomKnown false, and no headroomPct,
+-- when it cannot be read), the waits so far, and how long the first wait has
+-- held the policy off. That is never negative: a first wait stamped after
+-- now has held nothing yet. Pure.
+function M.floorRecord(state, metrics, now, cfg)
+  cfg = cfg or M.cfg
+  local first = type(state) == "table" and state.firstAt or nil
+  local headroom = M.floorHeadroom(metrics)
+  return { floorAvailPct = cfg.floorAvailPct, maxHoldSec = cfg.maxHoldSec,
+           headroomPct = headroom, headroomKnown = headroom ~= nil,
+           deferrals = type(state) == "table" and state.count or nil,
+           deferredSec = (type(first) == "number" and type(now) == "number")
+             and math.max(0, math.floor(now - first)) or nil }
+end
+
+-- A decision the floor's every-tick check brought forward says so, whatever
+-- answered it (the held wait's own verdict, a fresh verdict of another
+-- action, or none): the floor's rail (unless the floor is off) and its
+-- record's fields, where the decision's own record leaves them unset.
+-- Returns new tables; neither argument is changed. Pure.
+function M.withFloorRecord(rails, extra, why, rec)
+  local out, seen = {}, {}
+  for _, r in ipairs(rails or {}) do out[#out + 1] = r; seen[r] = true end
+  if why and why ~= "no-floor" and not seen["deferral-floor-fired-by-" .. why] then
+    out[#out + 1] = "deferral-floor-fired-by-" .. why
+  end
+  local x = {}
+  for k, v in pairs(extra or {}) do x[k] = v end
+  for k, v in pairs(rec or {}) do if x[k] == nil then x[k] = v end end
+  return out, x
+end
+
+-- Does the floor act this tick, ahead of the grace window, on a wait the last
+-- decision held past its bound (state.exhausted)? Only while the adjudicator
+-- is enabled: with it off, the base system decides at its own cadence.
+function M.floorDue(state, metrics, now, cfg)
+  cfg = cfg or M.cfg
+  if cfg.enabled ~= true then return false end
+  if type(state) ~= "table" or state.exhausted ~= true then return false end
+  return M.floorActs(state, metrics, now, cfg) ~= nil
+end
+
 -- One model wait at grace expiry, folded into the per-offender deferral
--- state { firstAt, count }; a nil (or malformed) state starts at now. The
+-- state { firstAt, count }; a nil (or malformed) state starts at now. Each
+-- step returns a fresh table, so the floor's every-tick mark (exhausted, set
+-- by the caller on a wait held past the bound) never survives a step: only a
+-- wait held again re-arms it. The
 -- caller passes the decision tick's own clock to every step: a first stamp
 -- read later than the checks that follow it (behind a slow probe fork)
 -- would keep the wait that should exhaust the bound from exhausting it.

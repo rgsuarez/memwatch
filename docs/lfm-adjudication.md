@@ -65,15 +65,56 @@ The model is an advisor inside hard rails, never an autonomous authority.
   process never acts on another.
 - **A clock stepped back never extends a wait.** A verdict or a first model
   wait stamped after now reads as stale, or as spent.
-- **A model wait is bounded in time.** A model wait defers the
-  deterministic policy, but only for `maxDeferSec` (120 s by default)
-  from the first wait on that offender; after that the deterministic
-  policy acts regardless.
+- **A model wait is bounded in time, then by headroom, then in time
+  again.** A model wait defers the deterministic policy for `maxDeferSec`
+  (120 s by default) from the first wait on that offender. Past that bound
+  the floor decides, and the deterministic policy acts when any of these
+  holds:
+  - available memory is at or below `floorAvailPct` (12% by default);
+  - headroom cannot be read (the memory size was unreadable, so the
+    reading is not a real 100%): the floor fails closed;
+  - `maxHoldSec` (600 s by default) has run since the first wait, whatever
+    the headroom: a model holds the decision for a while, never for good.
+    A first wait stamped after now (a clock step that could not be taken
+    out) counts as run.
+
+  Otherwise the wait holds: a burst still holding more headroom than the
+  floor would stall work for nothing if frozen.
+- **A held wait is re-checked every tick the alert stands critical and
+  open.** Past the bound, the floor is checked on each such tick, so a
+  runaway that eats the headroom is frozen the tick it falls to the floor,
+  not a grace window later. That check ends the wait it was holding: after
+  any decision, the next one waits out the grace again unless the floor
+  holds the wait again, so an action that fails is never retried every
+  tick (a refused one is tried again at the grace cadence, as without the
+  floor). Each such act is a decision point the observation ledger records
+  on its own tick, with the floor's reason (`floorAct`). The step and the
+  ledger ask one predicate for it (unattended on, the alert's gate open, the
+  wait bound to the alert's start time, no final latch, no action in
+  flight, and the grace not yet run), so the ledger never records an act
+  the step did not take. Once the grace has run, the decision is the
+  grace's own, and nothing in it is credited to the floor unless the floor
+  ends a wait the decision consumed.
+- **The records say why.** A held wait's decision record carries the rail
+  `deferral-floor-held-by-headroom`. An act past the bound carries
+  `deferral-floor-fired-by-headroom`, `-by-unknown-headroom` or
+  `-by-hold-cap`. Both carry the threshold, the hold cap, the deferred
+  seconds and the headroom read: `headroomPct`, or `headroomKnown: false`
+  and no reading when it could not be read. Every act the every-tick check
+  brings forward carries the floor's rail and record, whatever answered it:
+  the held wait's verdict, a fresh verdict of another action (the model's
+  own rails ride beside), or none (with `no-fresh-verdict`). `floorAvailPct` 0
+  restores the old floor: the policy acts at the bound regardless, with no
+  floor rail. A `maxHoldSec` of 0 holds nothing past the bound: the policy
+  acts there, as it does for any cap at or under the bound.
 - **Disabled or unavailable means the base system.** If the feature is off,
   the model server is not running, a request times out, or the reply is
   malformed, memwatch behaves exactly as it does without the feature: the
   deterministic unattended policy acts (or the HUD simply waits for you),
-  and one rate-limited log line notes the degradation.
+  and one rate-limited log line notes the degradation. Turning the feature
+  off takes effect at once: cached verdicts, a request in flight and the
+  waits they held are dropped, so none of them decides anything after the
+  switch, even once the feature is on again.
 - **memwatch protects its own adjudicator.** The model server is filtered
   out of the runaway and ranked lists and refused by the kill-policy gate,
   so memwatch can never freeze or kill the process it depends on. An

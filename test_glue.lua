@@ -2288,6 +2288,219 @@ scenario("ledger: a table without its launch record keeps identity across a step
     fu[1] ~= nil and fu[1].fate ~= "exited", true)
 end)
 
+-- A step back to before a process's start window, while ps stalls (the top
+-- stream keeps the offender current): a process born from then on can carry,
+-- on the stepped clock, a start inside that window. The window goes at the
+-- step, so the observation written after it cannot take a same-name
+-- successor for the process it observed.
+scenario("ledger: a step back outliving a start window never lets a successor vouch for it", nil, function(W)
+  local t0 = W.now
+  local row = toDecision(W, 4242)
+  if not row then check("outlived: decision row", false, true); return end
+  W.topEmits = true
+  W.run(6)
+  W.psStarved = true                  -- the tracker keeps the window the last pre-step table placed
+  W.run(20)
+  local S = 260                       -- longer than the leaker has lived
+  W.wallOffset = (W.wallOffset or 0) - S
+  check("outlived: the step was taken out (control)",
+    runUntil(W, 6, function() return logHas(W, "clock-stepped-back:" .. S .. "s") end), true)
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local nextRow, tRow
+  runUntil(W, 100, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not before[r.seq] then nextRow = nextRow or r end
+    end
+    if nextRow and not tRow then tRow = W.now end
+    return nextRow ~= nil
+  end)
+  check("outlived: a row is written after the step (control)", nextRow ~= nil, true)
+  if not nextRow then return end
+  check("outlived: it takes no identity from the outlived window", nextRow.identityBasis, "none")
+  check("outlived: and says why", nextRow.identityReplayed, true)
+  check("outlived: the successor is born after the row (control)", (t0 + S) > tRow, true)
+  W.run(math.max(0, (t0 + S) - W.now))
+  W.reusePid(4242, "leaker", 2000)    -- a same-name successor takes the pid
+  W.psStarved = false
+  W.run(200)
+  local fu = followups(W, nextRow.seq)
+  check("outlived: three follow-ups came (control)", #fu, 3)
+  local last = fu[#fu]
+  check("outlived: the gone process is never read alive or frozen (" .. tostring(last and last.fate) .. ")",
+    last ~= nil and last.fate ~= "alive" and last.fate ~= "frozen", true)
+  -- Once the clock has run past the stretch, a row on the successor (born in
+  -- it) still takes no identity from a start the step replayed.
+  local function wall() return W.now + (W.wallOffset or 0) end
+  runUntil(W, 400, function() return wall() > t0 + S + 10 end)
+  local seen = {}
+  for _, r in ipairs(ledgerRows(W)) do seen[r.seq or -1] = true end
+  local late
+  runUntil(W, 120, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not seen[r.seq] then late = late or r end
+    end
+    return late ~= nil
+  end)
+  check("outlived: a row once the clock has run past the stretch (control)", late ~= nil, true)
+  check("outlived: it still takes no identity from a replayed start",
+    late and late.identityBasis == "none" and late.identityReplayed == true, true)
+end)
+
+-- A successor born in wall time a step back replayed, against a process
+-- older than the step (which keeps its identity). ps stalled across the
+-- step, so the observation written right after it keeps the process's
+-- pre-step age. A newborn takes the pid, and one slow table then places its
+-- window wide enough to overlap the observed start, fresh at the +60
+-- horizon. That window proves nothing: the follow-up never reads the gone
+-- process alive with the newborn's weight.
+scenario("ledger: a successor born in replayed time never vouches for an older process", nil, function(W, mw)
+  local t0 = W.now
+  local row = toDecision(W, 4242)
+  if not row then check("replay-successor: decision row", false, true); return end
+  W.topEmits = true
+  W.run(6)
+  W.psStarved = true                  -- the tracker keeps the leaker's pre-step window and age
+  local n0 = #ledgerRows(W)
+  runUntil(W, 60, function() return #ledgerRows(W) > n0 end)
+  W.run(38)                           -- a tick ahead of the next row, 45 s after that one
+  -- A step back a little shorter than the leaker's reported age: it started
+  -- before the stretch the step replays (the stretch reaches back to the
+  -- reading before the step, so the margin is about 2 s), and it keeps its
+  -- identity.
+  local D = math.floor(W.now - t0) + 115
+  local tStep = W.now
+  W.wallOffset = (W.wallOffset or 0) - D
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local obsRow, tObs
+  runUntil(W, 15, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not before[r.seq] then obsRow = obsRow or r end
+    end
+    if obsRow and not tObs then tObs = W.now end
+    return obsRow ~= nil
+  end)
+  check("replay-successor: the step was taken out (control)", logHas(W, "clock-stepped-back:" .. D .. "s"), true)
+  -- Written by a later tick than the one that saw the step (a row the same
+  -- tick writes is closed when that tick ends), and soon after it.
+  check("replay-successor: a row soon after the step, in a later tick (control)",
+    obsRow ~= nil and tObs - tStep > 2 and tObs - tStep <= 10, true)
+  if not obsRow then return end
+  check("replay-successor: it keeps the older process's identity (control)", obsRow.identityBasis, "window")
+  W.run(1)
+  W.reusePid(4242, "leaker", 2000, { bornAgoSec = 0 })  -- a newborn takes the pid
+  W.psStarved, W.samplerStartFails = false, true        -- no table until the slow one
+  runUntil(W, 60, function() return W.now - tObs >= 44 end)
+  -- One slow table: read at its delivery, 12 s after its launch, landing
+  -- before the +60 follow-up; nothing else lands before that horizon.
+  W.samplerStartFails, W.samplerReadsLate, W.samplerDelay = false, true, 12
+  local a0 = W.samplerStartAttempts or 0
+  runUntil(W, 8, function() return (W.samplerStartAttempts or 0) > a0 end)
+  W.samplerReadsLate, W.samplerDelay, W.samplerStartFails = nil, nil, true
+  runUntil(W, 30, function() return W.now - tObs >= 62 end)
+  W.samplerStartFails = false
+  local fu = followups(W, obsRow.seq)
+  check("replay-successor: the +60 follow-up came (control)", fu[1] ~= nil, true)
+  local f = fu[1] or {}
+  check("replay-successor: it never reads the gone process alive (" .. tostring(f.fate) .. ", "
+    .. tostring(f.weightMB) .. " MB)", f.fate ~= "alive" and f.fate ~= "frozen", true)
+end)
+
+-- The same, with the successor already holding the pid when the observation
+-- is written, after the clock has run past the stretch. The observed process
+-- started just before the stretch (it keeps its identity), ps stalls, and a
+-- same-name successor takes the pid right after the step, born inside the
+-- stretch; the tracker still shows the observed process's window. A slow
+-- table then places the successor's window over it: checked against every
+-- stretch recorded, not only those still being replayed, it proves nothing.
+scenario("ledger: a successor already at the pid when the stretch has passed never vouches for it", nil, function(W, mw)
+  local t0 = W.now
+  local row = toDecision(W, 4242)
+  if not row then check("passed-successor: decision row", false, true); return end
+  W.topEmits = true
+  W.run(6)
+  W.psStarved = true                  -- the tracker keeps the leaker's window (born 120 s before t0)
+  W.run(4)
+  -- A step back that leaves the leaker's start at least 3 s before the
+  -- stretch, which reaches back to the reading before the step.
+  local tStep = W.now
+  local D = math.floor(tStep - t0) + 111
+  W.wallOffset = (W.wallOffset or 0) - D
+  W.run(1)
+  W.reusePid(4242, "leaker", 2000, { bornAgoSec = 0 })  -- born inside the stretch, 1 s after the step
+  check("passed-successor: the step was taken out (control)",
+    runUntil(W, 6, function() return logHas(W, "clock-stepped-back:" .. D .. "s") end), true)
+  -- The first row written after the clock has run past the stretch.
+  runUntil(W, D + 30, function() return W.now - tStep >= D + 10 end)
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local obsRow, tObs
+  runUntil(W, 60, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not before[r.seq] then obsRow = obsRow or r end
+    end
+    if obsRow and not tObs then tObs = W.now end
+    return obsRow ~= nil
+  end)
+  check("passed-successor: a row after the stretch has passed (control)", obsRow ~= nil, true)
+  if not obsRow then return end
+  check("passed-successor: it keeps the older process's window as identity (control)", obsRow.identityBasis, "window")
+  -- One slow table (read at its delivery, 12 s after its launch) landing just
+  -- before the +60 follow-up; nothing else lands before that horizon.
+  W.psStarved, W.samplerStartFails = false, true
+  runUntil(W, 60, function() return W.now - tObs >= 44 end)
+  W.samplerStartFails, W.samplerReadsLate, W.samplerDelay = false, true, 12
+  local a0 = W.samplerStartAttempts or 0
+  runUntil(W, 8, function() return (W.samplerStartAttempts or 0) > a0 end)
+  W.samplerReadsLate, W.samplerDelay, W.samplerStartFails = nil, nil, true
+  runUntil(W, 30, function() return W.now - tObs >= 62 end)
+  W.samplerStartFails = false
+  local fu = followups(W, obsRow.seq)
+  check("passed-successor: the +60 follow-up came (control)", fu[1] ~= nil, true)
+  local f = fu[1] or {}
+  check("passed-successor: it never reads the gone process alive (" .. tostring(f.fate) .. ", "
+    .. tostring(f.weightMB) .. " MB)", f.fate ~= "alive" and f.fate ~= "frozen", true)
+end)
+
+-- Without a monotonic clock a step back's stretch cannot be bounded: from
+-- then on identity is refused (until a reload), said once in the log, and
+-- marked on every row.
+scenario("ledger: with no monotonic clock a step back refuses identity from then on", nil, function(W, mw)
+  W.hs.timer.absoluteTime = nil
+  W.reloadState()
+  F.load(W, nil, { keepHome = true })
+  local row = toDecision(W, 4242)
+  if not row then check("blind: decision row", false, true); return end
+  check("blind: identity before any step (control)", row.identityBasis, "window")
+  W.wallOffset = (W.wallOffset or 0) - 30   -- a step back the wall clock alone shows
+  check("blind: the step was taken out (control)",
+    runUntil(W, 10, function() return logHas(W, "clock-stepped-back:") end), true)
+  check("blind: refusing identity from then on is logged", logHas(W, "replay-unbounded:identity-refused-until-reload"), true)
+  W.wallOffset = (W.wallOffset or 0) - 30   -- a second step back
+  runUntil(W, 10, function() return false end)
+  local n = 0
+  local f = io.open(W.home .. "/projects/memwatch/memwatch.log", "r")
+  if f then for line in f:lines() do if line:find("replay-unbounded:", 1, true) then n = n + 1 end end f:close() end
+  check("blind: and said once, across a second step (" .. n .. ")", n, 1)
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local nextRow
+  runUntil(W, 120, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.pid == 4242 and not r.followup_for and not before[r.seq] then nextRow = nextRow or r end
+    end
+    return nextRow ~= nil
+  end)
+  check("blind: a row after the step (control)", nextRow ~= nil, true)
+  if not nextRow then return end
+  check("blind: it takes no identity", nextRow.identityBasis, "none")
+  check("blind: and says why", nextRow.identityReplayed, true)
+  W.run(70)
+  local fu = followups(W, nextRow.seq)
+  check("blind: its follow-up never reads the process alive", fu[1] ~= nil and fu[1].fate ~= "alive", true)
+end)
+
 -- (round 9) The jetsam blind ceiling is a raw file time: a second step back
 -- never lowers it, so a report from before the first step is never counted
 -- by an observation written before the clock catches up with it.
@@ -2541,6 +2754,57 @@ scenario("ledger: a top-born offender is told apart by its bound start time", UN
     return false end)(), false)
 end)
 
+-- The same rule on the bound start time: a process only the top stream
+-- named, younger than a step back, read after the stepped clock has passed
+-- its start again. That start lies in the replayed stretch, so it identifies
+-- nothing (identityBasis none, not lstart).
+scenario("ledger: a bound start time a step back replayed identifies nothing", nil, function(W, mw)
+  W.kern = 4
+  runUntil(W, 60, function() return mw.debug().state == "critical" and mw.debug().streamAlive end)
+  W.run(1)
+  W.psStarved, W.topEmits = true, true
+  local tA = W.now
+  W.addProc(4242, "topborn", 2000, { unstoppable = true })
+  W.grow(4242, 220)
+  local row
+  runUntil(W, 200, function() row = decisionRow(W, 4242); return row ~= nil end)
+  check("bound-replayed: a decision row from the bound start time (control)", row and row.identityBasis, "lstart")
+  if not row then return end
+  -- A step back 30 s longer than its reported age (born 120 s before tA).
+  local D = math.floor(W.now - tA) + 120 + 30
+  local tStep = W.now
+  W.wallOffset = (W.wallOffset or 0) - D
+  local before = {}
+  for _, r in ipairs(ledgerRows(W)) do before[r.seq or -1] = true end
+  local nextRow
+  runUntil(W, 150, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not before[r.seq] and W.now - tStep > 35 then
+        nextRow = nextRow or r
+      end
+    end
+    return nextRow ~= nil
+  end)
+  check("bound-replayed: the step was taken out (control)", logHas(W, "clock-stepped-back:" .. D .. "s"), true)
+  check("bound-replayed: a decision row once the clock has passed the start again (control)", nextRow ~= nil, true)
+  check("bound-replayed: it takes no identity from the replayed start", nextRow and nextRow.identityBasis, "none")
+  check("bound-replayed: and says why", nextRow and nextRow.identityReplayed, true)
+  -- Once the clock has run past the stretch, still none.
+  runUntil(W, D + 60, function() return W.now - tStep >= D + 10 end)
+  local seen = {}
+  for _, r in ipairs(ledgerRows(W)) do seen[r.seq or -1] = true end
+  local late
+  runUntil(W, 150, function()
+    for _, r in ipairs(ledgerRows(W)) do
+      if r.point == "decision" and r.pid == 4242 and not seen[r.seq] then late = late or r end
+    end
+    return late ~= nil
+  end)
+  check("bound-replayed: a decision row once the clock has run past the stretch (control)", late ~= nil, true)
+  check("bound-replayed: it still takes no identity from the replayed start",
+    late and late.identityBasis == "none" and late.identityReplayed == true, true)
+end)
+
 -- Follow-up timers that never run (a stalled run loop): the records stop
 -- collecting once far past their last horizon, and the tick log with them.
 scenario("ledger: records whose follow-ups never run stop growing", nil, function(W, mw)
@@ -2666,10 +2930,11 @@ do
 end
 local REMOTE_LFM = '{"lfm":{"enabled":true,"remoteServer":"https://lfm.invalid","remoteKeyFile":"'
   .. LFM_KEYFILE .. '"}}'
-local function cannedVerdict(action)
+local function cannedVerdict(action, conf)
   return function()
     return 200, '{"choices":[{"message":{"content":"{\\"action\\":\\"' .. action
-      .. '\\",\\"process_class\\":\\"build\\",\\"confidence\\":0.9,\\"rationale\\":\\"test\\"}"}}]}'
+      .. '\\",\\"process_class\\":\\"build\\",\\"confidence\\":' .. tostring(conf or 0.9)
+      .. ',\\"rationale\\":\\"test\\"}"}}]}'
   end
 end
 
@@ -2711,8 +2976,46 @@ local function unattendedRow(W, adjudicator)
     if r.adjudicator == adjudicator then return r end
   end
 end
+-- Decision rows that carry a rail; the last row by an adjudicator; the
+-- observation ledger's decision rows for a pid.
+local function railRows(W, rail)
+  local out = {}
+  for _, r in ipairs(decisionRows(W)) do
+    for _, x in ipairs(r.rails or {}) do
+      if x == rail then out[#out + 1] = r; break end
+    end
+  end
+  return out
+end
+local function lastRowBy(W, adjudicator)
+  local last
+  for _, r in ipairs(decisionRows(W)) do
+    -- (not the 60 s outcome row each decision schedules)
+    if r.adjudicator == adjudicator and r.outcome_for == nil then last = r end
+  end
+  return last
+end
+local function obsDecisions(W, pid)
+  local out = {}
+  for _, r in ipairs(ledgerRows(W)) do
+    if r.point == "decision" and r.pid == pid then out[#out + 1] = r end
+  end
+  return out
+end
+local function stopsWithin(W, sec)
+  return runUntil(W, sec, function() return W.signalsTo(4242):find("STOP", 1, true) ~= nil end)
+end
 local REMOTE_LFM_FREEZE = '{"unattended":"freeze","lfm":{"enabled":true,"advisoryIntervalSec":600,'
   .. '"remoteServer":"https://lfm.invalid","remoteKeyFile":"' .. LFM_KEYFILE .. '"}}'
+-- A model's wait held past its bound by headroom (30%), on the decision tick.
+local function toHeldWait(W)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  return runUntil(W, 300, function() return #railRows(W, "deferral-floor-held-by-headroom") > 0 end)
+end
 
 -- A fresh verdict on the offender's own snapshot is the model's call at
 -- grace expiry: its wait defers the deterministic freeze.
@@ -2728,6 +3031,369 @@ scenario("a verdict on the offender's own snapshot defers the freeze", REMOTE_LF
   check("verdict: so nothing was stopped yet", W.signalsTo(4242), "")
 end)
 
+-- The deferral floor acts only at or below floorAvailPct (12%) once the
+-- bound has run. Above it a model's wait keeps standing; past the bound,
+-- headroom is checked every tick, so the floor acts the tick it falls.
+scenario("a wait past its bound holds while headroom stays above the floor", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("floor-held: the model's wait deferred the freeze", waited, true)
+  local firstWait = W.now
+  W.run(200)                        -- well past the 120 s bound
+  check("floor-held: no freeze while headroom stays above the floor", W.signalsTo(4242), "")
+  local heldRow = false
+  for _, r in ipairs(decisionRows(W)) do
+    for _, rail in ipairs(r.rails or {}) do
+      if rail == "deferral-floor-held-by-headroom" then heldRow = true end
+    end
+  end
+  check("floor-held: the decision record says headroom held it", heldRow, true)
+  local dropAt = W.now
+  W.availPct = 10                   -- the runaway eats the headroom
+  local stopped = runUntil(W, 90, function() return W.signalsTo(4242):find("STOP", 1, true) ~= nil end)
+  check("floor-held: the floor acts once headroom falls", stopped, true)
+  check("floor-held: within a tick or two of the fall, not a grace window later (" .. math.floor(W.now - dropAt) .. " s)",
+    W.now - dropAt <= 12, true)      -- two ticks at most; the grace cadence is 60 s
+end)
+
+-- The every-tick check ends one held wait. A decision that does not hold
+-- the wait again (here the verdict has aged out and the deterministic
+-- freeze cannot be sent) is retried a grace window later, not every tick.
+scenario("the floor's every-tick check ends with the wait it held", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+  check("floor-once: the model's wait deferred the freeze", waited, true)
+  local held = runUntil(W, 200, function()
+    for _, r in ipairs(decisionRows(W)) do
+      for _, rail in ipairs(r.rails or {}) do
+        if rail == "deferral-floor-held-by-headroom" then return true end
+      end
+    end
+    return false
+  end)
+  check("floor-once: past the bound, headroom holds the wait", held, true)
+  W.httpReply = function() return 503, "" end   -- the model stops answering
+  W.sendFails = { STOP = true }                 -- and no freeze can be sent
+  local function attempts()
+    local n = 0
+    for _, r in ipairs(decisionRows(W)) do
+      if r.adjudicator == "deterministic-fallback" then n = n + 1 end
+    end
+    return n
+  end
+  local tried = runUntil(W, 200, function() return attempts() >= 1 end)
+  check("floor-once: once the verdict ages out, the deterministic freeze is tried", tried, true)
+  local before, at = attempts(), W.now
+  W.availPct = 10                                -- headroom falls under the floor
+  W.run(40)                                      -- inside one grace window of that try
+  check("floor-once: and is not tried again every tick (" .. (attempts() - before) .. " more in "
+    .. math.floor(W.now - at) .. " s)", attempts() - before, 0)
+end)
+
+-- A held wait's record says what held it, and a floor act inside the grace
+-- window is a decision point the observation ledger records on its tick.
+scenario("a held wait's record, and the ledger row for a floor act mid-window", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-rec: headroom holds the wait", toHeldWait(W), true)
+  local r = railRows(W, "deferral-floor-held-by-headroom")[1] or {}
+  check("floor-rec: past the bound (" .. tostring(r.deferredSec) .. " s)", (r.deferredSec or 0) >= 120, true)
+  check("floor-rec: with the threshold in force", r.floorAvailPct, 12)
+  check("floor-rec: and the hold cap", r.maxHoldSec, 600)
+  check("floor-rec: the headroom it read (" .. tostring(r.headroomPct) .. ")",
+    type(r.headroomPct) == "number" and math.abs(r.headroomPct - 30) < 1, true)
+  check("floor-rec: availPct stays the row's whole-number reading", r.availPct, math.floor(r.availPct or -1))
+  W.run(25)                         -- mid-window: no grace boundary near
+  local before = #obsDecisions(W, 4242)
+  W.availPct = 10
+  check("floor-rec: the floor acts on the fall", stopsWithin(W, 15), true)
+  check("floor-rec: and the ledger records that decision point", #obsDecisions(W, 4242) - before, 1)
+  local od = obsDecisions(W, 4242)
+  check("floor-rec: the forced row says why the floor brought it forward", (od[#od] or {}).floorAct, "headroom")
+  check("floor-rec: a cadence row says nothing of the kind (control)", (od[1] or {}).floorAct, nil)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  local fired = false
+  for _, x in ipairs(a.rails or {}) do if x == "deferral-floor-fired-by-headroom" then fired = true end end
+  check("floor-rec: the acting record names the floor", fired, true)
+  check("floor-rec: and its threshold", a.floorAvailPct, 12)
+end)
+
+-- (round 3) A held wait whose verdict ages out before the headroom falls: the
+-- floor still acts on the tick it falls, and the record still says why. A
+-- 45 s freshness makes the cached verdict expire inside the grace window.
+local REMOTE_LFM_FREEZE_FRESH45 = '{"unattended":"freeze","lfm":{"enabled":true,"advisoryIntervalSec":600,'
+  .. '"verdictFreshSec":45,"remoteServer":"https://lfm.invalid","remoteKeyFile":"' .. LFM_KEYFILE .. '"}}'
+scenario("a floor act after its held verdict expired still records the floor", REMOTE_LFM_FREEZE_FRESH45, function(W, mw)
+  check("floor-expired: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  W.httpDelay = 600                   -- re-asks stay in flight: the cached verdict ages out
+  W.run(50)                           -- past its 45 s freshness, still inside the grace window
+  check("floor-expired: nothing acted while the verdict aged out (control)", W.signalsTo(4242), "")
+  W.availPct = 10
+  check("floor-expired: the floor acts on the fall, ahead of the grace expiry", stopsWithin(W, 8), true)
+  check("floor-expired: before the next grace expiry (" .. math.floor(W.now - heldAt) .. " s after the hold)",
+    W.now - heldAt < 60, true)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  local rails = {}
+  for _, x in ipairs(a.rails or {}) do rails[x] = true end
+  check("floor-expired: with no fresh verdict at hand (control)", rails["no-fresh-verdict"] == true, true)
+  check("floor-expired: the acting record names the floor", rails["deferral-floor-fired-by-headroom"] == true, true)
+  check("floor-expired: with its threshold, hold cap and headroom",
+    a.floorAvailPct == 12 and a.maxHoldSec == 600 and type(a.headroomPct) == "number" and a.headroomPct <= 12, true)
+  check("floor-expired: and how long the wait held (" .. tostring(a.deferredSec) .. " s)", (a.deferredSec or 0) >= 160, true)
+end)
+
+-- (round 4) The negative case: a held wait whose verdict expired, with
+-- headroom falling only on the grace-expiry tick. That decision is the
+-- plain deterministic one the grace brings, the floor brought nothing
+-- forward, and its record says so: no floor rail, no floor fields.
+scenario("a grace-expiry fallback after a held wait is not credited to the floor", REMOTE_LFM_FREEZE_FRESH45, function(W, mw)
+  check("floor-grace: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  W.httpDelay = 600                   -- re-asks stay in flight: the verdict ages out
+  runUntil(W, 70, function() return W.now - heldAt >= 59 end)
+  check("floor-grace: nothing acted inside the window (control)", W.signalsTo(4242), "")
+  W.availPct = 10                     -- the fall lands on the grace-expiry tick
+  check("floor-grace: the grace expiry acts", stopsWithin(W, 8), true)
+  check("floor-grace: at the grace expiry (" .. math.floor(W.now - heldAt) .. " s after the hold, control)",
+    W.now - heldAt >= 60, true)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  local floorRail = false
+  for _, x in ipairs(a.rails or {}) do if x:find("deferral-floor", 1, true) then floorRail = true end end
+  check("floor-grace: the record names no floor", floorRail, false)
+  check("floor-grace: and carries no floor fields", a.floorAvailPct == nil and a.headroomPct == nil, true)
+end)
+
+-- (round 4) A held wait whose model has since answered freeze: the floor
+-- brings that decision forward when headroom falls mid-window, and the
+-- record says so beside the model's own.
+scenario("a fresh freeze verdict on a held wait still records the floor that brought it forward", REMOTE_LFM_FREEZE_FRESH45, function(W, mw)
+  check("floor-fresh-freeze: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  W.httpReply = cannedVerdict("freeze")  -- the next answer, once the wait verdict ages out (45 s)
+  W.run(50)
+  check("floor-fresh-freeze: nothing acted before the fall (control)", W.signalsTo(4242), "")
+  W.availPct = 10
+  check("floor-fresh-freeze: the decision comes on the fall", stopsWithin(W, 8), true)
+  check("floor-fresh-freeze: ahead of the grace expiry (" .. math.floor(W.now - heldAt) .. " s after the hold)",
+    W.now - heldAt < 60, true)
+  local a = lastRowBy(W, "lfm") or {}
+  local rails = {}
+  for _, x in ipairs(a.rails or {}) do rails[x] = true end
+  check("floor-fresh-freeze: it is the model's freeze (control)", a.action, "freeze")
+  check("floor-fresh-freeze: and its record names the floor", rails["deferral-floor-fired-by-headroom"] == true, true)
+  check("floor-fresh-freeze: with its threshold and headroom",
+    a.floorAvailPct == 12 and type(a.headroomPct) == "number" and a.headroomPct <= 12, true)
+end)
+
+-- (round 3) Switching the adjudicator off and on again: a verdict cached
+-- before the switch decides nothing after it, and a wait it held no longer
+-- holds the policy off or arms the floor's every-tick check.
+scenario("a verdict cached before an off-and-on switch decides nothing after it", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  local kAt = W.now
+  check("switch-cache: a wait verdict is cached (control)",
+    runUntil(W, 40, function() return mw.debug().lfm.cached > 0 end), true)
+  -- Late enough that the cached verdict is the one asked about the start
+  -- time the alert bound (an earlier one is dropped and asked again at the
+  -- bind), early enough that the grace expiry has not come.
+  runUntil(W, 60, function() return W.now - kAt >= 45 end)
+  check("switch-cache: before the grace expiry (control)", W.signalsTo(4242) == "" and unattendedRow(W, "lfm") == nil, true)
+  mw.setLfmEnabled(false)
+  W.httpDelay = 600                   -- nothing the switch-on asks comes back in time
+  mw.setLfmEnabled(true)
+  check("switch-cache: the deterministic freeze acts at grace expiry", stopsWithin(W, 90), true)
+  check("switch-cache: and no model decision was made", unattendedRow(W, "lfm"), nil)
+end)
+
+scenario("a held wait does not survive an off-and-on switch", REMOTE_LFM_FREEZE, function(W, mw)
+  check("switch-held: headroom holds the wait", toHeldWait(W), true)
+  W.run(10)
+  mw.setLfmEnabled(false)
+  W.httpDelay = 600
+  mw.setLfmEnabled(true)
+  W.availPct = 10                     -- a fall the held wait's check would act on mid-window
+  check("switch-held: no floor act mid-window: the held wait is gone", stopsWithin(W, 20), false)
+  check("switch-held: the base system decides at its grace expiry", stopsWithin(W, 60), true)
+end)
+
+-- Headroom that cannot be read (no memory size: availPct reads 100) is
+-- unknown, and the floor fails closed on it.
+scenario("a held wait ends when headroom cannot be read", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-unknown: headroom holds the wait", toHeldWait(W), true)
+  W.run(25)
+  local at = W.now
+  W.memSizeUnknown = true
+  check("floor-unknown: the floor acts on headroom it cannot read", stopsWithin(W, 15), true)
+  check("floor-unknown: within two ticks (" .. math.floor(W.now - at) .. " s)", W.now - at <= 12, true)
+  check("floor-unknown: and says so", #railRows(W, "deferral-floor-fired-by-unknown-headroom"), 1)
+end)
+
+-- With the adjudicator turned off, the base system decides at its own
+-- cadence: a held wait arms no every-tick check, and a verdict cached before
+-- the switch decides nothing after it.
+scenario("with the adjudicator turned off, a held wait waits out the grace", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-off: headroom holds the wait", toHeldWait(W), true)
+  local heldAt = W.now
+  mw.setLfmEnabled(false)
+  W.availPct = 10
+  W.run(40)
+  check("floor-off: no act on the floor's tick with the adjudicator off", W.signalsTo(4242), "")
+  check("floor-off: the base system still freezes", stopsWithin(W, 60), true)
+  check("floor-off: at its own grace (" .. math.floor(W.now - heldAt) .. " s after the held decision)",
+    W.now - heldAt >= 55, true)
+end)
+scenario("a verdict cached before the adjudicator is turned off decides nothing", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  -- The alert's first binding asks again: that answer is the verdict a
+  -- decision point would consume (the advisory one before it is not).
+  local asked = runUntil(W, 60, function() return #(W.httpPosts or {}) >= 2 end)
+  W.run(2)
+  check("off-cache: a wait verdict on the bound process is cached before the grace runs out",
+    asked and (mw.debug().lfm.cached or 0) > 0 and unattendedRow(W, "lfm") == nil, true)
+  mw.setLfmEnabled(false)
+  check("off-cache: the base system freezes at grace expiry", stopsWithin(W, 90), true)
+  check("off-cache: no model wait decided after the switch", unattendedRow(W, "lfm"), nil)
+end)
+
+-- A held wait belongs to the process it was held for: a newcomer on the pid
+-- starts its own grace and deferral, whatever the headroom.
+scenario("a held wait is not inherited by the pid's next process", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-reuse: headroom holds the wait", toHeldWait(W), true)
+  local reusedAt = W.now
+  W.reusePid(4242, "leaker", 2000)  -- the leaker's growth carries on in the newcomer
+  W.availPct = 10
+  check("floor-reuse: the newcomer is frozen in time", stopsWithin(W, 400), true)
+  check("floor-reuse: after its own grace and deferral (" .. math.floor(W.now - reusedAt) .. " s)",
+    W.now - reusedAt >= 150, true)
+  local a = lastRowBy(W, "deterministic-fallback") or {}
+  check("floor-reuse: on its own deferral (" .. tostring(a.deferredSec) .. " s)", (a.deferredSec or 999) <= 130, true)
+end)
+
+-- The configured threshold and hold cap reach the decision.
+for _, case in ipairs({
+  { name = "a threshold of 0 acts at the bound", key = '"floorAvailPct":0', avail = 30, lo = 115, hi = 135 },
+  { name = "a threshold of 25 acts at 20%", key = '"floorAvailPct":25', avail = 20, lo = 115, hi = 135,
+    rail = "deferral-floor-fired-by-headroom" },
+  { name = "a hold cap of 330 s acts at 30%, between grace expiries", key = '"maxHoldSec":330', avail = 30, lo = 325, hi = 345,
+    rail = "deferral-floor-fired-by-hold-cap" },
+}) do
+  local conf = REMOTE_LFM_FREEZE:gsub('"advisoryIntervalSec":600,', '"advisoryIntervalSec":600,' .. case.key .. ',')
+  scenario("floor config: " .. case.name, conf, function(W, mw)
+    W.httpReply = cannedVerdict("wait")
+    leaker(W, 4242)
+    W.run(12)
+    W.kern = 4
+    W.availPct = case.avail
+    local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
+    check("floor config (" .. case.name .. "): the model's wait deferred the freeze", waited, true)
+    local firstWait = W.now
+    check("floor config (" .. case.name .. "): the freeze comes", stopsWithin(W, 500), true)
+    local d = W.now - firstWait
+    check("floor config (" .. case.name .. "): " .. math.floor(d) .. " s from the first wait", d >= case.lo and d <= case.hi, true)
+    if case.rail then
+      check("floor config (" .. case.name .. "): and says why", #railRows(W, case.rail), 1)
+    else
+      check("floor config (" .. case.name .. "): as before, with no floor rail",
+        #railRows(W, "deferral-floor-fired-by-headroom") + #railRows(W, "deferral-floor-held-by-headroom"), 0)
+    end
+  end)
+end
+
+-- A wall clock stepped back while a wait is held: the first wait moves with
+-- the step, so the hold cap reads the time really held (unshifted, the first
+-- wait would read as after now and end the hold at once).
+scenario("a held wait survives a step back without acting early", REMOTE_LFM_FREEZE, function(W, mw)
+  check("floor-step: headroom holds the wait", toHeldWait(W), true)
+  local r = railRows(W, "deferral-floor-held-by-headroom")[1] or {}
+  W.run(10)
+  local step = (r.deferredSec or 120) + 10 + 30   -- past the first wait, short of the process's age
+  local age = W.now - W.procs[4242].bornAt
+  check("floor-step: the step (" .. step .. " s) is shorter than the process's age (" .. math.floor(age) .. " s)",
+    step < age - 10, true)
+  W.wallOffset = (W.wallOffset or 0) - step
+  W.run(30)
+  check("floor-step: no act after the step", W.signalsTo(4242), "")
+  check("floor-step: the shift ran without error", logHas(W, "error:clock-shift"), false)
+  W.availPct = 10
+  check("floor-step: and the floor still acts when headroom falls", stopsWithin(W, 15), true)
+end)
+
+-- (round 2) Unattended mode switched off while a wait is held: the step does
+-- nothing, so the ledger writes no forced decision row either.
+scenario("with unattended off mid-hold, no forced decision rows", REMOTE_LFM_FREEZE, function(W, mw)
+  check("mode-off: headroom holds the wait", toHeldWait(W), true)
+  require("memwatch_core").cfg.unattended = "off"
+  W.run(5)
+  local before = #obsDecisions(W, 4242)
+  W.availPct = 10
+  W.run(30)
+  check("mode-off: no act with unattended off", W.signalsTo(4242), "")
+  check("mode-off: no forced rows, at most the grace cadence's own (" .. (#obsDecisions(W, 4242) - before) .. " in 30 s)",
+    #obsDecisions(W, 4242) - before <= 1, true)
+end)
+
+-- (round 2) The floor's act ahead of the grace respects a closed gate: an
+-- alert the operator closed is an answer, and the floor does not act on it.
+scenario("the floor does not act on an alert the operator closed", REMOTE_LFM_FREEZE, function(W, mw)
+  check("gate-closed: headroom holds the wait", toHeldWait(W), true)
+  check("gate-closed: the alert is up (control)", W.hudShowing(), true)
+  if W.hudShowing() then W.click("close") end
+  W.run(5)
+  W.availPct = 10
+  W.run(70)                           -- past the next grace expiry too
+  check("gate-closed: nothing is stopped", W.signalsTo(4242), "")
+end)
+
+-- (round 2) A held wait's record keeps the verdict's own rails: a freeze
+-- under the confidence floor arrives as a wait, and says so.
+scenario("a held wait's record keeps the verdict's own rails", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("freeze", 0.3)
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local held = runUntil(W, 300, function() return #railRows(W, "deferral-floor-held-by-headroom") > 0 end)
+  check("held-rails: headroom holds the wait", held, true)
+  local r = railRows(W, "deferral-floor-held-by-headroom")[1] or {}
+  local has = false
+  for _, x in ipairs(r.rails or {}) do if x == "conf-floor-freeze" then has = true end end
+  check("held-rails: the record says the wait came from the confidence floor", has, true)
+end)
+
+-- (round 2) A verdict whose reply lands after the adjudicator is switched off
+-- decides nothing, even once it is on again: the switch drops the request
+-- in flight and the cache with it.
+scenario("a verdict across an off-and-on switch decides nothing", REMOTE_LFM_FREEZE, function(W, mw)
+  W.httpReply = cannedVerdict("wait")
+  W.httpDelay = 20                    -- the answer is slow
+  leaker(W, 4242)
+  W.run(12)
+  W.kern = 4
+  W.availPct = 30
+  local asked = runUntil(W, 60, function() return #(W.httpPosts or {}) >= 2 end)
+  check("switch: the bound process's request is in flight (control)", asked, true)
+  mw.setLfmEnabled(false)             -- switched off while it is in flight
+  W.run(25)                           -- its reply lands meanwhile
+  W.httpDelay = 600                   -- a new ask would not land before the next decision
+  mw.setLfmEnabled(true)
+  check("switch: the base system freezes at grace expiry", stopsWithin(W, 90), true)
+  check("switch: no model wait from the verdict across the switch", unattendedRow(W, "lfm"), nil)
+end)
+
 -- (round 6) A wall clock stepped back while a model's wait defers the
 -- freeze: the deferral's first wait moves with the step, so the freeze
 -- comes when the deferral ends (120 s of real time from the first wait),
@@ -2737,6 +3403,7 @@ scenario("a step back while a wait defers the freeze keeps the deferral whole", 
   leaker(W, 4242)
   W.run(12)
   W.kern = 4
+  W.availPct = 8                    -- low headroom: the floor acts at the bound
   local waited = runUntil(W, 150, function() return unattendedRow(W, "lfm") ~= nil end)
   check("defer-step: the model's wait deferred the freeze", waited, true)
   local firstWait = W.now

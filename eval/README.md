@@ -44,9 +44,11 @@ A reply counts as the model's only when the server sent it. An HTTP status
 other than 2xx, a 2xx with an empty body, or a request that failed fails
 the run instead of scoring as an invalid reply. Rate limiting, a server
 error or a dropped connection is tried again `--retries` times, waiting
-`--retry-wait` seconds and then twice that, and a retried request's wall
-time counts every attempt and wait. A rerun's result file is the rerun's
-or nothing: a stale one at the path is removed first, and the new one is
+`--retry-wait` seconds and then twice that. A retried request's wall time
+counts the time the server took over every attempt (a timeout that reports
+no time counts its limit); the runner's own waits between attempts are
+recorded apart, as `wait_ms`. A rerun's result file is the rerun's or
+nothing: a stale one at the path is removed first, and the new one is
 written whole and renamed into place.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
@@ -163,10 +165,15 @@ that decision.
   (a bad flag, a set it cannot read, decisions that do not answer the
   episodes). `controls` exits 1 when a control fails, 2 when the set is
   undecidable or underpowered, and 3 on a refusal. A result file
-  (`--out`) is written whole and renamed into place. A split holds each episode once: a
+  (`--out`) is this run's or nothing: the path is cleared before the run,
+  so an earlier result never stands after a refusal or a failed write, and
+  the new one is written whole and renamed into place. A split holds each episode once: a
   directory with the same episode twice (a copied file, or the episode
   under another id) is refused, since a copy would count twice toward the
-  decisive size.
+  decisive size. Two episodes are the same when their trajectories are:
+  the same steps, alert changes, per-tick headroom and labels, whatever
+  their ids, their template or their alerts' numbering. Every episode
+  must carry an id.
 - `bakeoff.lua episodes` records a model's decision at every decision point
   through the production builders (`--api chat|systemone|completion`), and
   `score-episodes.lua` replays the rows through the proposed wait rail, the

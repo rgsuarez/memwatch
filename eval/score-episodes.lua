@@ -27,7 +27,9 @@
 --   gate also takes --prevalence <weights.json> ({ category = count } from field
 --   decisions) for a field-weighted diagnostic beside the pre-registered gate.
 -- Candidates: always-freeze | never-act | rule | ttx | tree | oracle | noisy-oracle |
---   decisions (recorded model decisions, --decisions <rows.jsonl> [--key] --tau <x>)
+--   decisions (recorded model decisions, --decisions <rows.jsonl> [--key] --tau <x>).
+--   ttx and tree are the baselines as fit on --fit-dir (the ttx horizon fit
+--   there), the same functions the gate compares against.
 
 package.path = "lua/?.lua;eval/?.lua;" .. package.path
 local lfm = require("memwatch_lfm")
@@ -739,11 +741,18 @@ function M.main(argv)
     for _, ep in ipairs(fitEps) do has[ep.labels and ep.labels.class or "?"] = true end
     assert(has.runaway and has.savable,
       "--fit-dir has no runaway or no savable episode; the baselines cannot be fit on it")
-    -- Another directory holding the same episodes (a copy) is the same split.
+    -- Another directory holding the same episodes (a copy, or the same
+    -- templates and seeds regenerated under another split label) is the
+    -- same split: episodes are compared by what they hold, not by id.
+    local function content(ep)
+      return lfm.jsonEncode({ template = ep.template, labels = ep.labels, steps = ep.steps })
+    end
     local scored = {}
-    for _, ep in ipairs(eps) do scored[ep.id] = true end
+    for _, ep in ipairs(eps) do scored[content(ep)] = ep.id end
     for _, ep in ipairs(fitEps) do
-      assert(not scored[ep.id], "--fit-dir shares episode " .. tostring(ep.id) .. " with the evaluated set")
+      local twin = scored[content(ep)]
+      assert(not twin, "--fit-dir holds " .. tostring(ep.id) .. ", the same episode as " .. tostring(twin)
+        .. " in the evaluated set")
     end
   end
   local baselines, tree, horizon = M.baselineSet(fitEps, a.depth)

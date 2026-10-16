@@ -121,7 +121,8 @@ that decision.
   one-sided 95% lower bound above zero, bootstrapped by template). The
   baselines are always-freeze, a category rule, a time-to-exhaustion rule
   and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
-  required, never the evaluated directory).
+  required, holding runaways and savables and none of the evaluated
+  episodes), and `--candidate ttx|tree` scores them as fit there.
 - A set decides the gate only with enough runaways: 59 at zero misses, 93
   at one. Generate dev with `--per-template 8` or more (88 runaways from
   the public dev templates). `gate` exits nonzero when G7 fails, and

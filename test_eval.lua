@@ -377,6 +377,11 @@ do
   local dead = ticksOpen(function() return true end)
   for t = 60, 180, 5 do dead[t].alive = false end
   check("re-arm: a process gone by the re-arm decides once", times(dead), "0")
+  local floored = ticksOpen(function() return true end)
+  for t = 55, 115, 5 do floored[t].avail = 5 end
+  check("re-arm: a machine at the exhaustion floor is no decision point", times(floored), "0,120,180")
+  check("re-arm: a gate that reopens only at the horizon decides there",
+    times(ticksOpen(function(t) return t == 0 or t == 180 end)), "0,180")
   -- Exhaustion at the release instant: the memory comes back at that
   -- instant, so only a crossing strictly before it is exhaustion; a hold
   -- crossing as its growth ends counts.
@@ -502,6 +507,15 @@ do
   local copy = tmpDir()
   os.execute("cp '" .. held .. "'/*.json '" .. copy .. "'/")
   local okCopy, errCopy = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", copy })
+  -- The same episodes under other ids (another split label) are the same split.
+  local relabeled = tmpDir()
+  for _, e in ipairs(sc.loadDir(held)) do
+    e.id = "alt-" .. e.id
+    local rf = assert(io.open(relabeled .. "/" .. e.id .. ".json", "w"))
+    rf:write(lfm.jsonEncode(e), "\n")
+    rf:close()
+  end
+  local okRel, errRel = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", relabeled })
   local okEmpty, errEmpty = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", empty })
   local okLate, errLate = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", late })
   print = quiet
@@ -514,12 +528,14 @@ do
   check("cli: a gate without a fit split is refused", okNone, false)
   check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
   check("cli: a copy of the evaluated set is refused as the fit split",
-    okCopy == false and tostring(errCopy):find("shares episode", 1, true) ~= nil, true)
+    okCopy == false and tostring(errCopy):find("the same episode", 1, true) ~= nil, true)
+  check("cli: so are the same episodes under other ids",
+    okRel == false and tostring(errRel):find("the same episode", 1, true) ~= nil, true)
   check("cli: an empty fit split is refused",
     okEmpty == false and tostring(errEmpty):find("cannot be fit", 1, true) ~= nil, true)
   check("cli: so is one with only late episodes",
     okLate == false and tostring(errLate):find("cannot be fit", 1, true) ~= nil, true)
-  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "'")
+  os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "' '" .. relabeled .. "'")
 end
 
 -- ---- on a set large enough to decide the gate (the documented dev size) ----
@@ -549,6 +565,14 @@ do
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)
   check("cli: the ttx candidate is the fitted baseline", sc.resolveCandidate("ttx", baselines) == baselines.ttx, true)
   check("cli: so is the tree", sc.resolveCandidate("tree", baselines) == baselines.tree, true)
+  check("cli: the noisy oracle resolves", type(sc.resolveCandidate("noisy-oracle", baselines)), "function")
+  check("cli: an unknown candidate is refused", (pcall(sc.resolveCandidate, "no-such-candidate", baselines)), false)
+  local okNoRows, errNoRows = pcall(sc.resolveCandidate, "decisions", baselines, {})
+  check("cli: recorded decisions need their rows",
+    okNoRows == false and tostring(errNoRows):find("--decisions", 1, true) ~= nil, true)
+  local okNoTau, errNoTau = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = "rows.jsonl" })
+  check("cli: and a threshold chosen on dev",
+    okNoTau == false and tostring(errNoTau):find("--tau", 1, true) ~= nil, true)
   check("ttx: the fitted horizon makes fewer wrongful freezes than always-freeze",
     gO.baselines.ttx.wrongful < gO.baselines["always-freeze"].wrongful
       and gO.baselines.ttx.missUpper <= sc.cfg.missBound, true)

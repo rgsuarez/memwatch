@@ -179,8 +179,9 @@ metric operationally defined:
 
 Independently of adjudication, memwatch keeps a passive observation ledger,
 `memwatch-observe.jsonl` (local and gitignored). It writes a row at each
-grace-expiry decision point, and every 45 s while pressure is up and an
-offender is named. A decision point is a tick where the live unattended gate
+grace-expiry decision point, on the tick the deferral floor acts on a held
+wait (which can fall inside the grace window), and every 45 s while
+pressure is up and an offender is named. A decision point is a tick where the live unattended gate
 stands open, whatever the unattended mode: an extreme runaway, surfaced by
 the alert, unanswered for its grace window, and not frozen, gone or ignored.
 

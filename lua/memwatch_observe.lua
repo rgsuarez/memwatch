@@ -96,6 +96,9 @@ function M.row(a)
     -- wouldAct cannot miss it.
     wouldActBasis = (a.mode == "kill" and a.wouldAct ~= nil and a.wouldAct ~= "none") and "name" or nil,
     graceElapsedSec = floorOrNil(a.graceElapsedSec),
+    -- Why the deferral floor brought this decision forward, on the row it
+    -- forced ahead of the grace window (lfm.floorActs); nil otherwise.
+    floorAct = type(a.floorAct) == "string" and a.floorAct or nil,
     pid = floorOrNil(off.pid),
     offender = {
       name = M.sanitizeName(off.name), category = a.category, kind = off.kind,
@@ -164,10 +167,13 @@ end
 -- (sinceLastSec is nil when it has no live stamp; see liveStamp). The
 -- unattended mode is deliberately not an input: the ledger records what an
 -- adjudicator would face under every mode, including off, and a decision
--- row marks exactly the ticks where the live gate would act.
--- a: { enabled, gate ("open" | "unbound" | "closed"), sinceLastSec, graceSec }
+-- row marks exactly the ticks where the live gate would act. forced: the
+-- live step acts this tick ahead of its grace window (the deferral floor), so
+-- the row is due whenever the gate is open.
+-- a: { enabled, gate ("open" | "unbound" | "closed"), sinceLastSec, graceSec, forced }
 function M.decisionDue(a)
   if type(a) ~= "table" or a.enabled ~= true or a.gate ~= "open" then return false end
+  if a.forced == true then return true end
   if type(a.graceSec) ~= "number" then return false end
   -- A stamp after now (the wall clock stepped back since) counts as elapsed,
   -- as the unattended step's own grace stamp does.

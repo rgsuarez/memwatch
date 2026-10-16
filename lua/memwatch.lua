@@ -1781,6 +1781,31 @@ function obs.gateFor(offender, now)
   })
 end
 
+-- Does the deferral floor bring this offender's decision forward now, ahead
+-- of its grace? Why it does (lfm.floorActs), or nil. The one answer both
+-- callers read: the unattended step acts on it, and the observation ledger
+-- records that tick as a decision point and says why. Every early return of
+-- the step is here too: unattended off, a gate that is not open, a held wait
+-- bound to another start time than the alert's, a final latch, an action in
+-- flight. So the two never disagree on a tick. Once the grace has run, the
+-- step decides by it, and the floor brings nothing forward: nil.
+function obs.floorActDue(offender, now)
+  if not offender or core.resolveUnattended(core.cfg) == "off" then return nil end
+  if obs.gateFor(offender, now) ~= "open" then return nil end
+  local fired = unattendedFiredFor[offender.pid]
+  if not (fired and hudOffender and fired.lstart ~= nil and fired.lstart == hudOffender.lstart) then
+    return nil
+  end
+  if fired.final or actionInFlight(hudOffender) then return nil end
+  -- (A stamp after now counts as now, as the step clamps it: the grace has
+  -- not run.)
+  if type(fired.at) == "number" and fired.at <= now
+     and (now - fired.at) >= core.cfg.cool.autoKillGraceSec then return nil end
+  local w = unattendedWaitStreak[offender.pid]
+  if not lfm.floorDue(w, lastMetrics, now) then return nil end
+  return lfm.floorActs(w, lastMetrics, now)
+end
+
 local function unattendedStep(offender, now)
   local mode = core.resolveUnattended(core.cfg)
   if mode == "off" then return end
@@ -1817,9 +1842,30 @@ local function unattendedStep(offender, now)
   -- never none (rule 8).
   if fired and type(fired.at) == "number" and fired.at > now then fired.at = now end
   local sinceFired = now - ((fired and fired.at) or 0)
-  if sinceFired < core.cfg.cool.autoKillGraceSec then return end
+  -- A model's wait held past its bound is re-checked every tick while the
+  -- adjudicator is on: the floor acts the tick headroom falls to
+  -- floorAvailPct, becomes unreadable, or the hold reaches maxHoldSec, not at
+  -- the next grace expiry (obs.floorActDue; the observation hook asks the
+  -- same, before this step consumes the check below).
+  local w = unattendedWaitStreak[offender.pid]
+  -- Why the floor brings this decision forward (nil when it does not: the
+  -- grace has run, or nothing is due), read before its check is consumed,
+  -- so the decision records it even when the held wait's verdict has
+  -- expired since.
+  local floorWhy = obs.floorActDue(offender, now)
+  if sinceFired < core.cfg.cool.autoKillGraceSec and not floorWhy then return end
+  -- That check ends one held wait. Whatever this decision is, the next one
+  -- waits out the grace again, unless headroom holds the wait again.
+  if type(w) == "table" then w.exhausted = nil end
   unattendedFiredFor[offender.pid] = { at = now, lstart = lstart }
-  local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now)
+  local action, adjudicator, rationale, rails, extra = resolveUnattendedAction(mode, offender, now, floorWhy)
+  -- A decision the floor brought forward says so, whatever answered it: the
+  -- held wait's verdict, a fresh verdict of another action, or none. The
+  -- record is the held wait's as it stood (the resolver may replace or drop
+  -- it); the decision's own fields win where both have one.
+  if floorWhy and action ~= "wait" then
+    rails, extra = lfm.withFloorRecord(rails, extra, floorWhy, lfm.floorRecord(w, lastMetrics, now))
+  end
   M.logSnapshot(string.format("unattended-%s:%s(%d):%s",
     action, offender.name, offender.pid, adjudicator))
   writeDecisionOutcome(offender, action, adjudicator, rationale, rails, extra)
@@ -2028,16 +2074,23 @@ local function alertSurfaces(state, now)
     local decGrace = hudOffender and recordFor(exposure, hudOffender, false) or nil
     local decEntry = offender and tracker.procs[offender.pid] or nil
     local decStamp = offender and observe.liveStamp(obs.decisionAt[offender.pid], decEntry) or nil
+    -- The deferral floor acts ahead of the grace window: that act is a
+    -- decision point too. Asked here before unattendedStep runs below, which
+    -- consumes the held wait's check on the tick it acts and asks the same
+    -- predicate again. The two agree because nothing between them changes
+    -- what it reads: the write below only appends a row and schedules its
+    -- follow-ups, never the wait, fired, metrics or receipt state.
+    local floorNow = obs.floorActDue(offender, now)
     if observe.decisionDue({
          enabled = obs.enabled, gate = obs.gateFor(offender, now),
          sinceLastSec = decStamp and (now - decStamp.at) or nil,
-         graceSec = core.cfg.cool.autoKillGraceSec,
+         graceSec = core.cfg.cool.autoKillGraceSec, forced = floorNow ~= nil,
        }) then
       -- Stamped before the write on purpose: a throwing write must not retry every tick.
       obs.decisionAt[offender.pid] = { at = now, comm = decEntry and decEntry.comm or nil,
                                           start = observe.startOf(decEntry) }
       local okObs, errObs = pcall(obs.writeObservation, "decision", offender, now,
-        { graceElapsedSec = decGrace and decGrace.sec or 0,
+        { graceElapsedSec = decGrace and decGrace.sec or 0, floorAct = floorNow,
           lstart = (hudOffender and hudOffender.pid == offender.pid) and hudOffender.lstart or nil })
       if not okObs then logError("observe-decision", errObs) end
     end
@@ -3000,6 +3053,9 @@ end
 -- detector kind this decision sees (lfm.verdictUsable). The snapshot hash in
 -- the entry is ledger correlation, never a consumption predicate.
 local function consumeVerdict(offender)
+  -- Off means the base system (rule: disabled or unavailable): a verdict
+  -- cached before the switch decides nothing after it.
+  if not lfm.cfg.enabled then return nil end
   local e = verdictCache[offender.pid]
   if not lfm.verdictUsable(e, offender, clock.now(), lfm.cfg.verdictFreshSec) then
     return nil
@@ -3028,7 +3084,7 @@ end
 -- deterministic policy acts exactly as the legacy autoKill did (the mode is
 -- the action, extreme-only, policy-gated inside the signal path). now is
 -- the decision tick's clock.
-resolveUnattendedAction = function(mode, offender, now)
+resolveUnattendedAction = function(mode, offender, now, floorWhy)
   -- The foreground termination rail must fire in the LIVE path, not only in
   -- the advisory snapshot: lastOffender never carries a foreground flag, so
   -- compute it here against the frontmost app before applyVerdict.
@@ -3071,7 +3127,9 @@ resolveUnattendedAction = function(mode, offender, now)
     -- two), but an inert or over-conservative model must not capture the
     -- decision forever while a true runaway grinds the machine down. Once
     -- lfm.cfg.maxDeferSec has elapsed since the FIRST model wait on this
-    -- offender at grace expiry, the deterministic policy proceeds. The bound
+    -- offender at grace expiry, the floor decides: the deterministic policy
+    -- proceeds on low or unreadable headroom, and after maxHoldSec in any
+    -- case. The bound
     -- is time, not a wait count: a 90 s verdict cache against a 60 s grace
     -- cadence let one cached wait count twice under the old counter. It is
     -- measured on the tick's clock, never on a read after the probe forks
@@ -3080,14 +3138,30 @@ resolveUnattendedAction = function(mode, offender, now)
       local w, exhausted = lfm.deferralStep(unattendedWaitStreak[offender.pid], now, lfm.cfg.maxDeferSec)
       unattendedWaitStreak[offender.pid] = w
       if exhausted then
+        -- Past the bound the floor decides (lfm.floorActs): it acts at or
+        -- below floorAvailPct of headroom, on headroom it cannot read, or
+        -- once maxHoldSec has run since the first wait. Otherwise the wait
+        -- holds: a savable burst still holding headroom is not frozen for
+        -- outlasting the bound. A held wait arms the every-tick check in
+        -- unattendedStep (w.exhausted), so a runaway that eats the headroom
+        -- is frozen the tick it crosses, not a grace window later.
+        local why = lfm.floorActs(w, lastMetrics, now)
+        local floorRec = lfm.floorRecord(w, lastMetrics, now)
+        if not why then
+          w.exhausted = true
+          local held = { "deferral-floor-held-by-headroom" }
+          for _, r in ipairs(rails or {}) do held[#held + 1] = r end
+          floorRec.model, floorRec.snapshotHash, floorRec.confidence = lfm.cfg.model, e.snapshotHash, e.verdict.confidence
+          floorRec.verdictKind, floorRec.snapshot = e.kind, e.snapshot
+          return eff, "lfm", e.verdict.rationale, held, floorRec
+        end
         -- The model's wait rationale is SUPERSEDED here, so do not attach it
         -- to the deterministic action (it would mislabel the report card).
         local action = deterministicAction(mode, foreground)
         local drails = { "deterministic", "wait-deferral-exhausted" }
-        return action, "deterministic-fallback", nil, drails,
-          { model = lfm.cfg.model, deferrals = w.count,
-            deferredSec = math.floor(now - w.firstAt),
-            supersededModelAction = "wait" }
+        if why ~= "no-floor" then drails[#drails + 1] = "deferral-floor-fired-by-" .. why end
+        floorRec.model, floorRec.supersededModelAction = lfm.cfg.model, "wait"
+        return action, "deterministic-fallback", nil, drails, floorRec
       end
     else
       unattendedWaitStreak[offender.pid] = nil
@@ -3096,7 +3170,19 @@ resolveUnattendedAction = function(mode, offender, now)
       { model = lfm.cfg.model, snapshotHash = e.snapshotHash, confidence = e.verdict.confidence,
         verdictKind = e.kind, snapshot = e.snapshot }
   end
-  return deterministicAction(mode, foreground), "deterministic-fallback", nil, { "deterministic" }, nil
+  -- No usable verdict (expired since the wait was held, or tied to another
+  -- kind or identity): the deterministic policy acts. When the floor's
+  -- every-tick check brought this decision forward (floorWhy), the record
+  -- still says why, as it does with the verdict at hand.
+  local action = deterministicAction(mode, foreground)
+  if floorWhy then
+    -- (unattendedStep adds the floor's rail and record to every decision
+    -- the floor brought forward, this one included.)
+    return action, "deterministic-fallback", nil,
+      { "deterministic", "wait-deferral-exhausted", "no-fresh-verdict" },
+      { model = lfm.cfg.model, supersededModelAction = "wait" }
+  end
+  return action, "deterministic-fallback", nil, { "deterministic" }, nil
 end
 
 ------------------------------------------------------------------------------
@@ -3609,7 +3695,7 @@ obs.writeObservation = function(point, offender, now, extra)
     swapoutRate = lastRates.swapOut, compRate = lastRates.comp, runawayCount = #lastRuns,
     mode = mode, lfmEnabled = lfm.cfg.enabled,
     wouldAct = wouldAct, wouldActAtFreeze = wouldActAtFreeze,
-    graceElapsedSec = extra.graceElapsedSec,
+    graceElapsedSec = extra.graceElapsedSec, floorAct = extra.floorAct,
     category = lfm.categorize(offender.name, nil),
     offender = { pid = offender.pid, name = offender.name, kind = offender.kind,
                  weightMB = offender.weightMB, slopeMBmin = offender.slopeMBmin,
@@ -4557,6 +4643,12 @@ end
 -- local config so the choice survives reloads.
 function M.setLfmEnabled(on)
   lfm.cfg.enabled = on == true
+  if not lfm.cfg.enabled then
+    -- Off means the base system at once: cached verdicts, a request in flight
+    -- (its reply is dropped by nonce) and the waits they held all go, so none
+    -- of them decides anything after the switch, even once it is on again.
+    verdictCache, lfmInFlight, unattendedWaitStreak = {}, nil, {}
+  end
   if not saveLocalConfig() then
     showAlert("couldn't save the LFM setting (local config unreadable); it lasts until reload", 4)
   end

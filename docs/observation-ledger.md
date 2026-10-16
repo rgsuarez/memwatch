@@ -1,8 +1,10 @@
 # The observation ledger: design
 
 The observation ledger (`memwatch-observe.jsonl`, local and gitignored)
-records what memwatch saw at each would-be decision point, and every 45 s
-while pressure is up, and what became of the process and the machine 60,
+records what memwatch saw at each would-be decision point (once per grace
+window, and on the tick a held model wait meets the deferral floor, a row
+that carries the floor's reason as `floorAct`), and
+every 45 s while pressure is up, and what became of the process and the machine 60,
 120 and 180 s later. It is raw material for an outcome-labeled evaluation
 set. It never acts, never forks and never leaves the machine. The README
 lists the fields; this note states the rules the code holds to, so a change

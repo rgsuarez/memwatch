@@ -139,6 +139,9 @@ function M.metrics(vm, swapBytes, totalBytes, pageSize)
     compGB   = (storedPages * pageSize) / 1e9,
     swapGB   = (swapBytes or 0) / 1e9,
     availPct = totalBytes > 0 and (availPages * pageSize / totalBytes * 100) or 100,
+    -- availPct reads 100 when the memory size is unknown; a reader that must
+    -- fail closed on unknown headroom checks this instead.
+    availKnown = totalBytes > 0,
   }
 end
 
@@ -159,6 +162,7 @@ function M.metricsFromVmStat(v, swapBytes)
     compGB   = n("uncompressedPages") * pageSize / 1e9,
     swapGB   = (swapBytes or 0) / 1e9,
     availPct = total > 0 and (availPages * pageSize / total * 100) or 100,
+    availKnown = total > 0,   -- see metrics: 100 above means unknown when this is false
     totalGB  = total / 1e9,
     counters = {
       swapOuts   = n("swapOuts"),

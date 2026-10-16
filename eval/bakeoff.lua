@@ -192,6 +192,15 @@ local function postJson(url, body, reqPath, respPath, hdr, timeout)
   return ok and (readFile(respPath) or "") or "", wall and math.floor(wall * 1000) or -1
 end
 
+-- The production prompt builder falls back to the baseline prompt for any
+-- name it does not know, so a mistyped --variant would silently run the
+-- baseline under another label. A name is known when it is "baseline" or
+-- builds a prompt other than the baseline's.
+local function knownVariant(variant)
+  return variant == "baseline"
+    or lfm.buildSystemPrompt({ variant = variant }) ~= lfm.buildSystemPrompt({ variant = "baseline" })
+end
+
 ------------------------------------------------------------------------------
 -- Run mode
 ------------------------------------------------------------------------------
@@ -200,6 +209,7 @@ local function runMode(args)
   local server = args.server or "http://127.0.0.1:11435"
   local label = assert(args.label, "--label required")
   local variant = args.variant or "baseline"
+  assert(knownVariant(variant), "unknown --variant " .. tostring(variant))
   local maxTokens = tonumber(args.max_tokens) or 128
   local scenariosDir = args.scenarios or "eval/scenarios"
   local useSchema = not args.no_schema
@@ -441,6 +451,7 @@ local function episodesMode(args)
   assert(api == "chat" or api == "systemone" or api == "completion",
     "--api must be chat, systemone or completion")
   local variant = args.variant or "discriminate"
+  assert(knownVariant(variant), "unknown --variant " .. tostring(variant))
   local out = args.out or string.format("eval/results/episodes-%s-%s.jsonl", label, api)
   local timeout = tonumber(args.timeout) or 60
   -- Everything that can refuse does so before the output is claimed, so a
@@ -521,8 +532,14 @@ local function episodesMode(args)
         end
         n = n + 1
         if action then valid = valid + 1 end
+        -- Each row says what asked it: the prompt variant, the API and the
+        -- model, so rows from two runs can never be mistaken for one.
+        -- snapshotHash binds the row to the input it answered (the scorer
+        -- computes the same: score-episodes.lua, M.stepHash).
         of:write(assert(lfm.jsonEncode({ episode = ep.id, t = st.t, action = action or "freeze",
           pWait = pWait, valid = action ~= nil, wall_ms = wallMs,
+          variant = variant, api = api, model = args.model,
+          snapshotHash = lfm.snapshotHash(assert(lfm.jsonEncode(st.snapshot))),
           error = err and tostring(err):sub(1, 120) or nil })), "\n")
       end
     end

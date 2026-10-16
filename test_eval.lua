@@ -801,6 +801,43 @@ do
   local okNoTau, errNoTau = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = "rows.jsonl" })
   check("cli: and a threshold chosen on dev",
     okNoTau == false and tostring(errNoTau):find("--tau", 1, true) ~= nil, true)
+  -- Rows must cover every decision point: confident waits on the savables
+  -- alone would otherwise pass, every runaway scored as the floor's freeze.
+  local function rowsFile(keep, hashOf)
+    local path = os.tmpname()
+    local rf = assert(io.open(path, "w"))
+    for _, ep in ipairs(dev) do
+      for _, st in ipairs(ep.steps) do
+        if keep(ep) then
+          rf:write(lfm.jsonEncode({ episode = ep.id, t = st.t, action = ep.labels.runaway and "freeze" or "wait",
+                                    pWait = ep.labels.runaway and 0.01 or 0.99,
+                                    snapshotHash = hashOf and hashOf(st) or nil }), "\n")
+        end
+      end
+    end
+    rf:close()
+    return path
+  end
+  local quiet2 = print
+  print = function() end
+  local partial = rowsFile(function(ep) return not ep.labels.runaway end)
+  local okPart, errPart = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = partial, tau = 0.5, episodes = dev })
+  local whole = rowsFile(function() return true end)
+  local okWhole = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = whole, tau = 0.5, episodes = dev })
+  -- Rows recorded on other inputs (the split regenerated since) are refused,
+  -- whatever their coverage; rows on these inputs resolve.
+  local stale = rowsFile(function() return true end, function() return "00000000" end)
+  local okStale, errStale = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = stale, tau = 0.5, episodes = dev })
+  local fresh = rowsFile(function() return true end, sc.stepHash)
+  local okFresh = pcall(sc.resolveCandidate, "decisions", baselines, { decisions = fresh, tau = 0.5, episodes = dev })
+  print = quiet2
+  os.remove(partial); os.remove(whole); os.remove(stale); os.remove(fresh)
+  check("cli: decisions recorded on another snapshot are refused",
+    okStale == false and tostring(errStale):find("another snapshot", 1, true) ~= nil, true)
+  check("cli: decisions recorded on these snapshots resolve", okFresh, true)
+  check("cli: decisions that leave decision points uncovered are refused",
+    okPart == false and tostring(errPart):find("the decisions cover", 1, true) ~= nil, true)
+  check("cli: decisions covering every decision point resolve", okWhole, true)
   check("ttx: the fitted horizon makes fewer wrongful freezes than always-freeze",
     gO.baselines.ttx.wrongful < gO.baselines["always-freeze"].wrongful
       and gO.baselines.ttx.missUpper <= sc.cfg.missBound, true)
@@ -1016,6 +1053,9 @@ printf '0.010'
     rp.action == "wait" and math.abs((rp.pWait or -1) - 0.7) < 1e-6, true)
   check("runner: an invalid reply is recorded as the deterministic freeze, marked invalid",
     rbad.action == "freeze" and rbad.valid == false and rbad.error ~= nil, true)
+  check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)
+  check("runner: and binds the input it answered, as the scorer hashes it",
+    rc.snapshotHash ~= nil and rc.snapshotHash == sc.stepHash(ep.steps[1]), true)
   run("chat", chat, "effort", "--reasoning-effort low")
   local bl = io.open(root .. "/bodies-effort.log", "r")
   local bodies = bl and bl:read("a") or ""
@@ -1026,6 +1066,9 @@ printf '0.010'
   check("runner: the episodes chat path sends the reasoning effort asked for",
     bodies:find('"reasoning_effort":"low"', 1, true) ~= nil, true)
   check("runner: and none when none is asked", plain ~= "" and plain:find("reasoning_effort", 1, true) == nil, true)
+  local rtypo = run("chat", chat, "typo", "--variant Discriminate")
+  check("runner: a mistyped variant is refused, before any row", rtypo.action == nil
+    and io.open(root .. "/rows-typo.jsonl", "r") == nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 

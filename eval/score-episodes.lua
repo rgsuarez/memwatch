@@ -379,7 +379,7 @@ function M.loadDecisions(path, keyPath)
       end
       assert(r.action == "freeze" or r.action == "wait", "decision action must be freeze or wait")
       out[ep] = out[ep] or {}
-      out[ep][t] = { action = r.action, pWait = pWait }
+      out[ep][t] = { action = r.action, pWait = pWait, hash = r.snapshotHash }
       n = n + 1
       if type(pWait) ~= "number" then noP = noP + 1 end
       if r.valid == false then invalid = invalid + 1 end
@@ -391,6 +391,33 @@ end
 -- How many of the episodes' decision points carry no recorded decision
 -- (scored as the deterministic freeze, so a short or mismatched file makes
 -- a model look like always-freeze there). Returns missing, total.
+-- The hash a recorded decision carries of the input it answered: the
+-- step's snapshot as the episode file holds it. The runner computes the
+-- same (eval/bakeoff.lua, episodes mode); the end-to-end test pins that the
+-- two agree.
+function M.stepHash(st)
+  return lfm.snapshotHash(assert(lfm.jsonEncode(st.snapshot or {})))
+end
+
+-- Do the recorded decisions answer these episodes' inputs? Episode ids are
+-- the same for every regeneration of a split, so a decisions file recorded
+-- before the generator changed still covers a new one by id. Returns how
+-- many decision points' rows were recorded on another snapshot, and how
+-- many carry no hash to check.
+function M.contentCheck(episodes, decisions)
+  local mismatched, unchecked = 0, 0
+  for _, ep in ipairs(episodes) do
+    for _, st in ipairs(ep.steps) do
+      local d = decisions[ep.id] and decisions[ep.id][st.t]
+      if d then
+        if d.hash == nil then unchecked = unchecked + 1
+        elseif d.hash ~= M.stepHash(st) then mismatched = mismatched + 1 end
+      end
+    end
+  end
+  return mismatched, unchecked
+end
+
 function M.coverage(episodes, decisions)
   local missing, total = 0, 0
   for _, ep in ipairs(episodes) do
@@ -720,17 +747,28 @@ function M.powerControl(eps, baselines, bestName, trials, cfg)
   return passes
 end
 
--- Notes on what a decisions file holds: rows the runner recorded as invalid
--- replies (each stands as the deterministic freeze), and decision points
--- it does not cover.
+-- What a decisions file holds: rows the runner recorded as invalid replies
+-- (each stands as the deterministic freeze) are noted. A decision point it
+-- does not cover is refused: scored as the deterministic freeze it would
+-- make a short, interrupted or mismatched file pass for a model (rows that
+-- wait on the savables alone, say, pass with no runaway asked).
 local function decisionsNotes(episodes, decisions, n, invalid)
   if invalid > 0 then
     print(string.format("note: %d of %d rows are invalid replies, recorded as the deterministic freeze", invalid, n))
   end
   local missing, total = M.coverage(episodes, decisions)
   if missing > 0 then
-    print(string.format("note: %d of %d decision points have no recorded decision (scored as the deterministic freeze)",
-      missing, total))
+    error(string.format("the decisions cover %d of %d decision points; record every one (a run that was "
+      .. "interrupted, or rows from another episode set, cover fewer)", total - missing, total), 0)
+  end
+  local mismatched, unchecked = M.contentCheck(episodes, decisions)
+  if mismatched > 0 then
+    error(string.format("%d of %d decision points were recorded on another snapshot than the episode holds "
+      .. "(the split was regenerated since, or another set shares its ids); record them again", mismatched, total), 0)
+  end
+  if unchecked > 0 then
+    print(string.format("note: %d of %d rows carry no snapshot hash, so the inputs they answered are not checked",
+      unchecked, total))
   end
 end
 

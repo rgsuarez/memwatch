@@ -1277,6 +1277,28 @@ dofile("eval/score-episodes.lua")
       and tostring(errStuck):find("would read as this run's", 1, true) ~= nil and stuckNow == stuckText, true)
     os.remove(stuck)
   end
+  -- A gate result that cannot be read (injected) is refused, never taken for
+  -- absent, and kept, whoever runs it.
+  do
+    local unreadable = outFile .. "-unreadable.json"
+    local unreadableText = '{"candidate":"x","pass":true}\n'
+    local uw = assert(io.open(unreadable, "w"))
+    uw:write(unreadableText)
+    uw:close()
+    local realOpen = io.open
+    io.open = function(path, m)
+      if path == unreadable and m == "r" then return nil, path .. ": Permission denied", 13 end
+      return realOpen(path, m)
+    end
+    local okUnread, errUnread = pcall(sc.clearResult, unreadable)
+    io.open = realOpen
+    local ur = io.open(unreadable, "r")
+    local unreadNow = ur and ur:read("a")
+    if ur then ur:close() end
+    check("cli: a gate result that cannot be read is refused, never taken for absent, and kept",
+      okUnread == false and tostring(errUnread):find("it cannot be read", 1, true) ~= nil and unreadNow == unreadableText, true)
+    os.remove(unreadable)
+  end
   os.remove(epAtOut)
   -- --out names a gate's result; the controls and tau write none.
   local okCtlOut, errCtlOut = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev, "--out", outFile })
@@ -1602,7 +1624,8 @@ printf '0.010 %s' "$status"
     and keptSaid:find("it is not a run result", 1, true) ~= nil, true)
   local emptyDir = root .. "/empty-dir"
   os.execute("mkdir -p '" .. emptyDir .. "'")
-  check("runner: and --out naming a directory, even an empty one", keptAfter(emptyDir, nil), true)
+  check("runner: and --out naming a directory, even an empty one", keptAfter(emptyDir, nil)
+    and keptSaid:find("only a run result is cleared", 1, true) ~= nil, true)
   -- A successful rerun replaces an earlier result.
   local replaced = root .. "/replaced.json"
   local rf4 = assert(io.open(replaced, "w"))
@@ -2491,6 +2514,28 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
     check("runner: a run result that cannot be removed refuses the clear, and is kept, for any user", okStuck == false
       and tostring(errStuck):find("would read as this run's", 1, true) ~= nil and stuckNow == stuckText, true)
     os.remove(stuck)
+  end
+  -- A run result that cannot be read (injected) is refused, never taken for
+  -- absent, and kept, whoever runs it.
+  do
+    local unreadable = root .. "/unreadable-inproc.json"
+    local unreadableText = '{"label":"t","rows":[]}\n'
+    local uw = assert(io.open(unreadable, "w"))
+    uw:write(unreadableText)
+    uw:close()
+    local realOpen = io.open
+    io.open = function(path, m)
+      if path == unreadable and m == "r" then return nil, path .. ": Permission denied", 13 end
+      return realOpen(path, m)
+    end
+    local okUnread, errUnread = pcall(bk.clearResult, unreadable)
+    io.open = realOpen
+    local ur = io.open(unreadable, "r")
+    local unreadNow = ur and ur:read("a")
+    if ur then ur:close() end
+    check("runner: a run result that cannot be read is refused, never taken for absent, and kept",
+      okUnread == false and tostring(errUnread):find("it cannot be read", 1, true) ~= nil and unreadNow == unreadableText, true)
+    os.remove(unreadable)
   end
   local okUnder, under = pcall(bk.parseArgs, { "--raw_names", "run", "--no_schema", "--redact_names" })
   check("runner: the boolean flags read under either spelling, taking no value", okUnder and under.raw_names == true

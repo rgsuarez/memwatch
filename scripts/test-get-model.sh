@@ -59,6 +59,10 @@ if [ -n "${FAKE_PARTIAL:-}" ] && [ "$FAKE_PARTIAL" = "$name" ]; then
   # A transfer cut after the headers: curl still reports the 200 it got.
   head -c 9 "$src" > "$out"; status 200; exit 18
 fi
+if [ -n "${FAKE_REDIRECT_DEAD:-}" ] && [ "$FAKE_REDIRECT_DEAD" = "$name" ]; then
+  # A redirect whose target cannot be reached: the 302 it got, exit 7.
+  status 302; exit 7
+fi
 if [ -n "${FAKE_SHORT:-}" ] && [ "$FAKE_SHORT" = "$name" ]; then
   # A cut curl cannot see (no length given): a short body, a 200, exit 0.
   head -c 9 "$src" > "$out"; status 200; exit 0
@@ -121,6 +125,9 @@ check "  before any download" noWeightsAsked
 cp "$tmp/srv/LICENSE" "$localLic"
 expect 0 "and a license transfer cut short after its 200" FAKE_PARTIAL=LICENSE
 check "  not read as a changed license" saysNot "license changed"
+rm -f "$models/m.gguf"
+expect 0 "a redirect to a host that cannot be reached is no answer: the verified copy stands" FAKE_REDIRECT_DEAD=LICENSE
+check "  and the weights are then fetched and verified" hashIs "$models/m.gguf" "$msha"
 expect 1 "a final redirect on the license is refused" FAKE_HTTP=LICENSE=302
 check "  before any download" noWeightsAsked
 expect 1 "a cut curl cannot see is refused" FAKE_SHORT=LICENSE

@@ -48,12 +48,13 @@ PART=""
 trap 'rm -f "$LICTMP" ${PART:+"$PART"}' EXIT
 # The fetch tells an answer about the license from no usable answer.
 # - A complete 200: the text is verified against its pin.
-# - A 4xx other than 429 (the license removed, renamed or gated upstream):
-#   a refusal, whatever is on disk. curl reports the last status it
-#   received, so a redirect to a failing host shows the redirect's.
+# - A 4xx other than 429 (the license removed, renamed or gated upstream),
+#   or a final redirect curl did not follow: a refusal, whatever is on disk.
 # - No usable answer: no network (000), a server error (5xx), rate limiting
-#   (429), or a transfer cut short (curl failed after a 200). The verified
-#   local copy stands in, if there is one.
+#   (429), or a transfer that failed after a 2xx or a redirect (a body cut
+#   short, or a redirect to a host that could not be reached: curl reports
+#   the last status it received, the redirect's). The verified local copy
+#   stands in, if there is one.
 # - No status at all means curl itself did not run: a refusal.
 set +e
 CODE="$(curl -sSL --connect-timeout 10 --max-time 30 -o "$LICTMP" -w '%{http_code}' \
@@ -62,7 +63,7 @@ RC=$?
 set -e
 NOANSWER=0
 case "$CODE" in
-  200) [ "$RC" -ne 0 ] && NOANSWER=1 ;;
+  2??|3??) [ "$RC" -ne 0 ] && NOANSWER=1 ;;
   000|429|5??) NOANSWER=1 ;;
 esac
 if [ -z "$CODE" ]; then

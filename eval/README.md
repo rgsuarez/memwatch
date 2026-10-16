@@ -58,10 +58,13 @@ touches nothing. Every flag reads under either spelling (`--retry-wait`
 and `--retry_wait` are one flag); a flag given twice is refused, and so
 are `--raw-names` with `--redact-names` and `--api-key-env` with
 `--api-key-file`, in every mode. `--server-pid` samples a process on this
-machine, so it must be a pid, and a run whose server answers from
-elsewhere fails, leaving no result: curl reports the address it
-connected to (its requests skip any proxy, whose address would stand in
-for the server's), and only a loopback address (127.0.0.0/8, ::1, an
+machine, so it must be a pid, and every reply of such a run (its control
+re-asks' and retries' included) must come from this machine, or the run
+fails, leaving no result. (An attempt that failed is no reply: one that
+failed from elsewhere and was retried from here stands, its time
+charged to the row.) curl reports the address it connected to (the
+run's requests skip any proxy, whose address would stand in for the
+server's), and only a loopback address (127.0.0.0/8, ::1, an
 IPv4-mapped 127 address) or an unspecified one (0.0.0.0, ::) is this
 machine.
 

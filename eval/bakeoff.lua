@@ -644,8 +644,9 @@ end
 -- A server error fails the run, as in run mode, and so does an
 -- /apply-template reply with no prompt. A flag the mode would not send is
 -- refused: --raw-names and --no-schema always, --variant (other than
--- discriminate) with --api systemone, --model with --api completion, and
--- --temperature and --reasoning-effort with any API but chat.
+-- discriminate) with --api systemone, --model with --api completion,
+-- --temperature and --reasoning-effort with any API but chat, and
+-- --server-pid (the mode samples no footprint).
 ------------------------------------------------------------------------------
 
 local function episodesMode(args)

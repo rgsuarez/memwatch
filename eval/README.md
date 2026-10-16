@@ -36,8 +36,37 @@ scenario file carrying one.
 
 ```
 lua eval/bakeoff.lua run --server http://127.0.0.1:PORT --label 230M-Q4_K_M \
-  --variant taxonomy [--max-tokens 128] [--no-schema] [--server-pid N]
+  --variant taxonomy [--max-tokens 128] [--no-schema] [--server-pid N] \
+  [--raw-names] [--retries 2] [--retry-wait 2]
 ```
+
+A reply counts as the model's only when the server sent it. An HTTP status
+other than 2xx, a 2xx with an empty body, or a request that failed fails
+the run instead of scoring as an invalid reply. Rate limiting, a server
+error or a dropped connection is tried again `--retries` times, waiting
+`--retry-wait` seconds and then twice that. A retried request's wall time
+counts the time the server took over every attempt (a timeout that reports
+no time counts its limit); the runner's own waits between attempts are
+recorded apart, as `wait_ms`. A rerun's result file is the rerun's or
+nothing: once the command line parses, an explicit `--out` is cleared
+before any other check, and a default path as soon as the label and
+variant naming it are known; the new result is written whole and renamed
+into place. Only a run result is ever cleared: a path holding anything
+else (a scenario, a script, a directory) refuses the run untouched, and so
+does a result that cannot be removed. A command line that does not parse
+touches nothing. Every flag reads under either spelling (`--retry-wait`
+and `--retry_wait` are one flag); a flag given twice is refused, and so
+are `--raw-names` with `--redact-names` and `--api-key-env` with
+`--api-key-file`, in every mode. `--server-pid` samples a process on this
+machine, so it must be a pid, and every reply of such a run (its control
+re-asks' and retries' included) must come from this machine, or the run
+fails, leaving no result. (An attempt that failed is no reply: one that
+failed from elsewhere and was retried from here stands, its time
+charged to the row.) curl reports the address it connected to (the
+run's requests skip any proxy, whose address would stand in for the
+server's), and only a loopback address (127.0.0.0/8, ::1, an
+IPv4-mapped 127 address) or an unspecified one (0.0.0.0, ::) is this
+machine.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count
@@ -85,7 +114,10 @@ Composite for gate-passers: `0.55*gold + 0.30*acceptable +
 0.15*unconstrained-JSON-validity`. Promotion rule: within 0.02 of the best
 composite, the lightest model wins. Only rows run the way production would
 run the model can win: the decided prompt variant, with names redacted as
-production redacts them; other rows stay in the league as diagnostics. The
+production redacts them; other rows stay in the league as diagnostics. A
+`--raw-names` run writes its own file by default (its name ends
+`-rawnames`), so it never replaces the redacted run of the same model and
+variant. The
 league's winner is chosen on G1 to G6, and it sets the shipped defaults
 only if it also passes G7 (below), which `score-episodes.lua gate` scores.
 
@@ -145,9 +177,26 @@ that decision.
   one can still meet the miss bound: 93 at the defaults. On a smaller set
   the comparator would fall back to always-freeze, which any fixed rule
   can beat. Generate dev with `--per-template 10` (110 runaways from the
-  public dev templates). `gate` exits 0 when G7 passes, 1 when it fails
-  and 2 when the set is too small to decide; `controls` exits nonzero when
-  a control fails or the set is undecidable or underpowered.
+  public dev templates). `gate` exits 0 when G7 passes, 1 when it fails,
+  2 when the set is too small to decide, and 3 when it refuses its input
+  (a bad flag, a set it cannot read, decisions that do not answer the
+  episodes). `controls` exits 1 when a control fails, 2 when the set is
+  undecidable or underpowered, and 3 on a refusal. A result file
+  (`--out`) is this run's or nothing: once the arguments parse, the path is
+  cleared before anything else, so an earlier result never stands after a
+  refusal or a failed write; the new one is written whole and renamed into
+  place. Only a gate result is ever cleared: a path holding anything else
+  (an episode, a script, a directory) refuses the run untouched, and so
+  does a result that cannot be removed. A command line that does not
+  parse (an unknown command or flag, a flag given twice) touches nothing.
+  `--out` applies to `gate` only. A split holds each episode once: a
+  directory with the same episode twice (a copied file, or the episode
+  under another id) is refused, since a copy would count twice toward the
+  decisive size. Two episodes are the same when their trajectories are:
+  the same steps, alert changes, per-tick headroom and labels, whatever
+  their ids, their template or their alerts' numbering. Every episode
+  must carry an id: the scorer refuses a file without one, and so does
+  the runner, before it claims its output.
 - `bakeoff.lua episodes` records a model's decision at every decision point
   through the production builders (`--api chat|systemone|completion`), and
   `score-episodes.lua` replays the rows through the proposed wait rail, the
@@ -155,7 +204,13 @@ that decision.
   yet): a wait counts only when the model's own P(wait) reaches the
   threshold chosen on dev (`tau`), and a wait with no probability (a chat
   verdict) is never honored. Candidates are scored on the `discriminate` prompt
-  variant.
+  variant. As in run mode, a server error fails the run; so does an
+  `/apply-template` reply with no prompt. A flag the mode would not send is
+  refused: `--raw-names` and `--no-schema` always, `--variant` other than
+  `discriminate` with `--api systemone` (System One sends its own
+  instructions), `--model` with `--api completion` (no request names one),
+  `--temperature` and `--reasoning-effort` with any API but chat, and
+  `--server-pid` (the mode samples no footprint).
 - A decisions file is one JSON row per decision point: `episode`, `t`,
   `action` (`freeze` or `wait`), `pWait` when the model gives one, and
   `snapshotHash`, the hash of the step's snapshot the row answered

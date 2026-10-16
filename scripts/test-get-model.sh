@@ -122,6 +122,7 @@ printf 'tampered license text\n' > "$localLic"
 rm -f "$models/m.gguf"
 expect 1 "no usable answer beside a local license that fails its pin is refused" FAKE_HTTP=LICENSE=503
 check "  before any download" noWeightsAsked
+check "  naming the answer it got" grep -q "(HTTP 503, curl exit 0, and no verified local copy)" "$tmp/out"
 cp "$tmp/srv/LICENSE" "$localLic"
 expect 0 "and a license transfer cut short after its 200" FAKE_PARTIAL=LICENSE
 check "  not read as a changed license" saysNot "license changed"

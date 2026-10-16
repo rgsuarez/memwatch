@@ -205,21 +205,6 @@ function M.availAt(p, t, cfg)
   return p.avail0 - (M.weightAt(p, t) - p.wAt0) * fracOf(p, cfg)
 end
 
--- Sampler ticks from first to last (multiples of tickSec), feeding the
--- PRODUCTION tracker (memwatch_procs) one ps row per tick while the process
--- exists, and the production pressure state machine (memwatch_core) the
--- same tick's signals. The alert runs as production runs it: it rises (its
--- grace starting over) when the state goes critical with the process alive
--- to head it, as a runaway or, once its latch lapses, as the hog fallback,
--- and it ends only once the state has settled below critical for
--- settleSec. Grace accrues, interval by interval and only while critical,
--- while the offender heads the alert as extreme (a stalled interval counts
--- at most exposureStepMax). The PRODUCTION unattended gate
--- (core.unattendedGate), asked only while critical as production asks it,
--- says whether the tick could act. Returns ticks[t] = { alive, w, avail,
--- run (the tracker's runaway row for the offender, or nil), state, kern,
--- rates, exposureSec, gate }, plus the first tick the alert's head was
--- extreme (onset).
 local function pressureOf(avail, slopeMBmin)
   local pressure = (20 - avail) / 20
   if pressure < 0 then pressure = 0 end
@@ -260,6 +245,21 @@ function M.alertStep(st, t, critical, alive, extreme, cfg)
   return st
 end
 
+-- Sampler ticks from first to last (multiples of tickSec), feeding the
+-- PRODUCTION tracker (memwatch_procs) one ps row per tick while the process
+-- exists, and the production pressure state machine (memwatch_core) the
+-- same tick's signals. The alert runs as production runs it: it rises (its
+-- grace starting over) when the state goes critical with the process alive
+-- to head it, as a runaway or, once its latch lapses, as the hog fallback,
+-- and it ends only once the state has settled below critical for
+-- settleSec. Grace accrues, interval by interval and only while critical,
+-- while the offender heads the alert as extreme (a stalled interval counts
+-- at most exposureStepMax). The PRODUCTION unattended gate
+-- (core.unattendedGate), asked only while critical as production asks it,
+-- says whether the tick could act. Returns ticks[t] = { alive, w, avail,
+-- run (the tracker's runaway row for the offender, or nil), state, kern,
+-- rates, exposureSec, gate }, plus the first tick the alert's head was
+-- extreme (onset).
 function M.track(p, cfg, first, last)
   cfg = cfg or M.cfg
   local tr = procs.newTracker()
@@ -636,6 +636,11 @@ function M.main(argv)
   -- template whose sample cannot exist) leaves no partial split behind.
   local counts = { runaway = 0, savable = 0, late = 0 }
   local eps, noStep, refused, seen = {}, 0, 0, {}
+  -- The scorer's own identity for an episode (everything its scoring reads),
+  -- so the generator refuses exactly the duplicates the scorer would.
+  package.path = "eval/?.lua;" .. package.path
+  local replayPrint = require("score-episodes").replayPrint
+  local seenPrint = {}
   for _, tpl in ipairs(templates) do
     if tpl.split == nil or tpl.split == a.split then
       -- A template none of whose names production's policy would freeze can
@@ -659,6 +664,13 @@ function M.main(argv)
           if seen[ep.id] then error(string.format("%s seed %d: episode id %s repeats (a template id used twice?)",
             tostring(tpl.id), seed, ep.id), 0) end
           seen[ep.id] = true
+          -- A template whose parameters do not vary yields the same episode
+          -- for every seed; the scorer refuses a split holding one twice, so
+          -- the split is refused here, where the template can be named.
+          local fp = replayPrint(ep)
+          if seenPrint[fp] then error(string.format("%s seed %d: episode %s would score exactly as %s (does the"
+            .. " template vary any parameter?)", tostring(tpl.id), seed, ep.id, seenPrint[fp]), 0) end
+          seenPrint[fp] = ep.id
           eps[#eps + 1] = { id = ep.id, enc = assert(lfm.jsonEncode(ep)) }
           counts[ep.labels.class] = counts[ep.labels.class] + 1
         end

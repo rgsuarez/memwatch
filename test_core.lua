@@ -1320,6 +1320,12 @@ end
 do
   local lfm = require("memwatch_lfm")
   check("cat: browser helper",    lfm.categorize("Google Chrome Helper (Renderer)"), "browser")
+  -- A Chromium or Electron helper reads browser whatever its product name
+  -- holds before " helper (": punctuation, or another script.
+  check("cat: a helper whose product name has punctuation is a browser helper",
+    lfm.categorize("Code - Insiders Helper (Renderer)") .. "|" .. lfm.categorize("draw.io Helper (Renderer)")
+      .. "|" .. lfm.categorize("Battle.net Helper (GPU)"), "browser|browser|browser")
+  check("cat: so is one named in another script", lfm.categorize("\u{5FAE}\u{4FE1} Helper (Renderer)"), "browser")
   check("cat: vm host",           lfm.categorize("com.apple.Virtualization.VirtualMachine"), "vm")
   check("cat: the QEMU launcher is a vm", lfm.categorize("QEMULauncher"), "vm")
   check("cat: search tool",       lfm.categorize("ugrep"), "search-tool")
@@ -3502,6 +3508,15 @@ do
   check("systemone parse: a negative probability is refused", (lfm.parseSystemOne(reply({ freeze = 1.2, wait = -0.2 }))), nil)
   check("systemone parse: a probability above one is refused, though the sum is within tolerance",
     (lfm.parseSystemOne(reply({ freeze = 0, wait = 1.01 }))), nil)
+  -- A saturated option a float32 step past 1 is rounding: it reads as 1, as
+  -- the token path reads it. Past the slack it is out of range, and says so.
+  local sat = lfm.parseSystemOne(reply({ freeze = 0, wait = 1.0000001 }))
+  check("systemone parse: a probability within rounding of 1 reads as 1",
+    sat ~= nil and sat.action == "wait" and sat.pWait == 1, true)
+  check("systemone parse: and is honored as the token path's would be", sat ~= nil and lfm.waitHonored(sat, 0.9), true)
+  local noFar, whyFar = lfm.parseSystemOne(reply({ freeze = 0, wait = 1.00001 }))
+  check("systemone parse: past the slack it is out of range, and says so",
+    noFar == nil and tostring(whyFar):find("out of range", 1, true) ~= nil, true)
   check("systemone parse: no answers is refused", (lfm.parseSystemOne('{"model":"d1"}')), nil)
   check("systemone parse: non-JSON is refused", (lfm.parseSystemOne("not json")), nil)
   check("systemone parse: empty is refused", (lfm.parseSystemOne("")), nil)

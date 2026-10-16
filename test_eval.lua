@@ -16,6 +16,28 @@ local function check(name, got, want)
   end
 end
 local function near(a, b, tol) return type(a) == "number" and math.abs(a - b) <= tol end
+-- What each read of one file asked for while fn ran: a harness for the
+-- result clears' read bound.
+local function readsOf(path, fn, ...)
+  local asked, realOpen = {}, io.open
+  io.open = function(p, m)
+    local f, e, c = realOpen(p, m)
+    if f and p == path then
+      local real = getmetatable(f).__index
+      return setmetatable({ read = function(_, ...) asked[#asked + 1] = (...); return f:read(...) end },
+        { __index = function(_, k) return function(_, ...) return real[k](f, ...) end end })
+    end
+    return f, e, c
+  end
+  local ok, err = pcall(fn, ...)
+  io.open = realOpen
+  return asked, ok, err
+end
+local function bigFile(path)
+  local f = assert(io.open(path, "w"))
+  f:write(string.rep("x", 2 * 1048576))
+  f:close()
+end
 
 -- ---- PRNG: deterministic and identical across runs ----
 do
@@ -936,7 +958,7 @@ do
     local lf = assert(io.open(late .. "/late-" .. i .. ".json", "w"))
     lf:write(lfm.jsonEncode({ id = "late-" .. i, template = "T", family = "f",
       labels = { class = "late", runaway = false, resolvesBySec = 150 },
-      steps = lfm.jsonArray({ { t = 0, snapshot = { availPct = 20 } } }) }), "\n")
+      steps = lfm.jsonArray({ { t = 0, snapshot = { availPct = 20 + i } } }) }), "\n")
     lf:close()
   end
   local copy = tmpDir()
@@ -987,7 +1009,7 @@ do
                                              "--tree-depth", "deep" })
   check("cli: so is a number that is not one",
     okDepth == false and tostring(errDepth):find("must be a number", 1, true) ~= nil, true)
-  check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
+  check("cli: controls on an undecidable set exit 2, as the gate does", okCtl and ctl, 2)
   check("cli: and say it is undecidable first", (ctlLines[1] or ""):sub(1, 12), "UNDECIDABLE:")
   check("cli: reading neither control there", ctlRead, false)
   check("cli: the gate's result file says the set could not decide, and the size it needs",
@@ -1004,6 +1026,320 @@ do
     okEmpty == false and tostring(errEmpty):find("cannot be fit", 1, true) ~= nil, true)
   check("cli: so is one with only late episodes",
     okLate == false and tostring(errLate):find("cannot be fit", 1, true) ~= nil, true)
+  -- A split holds each episode once: a copied file (the same id) or the same
+  -- episode under another id is refused, naming both files, rather than
+  -- scored twice toward the decisive size.
+  local dupId, dupPrint = tmpDir(), tmpDir()
+  os.execute("cp '" .. held .. "'/*.json '" .. dupId .. "'/")
+  os.execute("cp '" .. held .. "'/*.json '" .. dupPrint .. "'/")
+  local one = sc.loadDir(held)[1]
+  local cf = assert(io.open(dupId .. "/" .. one.id .. " copy.json", "w"))
+  cf:write(lfm.jsonEncode(one), "\n")
+  cf:close()
+  local other = lfm.jsonDecode(lfm.jsonEncode(one))
+  other.id = one.id .. "-again"
+  local of = assert(io.open(dupPrint .. "/" .. other.id .. ".json", "w"))
+  of:write(lfm.jsonEncode(other), "\n")
+  of:close()
+  local okDupId, errDupId = pcall(sc.loadDir, dupId)
+  local okDupPrint, errDupPrint = pcall(sc.loadDir, dupPrint)
+  check("cli: a split holding a copied episode file is refused",
+    okDupId == false and tostring(errDupId):find("the same episode twice", 1, true) ~= nil
+      and tostring(errDupId):find(one.id .. " copy.json", 1, true) ~= nil, true)
+  check("cli: so is the same episode under another id",
+    okDupPrint == false and tostring(errDupPrint):find("the same episode twice", 1, true) ~= nil, true)
+  check("cli: a split of distinct episodes still loads", #sc.loadDir(held) > 0, true)
+  local noIds = tmpDir()
+  for _, n in ipairs({ "a", "b" }) do
+    local e = lfm.jsonDecode(lfm.jsonEncode(one))
+    e.id = nil
+    local nf = assert(io.open(noIds .. "/" .. n .. ".json", "w"))
+    nf:write(lfm.jsonEncode(e), "\n")
+    nf:close()
+  end
+  local renum = tmpDir()
+  local copyR = lfm.jsonDecode(lfm.jsonEncode(one))
+  copyR.id = one.id .. "-renumbered"
+  for _, st in ipairs(copyR.steps) do st.alertSeq = (st.alertSeq or 0) + 10 end
+  for _, e in ipairs({ one, copyR }) do
+    local rf2 = assert(io.open(renum .. "/" .. e.id .. ".json", "w"))
+    rf2:write(lfm.jsonEncode(e), "\n")
+    rf2:close()
+  end
+  local okRenum, errRenum = pcall(sc.loadDir, renum)
+  check("cli: a copy with its alerts renumbered is the same episode, refused",
+    okRenum == false and tostring(errRenum):find("the same episode twice", 1, true) ~= nil, true)
+  os.execute("rm -rf '" .. renum .. "'")
+  -- Unevenly renumbered: alerts 1,2,1 and 5,7,9 change at the same steps
+  -- (the replay reads only the change), so they are one episode; 1,1,2 and
+  -- 1,2,2 change at different steps, so they are two.
+  local function alertEp(id, a, b, c)
+    return { id = id, template = "T-alerts", labels = { class = "savable", runaway = false, resolvesBySec = 100 },
+             steps = lfm.jsonArray({ { t = 0, alertSeq = a, snapshot = { availPct = 20 } },
+                                     { t = 60, alertSeq = b, snapshot = { availPct = 21 } },
+                                     { t = 120, alertSeq = c, snapshot = { availPct = 22 } } }) }
+  end
+  local function loadsAll(eps)
+    local dd = tmpDir()
+    for _, e in ipairs(eps) do
+      local ef2 = assert(io.open(dd .. "/" .. e.id .. ".json", "w"))
+      ef2:write(lfm.jsonEncode(e), "\n")
+      ef2:close()
+    end
+    local okL = pcall(sc.loadDir, dd)
+    os.execute("rm -rf '" .. dd .. "'")
+    return okL
+  end
+  check("cli: alerts renumbered unevenly but changing at the same steps are one episode",
+    loadsAll({ alertEp("a1", 1, 2, 1), alertEp("a2", 5, 7, 9) }), false)
+  check("cli: alerts changing at different steps are two",
+    loadsAll({ alertEp("b1", 1, 1, 2), alertEp("b2", 1, 2, 2) }), true)
+  local okNoIds, errNoIds = pcall(sc.loadDir, noIds)
+  check("cli: an episode with no id is refused, naming its file",
+    okNoIds == false and tostring(errNoIds):find("carries no episode id", 1, true) ~= nil, true)
+  os.execute("rm -rf '" .. noIds .. "'")
+  -- The same snapshots over different raw headroom, or under another alert,
+  -- replay apart: both are kept.
+  local apart = tmpDir()
+  local base1 = lfm.jsonDecode(lfm.jsonEncode(one))
+  base1.floorTicks = lfm.jsonArray({ { t = 120, avail = 12, open = true } })
+  local twin1 = lfm.jsonDecode(lfm.jsonEncode(base1))
+  twin1.id = one.id .. "-headroom"
+  twin1.floorTicks = lfm.jsonArray({ { t = 120, avail = 12.1, open = true } })
+  local twin2 = lfm.jsonDecode(lfm.jsonEncode(base1))
+  twin2.id = one.id .. "-alert"
+  twin2.steps[1].alertSeq = (twin2.steps[1].alertSeq or 1) + 1
+  for _, e in ipairs({ base1, twin1, twin2 }) do
+    local af = assert(io.open(apart .. "/" .. e.id .. ".json", "w"))
+    af:write(lfm.jsonEncode(e), "\n")
+    af:close()
+  end
+  local okApart, apartEps = pcall(sc.loadDir, apart)
+  check("cli: episodes alike but for their raw headroom or alert are both kept",
+    okApart == true and #apartEps == 3, true)
+  os.execute("rm -rf '" .. apart .. "'")
+  -- The same trajectory filed under another template is the same episode:
+  -- kept, it would count as another bootstrap group.
+  local relabelT = tmpDir()
+  local twin3 = lfm.jsonDecode(lfm.jsonEncode(base1))
+  twin3.id = one.id .. "-template"
+  twin3.template = tostring(one.template) .. "-other"
+  for _, e in ipairs({ base1, twin3 }) do
+    local tf3 = assert(io.open(relabelT .. "/" .. e.id .. ".json", "w"))
+    tf3:write(lfm.jsonEncode(e), "\n")
+    tf3:close()
+  end
+  local okRelabel, errRelabel = pcall(sc.loadDir, relabelT)
+  check("cli: a copy filed under another template is the same episode, refused",
+    okRelabel == false and tostring(errRelabel):find("the same episode twice", 1, true) ~= nil, true)
+  os.execute("rm -rf '" .. relabelT .. "'")
+  -- As a script, the gate's exit status tells the outcomes apart: 2 for a
+  -- set too small to decide, 3 for a refusal (never 1, a gate that failed),
+  -- and 3 when the result file does not reach the disk.
+  local function exitOf(cmd)
+    local ok2, _, code = os.execute(cmd .. " >/dev/null 2>&1")
+    return ok2 and 0 or code
+  end
+  local function q(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
+  local gateCmd = "lua eval/score-episodes.lua gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+  check("cli: as a script, a set too small to decide exits 2", exitOf(gateCmd .. " --candidate always-freeze"), 2)
+  check("cli: and a refusal exits 3", exitOf(gateCmd .. " --candidate no-such-candidate"), 3)
+  check("cli: so does a split holding an episode twice",
+    exitOf("lua eval/score-episodes.lua gate --dir " .. q(dupId) .. " --fit-dir " .. q(dev) .. " --candidate oracle"), 3)
+  local fwrap = os.tmpname()
+  local fw = assert(io.open(fwrap, "w"))
+  fw:write([[
+local target = os.getenv("FAIL_OUT")
+local realOpen = io.open
+io.open = function(path, m)
+  local f, e, c = realOpen(path, m)
+  if f and tostring(path):sub(1, #target) == target and m == "w" then
+    return { write = function() return true end,
+             close = function() f:close(); return nil, "No space left on device" end }
+  end
+  return f, e, c
+end
+arg[0] = "eval/score-episodes.lua"
+dofile("eval/score-episodes.lua")
+]])
+  fw:close()
+  local outFile = os.tmpname()
+  os.remove(outFile)
+  check("cli: a result file whose close fails exits 3",
+    exitOf("FAIL_OUT=" .. q(outFile) .. " lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+      .. " --candidate always-freeze --out " .. q(outFile)), 3)
+  local torn = io.open(outFile, "r")
+  if torn then torn:close() end
+  local dirOf = outFile:match("^(.*)/[^/]*$")
+  local partials = 0
+  local pp = io.popen("ls '" .. dirOf .. "' 2>/dev/null")
+  for n in pp:lines() do if n:find(outFile:match("([^/]*)$") .. ".partial-", 1, true) then partials = partials + 1 end end
+  pp:close()
+  check("cli: and leaves no result at the path, and no partial beside it", torn == nil and partials == 0, true)
+  local function writePass(path)
+    local pf = assert(io.open(path, "w"))
+    pf:write('{"candidate":"oracle","pass":true}\n')
+    pf:close()
+  end
+  writePass(outFile)
+  exitOf("FAIL_OUT=" .. q(outFile) .. " lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+    .. " --candidate always-freeze --out " .. q(outFile))
+  local stalePass = io.open(outFile, "r")
+  if stalePass then stalePass:close() end
+  check("cli: an earlier passing result at the path does not survive a failed write", stalePass == nil, true)
+  writePass(outFile)
+  exitOf(gateCmd .. " --candidate no-such-candidate --out " .. q(outFile))
+  local staleRef = io.open(outFile, "r")
+  if staleRef then staleRef:close() end
+  check("cli: nor a refusal", staleRef == nil, true)
+  local function exists(path) local f = io.open(path, "r"); if f then f:close() end; return f ~= nil end
+  local saved, current = outFile .. "-saved", outFile .. "-current"
+  writePass(saved); writePass(current)
+  local twice = exitOf(gateCmd .. " --candidate always-freeze --out " .. q(saved) .. " --out " .. q(current))
+  check("cli: an --out given twice is refused, clearing neither path",
+    twice == 3 and exists(saved) and exists(current), true)
+  os.remove(saved); os.remove(current)
+  -- A path that cannot be cleared: a directory with something in it (which
+  -- no one, root included, removes with a file's unlink).
+  local locked = outFile .. "-locked"
+  os.execute("mkdir -p " .. q(locked .. "/inside"))
+  local lh = io.popen(gateCmd .. " --candidate always-freeze --out " .. q(locked) .. " 2>&1; echo \"exit=$?\"")
+  local lockedSaid = lh:read("a")
+  lh:close()
+  check("cli: a result that cannot be cleared refuses the run, and says so",
+    lockedSaid:find("exit=3", 1, true) ~= nil and lockedSaid:find("cannot clear", 1, true) ~= nil, true)
+  check("cli: and the directory at the path is kept", os.execute("test -d " .. q(locked .. "/inside")) == true, true)
+  os.execute("rm -rf " .. q(locked))
+  -- Only a gate result is ever cleared: --out naming an episode is refused,
+  -- the episode kept.
+  local epAtOut = outFile .. "-episode.json"
+  local eaf = assert(io.open(epAtOut, "w"))
+  local epText = lfm.jsonEncode(one) .. "\n"
+  eaf:write(epText)
+  eaf:close()
+  local eph = io.popen(gateCmd .. " --candidate always-freeze --out " .. q(epAtOut) .. " 2>&1; echo \"exit=$?\"")
+  local epSaid = eph:read("a")
+  eph:close()
+  local eaf2 = io.open(epAtOut, "r")
+  local epNow = eaf2 and eaf2:read("a")
+  if eaf2 then eaf2:close() end
+  check("cli: --out naming an episode is refused, the episode kept",
+    epSaid:find("exit=3", 1, true) ~= nil and epNow == epText, true)
+  check("cli: and the refusal says only a gate result is cleared",
+    epSaid:find("only a gate result is cleared", 1, true) ~= nil, true)
+  -- A large file named by mistake is read no further than a result could be.
+  local bigOut = outFile .. "-big.bin"
+  bigFile(bigOut)
+  local gAsked, gOk, gErr = readsOf(bigOut, sc.clearResult, bigOut)
+  check("cli: the clear reads at most 1 MB of a large file at --out, and refuses it", gOk == false
+    and #gAsked == 1 and math.type(gAsked[1]) == "integer" and gAsked[1] <= 1048577
+    and tostring(gErr):find("only a gate result is cleared", 1, true) ~= nil
+    and tostring(gErr):find("over the 64 KB a result can be read at", 1, true) ~= nil, true)
+  os.remove(bigOut)
+  local emptyOut = outFile .. "-empty.json"
+  local eo = assert(io.open(emptyOut, "w"))
+  eo:close()
+  local okEmpty, errEmpty = pcall(sc.clearResult, emptyOut)
+  local stillThere = io.open(emptyOut, "r")
+  if stillThere then stillThere:close() end
+  check("cli: an empty file at --out is named as no gate result, and kept", okEmpty == false
+    and tostring(errEmpty):find("it is not a gate result", 1, true) ~= nil and stillThere ~= nil, true)
+  os.remove(emptyOut)
+  -- A FIFO at --out is refused at once, never opened (an open would block
+  -- with no writer), and kept. The alarm turns a hang into a failure.
+  do
+    local fifoOut = outFile .. "-fifo.json"
+    os.execute("mkfifo " .. q(fifoOut))
+    local fh = io.popen("perl -e 'alarm 20; exec @ARGV' " .. gateCmd .. " --candidate always-freeze --out " .. q(fifoOut)
+      .. " 2>&1; echo \"exit=$?\"")
+    local fifoSaid = fh:read("a")
+    fh:close()
+    check("cli: a FIFO at --out is refused at once, and kept", fifoSaid:find("exit=3", 1, true) ~= nil
+      and fifoSaid:find("it is not a regular file", 1, true) ~= nil and os.execute("test -p " .. q(fifoOut)) == true, true)
+    os.remove(fifoOut)
+  end
+  -- A device at --out is refused by its type, as no regular file.
+  do
+    local okDev, errDev = pcall(sc.clearResult, "/dev/null")
+    check("cli: a device at --out is refused by its type", okDev == false
+      and tostring(errDev):find("it is not a regular file", 1, true) ~= nil, true)
+  end
+  -- A gate result whose removal fails (injected) refuses the clear, the
+  -- result kept: an earlier verdict must never stand as this run's.
+  do
+    local stuck = outFile .. "-stuck.json"
+    local stuckText = '{"candidate":"x","pass":true}\n'
+    local sf = assert(io.open(stuck, "w"))
+    sf:write(stuckText)
+    sf:close()
+    local realRemove = os.remove
+    os.remove = function(path) if path == stuck then return nil, path .. ": Operation not permitted", 1 end return realRemove(path) end
+    local okStuck, errStuck = pcall(sc.clearResult, stuck)
+    os.remove = realRemove
+    local sf2 = io.open(stuck, "r")
+    local stuckNow = sf2 and sf2:read("a")
+    if sf2 then sf2:close() end
+    check("cli: a gate result that cannot be removed refuses the clear, and is kept", okStuck == false
+      and tostring(errStuck):find("would read as this run's", 1, true) ~= nil and stuckNow == stuckText, true)
+    os.remove(stuck)
+  end
+  -- A gate result that cannot be read (injected) is refused, never taken for
+  -- absent, and kept, whoever runs it.
+  do
+    local unreadable = outFile .. "-unreadable.json"
+    local unreadableText = '{"candidate":"x","pass":true}\n'
+    local uw = assert(io.open(unreadable, "w"))
+    uw:write(unreadableText)
+    uw:close()
+    local realOpen = io.open
+    io.open = function(path, m)
+      if path == unreadable and m == "r" then return nil, path .. ": Permission denied", 13 end
+      return realOpen(path, m)
+    end
+    local okUnread, errUnread = pcall(sc.clearResult, unreadable)
+    io.open = realOpen
+    local ur = io.open(unreadable, "r")
+    local unreadNow = ur and ur:read("a")
+    if ur then ur:close() end
+    check("cli: a gate result that cannot be read is refused, never taken for absent, and kept",
+      okUnread == false and tostring(errUnread):find("it cannot be read", 1, true) ~= nil and unreadNow == unreadableText, true)
+    os.remove(unreadable)
+  end
+  os.remove(epAtOut)
+  -- --out names a gate's result; the controls and tau write none.
+  local okCtlOut, errCtlOut = pcall(sc.main, { "controls", "--dir", held, "--fit-dir", dev, "--out", outFile })
+  check("cli: --out is refused where nothing writes one",
+    okCtlOut == false and tostring(errCtlOut):find("--out applies to gate only", 1, true) ~= nil, true)
+  local okBogus, errBogus = pcall(sc.main, { "gate", "--dir", held, "--bogus", "1", "--bogus", "2" })
+  check("cli: an unknown flag is called unknown, even given twice",
+    okBogus == false and tostring(errBogus):find("unknown argument --bogus", 1, true) ~= nil, true)
+  -- The command and the flags are named before anything is read or cleared:
+  -- tau writes no result either, a lone unknown flag is unknown (not one
+  -- missing its value), and an unknown command is a usage error.
+  local gateDoc = '{"candidate":"x","pass":true}\n'
+  local gdf = assert(io.open(outFile, "w"))
+  gdf:write(gateDoc)
+  gdf:close()
+  local function outFileNow()
+    local f = io.open(outFile, "r")
+    local t = f and f:read("a")
+    if f then f:close() end
+    return t
+  end
+  local okTauOut, errTauOut = pcall(sc.main, { "tau", "--dir", held, "--out", outFile })
+  check("cli: and so is --out on tau, its path untouched", okTauOut == false
+    and tostring(errTauOut):find("--out applies to gate only", 1, true) ~= nil and outFileNow() == gateDoc, true)
+  local okLone, errLone = pcall(sc.main, { "gate", "--dir", held, "--bogus" })
+  check("cli: a lone unknown flag is called unknown, not one missing its value",
+    okLone == false and tostring(errLone):find("unknown argument --bogus", 1, true) ~= nil, true)
+  local okCmd, errCmd = pcall(sc.main, { "gaet", "--out", outFile })
+  check("cli: an unknown command is a usage error, its --out untouched",
+    okCmd == false and tostring(errCmd):find("usage:", 1, true) ~= nil and outFileNow() == gateDoc, true)
+  check("cli: the harness's control, writing elsewhere, exits 2",
+    exitOf("FAIL_OUT=/nonexistent/x lua " .. q(fwrap) .. " gate --dir " .. q(held) .. " --fit-dir " .. q(dev)
+      .. " --candidate always-freeze --out " .. q(outFile)), 2)
+  os.remove(fwrap); os.remove(outFile)
+  os.execute("rm -rf '" .. dupId .. "' '" .. dupPrint .. "'")
   os.execute("rm -rf '" .. dev .. "' '" .. held .. "' '" .. held .. ".link' '" .. empty .. "' '" .. late .. "' '" .. copy .. "' '" .. relabeled .. "' '" .. edited .. "' '" .. older .. "'")
 end
 
@@ -1059,6 +1395,7 @@ do
   end
   local stub = assert(io.open(stubDir .. "/curl", "w"))
   stub:write([[#!/usr/bin/env bash
+[ -n "${FAKE_ARGV_LOG:-}" ] && printf '%s\n' "$*" >> "$FAKE_ARGV_LOG"
 out=""; body=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1070,7 +1407,21 @@ while [ $# -gt 0 ]; do
 done
 cat "$body" >> "$FAKE_BODY_LOG"; echo >> "$FAKE_BODY_LOG"
 printf '%s' '{"choices":[{"message":{"content":"{\"action\":\"wait\",\"process_class\":\"hog\",\"confidence\":0.5,\"rationale\":\"x\"}"}}]}' > "$out"
-printf '0.010'
+status="${FAKE_STATUS:-200}"
+if [ -n "${FAKE_STATUS_SEQ:-}" ]; then
+  n=$(cat "$FAKE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_SEQ_FILE"
+  i=0; for s in $FAKE_STATUS_SEQ; do i=$((i + 1)); status=$s; [ "$i" -ge "$n" ] && break; done
+fi
+# The address curl connected to, as its remote_ip prints it. FAKE_REMOTE_SEQ:
+# each request's in turn (the last repeats; "none" prints no address),
+# counted in the file FAKE_REMOTE_SEQ_FILE names.
+ip="${FAKE_REMOTE_IP-127.0.0.1}"
+if [ -n "${FAKE_REMOTE_SEQ:-}" ]; then
+  n=$(cat "$FAKE_REMOTE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_REMOTE_SEQ_FILE"
+  i=0; for a in $FAKE_REMOTE_SEQ; do i=$((i + 1)); ip=$a; [ "$i" -ge "$n" ] && break; done
+  [ "$ip" = none ] && ip=""
+fi
+printf '0.010 %s ip=%s' "$status" "$ip"
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -1089,6 +1440,468 @@ printf '0.010'
   for _ in bodies:gmatch("\n") do requests = requests + 1 end
   check("G1: a redacting run asks each control class again", table.concat(controls, ","), "ambiguous-hog,extreme-runaway")
   check("G1: three scenarios, five requests", requests, 5)
+  local scoredRow
+  for _, r in ipairs(result.rows or {}) do if not r.injection_control then scoredRow = scoredRow or r end end
+  check("runner: run mode's rows record their attempts",
+    scoredRow ~= nil and scoredRow.attempts == 1 and result.retried == 0, true)
+  -- The second request is the first scenario's control re-ask: rate limited
+  -- once, it is tried again and counted as retried, though no scored row was.
+  local seqRun, outSeq = root .. "/run-seq-count", root .. "/run-seq.json"
+  os.execute(string.format("PATH='%s':\"$PATH\" FAKE_STATUS_SEQ='200 429 200' FAKE_SEQ_FILE='%s' FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run "
+    .. "--server http://stub --label t --scenarios '%s' --retry-wait 0 --out '%s' >/dev/null 2>&1", stubDir, seqRun, log, corpus, outSeq))
+  local sf2 = io.open(outSeq, "r")
+  local seqResult = sf2 and lfm.jsonDecode(sf2:read("a")) or {}
+  if sf2 then sf2:close() end
+  check("runner: a control re-ask's retry is counted", seqResult.retried, 1)
+  -- The default output names the names condition: a redacted run and a
+  -- raw-names run of one model and variant write two files. (Run from a
+  -- scratch directory, so the default eval/results is the scratch's own.)
+  local ph = io.popen("pwd -P")
+  local here = ph:read("l")
+  ph:close()
+  local cwdRoot = root .. "/cwd"
+  os.execute(string.format("mkdir -p '%s/eval' && ln -s '%s/lua' '%s/lua' && ln -s '%s/eval/bakeoff.lua' '%s/eval/bakeoff.lua'",
+    cwdRoot, here, cwdRoot, here, cwdRoot))
+  for _, extra in ipairs({ "", "--raw-names" }) do
+    os.execute(string.format("cd '%s' && PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --variant taxonomy --scenarios '%s' %s >/dev/null 2>&1", cwdRoot, stubDir, log, corpus, extra))
+  end
+  local function resultAt(path)
+    local f = io.open(path, "r")
+    local doc = f and lfm.jsonDecode(f:read("a")) or {}
+    if f then f:close() end
+    return doc
+  end
+  local red, raw = resultAt(cwdRoot .. "/eval/results/t-taxonomy.json"), resultAt(cwdRoot .. "/eval/results/t-taxonomy-rawnames.json")
+  check("runner: a redacted run writes its default file", red.redact_names, true)
+  check("runner: a raw-names run writes its own beside it, naming its condition", raw.redact_names, false)
+  -- A failed rerun leaves no stale result at the default path either.
+  local defaultPath = cwdRoot .. "/eval/results/t-taxonomy.json"
+  local dw = assert(io.open(defaultPath, "w"))
+  dw:write('{"label":"t","variant":"taxonomy","rows":[],"stale":true}\n')
+  dw:close()
+  os.execute(string.format("cd '%s' && PATH='%s':\"$PATH\" FAKE_STATUS=503 FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --variant taxonomy --scenarios '%s' --retries 0 >/dev/null 2>&1", cwdRoot, stubDir, log, corpus))
+  local df = io.open(defaultPath, "r")
+  if df then df:close() end
+  check("runner: a failed rerun leaves no stale result at the default path", df == nil, true)
+  -- A server error fails the run, writing no results, rather than scoring
+  -- the error as the model's invalid reply.
+  local outErr = root .. "/run-err.json"
+  local stale = assert(io.open(outErr, "w"))
+  stale:write('{"label":"t","variant":"baseline","rows":[],"stale":true}\n')
+  stale:close()
+  local okErr = os.execute(string.format("PATH='%s':\"$PATH\" FAKE_STATUS=503 FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run "
+    .. "--server http://stub --label t --scenarios '%s' --retries 0 --out '%s' >/dev/null 2>&1", stubDir, log, corpus, outErr))
+  local errFile = io.open(outErr, "r")
+  if errFile then errFile:close() end
+  check("runner: in run mode a server error fails the run, leaving no result, not even a stale one",
+    okErr ~= true and errFile == nil, true)
+  local outRef = root .. "/run-refused.json"
+  local staleR = assert(io.open(outRef, "w"))
+  staleR:write('{"label":"t","rows":[],"stale":true}\n')
+  staleR:close()
+  os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --scenarios '%s' --retries -1 --out '%s' >/dev/null 2>&1", stubDir, log, corpus, outRef))
+  local refFile = io.open(outRef, "r")
+  if refFile then refFile:close() end
+  check("runner: a refusal once the path is known leaves no stale result either", refFile == nil, true)
+  -- An explicit --out is cleared before any other check: a mistyped variant
+  -- or a missing label refuses the run without leaving the stale result.
+  local function staleAfter(argsTail)
+    local sp = root .. "/run-early.json"
+    local sw = assert(io.open(sp, "w"))
+    sw:write('{"label":"t","rows":[],"stale":true}\n')
+    sw:close()
+    os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--scenarios '%s' %s --out '%s' >/dev/null 2>&1", stubDir, log, corpus, argsTail, sp))
+    local sf3 = io.open(sp, "r")
+    if sf3 then sf3:close(); os.remove(sp) end
+    return sf3 ~= nil
+  end
+  check("runner: a mistyped variant leaves no stale result at an explicit --out", staleAfter("--label t --variant typo"), false)
+  check("runner: nor does a missing label", staleAfter(""), false)
+  check("runner: nor does --raw-names with --redact-names", staleAfter("--label t --raw-names --redact-names"), false)
+  -- A command line that does not parse touches nothing: the stale result is
+  -- left as it was, and the run is refused.
+  local function untouchedAfter(argsTail)
+    local sp = root .. "/run-unparsed.json"
+    local staleText = '{"label":"t","rows":[],"stale":true}\n'
+    local sw = assert(io.open(sp, "w"))
+    sw:write(staleText)
+    sw:close()
+    local ok = os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--scenarios '%s' %s --out '%s' >/dev/null 2>&1", stubDir, log, corpus, argsTail, sp))
+    local sf = io.open(sp, "r")
+    local now = sf and sf:read("a")
+    if sf then sf:close() end
+    os.remove(sp)
+    return ok ~= true and now == staleText
+  end
+  check("runner: a flag given twice touches nothing", untouchedAfter("--label t --label u"), true)
+  check("runner: nor does a flag missing its value", untouchedAfter("--label"), true)
+  -- --server-pid samples a process on this machine: it must be a pid, and
+  -- a reply from elsewhere (by the address curl reports) fails the run.
+  local function runSaid(argsTail, outPath, env)
+    local h = io.popen(string.format("%s PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --label t "
+      .. "--scenarios '%s' %s --out '%s' 2>&1; echo \"exit=$?\"", env or "", stubDir, log, corpus, argsTail, outPath))
+    local said = h:read("a")
+    h:close()
+    return said
+  end
+  local pidOut = root .. "/pid.json"
+  local function landed(path)
+    local f = io.open(path, "r")
+    if f then f:close() end
+    return f ~= nil
+  end
+  local farSaid = runSaid("--server http://stub --server-pid 1", pidOut, "FAKE_REMOTE_IP=203.0.113.7")
+  check("runner: a reply from elsewhere fails a --server-pid run, leaving no result",
+    farSaid:find("the server answered from 203.0.113.7", 1, true) ~= nil and farSaid:find("exit=0", 1, true) == nil
+    and not landed(pidOut), true)
+  local blankSaid = runSaid("--server http://stub --server-pid 1", pidOut, "FAKE_REMOTE_IP=")
+  check("runner: and so does a reply whose address curl did not report",
+    blankSaid:find("an address curl did not report", 1, true) ~= nil and blankSaid:find("exit=0", 1, true) == nil
+    and not landed(pidOut), true)
+  -- Only a --server-pid run is held to this machine: a remote run takes a
+  -- reply from anywhere.
+  do
+    local cloudSaid = runSaid("--server http://stub", pidOut, "FAKE_REMOTE_IP=203.0.113.7")
+    check("runner: a run without --server-pid takes a reply from anywhere",
+      cloudSaid:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+    os.remove(pidOut)
+  end
+  local badPidSaid = runSaid("--server http://127.0.0.1:9 --server-pid abc", pidOut)
+  check("runner: and when it is not a process id",
+    badPidSaid:find("must be a process id", 1, true) ~= nil and badPidSaid:find("exit=0", 1, true) == nil, true)
+  do
+    local notPids = {}
+    for _, v in ipairs({ "0", "-1", "1.5" }) do
+      local said = runSaid("--server http://127.0.0.1:9 --server-pid " .. v, pidOut)
+      if not (said:find("must be a process id", 1, true) and not said:find("exit=0", 1, true)) then notPids[#notPids + 1] = v end
+    end
+    check("runner: nor 0, a negative or a fraction", table.concat(notPids, " "), "")
+  end
+  -- Every reply is held to it, the control re-asks' too: the second request
+  -- is the first scenario's control re-ask (see the G1 pins above).
+  do
+    local seqFile = root .. "/remote-seq"
+    os.remove(seqFile)
+    local ctlSaid = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 203.0.113.7 127.0.0.1' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: a control re-ask from elsewhere fails a --server-pid run too, leaving no result",
+      ctlSaid:find("the server answered from 203.0.113.7", 1, true) ~= nil and ctlSaid:find("exit=0", 1, true) == nil
+      and not landed(pidOut), true)
+    os.remove(seqFile)
+    local ctlBlank = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 none 127.0.0.1' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: and so does one whose address curl did not report",
+      ctlBlank:find("an address curl did not report", 1, true) ~= nil and ctlBlank:find("exit=0", 1, true) == nil
+      and not landed(pidOut), true)
+    os.remove(seqFile)
+    local lastFar = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1 203.0.113.7' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: and so does the run's last request, answered from elsewhere",
+      lastFar:find("the server answered from 203.0.113.7", 1, true) ~= nil and lastFar:find("exit=0", 1, true) == nil
+      and not landed(pidOut), true)
+    os.remove(seqFile)
+    local allLocal = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 ::1 127.0.0.2' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: a run whose every reply is local lands, under any loopback address",
+      allLocal:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+    os.remove(seqFile)
+    os.remove(pidOut)
+  end
+  -- A retried request is held to its successful attempt's address: a retry
+  -- answered from elsewhere fails the run, while an attempt that failed from
+  -- elsewhere and was retried from here does not.
+  do
+    local remoteFile, statusFile = root .. "/remote-seq2", root .. "/status-seq2"
+    local function retried(remotes)
+      os.remove(remoteFile)
+      os.remove(statusFile)
+      local said = runSaid("--server http://stub --server-pid 1 --retry-wait 0", pidOut,
+        "FAKE_STATUS_SEQ='503 200' FAKE_SEQ_FILE='" .. statusFile .. "' FAKE_REMOTE_SEQ='" .. remotes
+        .. "' FAKE_REMOTE_SEQ_FILE='" .. remoteFile .. "'")
+      local ok = landed(pidOut)
+      os.remove(pidOut)
+      os.remove(remoteFile)
+      os.remove(statusFile)
+      return said, ok
+    end
+    local farRetry, farLanded = retried("127.0.0.1 203.0.113.7 127.0.0.1")
+    check("runner: a retry answered from elsewhere fails a --server-pid run",
+      farRetry:find("the server answered from 203.0.113.7", 1, true) ~= nil and not farLanded, true)
+    local _, nearLanded = retried("203.0.113.7 127.0.0.1")
+    check("runner: an attempt that failed from elsewhere, retried from here, lands", nearLanded, true)
+  end
+  local nearSaid = runSaid("--server http://127.0.0.1:9 --server-pid 1", pidOut)
+  check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+  os.remove(pidOut)
+  local v6Said = runSaid("--server http://stub --server-pid 1", pidOut, "FAKE_REMOTE_IP=::1")
+  check("runner: and so does one that answers over IPv6 loopback", v6Said:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+  os.remove(pidOut)
+  -- A --server-pid run's requests skip any proxy, whose address would stand
+  -- in for the server's; a run without one keeps its proxy.
+  do
+    local argvLog = root .. "/argv.log"
+    local function argvOf(argsTail)
+      os.remove(argvLog)
+      runSaid(argsTail, pidOut, "FAKE_ARGV_LOG='" .. argvLog .. "'")
+      os.remove(pidOut)
+      local af = io.open(argvLog, "r")
+      local text = af and af:read("a") or ""
+      if af then af:close() end
+      os.remove(argvLog)
+      return text
+    end
+    local withPid = argvOf("--server http://127.0.0.1:9 --server-pid 1")
+    local withoutPid = argvOf("--server http://127.0.0.1:9")
+    check("runner: a --server-pid run's requests skip any proxy, and only its", withPid:find("--noproxy * ", 1, true) ~= nil
+      and withoutPid ~= "" and withoutPid:find("--noproxy", 1, true) == nil, true)
+  end
+  -- The gates refuse a contradiction too, before writing the league.
+  do
+    local gatesDir = root .. "/gates-results"
+    os.execute("mkdir -p '" .. gatesDir .. "'")
+    local lf = assert(io.open(gatesDir .. "/league.json", "w"))
+    lf:write('{"league":[],"earlier":true}\n')
+    lf:close()
+    local gh = io.popen(string.format("lua eval/bakeoff.lua gates --results '%s' --raw-names --redact-names 2>&1; echo \"exit=$?\"", gatesDir))
+    local gatesSaid = gh:read("a")
+    gh:close()
+    local lf2 = io.open(gatesDir .. "/league.json", "r")
+    local leagueNow = lf2 and lf2:read("a")
+    if lf2 then lf2:close() end
+    check("runner: the gates refuse a contradiction, the league untouched", gatesSaid:find("contradict each other", 1, true) ~= nil
+      and gatesSaid:find("exit=0", 1, true) == nil and leagueNow == '{"league":[],"earlier":true}\n', true)
+    local kh = io.popen(string.format("lua eval/bakeoff.lua gates --results '%s' --api-key-env A --api-key-file B 2>&1; echo \"exit=$?\"",
+      gatesDir))
+    local keysSaid = kh:read("a")
+    kh:close()
+    local lf3 = io.open(gatesDir .. "/league.json", "r")
+    local leagueAfterKeys = lf3 and lf3:read("a")
+    if lf3 then lf3:close() end
+    check("runner: and so is the key pair", keysSaid:find("name two keys", 1, true) ~= nil
+      and keysSaid:find("exit=0", 1, true) == nil and leagueAfterKeys == '{"league":[],"earlier":true}\n', true)
+  end
+  -- A FIFO at a run's --out is refused at once, never opened, and kept.
+  do
+    local fifoOut = root .. "/fifo.json"
+    os.execute("mkfifo '" .. fifoOut .. "'")
+    local fh = io.popen(string.format("PATH='%s':\"$PATH\" perl -e 'alarm 20; exec @ARGV' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1; echo \"exit=$?\"", stubDir, corpus, fifoOut))
+    local fifoSaid = fh:read("a")
+    fh:close()
+    check("runner: a FIFO at --out is refused at once, and kept", fifoSaid:find("it is not a regular file", 1, true) ~= nil
+      and fifoSaid:find("exit=0", 1, true) == nil and os.execute("test -p '" .. fifoOut .. "'") == true, true)
+    -- So is a symlink to one: the type is the link's target's.
+    local linkOut = root .. "/fifo-link.json"
+    os.execute("ln -s '" .. fifoOut .. "' '" .. linkOut .. "'")
+    local lh = io.popen(string.format("PATH='%s':\"$PATH\" perl -e 'alarm 20; exec @ARGV' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1; echo \"exit=$?\"", stubDir, corpus, linkOut))
+    local linkSaid = lh:read("a")
+    lh:close()
+    check("runner: and so is a symlink to a FIFO, the link kept", linkSaid:find("it is not a regular file", 1, true) ~= nil
+      and linkSaid:find("exit=0", 1, true) == nil and os.execute("test -h '" .. linkOut .. "'") == true, true)
+    os.remove(linkOut)
+    os.remove(fifoOut)
+  end
+  os.remove(pidOut)
+  -- Only a run result is ever cleared: --out naming an input, a file that is
+  -- not JSON, or a directory refuses the run and leaves it as it was.
+  local keptSaid
+  local function keptAfter(path, content)
+    local kh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--scenarios '%s' --out '%s' 2>&1", stubDir, log, corpus, path))
+    keptSaid = kh:read("a")
+    kh:close()
+    if content == nil then return os.execute("test -d '" .. path .. "'") == true end
+    local kf = io.open(path, "r")
+    local now = kf and kf:read("a")
+    if kf then kf:close() end
+    return now == content
+  end
+  local scenCopy = root .. "/scenario-copy.json"
+  os.execute("cp '" .. corpus .. "/extreme-02.json' '" .. scenCopy .. "'")
+  local scf = io.open(scenCopy, "r")
+  local scenText = scf:read("a")
+  scf:close()
+  check("runner: --out naming a scenario is refused, the scenario kept", keptAfter(scenCopy, scenText), true)
+  check("runner: and the refusal says only a run result is cleared",
+    keptSaid:find("only a run result is cleared", 1, true) ~= nil, true)
+  local notes = root .. "/notes.txt"
+  local nf2 = assert(io.open(notes, "w"))
+  nf2:write("not a result\n")
+  nf2:close()
+  check("runner: so is --out naming a file that is not JSON", keptAfter(notes, "not a result\n"), true)
+  local emptyFile = root .. "/empty.json"
+  local ef = assert(io.open(emptyFile, "w"))
+  ef:close()
+  check("runner: and an empty file, named as no run result", keptAfter(emptyFile, "")
+    and keptSaid:find("it is not a run result", 1, true) ~= nil, true)
+  local emptyDir = root .. "/empty-dir"
+  os.execute("mkdir -p '" .. emptyDir .. "'")
+  check("runner: and --out naming a directory, even an empty one", keptAfter(emptyDir, nil)
+    and keptSaid:find("only a run result is cleared", 1, true) ~= nil, true)
+  -- A successful rerun replaces an earlier result.
+  local replaced = root .. "/replaced.json"
+  local rf4 = assert(io.open(replaced, "w"))
+  rf4:write('{"label":"old","rows":[]}\n')
+  rf4:close()
+  os.execute(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, corpus, replaced))
+  local rf5 = io.open(replaced, "r")
+  local replacedDoc = rf5 and lfm.jsonDecode(rf5:read("a")) or {}
+  if rf5 then rf5:close() end
+  check("runner: a successful rerun replaces the earlier result", replacedDoc.label, "t")
+  -- A result that cannot be removed (its directory read-only) refuses the
+  -- run. (Root removes it anyway, so this pin runs only as another user.)
+  local idh = io.popen("id -u")
+  local uid = idh:read("l")
+  idh:close()
+  if uid ~= "0" then
+    local roDir = root .. "/ro"
+    os.execute("mkdir -p '" .. roDir .. "'")
+    local rof = assert(io.open(roDir .. "/r.json", "w"))
+    rof:write('{"label":"t","rows":[]}\n')
+    rof:close()
+    os.execute("chmod 555 '" .. roDir .. "'")
+    local roh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1", stubDir, log, corpus, roDir .. "/r.json"))
+    local roSaid = roh:read("a")
+    roh:close()
+    os.execute("chmod 755 '" .. roDir .. "'")
+    check("runner: a result that cannot be removed refuses the run", roSaid:find("cannot clear", 1, true) ~= nil
+      and roSaid:find("would read as this run's", 1, true) ~= nil, true)
+    -- A file at --out that cannot be read is refused and kept, never taken
+    -- for absent.
+    local unreadable = root .. "/unreadable.json"
+    local urf = assert(io.open(unreadable, "w"))
+    urf:write('{"label":"t","rows":[]}\n')
+    urf:close()
+    os.execute("chmod 000 '" .. unreadable .. "'")
+    local urh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1", stubDir, log, corpus, unreadable))
+    local urSaid = urh:read("a")
+    urh:close()
+    os.execute("chmod 644 '" .. unreadable .. "'")
+    local urKept = io.open(unreadable, "r")
+    local urNow = urKept and urKept:read("a")
+    if urKept then urKept:close() end
+    check("runner: a file at --out that cannot be read is refused and kept",
+      urSaid:find("cannot clear", 1, true) ~= nil and urNow == '{"label":"t","rows":[]}\n', true)
+  end
+  local leftovers = 0
+  for _, dirScan in ipairs({ cwdRoot .. "/eval/results", root }) do
+    local lp = io.popen("ls '" .. dirScan .. "' 2>/dev/null")
+    for n in lp:lines() do if n:find(".partial-", 1, true) then leftovers = leftovers + 1 end end
+    lp:close()
+  end
+  check("runner: a run's result is renamed into place, leaving no partial file", leftovers, 0)
+  -- An output that cannot be cleared (a directory with something in it)
+  -- refuses the run, which writes nothing.
+  local blocked = root .. "/blocked-out"
+  os.execute("mkdir -p '" .. blocked .. "/x'")
+  local bh = io.popen(string.format("PATH='%s':\"$PATH\" FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run --server http://stub "
+    .. "--label t --scenarios '%s' --out '%s' 2>&1; echo \"exit=$?\"", stubDir, log, corpus, blocked))
+  local blockedSaid = bh:read("a")
+  bh:close()
+  local bp = io.popen("ls '" .. root .. "' 2>/dev/null")
+  local blockedPartials = 0
+  for n in bp:lines() do if n:find("blocked-out.partial-", 1, true) then blockedPartials = blockedPartials + 1 end end
+  bp:close()
+  check("runner: an output that cannot be cleared refuses the run, writing nothing",
+    blockedSaid:find("cannot clear", 1, true) ~= nil and not blockedSaid:find("exit=0", 1, true) and blockedPartials == 0, true)
+  -- A rename that fails (injected) fails the run and leaves no partial and
+  -- no result.
+  local rw = assert(io.open(root .. "/renamewrap.lua", "w"))
+  rw:write([[
+local target = os.getenv("FAIL_RENAME")
+local realRename = os.rename
+os.rename = function(a, b)
+  if target and tostring(b) == target then return nil, "rename refused" end
+  return realRename(a, b)
+end
+-- FAIL_PARTIAL: a file opened for writing whose name starts with this
+-- fails at its close, as a full volume would, and appends the path it
+-- failed to the file FAIL_MARK names. Every other method is the real
+-- handle's.
+local partialPrefix, mark = os.getenv("FAIL_PARTIAL"), os.getenv("FAIL_MARK")
+local realOpen = io.open
+io.open = function(path, m)
+  local f, e, c = realOpen(path, m)
+  if f and partialPrefix and m == "w" and tostring(path):sub(1, #partialPrefix) == partialPrefix then
+    local real = getmetatable(f).__index
+    return setmetatable({
+      write = function(_, ...) return f:write(...) end,
+      close = function()
+        f:close()
+        if mark then
+          local mf = realOpen(mark, "a")
+          if mf then mf:write(tostring(path), "\n"); mf:close() end
+        end
+        return nil, "No space left on device"
+      end,
+    }, { __index = function(_, k) return function(_, ...) return real[k](f, ...) end end })
+  end
+  return f, e, c
+end
+arg[0] = "eval/bakeoff.lua"
+dofile("eval/bakeoff.lua")
+]])
+  rw:close()
+  local renameOut = root .. "/rename-fails.json"
+  local okRename = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='%s' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, renameOut, log, root .. "/renamewrap.lua", corpus, renameOut))
+  local rp2 = io.popen("ls '" .. root .. "' 2>/dev/null")
+  local renamePartials = 0
+  for n in rp2:lines() do if n:find("rename-fails.json.partial-", 1, true) then renamePartials = renamePartials + 1 end end
+  rp2:close()
+  local renameLanded = io.open(renameOut, "r")
+  if renameLanded then renameLanded:close() end
+  check("runner: a result whose rename fails fails the run, leaving no partial and no result",
+    okRename ~= true and renamePartials == 0 and renameLanded == nil, true)
+  -- The harness's control: the same run through it, renaming elsewhere, lands.
+  local controlOut = root .. "/rename-control.json"
+  local okRenameCtl = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='%s' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, renameOut, log, root .. "/renamewrap.lua", corpus, controlOut))
+  local controlLanded = io.open(controlOut, "r")
+  if controlLanded then controlLanded:close() end
+  check("runner: the rename harness's control lands its result", okRenameCtl == true and controlLanded ~= nil, true)
+  -- A result whose write fails (its close, as on a full volume) fails the run
+  -- and leaves no partial and no result.
+  local writeOut, writeMark = root .. "/write-fails.json", root .. "/write-fails.mark"
+  local okWriteFail = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_PARTIAL='%s' FAIL_MARK='%s' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, writeOut .. ".partial-",
+    writeMark, log, root .. "/renamewrap.lua", corpus, writeOut))
+  local wp = io.popen("ls '" .. root .. "' 2>/dev/null")
+  local writePartials = 0
+  for n in wp:lines() do if n:find("write-fails.json.partial-", 1, true) then writePartials = writePartials + 1 end end
+  wp:close()
+  local writeLanded = io.open(writeOut, "r")
+  if writeLanded then writeLanded:close() end
+  check("runner: a result whose write fails fails the run, leaving no partial and no result",
+    okWriteFail ~= true and writePartials == 0 and writeLanded == nil, true)
+  -- The failure fired at the result's own close, once: the run reached the
+  -- write.
+  local wm = io.open(writeMark, "r")
+  local failedAt = {}
+  if wm then
+    for line in wm:lines() do failedAt[#failedAt + 1] = line end
+    wm:close()
+  end
+  check("runner: the injected failure is the result's close",
+    #failedAt == 1 and failedAt[1]:sub(1, #(writeOut .. ".partial-")) == writeOut .. ".partial-", true)
+  -- The write harness's control: the same run, its failure aimed at a name
+  -- nothing writes, lands its result.
+  local writeCtl = root .. "/write-control.json"
+  local okWriteCtl = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_PARTIAL='%s' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, writeCtl .. ".nomatch-",
+    log, root .. "/renamewrap.lua", corpus, writeCtl))
+  local writeCtlLanded = io.open(writeCtl, "r")
+  if writeCtlLanded then writeCtlLanded:close() end
+  check("runner: the write harness's control lands its result", okWriteCtl == true and writeCtlLanded ~= nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 
@@ -1109,16 +1922,16 @@ do
   for _, f in ipairs({ "bakeoff", "gen-episodes", "score-episodes" }) do
     os.execute(string.format("ln -s '%s/eval/%s.lua' '%s/%s-renamed.lua'", here, f, base, f))
   end
-  -- Each refuses a run with no arguments (exit 1); a CLI that ran nothing
-  -- would exit 0.
+  -- Each refuses a run with no arguments (the runner and the generator exit
+  -- 1, the scorer 3, its refusal status); a CLI that ran nothing would exit 0.
   check("cli: the runner under another name still runs", status("lua '" .. base .. "/bakeoff-renamed.lua'"), 1)
   check("cli: so does the generator", status("lua '" .. base .. "/gen-episodes-renamed.lua'"), 1)
-  check("cli: and the scorer", status("lua '" .. base .. "/score-episodes-renamed.lua'"), 1)
+  check("cli: and the scorer", status("lua '" .. base .. "/score-episodes-renamed.lua'"), 3)
   -- The other spellings of the same script: a ./ path, and a symlinked
-  -- directory (each refuses an empty run, so exit 1 means it ran).
+  -- directory (each refuses an empty run, so exit 3 means it ran).
   os.execute(string.format("ln -s '%s/eval' '%s/evlink'", here, base))
-  check("cli: a ./ path runs the scorer", status("lua ./eval/score-episodes.lua"), 1)
-  check("cli: so does a path through a symlinked directory", status("lua '" .. base .. "/evlink/score-episodes.lua'"), 1)
+  check("cli: a ./ path runs the scorer", status("lua ./eval/score-episodes.lua"), 3)
+  check("cli: so does a path through a symlinked directory", status("lua '" .. base .. "/evlink/score-episodes.lua'"), 3)
   -- A script whose own name ends like the scorer's only requires it.
   local w = assert(io.open(base .. "/my-score-episodes.lua", "w"))
   w:write('package.path = "eval/?.lua;" .. package.path\nrequire("score-episodes")\nprint("required")\n')
@@ -1224,7 +2037,7 @@ do
   f:write([[
 return {
   { id = "T-fits", split = "test", class = "runaway", family = "script", names = { "python3" },
-    avail0 = 12, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
+    avail0 = { 11, 13 }, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
     phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "fits the machine" },
   { id = "T-overfull", split = "test", class = "runaway", family = "script", names = { "python3" },
     avail0 = 40, w0 = 30000, age0 = 150, peak0 = 12000, compress = 1,
@@ -1293,6 +2106,20 @@ return {
   fr:close()
   local okRoot, errRoot = pcall(gen.main, { "--templates", tr, "--split", "test", "--seed", "1",
                                            "--per-template", "1", "--out", base .. "/rootonly" })
+  -- A template whose parameters do not vary yields one episode for every
+  -- seed: refused here, naming the template, rather than at scoring.
+  local tc = base .. "/const.lua"
+  local fc = assert(io.open(tc, "w"))
+  fc:write([[
+return {
+  { id = "T-const", split = "test", class = "runaway", family = "script", names = { "python3" },
+    avail0 = 12, w0 = 3000, age0 = 150, peak0 = 12000, compress = 1.5,
+    phases = { { dur = 180, rate = 150 } }, after = "hold", rationale = "no ranges" },
+}
+]])
+  fc:close()
+  local okConst, errConst = pcall(gen.main, { "--templates", tc, "--split", "test", "--seed", "1",
+                                             "--per-template", "2", "--out", base .. "/const" })
   print = quiet
   check("generator: a write that fails publishes nothing",
     okWrite == false and tostring(errWrite):find("nothing published", 1, true) ~= nil, true)
@@ -1302,6 +2129,9 @@ return {
     okDup == false and tostring(errDup):find("repeats", 1, true) ~= nil, true)
   check("generator: so is a template whose every name production never freezes",
     okRoot == false and tostring(errRoot):find("never freezes any of its names", 1, true) ~= nil, true)
+  check("generator: and one that yields the same episode for every seed, named",
+    okConst == false and tostring(errConst):find("would score exactly as", 1, true) ~= nil
+      and tostring(errConst):find("T-const", 1, true) ~= nil, true)
   local stray = {}
   for _, n in ipairs(listing(base)) do
     if n ~= "good" and not n:match("%.lua$") then stray[#stray + 1] = n end
@@ -1362,6 +2192,13 @@ do
   check("decidable: a small bound is searched, not scanned", okSmall, true)
   check("decidable: and its size is the first to meet the bound", okSmall
     and sc.cpUpper(1, nSmall, 0.95) <= 1e-5 and sc.cpUpper(1, nSmall - 1, 0.95) > 1e-5, true)
+  -- The cap is a cap: a bound only a set past 2^24 meets (2e-7 needs about
+  -- 23.7 million) is refused, and one just inside it is answered under it.
+  check("decidable: a bound no set of up to 2^24 runaways meets is refused",
+    (pcall(sc.decisiveRunaways, { missBound = 2e-7, confidence = 0.95 })), false)
+  local okNear, nNear = pcall(sc.decisiveRunaways, { missBound = 3e-7, confidence = 0.95 })
+  check("decidable: one just inside the cap is searched to its size", okNear and nNear <= (1 << 24)
+    and sc.cpUpper(1, nNear, 0.95) <= 3e-7 and sc.cpUpper(1, nNear - 1, 0.95) > 3e-7, true)
   check("decidable: a bound outside (0, 1) is refused",
     (pcall(sc.decisiveRunaways, { missBound = 0, confidence = 0.95 }))
       or (pcall(sc.decisiveRunaways, { missBound = 1, confidence = 0.95 })), false)
@@ -1419,7 +2256,19 @@ do
     pdoc ~= nil and pdoc.decisive == true and pdoc.pass == true and pdoc.minRunaways == 93, true)
   print = function() end
   local okFail, failStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "always-freeze" })
+  -- The controls on a decidable set: 0 when they hold; 2 when the set is too
+  -- weak to show the gate's power; 1 when a control fails, even then.
+  local okC0, c0 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  local savedTarget, savedFreeze = sc.cfg.powerTarget, sc.candidates["always-freeze"]
+  sc.cfg.powerTarget = 1.01
+  local okC2, c2 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.candidates["always-freeze"] = sc.candidates.oracle
+  local okC1, c1 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.cfg.powerTarget, sc.candidates["always-freeze"] = savedTarget, savedFreeze
   print = quiet3
+  check("decidable: controls that hold exit 0", okC0 and c0, 0)
+  check("decidable: an underpowered set exits 2", okC2 and c2, 2)
+  check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a failing gate exits 1", okFail and failStatus, 1)
   -- One runaway short of the floor, the same set decides nothing.
@@ -1543,9 +2392,11 @@ do
   check("runner scratch: each is a directory", os.execute("test -d '" .. a .. "' && test -d '" .. b .. "'") == true, true)
   os.execute("rmdir '" .. a .. "' '" .. b .. "'")
   -- An existing output file is refused before anything runs, never truncated.
+  -- An episode with an id (checked before the claim) and a step with no
+  -- snapshot (the run fails on it only after the claim).
   local epDir = bk.privateDir()
   local ef = assert(io.open(epDir .. "/a.json", "w"))
-  ef:write("not json\n")
+  ef:write('{"id":"a","steps":[{"t":0}]}\n')
   ef:close()
   local out = os.tmpname()
   local f = assert(io.open(out, "w"))
@@ -1659,15 +2510,33 @@ if [ -n "${FAKE_BAD_FIRST:-}" ]; then
   n=$(cat "$FAKE_BAD_FIRST" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_BAD_FIRST"
   [ "$n" -eq 1 ] && FAKE_CHAT="not json"
 fi
+# FAKE_STATUS_SEQ: the HTTP status of each request in turn (the last one
+# repeats), counted in the file FAKE_SEQ_FILE names.
+status=200
+if [ -n "${FAKE_STATUS_SEQ:-}" ]; then
+  n=$(cat "$FAKE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_SEQ_FILE"
+  i=0; for s in $FAKE_STATUS_SEQ; do i=$((i + 1)); status=$s; [ "$i" -ge "$n" ] && break; done
+fi
+# A timeout: curl's write-out at its limit, no status, exit 28 (silent: a
+# timeout with no write-out at all).
+if [ "$status" = timeout ]; then printf '60.000 000'; exit 28; fi
+if [ "$status" = silent ]; then exit 28; fi
+# early: a timeout one second in (a connect timeout of curl's own).
+if [ "$status" = early ]; then printf '1.000 000'; exit 28; fi
+# exit6: a host that cannot be resolved; exit18: a transfer cut short.
+if [ "$status" = exit6 ]; then printf '0.001 000'; exit 6; fi
+if [ "$status" = exit18 ]; then printf '0.005 200'; exit 18; fi
 case "$url" in
   */v1/chat/completions) body="$FAKE_CHAT" ;;
   */v1/systemone) body='{"model":"d1","answers":{"action":{"type":"choice","choice":"freeze","probabilities":{"freeze":0.8,"wait":0.2},"confidence":0.4}}}' ;;
-  */apply-template) body='{"prompt":"PROMPT"}' ;;
+  */apply-template) body='{"prompt":"PROMPT"}'; [ -n "${FAKE_TEMPLATE:-}" ] && body="$FAKE_TEMPLATE" ;;
   */completion) body="$FAKE_COMPLETION" ;;
   *) exit 7 ;;
 esac
 printf '%s' "$body" > "$out"
-printf '0.010'
+# FAKE_COMMA: curl's timing as a comma-decimal locale would print it.
+if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.010 %s' "$status"; fi
+printf ' ip=%s' "${FAKE_REMOTE_IP-127.0.0.1}"
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -1691,17 +2560,21 @@ printf '0.010'
   local function sq(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
   local function run(api, chatBody, tag, extra, env, dir)
     local out = root .. "/rows-" .. tag .. ".jsonl"
+    local said = root .. "/said-" .. tag .. ".txt"
     local ok = os.execute(string.format("%s PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_COMPLETION=%s FAKE_BODY_LOG=%s lua eval/bakeoff.lua "
-      .. "episodes --server http://stub --label t --dir %s --api %s --out %s %s >/dev/null 2>&1",
+      .. "episodes --server http://stub --label t --dir %s --api %s --out %s %s >%s 2>&1",
       env or "", sq(stubDir), sq(chatBody), sq(completion), sq(root .. "/bodies-" .. tag .. ".log"), sq(dir or epDir),
-      api, sq(out), extra or ""))
+      api, sq(out), extra or "", sq(said)))
+    local sf = io.open(said, "r")
+    local saidText = sf and sf:read("a") or ""
+    if sf then sf:close() end
     local rows = {}
     local rf = io.open(out, "r")
     if rf then
       for line in rf:lines() do rows[#rows + 1] = lfm.jsonDecode(line) end
       rf:close()
     end
-    return rows[1] or {}, ok == true, #rows, rf ~= nil
+    return rows[1] or {}, ok == true, #rows, rf ~= nil, saidText
   end
   -- Two decision points (the episode twice, under two ids), for runs where
   -- one reply is garbage.
@@ -1716,6 +2589,85 @@ printf '0.010'
   end
   check("runner: --redact-names takes no value, so the next flag keeps its own",
     bk.parseArgs({ "episodes", "--redact-names", "--dir", "X" }).dir, "X")
+  -- A large file named by mistake is read no further than a result could be.
+  local bigOut = root .. "/big.bin"
+  bigFile(bigOut)
+  local rAsked, rOk, rErr = readsOf(bigOut, bk.clearResult, bigOut)
+  check("runner: the clear reads at most 1 MB of a large file at --out, and refuses it", rOk == false
+    and #rAsked == 1 and math.type(rAsked[1]) == "integer" and rAsked[1] <= 1048577
+    and tostring(rErr):find("only a run result is cleared", 1, true) ~= nil
+    and tostring(rErr):find("over the 64 KB a result can be read at", 1, true) ~= nil, true)
+  os.remove(bigOut)
+  -- An address as curl reports it is this machine when it is a loopback or
+  -- an unspecified one; nothing else is.
+  do
+    local here = { "127.0.0.1", "127.255.0.9", "::1", "::", "0.0.0.0", "::ffff:127.0.0.1" }
+    local elsewhere = { "", "203.0.113.7", "10.0.0.1", "128.0.0.1", "1127.0.0.1", "127.0.0.1x", "::2", "fe80::1",
+      "::ffff:10.0.0.1", "[::1]" }
+    local wrongHere, wrongElsewhere = {}, {}
+    -- (Quoted, so that an empty address shows.)
+    for _, ip in ipairs(here) do if not bk.isLoopbackIp(ip) then wrongHere[#wrongHere + 1] = string.format("%q", ip) end end
+    for _, ip in ipairs(elsewhere) do if bk.isLoopbackIp(ip) then wrongElsewhere[#wrongElsewhere + 1] = string.format("%q", ip) end end
+    check("runner: a loopback or unspecified address is this machine", table.concat(wrongHere, " "), "")
+    check("runner: and no other address is", table.concat(wrongElsewhere, " ") .. (bk.isLoopbackIp(nil) and " nil" or ""), "")
+  end
+  -- A device and a socket at --out are refused by their type.
+  do
+    local okDev, errDev = pcall(bk.clearResult, "/dev/null")
+    check("runner: a device at --out is refused by its type", okDev == false
+      and tostring(errDev):find("it is not a regular file", 1, true) ~= nil, true)
+    local sock = root .. "/s.sock"
+    os.execute("python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' '" .. sock .. "'")
+    check("runner: (the socket fixture is made)", os.execute("test -S '" .. sock .. "'") == true, true)
+    local okSock, errSock = pcall(bk.clearResult, sock)
+    check("runner: and so is a socket, kept", os.execute("test -S '" .. sock .. "'") == true and okSock == false
+      and tostring(errSock):find("it is not a regular file", 1, true) ~= nil, true)
+    os.remove(sock)
+  end
+  -- A run result whose removal fails (injected) refuses the clear, the result
+  -- kept, whoever runs it (root can remove from a read-only directory).
+  do
+    local stuck = root .. "/stuck.json"
+    local stuckText = '{"label":"t","rows":[]}\n'
+    local sf = assert(io.open(stuck, "w"))
+    sf:write(stuckText)
+    sf:close()
+    local realRemove = os.remove
+    os.remove = function(path) if path == stuck then return nil, path .. ": Operation not permitted", 1 end return realRemove(path) end
+    local okStuck, errStuck = pcall(bk.clearResult, stuck)
+    os.remove = realRemove
+    local sf2 = io.open(stuck, "r")
+    local stuckNow = sf2 and sf2:read("a")
+    if sf2 then sf2:close() end
+    check("runner: a run result that cannot be removed refuses the clear, and is kept, for any user", okStuck == false
+      and tostring(errStuck):find("would read as this run's", 1, true) ~= nil and stuckNow == stuckText, true)
+    os.remove(stuck)
+  end
+  -- A run result that cannot be read (injected) is refused, never taken for
+  -- absent, and kept, whoever runs it.
+  do
+    local unreadable = root .. "/unreadable-inproc.json"
+    local unreadableText = '{"label":"t","rows":[]}\n'
+    local uw = assert(io.open(unreadable, "w"))
+    uw:write(unreadableText)
+    uw:close()
+    local realOpen = io.open
+    io.open = function(path, m)
+      if path == unreadable and m == "r" then return nil, path .. ": Permission denied", 13 end
+      return realOpen(path, m)
+    end
+    local okUnread, errUnread = pcall(bk.clearResult, unreadable)
+    io.open = realOpen
+    local ur = io.open(unreadable, "r")
+    local unreadNow = ur and ur:read("a")
+    if ur then ur:close() end
+    check("runner: a run result that cannot be read is refused, never taken for absent, and kept",
+      okUnread == false and tostring(errUnread):find("it cannot be read", 1, true) ~= nil and unreadNow == unreadableText, true)
+    os.remove(unreadable)
+  end
+  local okUnder, under = pcall(bk.parseArgs, { "--raw_names", "run", "--no_schema", "--redact_names" })
+  check("runner: the boolean flags read under either spelling, taking no value", okUnder and under.raw_names == true
+    and under.no_schema == true and under.redact_names == true and under.positional[1] == "run", true)
   check("runner: a value flag missing its value is refused", (pcall(bk.parseArgs, { "episodes", "--out" })), false)
   local rc, rs = run("chat", chat, "chat"), run("systemone", chat, "systemone")
   local rp = run("completion", chat, "completion")
@@ -1743,6 +2695,139 @@ printf '0.010'
   check("runner: beside a valid reply, the run stands with both rows", okBad == true and nBad == 2, true)
   check("runner: a run with no valid reply fails, leaving no rows",
     okNone == false and nNone == 0 and fileNone == false, true)
+  -- A server error is no answer of the model's: the run fails, leaving no
+  -- rows. Rate limiting is tried again and the run stands; a refused key is
+  -- not tried again. (--retry-wait 0 keeps a retry immediate.)
+  local seqFile = root .. "/seq-count"
+  local function runSeq(tag, statuses, extra, api)
+    os.remove(seqFile)
+    return run(api or "chat", chat, tag, "--retry-wait 0 " .. (extra or ""),
+      "FAKE_STATUS_SEQ=" .. sq(statuses) .. " FAKE_SEQ_FILE=" .. sq(seqFile))
+  end
+  local _, ok500, n500, f500, said500 = runSeq("s500", "500")
+  check("runner: a server error fails the run, leaving no rows", ok500 == false and n500 == 0 and f500 == false, true)
+  check("runner: and says the server gave no reply", said500:find("gave no reply (HTTP 500", 1, true) ~= nil, true)
+  local r429, ok429, n429 = runSeq("s429", "429 200")
+  check("runner: rate limiting is tried again, and the run stands",
+    ok429 == true and n429 == #ep.steps and r429.valid == true, true)
+  check("runner: the retried row records its attempts, and the time of both",
+    r429.attempts == 2 and (r429.wall_ms or 0) >= 19, true)
+  check("runner: a row answered at once records one attempt", rc.attempts, 1)
+  local rComp, okComp = runSeq("scomp", "429 200 200", nil, "completion")
+  check("runner: a completion row counts its template request's attempts with its own",
+    okComp == true and rComp.attempts == 3, true)
+  os.remove(seqFile)
+  local rCompW = run("completion", chat, "scompwait", "--retry-wait 1",
+    "FAKE_STATUS_SEQ=" .. sq("429 200 200") .. " FAKE_SEQ_FILE=" .. sq(seqFile))
+  check("runner: and records its template request's wait apart, not as the model's time",
+    rCompW.attempts == 3 and (rCompW.wait_ms or 0) >= 1000 and (rCompW.wall_ms or 0) < 1000, true)
+  local rTo, okTo = runSeq("stimeout", "timeout 200")
+  check("runner: a timeout is tried again, and its time counts toward the answer's",
+    okTo == true and rTo.attempts == 2 and (rTo.wall_ms or 0) >= 60000, true)
+  local rEarly = runSeq("searly", "early 200")
+  check("runner: a timeout that reports its own time counts that time, not the limit",
+    rEarly.attempts == 2 and (rEarly.wall_ms or 0) >= 1000 and (rEarly.wall_ms or 0) < 60000, true)
+  local rSil = runSeq("ssilent", "silent 200", "--timeout 7")
+  check("runner: a timeout that reports no time took at least the time allowed",
+    rSil.attempts == 2 and (rSil.wall_ms or 0) >= 7000 and (rSil.wall_ms or 0) < 60000, true)
+  os.remove(seqFile)
+  local rWait = run("chat", chat, "swait", "--retry-wait 1",
+    "FAKE_STATUS_SEQ=" .. sq("429 200") .. " FAKE_SEQ_FILE=" .. sq(seqFile))
+  check("runner: the runner's own wait between attempts is recorded apart, not as the model's time",
+    rWait.attempts == 2 and (rWait.wait_ms or 0) >= 1000 and (rWait.wall_ms or 0) < 1000, true)
+  local _, ok401, _, f401, said401 = runSeq("s401", "401 200")
+  check("runner: a refused key is not tried again", ok401 == false and f401 == false, true)
+  check("runner: and is called a refused request, not a server error",
+    said401:find("the server refused the request", 1, true) ~= nil, true)
+  local function requestsMade() local f = io.open(seqFile, "r"); local n = f and tonumber(f:read("a")) or 0; if f then f:close() end; return n end
+  local _, okE6 = runSeq("sexit6", "exit6 200")
+  check("runner: a host that cannot be resolved fails at once, untried", okE6 == false and requestsMade() == 1, true)
+  local rE18, okE18 = runSeq("sexit18", "exit18 200")
+  check("runner: a transfer cut short is tried again", okE18 == true and rE18.attempts == 2, true)
+  local _, okEmpty, _, fEmpty, saidEmpty = run("chat", "", "empty")
+  check("runner: a 2xx with an empty body is no reply: the run fails",
+    okEmpty == false and fEmpty == false and saidEmpty:find("with an empty body", 1, true) ~= nil, true)
+  local rComma, okComma = run("chat", chat, "comma", nil, "FAKE_COMMA=1")
+  check("runner: a timing printed with a decimal comma still reads", okComma == true and rComma.wall_ms == 10, true)
+  local _, okNoRetry, _, fNoRetry = runSeq("s503", "503 200", "--retries 0")
+  check("runner: with no retries, a server error fails at once", okNoRetry == false and fNoRetry == false, true)
+  local _, okTplSrv, _, fTplSrv = runSeq("stpl", "500", nil, "completion")
+  check("runner: so does a server error on the template request", okTplSrv == false and fTplSrv == false, true)
+  local _, okTpl, _, fTpl, saidTpl = run("completion", chat, "tpl", nil, "FAKE_TEMPLATE=" .. sq("not json"))
+  check("runner: an /apply-template reply with no prompt fails the run",
+    okTpl == false and fTpl == false and saidTpl:find("gave no prompt", 1, true) ~= nil, true)
+  local noIdDir = root .. "/eps-noid"
+  os.execute("mkdir -p '" .. noIdDir .. "'")
+  local noIdEp = lfm.jsonDecode(lfm.jsonEncode(ep))
+  noIdEp.id = nil
+  local nif = assert(io.open(noIdDir .. "/x.json", "w"))
+  nif:write(lfm.jsonEncode(noIdEp), "\n")
+  nif:close()
+  local _, okNoId, _, fNoId, saidNoId = run("chat", chat, "noid", nil, nil, noIdDir)
+  check("runner: an episode file with no id is refused before any row",
+    okNoId == false and fNoId == false and saidNoId:find("carries no episode id", 1, true) ~= nil, true)
+  local _, okTwice, _, fTwice = run("chat", chat, "twice", "--timeout 5 --timeout 6")
+  check("runner: a flag given twice is refused", okTwice == false and fTwice == false, true)
+  local _, okSpell, _, fSpell = run("chat", chat, "twice2", "--retry-wait 1 --retry_wait 2")
+  check("runner: so is one given twice under its two spellings", okSpell == false and fSpell == false, true)
+  local _, okContra, _, _, saidContra = run("chat", chat, "contra", "--raw-names --redact-names")
+  check("runner: --raw-names with --redact-names is refused as a contradiction",
+    okContra == false and saidContra:find("contradict each other", 1, true) ~= nil, true)
+  do
+    local _, okFar, nFar = run("chat", chat, "farep", nil, "FAKE_REMOTE_IP=203.0.113.7")
+    check("runner: episodes mode, sampling no footprint, takes a reply from anywhere", okFar == true and nFar > 0, true)
+  end
+  do
+    local _, okSpid, _, fSpid, saidSpid = run("chat", chat, "spid", "--server-pid 1")
+    check("runner: episodes mode refuses --server-pid, before any row",
+      okSpid == false and fSpid == false and saidSpid:find("samples no footprint", 1, true) ~= nil, true)
+  end
+  local _, okKeys, _, fKeys, saidKeys = run("chat", chat, "twokeys", "--api-key-env FAKE_KEY --api-key-file "
+    .. sq(root .. "/no-such-key"))
+  check("runner: so is --api-key-env with --api-key-file, before any row",
+    okKeys == false and fKeys == false and saidKeys:find("name two keys", 1, true) ~= nil, true)
+  local badDir = root .. "/eps-bad"
+  os.execute("mkdir -p '" .. badDir .. "'")
+  local bdf = assert(io.open(badDir .. "/x.json", "w"))
+  bdf:write("not json\n")
+  bdf:close()
+  local _, okBadEp, _, fBadEp, saidBadEp = run("chat", chat, "badep", nil, nil, badDir)
+  check("runner: an episode file that is not JSON is named as such, before any row",
+    okBadEp == false and fBadEp == false and saidBadEp:find("is not an episode", 1, true) ~= nil, true)
+  local scalarDir, unreadDir = root .. "/eps-scalar", root .. "/eps-unread"
+  os.execute("mkdir -p '" .. scalarDir .. "' '" .. unreadDir .. "/x.json'")
+  local scf2 = assert(io.open(scalarDir .. "/x.json", "w"))
+  scf2:write("42\n")
+  scf2:close()
+  local _, okScalar, _, _, saidScalar = run("chat", chat, "scalar", nil, nil, scalarDir)
+  check("runner: a JSON value that is not an object is no episode", okScalar == false and saidScalar:find("is not an episode", 1, true) ~= nil, true)
+  local arrayDir = root .. "/eps-array"
+  os.execute("mkdir -p '" .. arrayDir .. "'")
+  local arf = assert(io.open(arrayDir .. "/x.json", "w"))
+  arf:write("[]\n")
+  arf:close()
+  local _, okArray, _, _, saidArray = run("chat", chat, "array", nil, nil, arrayDir)
+  check("runner: and a JSON array is named as one",
+    okArray == false and saidArray:find("is not an episode (a JSON array)", 1, true) ~= nil, true)
+  local _, okUnread, _, _, saidUnread = run("chat", chat, "unread", nil, nil, unreadDir)
+  check("runner: an episode file that cannot be read says so", okUnread == false and saidUnread:find("cannot be read", 1, true) ~= nil, true)
+  local _, okRetryArg = run("chat", chat, "badretries", "--retries -1")
+  check("runner: a negative --retries is refused", okRetryArg, false)
+  -- A flag the mode would not send is refused before any row.
+  local _, okRawN, _, fRawN = run("chat", chat, "rawn", "--raw-names")
+  check("runner: episodes mode refuses --raw-names, which it would not send", okRawN == false and fRawN == false, true)
+  local _, okNoS, _, fNoS = run("chat", chat, "nosch", "--no-schema")
+  check("runner: and --no-schema", okNoS == false and fNoS == false, true)
+  local _, okSv, _, fSv = run("systemone", chat, "s1var", "--variant baseline")
+  check("runner: System One refuses a --variant it would not send", okSv == false and fSv == false, true)
+  local rsd = run("systemone", chat, "s1disc", "--variant discriminate")
+  check("runner: and records discriminate, the instructions it sends", rsd.variant, "discriminate")
+  local _, okCm, _, fCm = run("completion", chat, "cmodel", "--model foo")
+  check("runner: a completion run refuses --model, which no request carries", okCm == false and fCm == false, true)
+  local _, okSt, _, fSt = run("systemone", chat, "s1temp", "--temperature 0.5")
+  local _, okCr, _, fCr = run("completion", chat, "creason", "--reasoning-effort low")
+  check("runner: sampling flags are refused where no request carries them",
+    okSt == false and fSt == false and okCr == false and fCr == false, true)
   check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)
   check("runner: and binds the input it answered, as the scorer hashes it",
     rc.snapshotHash ~= nil and rc.snapshotHash == sc.stepHash(ep.steps[1]), true)
@@ -1786,7 +2871,7 @@ printf '0.010'
 local match, mode = os.getenv("FAIL_MATCH"), os.getenv("FAIL_MODE")
 local realOpen = io.open
 io.open = function(path, m)
-  local f, e = realOpen(path, m)
+  local f, e, c = realOpen(path, m)
   if f and m == "w" and match and tostring(path):find(match) then
     local proxy = {}
     function proxy:write(...)
@@ -1800,7 +2885,7 @@ io.open = function(path, m)
     end
     return proxy
   end
-  return f, e
+  return f, e, c
 end
 arg[0] = "eval/bakeoff.lua"
 dofile("eval/bakeoff.lua")

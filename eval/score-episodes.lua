@@ -465,9 +465,6 @@ function M.loadDecisions(path, keyPath)
   return out, n, noP, invalid
 end
 
--- How many of the episodes' decision points carry no recorded decision
--- (scored as the deterministic freeze, so a short or mismatched file makes
--- a model look like always-freeze there). Returns missing, total.
 -- The hash a recorded decision carries of the input it answered: the
 -- step's snapshot as the episode file holds it. The runner computes the
 -- same (eval/bakeoff.lua, episodes mode); the end-to-end test pins that the
@@ -495,6 +492,9 @@ function M.contentCheck(episodes, decisions)
   return mismatched, unchecked
 end
 
+-- How many of the episodes' decision points carry no recorded decision
+-- (scored as the deterministic freeze, so a short or mismatched file makes
+-- a model look like always-freeze there). Returns missing, total.
 function M.coverage(episodes, decisions)
   local missing, total = 0, 0
   for _, ep in ipairs(episodes) do
@@ -647,14 +647,69 @@ end
 -- scoring and the gate
 ------------------------------------------------------------------------------
 
+-- An episode's identity, for the duplicate and overlap checks: its inputs
+-- (each step's time and snapshot) and its outcome labels. The inputs alone,
+-- so a field a later generator adds to a step (alertSeq, say) cannot make an
+-- older copy of the same episode look new.
+function M.fingerprint(ep)
+  local L = ep.labels or {}
+  local inputs = {}
+  for i, st in ipairs(ep.steps or {}) do inputs[i] = { t = st.t, snapshot = st.snapshot } end
+  return lfm.jsonEncode({ steps = lfm.jsonArray(inputs), class = L.class, runaway = L.runaway,
+                          ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
+end
+
+-- Everything the replay reads from an episode: each step's time and
+-- snapshot, whether it starts a new alert, the floor's ticks, and the outcome
+-- labels. Two episodes alike in all of it are the same trajectory, whatever
+-- their ids or the template they are filed under (a copy relabeled to another
+-- template would otherwise count as another bootstrap group); two that differ
+-- in any of it can score apart (the same snapshots over different raw
+-- headroom, say), so a split may hold both. The replay reads an alert only as
+-- a change from the step before (M.play), so the identity holds that change,
+-- not the alert's number: a copy with its alerts renumbered is the same
+-- episode.
+function M.replayPrint(ep)
+  local L = ep.labels or {}
+  local steps = {}
+  for i, st in ipairs(ep.steps or {}) do
+    local prev = ep.steps[i - 1]
+    steps[i] = { t = st.t, newAlert = i > 1 and st.alertSeq ~= prev.alertSeq, snapshot = st.snapshot }
+  end
+  return lfm.jsonEncode({ steps = lfm.jsonArray(steps), floorTicks = lfm.jsonArray(ep.floorTicks or {}),
+                          class = L.class, runaway = L.runaway, ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
+end
+
+-- Every episode in a directory, each once: a copied file (the same episode
+-- under another file name or id) would be scored twice, counting toward the
+-- decisive size and the miss bound, so a directory holding one is refused.
+-- Within a split, the same episode is the same id or the same replay inputs
+-- (M.replayPrint); across splits the overlap check reads the coarser
+-- M.fingerprint, which fails safe.
 function M.loadDir(dir)
   local eps = {}
+  local byId, byPrint = {}, {}
   local p = io.popen("ls '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null")
   for name in p:lines() do
     if name:match("%.json$") then
       local f = assert(io.open(dir .. "/" .. name, "r"))
-      eps[#eps + 1] = assert(lfm.jsonDecode(f:read("a")))
+      local ep = assert(lfm.jsonDecode(f:read("a")))
       f:close()
+      -- Every episode carries its id (the generator writes one): rows, keys
+      -- and the sort all read it.
+      if type(ep.id) ~= "string" or ep.id == "" then
+        p:close()
+        error(string.format("%s/%s carries no episode id (ids are non-empty strings)", dir, name), 0)
+      end
+      local fp = M.replayPrint(ep)
+      local first = byId[ep.id] or byPrint[fp]
+      if first then
+        p:close()
+        error(string.format("%s holds the same episode twice (%s and %s): score each episode once", dir, first, name), 0)
+      end
+      byId[ep.id] = name
+      byPrint[fp] = name
+      eps[#eps + 1] = ep
     end
   end
   p:close()
@@ -750,10 +805,13 @@ function M.decisiveRunaways(cfg)
   -- lo never meets the bound: under the zero-miss size (less two, for
   -- rounding) not even a set with no miss does. hi will.
   local lo = math.max(0, math.ceil(math.log(1 - conf) / math.log(1 - bound)) - 2)
+  -- The doubling stops at the cap, which is tried itself: a bound only a
+  -- larger set meets is refused, never answered past the cap.
+  local cap = 1 << 24
   local hi = lo + 1
   while not meets(hi) do
-    assert(hi < 2 ^ 24, "the miss bound is too small: no set of up to 2^24 runaways meets it with a miss")
-    lo, hi = hi, hi * 2
+    assert(hi < cap, "the miss bound is too small: no set of up to 2^24 runaways meets it with a miss")
+    lo, hi = hi, math.min(hi * 2, cap)
   end
   while hi - lo > 1 do
     local mid = (lo + hi) // 2
@@ -801,16 +859,25 @@ end
 -- CLI
 ------------------------------------------------------------------------------
 
+local USAGE = "usage: score-episodes.lua gate|controls|tau --dir <episodes> [--fit-dir <dev>] [--candidate <name>]"
+local COMMANDS = { gate = true, controls = true, tau = true }
+local KNOWN_FLAGS = { ["--dir"] = true, ["--fit-dir"] = true, ["--candidate"] = true, ["--out"] = true,
+                      ["--tree-depth"] = true, ["--decisions"] = true, ["--key"] = true, ["--tau"] = true,
+                      ["--prevalence"] = true }
 local function parse(argv)
   local a = { cmd = argv[1] }
+  local seen = {}
   local i = 2
   while i <= #argv do
     local k, v = argv[i], argv[i + 1]
-    -- Every flag takes a value: one missing (the last argument, or another
-    -- flag in its place) is refused, never read as unset.
-    if type(k) == "string" and k:match("^%-%-") and (v == nil or v:match("^%-%-")) then
-      error(k .. " needs a value", 0)
-    end
+    -- An unknown flag is named as one first. Every flag takes a value: one
+    -- missing (the last argument, or another flag in its place) is refused,
+    -- never read as unset. A flag given twice is refused too: which value
+    -- was meant is not this script's to guess.
+    if not KNOWN_FLAGS[k] then error("unknown argument " .. tostring(k), 0) end
+    if v == nil or v:match("^%-%-") then error(k .. " needs a value", 0) end
+    if seen[k] then error(tostring(k) .. " given twice", 0) end
+    seen[k] = true
     local function number(x) return assert(tonumber(x), k .. " must be a number, not " .. tostring(x)) end
     if k == "--dir" then a.dir = v elseif k == "--fit-dir" then a.fitDir = v
     elseif k == "--candidate" then a.candidate = v elseif k == "--out" then a.out = v
@@ -936,7 +1003,6 @@ function M.resolveCandidate(name, baselines, a)
   error("unknown candidate " .. name)
 end
 
--- Returns the exit status: 0, or 1 when the gate fails or a control does.
 -- Episodes carry the deferral bound their labels were computed under; a
 -- scorer playing the floor at another bound would score them by rules
 -- they were not labeled by. (An episode file without it predates the
@@ -952,9 +1018,69 @@ function M.checkDeferral(episodes, cfg)
   end
 end
 
+-- Clear a result path before a run writes one. Already absent is fine
+-- (errno 2, no such file). Only a gate result is ever cleared: --out may name
+-- the wrong path, so a file there that is not one (an episode, a script, a
+-- directory, a file that is not JSON or cannot be read) refuses the run
+-- untouched. A result that cannot be removed refuses it too, since an earlier
+-- result left there would read as this run's.
+-- A result is a few hundred bytes and the decoder takes at most 64 KB, so
+-- the clear reads at most 1 MB of what --out names: a large file named by
+-- mistake costs that much, never its size.
+local CLEAR_READ_MAX = 1048576
+function M.clearResult(path)
+  -- Opening a FIFO blocks (and a socket or a device is no result either),
+  -- so a path that is one is refused before anything opens it.
+  local q = "'" .. tostring(path):gsub("'", "'\\''") .. "'"
+  if os.execute(string.format("test -p %s || test -S %s || test -c %s || test -b %s", q, q, q, q)) == true then
+    error(string.format("cannot clear %s: it is not a regular file; only a gate result is cleared,"
+      .. " so remove it or name another path", path), 0)
+  end
+  local f, oerr, ocode = io.open(path, "r")
+  if not f and ocode == 2 then return end
+  local text, rerr
+  if f then
+    text, rerr = f:read(CLEAR_READ_MAX + 1)
+    -- (An empty file gives nothing at its end, and no error.)
+    if text == nil and rerr == nil then text = "" end
+    f:close()
+  end
+  local doc, derr = nil, nil
+  if text then doc, derr = lfm.jsonDecode(text) end
+  if not (type(doc) == "table" and type(doc.candidate) == "string" and type(doc.pass) == "boolean") then
+    local why = not f and ("it cannot be read: " .. tostring(oerr))
+      or not text and ("it cannot be read: " .. tostring(rerr))
+      or derr == "decode: input too large" and "it is over the 64 KB a result can be read at"
+      or derr and ("it is not a gate result: " .. derr)
+      or "it is not a gate result"
+    error(string.format("cannot clear %s: %s; only a gate result is cleared, so remove it or name another path",
+      path, why), 0)
+  end
+  local ok, err, code = os.remove(path)
+  if not ok and code ~= 2 then
+    error(string.format("cannot clear %s (%s): an earlier result left there would read as this run's",
+      path, tostring(err)), 0)
+  end
+end
+
+-- The CLI. Returns the exit status: 0 when the gate passes or the controls
+-- hold, 1 when the gate fails or a control does, 2 when the set is too small
+-- to decide (for the controls, or too weak to show the gate's power). A
+-- refusal raises, and the script then exits 3, so a refusal is never read as
+-- a verdict.
 function M.main(argv)
   local status = 0
+  -- The command first: an unknown one is a usage error, whatever follows it.
+  if not COMMANDS[argv[1]] then error(USAGE, 0) end
   local a = parse(argv)
+  -- A gate's result file is this run's or nothing. One left at the path by an
+  -- earlier run would read as this run's verdict if this one is refused or
+  -- fails to write, so once the arguments parse, the path is cleared before
+  -- anything else. (A command line that does not parse touches nothing.)
+  if a.cmd == "gate" and a.out then M.clearResult(a.out) end
+  -- Only the gate writes a result file: --out elsewhere would name a path
+  -- nothing writes, and a stale gate result there would stand unclaimed.
+  assert(a.out == nil or a.cmd == "gate", "--out applies to gate only")
   assert(a.dir, "--dir is required")
   local eps = M.loadDir(a.dir)
   assert(#eps > 0, "no episodes in " .. a.dir)
@@ -981,20 +1107,11 @@ function M.main(argv)
     -- label, or a copy with only its descriptive fields edited. Episodes
     -- are compared by their inputs and outcome labels, and by id, which
     -- fails safe.
-    -- The inputs alone (each step's time and snapshot), so a field a later
-    -- generator adds to a step (alertSeq, say) cannot make an older copy of
-    -- the same episode look new.
-    local function fingerprint(ep)
-      local L = ep.labels or {}
-      local inputs = {}
-      for i, st in ipairs(ep.steps or {}) do inputs[i] = { t = st.t, snapshot = st.snapshot } end
-      return lfm.jsonEncode({ steps = lfm.jsonArray(inputs), class = L.class, runaway = L.runaway,
-                              ttxSec = L.ttxSec, resolvesBySec = L.resolvesBySec })
-    end
+    -- (M.fingerprint: the inputs and the outcome labels.)
     local scored, scoredIds = {}, {}
-    for _, ep in ipairs(eps) do scored[fingerprint(ep)] = ep.id; scoredIds[ep.id] = true end
+    for _, ep in ipairs(eps) do scored[M.fingerprint(ep)] = ep.id; scoredIds[ep.id] = true end
     for _, ep in ipairs(fitEps) do
-      local twin = scored[fingerprint(ep)]
+      local twin = scored[M.fingerprint(ep)]
       assert(not twin and not scoredIds[ep.id], "--fit-dir holds " .. tostring(ep.id) .. ", the same episode as "
         .. tostring(twin or ep.id) .. " in the evaluated set")
     end
@@ -1036,13 +1153,25 @@ function M.main(argv)
     print(string.format("ttx baseline horizon (fit on the same split): %d s%s", horizon, certified and ""
       or " (no horizon can meet the miss bound on a split this small: fit on its fewest misses)"))
     if a.out then
-      local f = assert(io.open(a.out, "w"))
-      f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
-        bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
-        missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
-        nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
-        decisive = g.decisive, minRunaways = g.minRunaways })), "\n")
-      f:close()
+      -- A result that did not reach the disk (a full volume) fails the run:
+      -- the flush surfaces only at close, so both are checked. It is written
+      -- whole beside the path, then renamed onto it, so a file at the path is
+      -- always a whole result.
+      local partial = a.out .. string.format(".partial-%08x", math.random(0, 0x7fffffff))
+      local okW, errW = pcall(function()
+        local f = assert(io.open(partial, "w"))
+        assert(f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
+          bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
+          missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
+          nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
+          decisive = g.decisive, minRunaways = g.minRunaways })), "\n"))
+        assert(f:close())
+        assert(os.rename(partial, a.out))
+      end)
+      if not okW then
+        os.remove(partial)
+        error(errW, 0)
+      end
     end
   elseif a.cmd == "tau" then
     assert(a.decisions, "--decisions is required")
@@ -1061,32 +1190,34 @@ function M.main(argv)
   elseif a.cmd == "controls" then
     local gO = M.gate(eps, M.candidates["oracle"](), baselines)
     -- An undecidable set (too few runaways for a one-miss baseline to
-    -- qualify, or no baseline meeting the bound) fails the run, and says so
-    -- first: the gate passes nothing on it, so neither control is read.
+    -- qualify, or no baseline meeting the bound) exits 2, as the gate does,
+    -- and says so first: the gate passes nothing on it, so neither control is
+    -- read.
     if not gO.decisive then
       print(string.format("UNDECIDABLE: this set holds %d runaways, under the %d G7 decides on, so the controls"
         .. " are not read: generate more episodes per template", gO.candidate.nRunaway, gO.minRunaways))
-      status = 1
+      status = 2
     elseif not gO.bestBaseline then
       print("UNDECIDABLE: no baseline meets the miss bound on this set, so the gate compares against nothing"
         .. " and the controls are not read")
-      status = 1
+      status = 2
     else
       local gF = M.gate(eps, M.candidates["always-freeze"](), baselines)
       print(string.format("control always-freeze must FAIL: %s", gF.pass and "FAILED (gate passed it)" or "ok (failed)"))
       print(string.format("control oracle must PASS: %s", gO.pass and "ok (passed)" or "FAILED (gate failed it)"))
       if gF.pass or not gO.pass then status = 1 end
-      -- An underpowered set fails the run too.
+      -- An underpowered set is too weak to show the gate works: exit 2, unless
+      -- a control failed (1).
       local trials = 50
       local passes = M.powerControl(eps, baselines, gO.bestBaseline, trials)
       local powered = (passes / trials) >= M.cfg.powerTarget
       print(string.format("power: a candidate %.0f%% of the way from %s to the oracle passed %d/%d seeds (target >= %.0f%%): %s",
         M.cfg.powerShare * 100, gO.bestBaseline, passes, trials, M.cfg.powerTarget * 100,
         powered and "ok" or "UNDERPOWERED"))
-      if not powered then status = 1 end
+      if not powered and status == 0 then status = 2 end
     end
   else
-    error("usage: score-episodes.lua gate|controls|tau --dir <episodes> [--fit-dir <dev>] [--candidate <name>]")
+    error(USAGE, 0)
   end
   return status
 end
@@ -1099,7 +1230,14 @@ local function isScript()
 end
 
 if isScript() then
-  os.exit(M.main(arg))
+  -- A refusal (a bad flag, a set that cannot be read, decisions that do not
+  -- answer these episodes) exits 3, never 1, which is a gate that failed.
+  local ok, status = pcall(M.main, arg)
+  if not ok then
+    io.stderr:write("score-episodes: " .. tostring(status) .. "\n")
+    os.exit(3)
+  end
+  os.exit(status)
 end
 
 return M

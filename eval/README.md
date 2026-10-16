@@ -110,7 +110,7 @@ that decision.
   offender's trajectory from grace expiry, with decision points where
   production makes one: at grace expiry, then at each re-arm (the first
   tick a grace window or more after the last), as many as the deferral bound
-  allows (three at the defaults: the last is the floor's), while the
+  allows (three at the defaults: the last is the first past the bound), while the
   process is alive and production's own unattended gate is open (the alert
   unanswered for its
   grace window, the offender extreme by production's tracker, at the head
@@ -127,10 +127,16 @@ that decision.
   sample could not exist (one that would not fit the machine, say) refuses
   the run, naming the template and the seed.
 - `score-episodes.lua` plays a candidate through each episode the way
-  production defers, then applies G7: the one-sided 95% Clopper-Pearson
-  upper bound on missed runaways is at most 5%, and the wrongful-freeze
-  rate beats the best deterministic baseline that meets that bound (paired,
-  one-sided 95% lower bound above zero, bootstrapped by template). The
+  production defers. Past the deferral bound, production's floor decides
+  (`lfm.floorActs`): it freezes at or below 12% headroom, on headroom it
+  cannot read, or at its 600 s hold cap, at a decision point or on any tick
+  after a held wait where a decision could act (each episode records each
+  tick's raw headroom for this); otherwise the wait holds, and a wait still
+  held when the episode ends is no freeze. Then it applies G7: the
+  one-sided 95% Clopper-Pearson upper bound on missed runaways is at most
+  5%, and the wrongful-freeze rate beats the best deterministic baseline
+  that meets that bound (paired, one-sided 95% lower bound above zero,
+  bootstrapped by template). The
   baselines are always-freeze, a category rule, a time-to-exhaustion rule
   and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
   required, holding runaways and savables and none of the evaluated

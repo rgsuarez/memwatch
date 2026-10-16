@@ -119,17 +119,20 @@ end
 do
   local ep3 = { id = "e3", labels = { class = "savable", runaway = false, resolvesBySec = 150 },
                 steps = { { t = 0, snapshot = {} }, { t = 60, snapshot = {} }, { t = 120, snapshot = {} } } }
+  -- No headroom recorded: the floor cannot read it, so it acts at the bound.
   local res = sc.play(ep3, function() return "wait" end)
   check("play: waits until the floor freezes at 120", res.freezeAt, 120)
   check("play: the floor is the actor", res.by, "floor")
-  -- The headroom-gated floor variant spares a savable still waiting with room.
+  check("play: on headroom it cannot read", res.why, "unknown-headroom")
+  -- The floor's threshold is the scorer's cfg (here 10, under production's
+  -- 12): a wait with 11% left holds, and one with 9% is frozen.
   local ep3r = { id = "e3r", labels = { class = "savable", runaway = false, resolvesBySec = 150 },
                  steps = { { t = 0, snapshot = { availPct = 30 } }, { t = 60, snapshot = { availPct = 28 } },
-                           { t = 120, snapshot = { availPct = 25 } } } }
-  local gated = { deferralSec = 120, floorMaxAvailPct = 10 }
-  check("play: a headroom-gated floor does not fire with room", sc.play(ep3r, function() return "wait" end, gated).freezeAt, nil)
+                           { t = 120, snapshot = { availPct = 11 } } } }
+  local gated = { deferralSec = 120, floorAvailPct = 10 }
+  check("play: the floor holds a wait above its threshold", sc.play(ep3r, function() return "wait" end, gated).freezeAt, nil)
   ep3r.steps[3].snapshot.availPct = 9
-  check("play: and fires once headroom is gone", sc.play(ep3r, function() return "wait" end, gated).freezeAt, 120)
+  check("play: and acts at or below it", sc.play(ep3r, function() return "wait" end, gated).freezeAt, 120)
   local ep2 = { id = "e2", labels = { class = "savable" }, steps = { { t = 0, snapshot = {} }, { t = 60, snapshot = {} } } }
   check("play: resolved before 120 means no freeze", sc.play(ep2, function() return "wait" end).freezeAt, nil)
   check("play: first freeze ends the episode", sc.play(ep3, function() return "freeze" end).freezeAt, 0)
@@ -179,6 +182,46 @@ do
   end
   check("tree: separable toy set fit exactly", wrong, 0)
   check("tree: description names the split", sc.describeTree(tree):find("availPct", 1, true) ~= nil, true)
+end
+
+-- ---- the replay's floor is production's (lfm.floorActs) ----
+do
+  -- Three decision points, the alert unbroken, and the per-tick headroom the
+  -- floor reads; a tick listed false is one no decision could act on.
+  local function fep(ticks, class, ttx)
+    local steps, ft = {}, {}
+    for _, t in ipairs({ 0, 60, 120 }) do steps[#steps + 1] = { t = t, alertSeq = 1, snapshot = {} } end
+    for _, k in ipairs(ticks) do ft[#ft + 1] = { t = k[1], avail = k[2], open = k[3] ~= false } end
+    return { id = "f", labels = { class = class or "runaway", ttxSec = ttx }, steps = steps, floorTicks = ft }
+  end
+  local function waitAll() return "wait", 0 end
+  local function at(r) return tostring(r.freezeAt) .. "/" .. tostring(r.why) end
+  -- Above the threshold at the bound, the floor holds; a runaway that
+  -- exhausts the machine before the next tick is then missed.
+  local above = fep({ { 0, 40 }, { 60, 30 }, { 120, 13.9 }, { 125, 4, false } }, "runaway", 121.6)
+  local r1 = sc.play(above, waitAll)
+  check("floor: above the threshold at the bound it holds", r1.freezeAt, nil)
+  check("floor: so a runaway exhausting before the next tick is missed", sc.outcome(above, r1).missed, true)
+  check("floor: at or below it at the bound, it acts there",
+    at(sc.play(fep({ { 0, 40 }, { 60, 30 }, { 120, 11 } }), waitAll)), "120/headroom")
+  check("floor: on headroom it cannot read at the bound, it acts",
+    at(sc.play(fep({ { 0, 40 }, { 60, 30 } }), waitAll)), "120/unknown-headroom")
+  local r4 = sc.play(fep({ { 0, 40 }, { 60, 30 }, { 120, 14 }, { 125, 13 }, { 130, 11.5 }, { 135, 10 } }), waitAll)
+  check("floor: held at the bound, it acts the tick headroom crosses the threshold", at(r4), "130/headroom")
+  check("floor: its reason is production's on the same inputs",
+    lfm.floorActs({ firstAt = 0 }, { availKnown = true, availPct = 11.5 }, 130), r4.why)
+  check("floor: a tick no decision could act on is skipped",
+    sc.play(fep({ { 0, 40 }, { 60, 30 }, { 120, 14 }, { 125, 11, false }, { 130, 10 } }), waitAll).freezeAt, 130)
+  check("floor: with a bound of 0 it decides at the first wait, as production's step does",
+    sc.play(fep({ { 0, 5 }, { 60, 30 } }), waitAll, { deferralSec = 0 }).freezeAt, 0)
+  check("floor: a threshold of 0 acts at the bound whatever the headroom",
+    at(sc.play(fep({ { 0, 40 }, { 60, 30 }, { 120, 60 } }), waitAll, { floorAvailPct = 0 })), "120/no-floor")
+  -- The episode ends where the next decision would come: a wait held there
+  -- is no freeze, whatever that tick reads.
+  check("floor: the every-tick check ends a grace window after the held decision",
+    sc.play(fep({ { 0, 40 }, { 60, 30 }, { 120, 14 }, { 180, 5 } }), waitAll).freezeAt, nil)
+  check("floor: its hold cap acts whatever the headroom",
+    at(sc.play(fep({ { 0, 40 }, { 60, 30 }, { 120, 60 } }), waitAll, { maxHoldSec = 120 })), "120/hold-cap")
 end
 
 -- ---- the floor's ticks: what production's every-tick check reads ----
@@ -305,9 +348,13 @@ do
   local heldTimes = {}
   for _, st in ipairs(held and held.steps or {}) do heldTimes[#heldTimes + 1] = st.t end
   check("deferral: a bound between re-arms keeps the floor's decision point", table.concat(heldTimes, ","), "0,60,120")
-  local heldRes = held and sc90.play(held, function() return "wait", 0 end) or {}
-  check("deferral: there the floor freezes what waited all through",
-    tostring(heldRes.freezeAt) .. "/" .. tostring(heldRes.by), "120/floor")
+  local function waitAll() return "wait", 0 end
+  local heldOff = held and sc90.play(held, waitAll, { deferralSec = 90, floorAvailPct = 0 }) or {}
+  check("deferral: there a floor acting at the bound freezes what waited all through",
+    tostring(heldOff.freezeAt) .. "/" .. tostring(heldOff.by), "120/floor")
+  -- Production's floor holds a wait that keeps its headroom (here about 28%).
+  local heldOn = held and sc90.play(held, waitAll) or {}
+  check("deferral: production's floor holds it, its headroom above the threshold", heldOn.freezeAt, nil)
   check("deferral: and are 3 and 180 s by default", gen.cfg.decisionsMax .. "/" .. gen.cfg.horizonSec, "3/180")
   check("deferral: a generated episode records its bound",
     gen.episode(dofile("eval/episode-templates.lua")[1], 1, "test").params.deferralSec, sc.cfg.deferralSec)
@@ -1346,7 +1393,8 @@ do
   check("cli: and a threshold chosen on dev",
     okNoTau == false and tostring(errNoTau):find("--tau", 1, true) ~= nil, true)
   -- Rows must cover every decision point: confident waits on the savables
-  -- alone would otherwise pass, every runaway scored as the floor's freeze.
+  -- alone would otherwise pass, each runaway's points standing uncovered as
+  -- the deterministic freeze.
   local function rowsFile(keep, hashOf)
     local path = os.tmpname()
     local rf = assert(io.open(path, "w"))

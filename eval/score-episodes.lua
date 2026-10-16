@@ -3,10 +3,14 @@
 --
 -- A candidate is played through each episode the way production defers:
 -- at each decision point (grace expiry, then each re-arm) it says freeze or
--- wait; the first freeze ends the episode; a wait defers, but once the
--- deferral bound has elapsed since the first wait the deterministic floor
--- supersedes a wait with its freeze. As in production, the candidate is
--- asked first, so a freeze it makes itself is its own, never the floor's.
+-- wait; the first freeze ends the episode; a wait defers, and once the
+-- deferral bound has elapsed since the first wait, production's floor
+-- decides (lfm.floorActs): it freezes at or below its headroom threshold,
+-- on headroom it cannot read, or at its hold cap, at a decision point or on
+-- any open tick after a held wait; otherwise the wait holds. A wait still
+-- held when the episode ends is no freeze. As in production, the candidate
+-- is asked first, so a freeze it makes itself is its own, never the
+-- floor's.
 -- Outcomes, from the simulator's labels:
 --
 --   missed runaway   a runaway whose first freeze lands after ttxSec (or never)
@@ -35,11 +39,18 @@
 
 package.path = "lua/?.lua;eval/?.lua;" .. package.path
 local lfm = require("memwatch_lfm")
+local core = require("memwatch_core")
 
 local M = {}
 
 M.cfg = {
   deferralSec  = lfm.cfg.maxDeferSec,   -- production's deferral bound (its default)
+  -- production's deferral floor past the bound (lfm.floorActs): the headroom
+  -- it acts at or below (0 acts at the bound), the hold cap, and the grace
+  -- window its every-tick check runs within after a held wait
+  floorAvailPct = lfm.cfg.floorAvailPct,
+  maxHoldSec   = lfm.cfg.maxHoldSec,
+  graceSec     = core.cfg.cool.autoKillGraceSec,
   missBound    = 0.05,
   confidence   = 0.95,
   bootstrap    = 2000,
@@ -77,12 +88,55 @@ M.rng = rng
 -- play one episode
 ------------------------------------------------------------------------------
 
+-- Production's deferral floor (lfm.floorActs), the one function the live
+-- step asks: past the bound it acts at or below floorAvailPct of headroom,
+-- on headroom it cannot read, or once maxHoldSec has run since the first
+-- wait; otherwise the wait holds. Returns why it acts, or nil.
+local function floorWhy(firstAt, avail, now, cfg)
+  return lfm.floorActs({ firstAt = firstAt }, { availKnown = avail ~= nil, availPct = avail }, now,
+    { floorAvailPct = cfg.floorAvailPct or M.cfg.floorAvailPct, maxHoldSec = cfg.maxHoldSec or M.cfg.maxHoldSec })
+end
+
 -- decide(step, ep) -> "freeze" | "wait", pFreeze (optional number)
+-- The candidate is asked at each decision point, and production's floor
+-- decides as production's does: at a decision point past the bound, on the
+-- headroom of that tick; and, once a wait is held past the bound, on every
+-- open tick after it until the next decision point (within a grace window
+-- of the held decision), reading each tick's raw headroom from the
+-- episode's floorTicks. An episode without them is read on its decision
+-- points alone, from each step's snapshot.
 function M.play(ep, decide, cfg)
   cfg = cfg or M.cfg
-  local firstWaitT, seq = nil, nil
+  -- A partial cfg (a test's) takes the scorer's defaults for what it leaves out.
+  local bound, grace = cfg.deferralSec or M.cfg.deferralSec, cfg.graceSec or M.cfg.graceSec
+  local firstWaitT, seq, heldAt = nil, nil, nil
   local trace = {}
+  local byT = {}
+  for _, k in ipairs(ep.floorTicks or {}) do byT[k.t] = k end
+  local function headroomAt(st)
+    local k = byT[st.t]
+    if k then return k.avail end
+    return st.snapshot and st.snapshot.availPct or nil
+  end
+  local function floorTick(untilT)
+    if heldAt == nil then return nil end
+    local stop = math.min(untilT, heldAt + grace)
+    for _, k in ipairs(ep.floorTicks or {}) do
+      if k.t > heldAt and k.t < stop and k.open == true then
+        local why = floorWhy(firstWaitT, k.avail, k.t, cfg)
+        if why then return k.t, why end
+      end
+    end
+    return nil
+  end
+  local function floorFreeze(t, why, p)
+    trace[#trace + 1] = { t = t, act = "freeze", by = "floor", why = why, p = p }
+    return { freezeAt = t, by = "floor", why = why, trace = trace }
+  end
   for i, st in ipairs(ep.steps) do
+    local ft, fwhy = floorTick(st.t)
+    if ft then return floorFreeze(ft, fwhy) end
+    heldAt = nil
     -- A decision under a new alert starts a new sequence, as production's
     -- episode reset does once an alert settles: the deferral starts over.
     if i > 1 and st.alertSeq ~= seq then firstWaitT = nil end
@@ -92,23 +146,18 @@ function M.play(ep, decide, cfg)
       trace[#trace + 1] = { t = st.t, act = act, p = p }
       return { freezeAt = st.t, by = "candidate", trace = trace }
     end
-    -- The deterministic floor: once the deferral bound has elapsed since the
-    -- first wait, a wait is superseded by the freeze. cfg.floorMaxAvailPct
-    -- (unset = always) is the proposed contract variant: the floor fires
-    -- only while headroom is at or below that level, and otherwise the
-    -- candidate keeps deciding.
-    local floorDue = firstWaitT and (st.t - firstWaitT) >= cfg.deferralSec
-    if floorDue and cfg.floorMaxAvailPct
-       and (st.snapshot and st.snapshot.availPct or 0) > cfg.floorMaxAvailPct then
-      floorDue = false
-    end
-    if floorDue then
-      trace[#trace + 1] = { t = st.t, act = "freeze", by = "floor", p = p }
-      return { freezeAt = st.t, by = "floor", trace = trace }
+    -- A wait, folded into the deferral as production's step folds it: the
+    -- bound runs from the first wait (this one, if it is the first).
+    firstWaitT = firstWaitT or st.t
+    if (st.t - firstWaitT) >= bound then
+      local why = floorWhy(firstWaitT, headroomAt(st), st.t, cfg)
+      if why then return floorFreeze(st.t, why, p) end
+      heldAt = st.t
     end
     trace[#trace + 1] = { t = st.t, act = act, p = p }
-    firstWaitT = firstWaitT or st.t
   end
+  local ft, fwhy = floorTick(math.huge)
+  if ft then return floorFreeze(ft, fwhy) end
   return { freezeAt = nil, by = nil, trace = trace }
 end
 
@@ -615,9 +664,11 @@ end
 
 function M.score(episodes, decide, cfg)
   cfg = cfg or M.cfg
-  -- wrongfulByFloor: savables frozen by the deterministic floor rather than
-  -- the candidate (a bystander still latched extreme at the deferral bound);
-  -- no candidate can prevent those, so they cancel in a paired comparison.
+  -- wrongfulByFloor: savables frozen by the deferral floor rather than the
+  -- candidate (a bystander still latched extreme past the bound with its
+  -- headroom at or below the floor's threshold); a candidate's wait cannot
+  -- prevent those, and freezing earlier is wrongful too, so they cancel in a
+  -- paired comparison.
   local s = { nRunaway = 0, nSavable = 0, nLate = 0, misses = 0, wrongful = 0,
               wrongfulByFloor = 0, perEpisode = {}, perFamily = {}, perCategory = {} }
   for _, ep in ipairs(episodes) do

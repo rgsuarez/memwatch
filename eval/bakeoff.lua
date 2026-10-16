@@ -106,8 +106,10 @@ end
 -- Remote auth: the bearer key comes from an environment variable (or, for
 -- older invocations, a key file) and goes into a 0600 header file inside a
 -- private mktemp directory; curl attaches it with -H @file, so the key never
--- appears on a command line, and the file is removed on every exit path,
--- errors included. No key: fn(nil).
+-- appears on a command line. The file is removed when the run returns or
+-- raises an error. A signal that kills the process (Ctrl-C, SIGTERM) skips
+-- that cleanup, and the file then stays behind in its 0700 directory under
+-- the system temp root until that is cleared. No key: fn(nil).
 local function readKey(args)
   if args.api_key_env then
     local key = os.getenv(args.api_key_env)
@@ -125,12 +127,20 @@ local function readKey(args)
   return nil
 end
 
-local function withAuthHeader(key, fn)
-  if not key then return fn(nil) end
+-- A private scratch directory: mktemp -d creates it atomically, mode 0700,
+-- under a name no other process holds, so nothing in it is ever shared
+-- between two invocations.
+local function privateDir()
   local mp = assert(io.popen("mktemp -d"))
   local dir = mp:read("l")
   mp:close()
   assert(dir and dir:match("^/"), "mktemp -d failed")
+  return dir
+end
+
+local function withAuthHeader(key, fn)
+  if not key then return fn(nil) end
+  local dir = privateDir()
   local hdr = dir .. "/auth"
   local f = assert(io.open(hdr, "w"))
   f:write("Authorization: Bearer " .. key .. "\n")
@@ -385,7 +395,10 @@ end
 -- not only until the first freeze, so the rail's threshold can be swept on
 -- dev without asking the model again. A chat model's terminate counts as
 -- freeze (no model holds terminate authority; the freeze ceiling caps it);
--- an invalid reply records the deterministic freeze. Chat verdicts carry no
+-- an invalid reply records the deterministic freeze. Rows record the
+-- model's own call: the replay applies only the wait rail, the
+-- configuration a candidate is gated for, not the chat path's confidence
+-- floor (which turns a low-confidence freeze into a deferral). Chat verdicts carry no
 -- P(wait) (a self-reported confidence never qualifies for the wait rail);
 -- decision models carry their option probability, and --api completion
 -- reads a local model's own token probability for the action value (the
@@ -405,19 +418,24 @@ local function episodesMode(args)
     "--api must be chat, systemone or completion")
   local variant = args.variant or "discriminate"
   local out = args.out or string.format("eval/results/episodes-%s-%s.jsonl", label, api)
+  -- One run's decisions per file: another run's file is never truncated.
+  local prior = io.open(out, "r")
+  if prior then prior:close(); error(out .. " exists; name another --out or remove it", 0) end
   local timeout = tonumber(args.timeout) or 60
   os.execute("mkdir -p eval/results eval/tmp")
   local files = listScenarios(dir)
   assert(#files > 0, "no episodes found in " .. dir)
   local systemPrompt = lfm.buildSystemPrompt({ variant = variant })
-  local tag = (label .. "-" .. api .. "-" .. tostring(os.time())):gsub("[^%w%-]", "_")
-  local reqPath = "eval/tmp/ereq-" .. tag .. ".json"
-  local respPath = "eval/tmp/eresp-" .. tag .. ".json"
+  -- This invocation's own private scratch directory: two runs never share
+  -- a request or a reply, whatever their label, API or start second.
+  local key = readKey(args)
+  local scratch = privateDir()
+  local reqPath, respPath = scratch .. "/req.json", scratch .. "/resp.json"
+  local tmplPath = scratch .. "/tmpl.json"
   local url = server .. ((api == "systemone") and "/v1/systemone"
     or (api == "completion") and "/completion" or "/v1/chat/completions")
-  local tmplPath = "eval/tmp/etmpl-" .. tag .. ".json"
   local n, valid = 0, 0
-  withAuthHeader(readKey(args), function(hdr)
+  local ok, runErr = pcall(withAuthHeader, key, function(hdr)
     local of = assert(io.open(out, "w"))
     for _, fname in ipairs(files) do
       local ep = assert(lfm.jsonDecode(readFile(dir .. "/" .. fname)))
@@ -448,11 +466,15 @@ local function episodesMode(args)
           local v, perr = lfm.parseSystemOne(resp)
           if v then action, pWait = v.action, v.pWait else err = perr end
         elseif api == "completion" then
-          local v, perr = body and lfm.parseTokenProbs(resp)
-          if v then
-            action, pWait = (v.action == "wait") and "wait" or "freeze", v.pWait
+          if not body then
+            err = "apply-template failed"
           else
-            err = body and perr or "apply-template failed"
+            local v, perr = lfm.parseTokenProbs(resp)
+            if v then
+              action, pWait = (v.action == "wait") and "wait" or "freeze", v.pWait
+            else
+              err = perr
+            end
           end
           if wallMs >= 0 and tmplMs and tmplMs >= 0 then wallMs = wallMs + tmplMs end
         else
@@ -472,6 +494,8 @@ local function episodesMode(args)
   os.remove(reqPath)
   os.remove(respPath)
   os.remove(tmplPath)
+  os.execute("rmdir " .. shellQuote(scratch))
+  if not ok then error(runErr, 0) end
   io.write(string.format("%s/%s: %d decision points, %d valid -> %s\n", label, api, n, valid, out))
 end
 
@@ -676,15 +700,21 @@ end
 
 ------------------------------------------------------------------------------
 
-local args = parseArgs(arg)
-local mode = args.positional[1] or "run"
-if mode == "run" then
-  runMode(args)
-elseif mode == "episodes" then
-  episodesMode(args)
-elseif mode == "gates" then
-  gatesMode(args)
-else
-  io.stderr:write("usage: lua eval/bakeoff.lua run|episodes|gates [options]\n")
-  os.exit(2)
+-- Run as a script. Loaded as a module (by the tests), it exports its
+-- scratch allocator and the episodes mode.
+if arg and arg[0] and arg[0]:match("bakeoff%.lua$") then
+  local args = parseArgs(arg)
+  local mode = args.positional[1] or "run"
+  if mode == "run" then
+    runMode(args)
+  elseif mode == "episodes" then
+    episodesMode(args)
+  elseif mode == "gates" then
+    gatesMode(args)
+  else
+    io.stderr:write("usage: lua eval/bakeoff.lua run|episodes|gates [options]\n")
+    os.exit(2)
+  end
 end
+
+return { privateDir = privateDir, episodes = episodesMode }

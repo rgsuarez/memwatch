@@ -496,6 +496,27 @@ do
   check("corpus names: each keeps its category", table.concat(wrong, "; "), "")
 end
 
+-- ---- the runner's scratch and output ----
+do
+  local bk = require("bakeoff")
+  local a, b = bk.privateDir(), bk.privateDir()
+  check("runner scratch: two invocations never share a directory", a ~= b, true)
+  check("runner scratch: each is a directory", os.execute("test -d '" .. a .. "' && test -d '" .. b .. "'") == true, true)
+  os.execute("rmdir '" .. a .. "' '" .. b .. "'")
+  -- An existing output file is refused before anything runs, never truncated.
+  local out = os.tmpname()
+  local f = assert(io.open(out, "w"))
+  f:write("another run's rows\n")
+  f:close()
+  local ok, err = pcall(bk.episodes, { positional = {}, label = "x", dir = "eval/episodes-none", out = out })
+  local kept = io.open(out, "r")
+  local body = kept and kept:read("a")
+  if kept then kept:close() end
+  os.remove(out)
+  check("runner output: an existing file is refused", ok == false and tostring(err):find("exists", 1, true) ~= nil, true)
+  check("runner output: and left as it was", body, "another run's rows\n")
+end
+
 if fails == 0 then
   print("\nALL PASS")
 else

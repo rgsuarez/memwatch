@@ -145,6 +145,10 @@ local OWN_UID = 501
 -- never freezes them, so no decision of a candidate's changes their fate.
 local SYSTEM_OWNED = { mds_stores = 308, mds = 0, backupd = 0, ["backupd-helper"] = 0, logd = 0, WindowServer = 88 }
 function M.ownerOf(name) return SYSTEM_OWNED[procs.friendlyName(name)] or OWN_UID end
+-- Production's policy gate on this name: may it freeze the process at all?
+function M.policyAllows(name)
+  return core.killAllowed({ pid = PID, uid = M.ownerOf(name), comm = name }, OWN_UID, 1) == true
+end
 
 -- Footprint at time t (MB). Before t = 0: the base, then the climb at the
 -- template's peak rate on which the detector first tags the offender
@@ -479,7 +483,7 @@ function M.episode(tpl, seed, split, cfg)
   -- An offender production's policy gate refuses (another user's process,
   -- or a denylisted name) is never frozen, whatever a candidate says: no
   -- episode.
-  local allowed = core.killAllowed({ pid = PID, uid = M.ownerOf(p.name), comm = p.name }, OWN_UID, 1)
+  local allowed = M.policyAllows(p.name)
   for _, t in ipairs(allowed and M.decisionTimes(ticks, cfg) or {}) do
     -- alertSeq: which alert the decision belongs to. Production starts a
     -- new decision sequence (its deferral included) once an alert settles,
@@ -490,6 +494,7 @@ function M.episode(tpl, seed, split, cfg)
     id = string.format("%s-%s-s%d", split, tpl.id, seed),
     template = tpl.id, split = split, family = tpl.family,
     intendedClass = tpl.class,
+    policyRefused = (not allowed) or nil,   -- never written: such an episode has no step
     labels = {
       class = sim.class, runaway = sim.runaway,
       ttxSec = sim.ttxSec, resolvesBySec = sim.resolvesBySec,
@@ -540,15 +545,24 @@ function M.main(argv)
   -- Every episode is built before anything is written, so a refusal (a
   -- template whose sample cannot exist) leaves no partial split behind.
   local counts = { runaway = 0, savable = 0, late = 0 }
-  local eps, noStep = {}, 0
+  local eps, noStep, refused = {}, 0, 0
   for _, tpl in ipairs(templates) do
     if tpl.split == nil or tpl.split == a.split then
+      -- A template none of whose names production's policy would freeze can
+      -- yield no episode: a template defect, refused rather than dropped.
+      local anyAllowed = false
+      for _, n in ipairs(tpl.names) do anyAllowed = anyAllowed or M.policyAllows(n) end
+      if not anyAllowed then
+        error(string.format("%s: production's policy never freezes any of its names (%s), so it yields no episode",
+          tostring(tpl.id), table.concat(tpl.names, ", ")), 0)
+      end
       for k = 1, a.per do
         local seed = a.seed * 1000 + k
         local ok, ep = pcall(M.episode, tpl, seed, a.split)
         if not ok then error(string.format("%s seed %d: %s", tostring(tpl.id), seed, tostring(ep)), 0) end
         if #ep.steps == 0 then
           noStep = noStep + 1   -- no decision point would ever exist; not an episode
+          if ep.policyRefused then refused = refused + 1 end
         else
           eps[#eps + 1] = { id = ep.id, enc = assert(lfm.jsonEncode(ep)) }
           counts[ep.labels.class] = counts[ep.labels.class] + 1
@@ -578,8 +592,9 @@ function M.main(argv)
     os.execute("rm -rf " .. quote(stage))
     error("writing the split failed, nothing published: " .. tostring(err), 0)
   end
-  print(string.format("wrote %d episodes to %s (runaway %d, savable %d, late %d; %d samples had no decision point)",
-    #eps, a.out, counts.runaway, counts.savable, counts.late, noStep))
+  print(string.format("wrote %d episodes to %s (runaway %d, savable %d, late %d; %d samples had no decision point, "
+    .. "%d of them a process production's policy never freezes)",
+    #eps, a.out, counts.runaway, counts.savable, counts.late, noStep, refused))
 end
 
 if arg and arg[0] and arg[0]:match("gen%-episodes%.lua$") then

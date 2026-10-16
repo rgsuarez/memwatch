@@ -656,8 +656,11 @@ local function episodesMode(args)
     local text = readFile(dir .. "/" .. fname)
     if text == nil then error(string.format("%s/%s cannot be read", dir, fname), 0) end
     local ep, why = lfm.jsonDecode(text)
-    if type(ep) ~= "table" then
-      error(string.format("%s/%s is not an episode (%s)", dir, fname, tostring(why or "not a JSON object")), 0)
+    -- (The decoder marks a JSON array, which is a table too.)
+    local array = type(ep) == "table" and (getmetatable(ep) or {}).__jsonarray == true
+    if type(ep) ~= "table" or array then
+      error(string.format("%s/%s is not an episode (%s)", dir, fname,
+        tostring(why or (array and "a JSON array" or "not a JSON object"))), 0)
     end
     if type(ep.id) ~= "string" or ep.id == "" then
       error(string.format("%s/%s carries no episode id (ids are non-empty strings)", dir, fname), 0)

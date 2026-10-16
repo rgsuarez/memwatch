@@ -2411,6 +2411,23 @@ if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.01
   local _, okBadEp, _, fBadEp, saidBadEp = run("chat", chat, "badep", nil, nil, badDir)
   check("runner: an episode file that is not JSON is named as such, before any row",
     okBadEp == false and fBadEp == false and saidBadEp:find("is not an episode", 1, true) ~= nil, true)
+  local scalarDir, unreadDir = root .. "/eps-scalar", root .. "/eps-unread"
+  os.execute("mkdir -p '" .. scalarDir .. "' '" .. unreadDir .. "/x.json'")
+  local scf2 = assert(io.open(scalarDir .. "/x.json", "w"))
+  scf2:write("42\n")
+  scf2:close()
+  local _, okScalar, _, _, saidScalar = run("chat", chat, "scalar", nil, nil, scalarDir)
+  check("runner: a JSON value that is not an object is no episode", okScalar == false and saidScalar:find("is not an episode", 1, true) ~= nil, true)
+  local arrayDir = root .. "/eps-array"
+  os.execute("mkdir -p '" .. arrayDir .. "'")
+  local arf = assert(io.open(arrayDir .. "/x.json", "w"))
+  arf:write("[]\n")
+  arf:close()
+  local _, okArray, _, _, saidArray = run("chat", chat, "array", nil, nil, arrayDir)
+  check("runner: and a JSON array is named as one",
+    okArray == false and saidArray:find("is not an episode (a JSON array)", 1, true) ~= nil, true)
+  local _, okUnread, _, _, saidUnread = run("chat", chat, "unread", nil, nil, unreadDir)
+  check("runner: an episode file that cannot be read says so", okUnread == false and saidUnread:find("cannot be read", 1, true) ~= nil, true)
   local _, okRetryArg = run("chat", chat, "badretries", "--retries -1")
   check("runner: a negative --retries is refused", okRetryArg, false)
   -- A flag the mode would not send is refused before any row.

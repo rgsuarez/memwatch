@@ -1258,6 +1258,12 @@ dofile("eval/score-episodes.lua")
       and fifoSaid:find("it is not a regular file", 1, true) ~= nil and os.execute("test -p " .. q(fifoOut)) == true, true)
     os.remove(fifoOut)
   end
+  -- A device at --out is refused by its type, as no regular file.
+  do
+    local okDev, errDev = pcall(sc.clearResult, "/dev/null")
+    check("cli: a device at --out is refused by its type", okDev == false
+      and tostring(errDev):find("it is not a regular file", 1, true) ~= nil, true)
+  end
   -- A gate result whose removal fails (injected) refuses the clear, the
   -- result kept: an earlier verdict must never stand as this run's.
   do
@@ -1599,6 +1605,16 @@ printf '0.010 %s ip=%s' "$status" "${FAKE_REMOTE_IP-127.0.0.1}"
     fh:close()
     check("runner: a FIFO at --out is refused at once, and kept", fifoSaid:find("it is not a regular file", 1, true) ~= nil
       and fifoSaid:find("exit=0", 1, true) == nil and os.execute("test -p '" .. fifoOut .. "'") == true, true)
+    -- So is a symlink to one: the type is the link's target's.
+    local linkOut = root .. "/fifo-link.json"
+    os.execute("ln -s '" .. fifoOut .. "' '" .. linkOut .. "'")
+    local lh = io.popen(string.format("PATH='%s':\"$PATH\" perl -e 'alarm 20; exec @ARGV' lua eval/bakeoff.lua run --server http://stub "
+      .. "--label t --scenarios '%s' --out '%s' 2>&1; echo \"exit=$?\"", stubDir, corpus, linkOut))
+    local linkSaid = lh:read("a")
+    lh:close()
+    check("runner: and so is a symlink to a FIFO, the link kept", linkSaid:find("it is not a regular file", 1, true) ~= nil
+      and linkSaid:find("exit=0", 1, true) == nil and os.execute("test -h '" .. linkOut .. "'") == true, true)
+    os.remove(linkOut)
     os.remove(fifoOut)
   end
   os.remove(pidOut)
@@ -2504,6 +2520,18 @@ printf ' ip=%s' "${FAKE_REMOTE_IP-127.0.0.1}"
     for _, ip in ipairs(elsewhere) do if bk.isLoopbackIp(ip) then wrongElsewhere[#wrongElsewhere + 1] = string.format("%q", ip) end end
     check("runner: a loopback or unspecified address is this machine", table.concat(wrongHere, " "), "")
     check("runner: and no other address is", table.concat(wrongElsewhere, " ") .. (bk.isLoopbackIp(nil) and " nil" or ""), "")
+  end
+  -- A device and a socket at --out are refused by their type.
+  do
+    local okDev, errDev = pcall(bk.clearResult, "/dev/null")
+    check("runner: a device at --out is refused by its type", okDev == false
+      and tostring(errDev):find("it is not a regular file", 1, true) ~= nil, true)
+    local sock = root .. "/s.sock"
+    os.execute("python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' '" .. sock .. "'")
+    local okSock, errSock = pcall(bk.clearResult, sock)
+    check("runner: and so is a socket, kept", os.execute("test -S '" .. sock .. "'") == true and okSock == false
+      and tostring(errSock):find("it is not a regular file", 1, true) ~= nil, true)
+    os.remove(sock)
   end
   -- A run result whose removal fails (injected) refuses the clear, the result
   -- kept, whoever runs it (root can remove from a read-only directory).

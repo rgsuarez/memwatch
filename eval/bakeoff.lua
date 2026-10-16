@@ -763,8 +763,10 @@ local function gatesMode(args)
     end
   end
 
+  -- The winner is G1 to G6 only: G7 (discrimination) is scored separately,
+  -- by score-episodes.lua gate, and a candidate is eligible only with both.
   local out = { league = lfm.jsonArray(league), winner = winner and winner.label or nil,
-    winner_variant = winner and winner.variant or nil }
+    winner_variant = winner and winner.variant or nil, winner_gates = "G1-G6; G7 is scored separately" }
   writeFile(resultsDir .. "/league.json", assert(lfm.jsonEncode(out)) .. "\n")
   for _, row in ipairs(league) do
     io.write(string.format(
@@ -775,7 +777,8 @@ local function gatesMode(args)
       row.gates_passed and "PASS" or "FAIL",
       (row.reference_only and " (reference)" or "") .. (row.remote and " (remote)" or "")))
   end
-  io.write("\nwinner: " .. tostring(out.winner) .. " (" .. tostring(out.winner_variant) .. ")\n")
+  io.write("\nwinner on G1 to G6 (G7 is scored separately, by score-episodes.lua gate): "
+    .. tostring(out.winner) .. " (" .. tostring(out.winner_variant) .. ")\n")
 end
 
 ------------------------------------------------------------------------------

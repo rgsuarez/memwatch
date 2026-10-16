@@ -43,7 +43,11 @@ local function parseArgs(argv)
         -- swallows the next argument.
         args[key:gsub("%-", "_")] = true
       else
-        args[key:gsub("%-", "_")] = argv[i + 1]
+        -- A value flag needs its value: one missing (the last argument, or
+        -- another flag in its place) is refused, never read as unset.
+        local v = argv[i + 1]
+        if v == nil or v:match("^%-%-") then error("--" .. key .. " needs a value", 0) end
+        args[key:gsub("%-", "_")] = v
         i = i + 1
       end
     else
@@ -755,4 +759,4 @@ if arg and arg[0] and arg[0]:match("bakeoff%.lua$") then
 end
 
 return { privateDir = privateDir, reserveOutput = reserveOutput, withAuthHeader = withAuthHeader,
-         episodes = episodesMode }
+         parseArgs = parseArgs, episodes = episodesMode }

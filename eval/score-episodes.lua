@@ -667,11 +667,19 @@ local function parse(argv)
   local i = 2
   while i <= #argv do
     local k, v = argv[i], argv[i + 1]
+    -- Every flag takes a value: one missing (the last argument, or another
+    -- flag in its place) is refused, never read as unset.
+    if type(k) == "string" and k:match("^%-%-") and (v == nil or v:match("^%-%-")) then
+      error(k .. " needs a value", 0)
+    end
+    local function number(x) return assert(tonumber(x), k .. " must be a number, not " .. tostring(x)) end
     if k == "--dir" then a.dir = v elseif k == "--fit-dir" then a.fitDir = v
     elseif k == "--candidate" then a.candidate = v elseif k == "--out" then a.out = v
-    elseif k == "--tree-depth" then a.depth = tonumber(v)
+    elseif k == "--tree-depth" then
+      a.depth = math.tointeger(number(v))
+      assert(a.depth and a.depth >= 1, "--tree-depth must be a whole number of levels, 1 or more")
     elseif k == "--decisions" then a.decisions = v elseif k == "--key" then a.key = v
-    elseif k == "--tau" then a.tau = tonumber(v)
+    elseif k == "--tau" then a.tau = number(v)
     elseif k == "--prevalence" then a.prevalence = v
     else error("unknown argument " .. tostring(k)) end
     i = i + 2

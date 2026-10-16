@@ -647,6 +647,13 @@ do
   check("cli: a gate without a fit split is refused", okNone, false)
   check("cli: so is one that names no candidate",
     okNoCand == false and tostring(errNoCand):find("--candidate is required", 1, true) ~= nil, true)
+  local okBare, errBare = pcall(sc.main, { "gate", "--dir", held, "--fit-dir" })
+  check("cli: a flag missing its value is refused, not read as unset",
+    okBare == false and tostring(errBare):find("--fit-dir needs a value", 1, true) ~= nil, true)
+  local okDepth, errDepth = pcall(sc.main, { "gate", "--dir", held, "--fit-dir", dev, "--candidate", "oracle",
+                                             "--tree-depth", "deep" })
+  check("cli: so is a number that is not one",
+    okDepth == false and tostring(errDepth):find("must be a number", 1, true) ~= nil, true)
   check("cli: controls on an undecidable set exit nonzero", okCtl and ctl, 1)
   check("cli: a copy of the evaluated set is refused as the fit split",
     okCopy == false and tostring(errCopy):find("the same episode", 1, true) ~= nil, true)
@@ -947,11 +954,13 @@ out=""; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
-    -w|-m|-X|-H|-d) shift 2 ;;
+    -d) body="${2#@}"; shift 2 ;;
+    -w|-m|-X|-H) shift 2 ;;
     -*) shift ;;
     *) url="$1"; shift ;;
   esac
 done
+if [ -n "${FAKE_BODY_LOG:-}" ] && [ -n "${body:-}" ]; then cat "$body" >> "$FAKE_BODY_LOG"; echo >> "$FAKE_BODY_LOG"; fi
 case "$url" in
   */v1/chat/completions) body="$FAKE_CHAT" ;;
   */v1/systemone) body='{"model":"d1","answers":{"action":{"type":"choice","choice":"freeze","probabilities":{"freeze":0.8,"wait":0.2},"confidence":0.4}}}' ;;
@@ -981,11 +990,12 @@ printf '0.010'
     pos('{"', { { '{"', 0.99 } }), pos("action", { { "action", 0.99 } }), pos('":"', { { '":"', 0.99 } }),
     pos("wait", { { "wait", 0.7 }, { "free", 0.3 } }) }) })
   local function sq(v) return "'" .. v:gsub("'", "'\\''") .. "'" end
-  local function run(api, chatBody, tag)
+  local function run(api, chatBody, tag, extra)
     local out = root .. "/rows-" .. tag .. ".jsonl"
-    os.execute(string.format("PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_COMPLETION=%s lua eval/bakeoff.lua episodes "
-      .. "--server http://stub --label t --dir %s --api %s --out %s >/dev/null 2>&1",
-      sq(stubDir), sq(chatBody), sq(completion), sq(epDir), api, sq(out)))
+    os.execute(string.format("PATH=%s:\"$PATH\" FAKE_CHAT=%s FAKE_COMPLETION=%s FAKE_BODY_LOG=%s lua eval/bakeoff.lua "
+      .. "episodes --server http://stub --label t --dir %s --api %s --out %s %s >/dev/null 2>&1",
+      sq(stubDir), sq(chatBody), sq(completion), sq(root .. "/bodies-" .. tag .. ".log"), sq(epDir), api, sq(out),
+      extra or ""))
     local rows = {}
     local rf = io.open(out, "r")
     if rf then
@@ -994,6 +1004,9 @@ printf '0.010'
     end
     return rows[1] or {}
   end
+  check("runner: --redact-names takes no value, so the next flag keeps its own",
+    bk.parseArgs({ "episodes", "--redact-names", "--dir", "X" }).dir, "X")
+  check("runner: a value flag missing its value is refused", (pcall(bk.parseArgs, { "episodes", "--out" })), false)
   local rc, rs = run("chat", chat, "chat"), run("systemone", chat, "systemone")
   local rp, rbad = run("completion", chat, "completion"), run("chat", "not json", "bad")
   check("runner: a chat verdict is recorded as the model's action", rc.action, "wait")
@@ -1003,6 +1016,16 @@ printf '0.010'
     rp.action == "wait" and math.abs((rp.pWait or -1) - 0.7) < 1e-6, true)
   check("runner: an invalid reply is recorded as the deterministic freeze, marked invalid",
     rbad.action == "freeze" and rbad.valid == false and rbad.error ~= nil, true)
+  run("chat", chat, "effort", "--reasoning-effort low")
+  local bl = io.open(root .. "/bodies-effort.log", "r")
+  local bodies = bl and bl:read("a") or ""
+  if bl then bl:close() end
+  local bc = io.open(root .. "/bodies-chat.log", "r")
+  local plain = bc and bc:read("a") or ""
+  if bc then bc:close() end
+  check("runner: the episodes chat path sends the reasoning effort asked for",
+    bodies:find('"reasoning_effort":"low"', 1, true) ~= nil, true)
+  check("runner: and none when none is asked", plain ~= "" and plain:find("reasoning_effort", 1, true) == nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 

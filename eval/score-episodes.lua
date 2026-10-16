@@ -37,7 +37,7 @@ local lfm = require("memwatch_lfm")
 local M = {}
 
 M.cfg = {
-  deferralSec  = 120,
+  deferralSec  = lfm.cfg.maxDeferSec,   -- production's deferral bound (its default)
   missBound    = 0.05,
   confidence   = 0.95,
   bootstrap    = 2000,

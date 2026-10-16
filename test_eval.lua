@@ -1385,6 +1385,13 @@ dofile("eval/bakeoff.lua")
   if renameLanded then renameLanded:close() end
   check("runner: a result whose rename fails fails the run, leaving no partial and no result",
     okRename ~= true and renamePartials == 0 and renameLanded == nil, true)
+  -- The harness's control: the same run through it, renaming elsewhere, lands.
+  local controlOut = root .. "/rename-control.json"
+  local okRenameCtl = os.execute(string.format("PATH='%s':\"$PATH\" FAIL_RENAME='no-such-target.json' FAKE_BODY_LOG='%s' lua '%s' run "
+    .. "--server http://stub --label t --scenarios '%s' --out '%s' >/dev/null 2>&1", stubDir, log, root .. "/renamewrap.lua", corpus, controlOut))
+  local controlLanded = io.open(controlOut, "r")
+  if controlLanded then controlLanded:close() end
+  check("runner: the rename harness's control lands its result", okRenameCtl == true and controlLanded ~= nil, true)
   os.execute("rm -rf '" .. root .. "'")
 end
 

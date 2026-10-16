@@ -510,6 +510,9 @@ end
 -- browser through "arc", "optimized-daemon" as editor through "zed").
 -- Order matters only where prefixes overlap: specific apps precede the
 -- generic renderer suffix, and the VM host precedes the com.apple. rule.
+-- The generic suffix takes any product name without parentheses (Code -
+-- Insiders, draw.io, a name in any script) before " helper (": the class
+-- stops at the first parenthesis, so the match stays linear in the name.
 local CATEGORY_RULES = {
   { "editor",          { "^code helper", "^cursor helper", "^code$", "^cursor$", "^zed$",
                          "^sublime_text$", "^idea$", "^pycharm", "^webstorm", "^jetbrains",
@@ -517,7 +520,7 @@ local CATEGORY_RULES = {
                          "^visual studio code" } },
   { "browser",         { "^google chrome", "^chromium", "^safari$", "^firefox", "^brave browser",
                          "^arc$", "^arc helper", "^microsoft edge", "^com%.apple%.webkit",
-                         "^[%w ]+ helper %(renderer%)$", "^[%w ]+ helper %(gpu%)$" } },
+                         "^[^%(%)]+ helper %(renderer%)$", "^[^%(%)]+ helper %(gpu%)$" } },
   { "vm",              { "^com%.apple%.virtualization%.", "^com%.apple%.virtua$", "^qemu%-system%-", "^qemulauncher$", "^vmware",
                          "^parallels", "^virtualbox", "^com%.docker%.", "^colima$", "^colima%-", "^utm$", "^limactl$" } },
   { "model-server",    { "^llama%-server$", "^llama%-cli$", "^ollama", "^mlx", "^vllm", "^lm%-studio",

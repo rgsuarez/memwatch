@@ -1320,6 +1320,12 @@ end
 do
   local lfm = require("memwatch_lfm")
   check("cat: browser helper",    lfm.categorize("Google Chrome Helper (Renderer)"), "browser")
+  -- A Chromium or Electron helper reads browser whatever its product name
+  -- holds before " helper (": punctuation, or another script.
+  check("cat: a helper whose product name has punctuation is a browser helper",
+    lfm.categorize("Code - Insiders Helper (Renderer)") .. "|" .. lfm.categorize("draw.io Helper (Renderer)")
+      .. "|" .. lfm.categorize("Battle.net Helper (GPU)"), "browser|browser|browser")
+  check("cat: so is one named in another script", lfm.categorize("\u{5FAE}\u{4FE1} Helper (Renderer)"), "browser")
   check("cat: vm host",           lfm.categorize("com.apple.Virtualization.VirtualMachine"), "vm")
   check("cat: the QEMU launcher is a vm", lfm.categorize("QEMULauncher"), "vm")
   check("cat: search tool",       lfm.categorize("ugrep"), "search-tool")

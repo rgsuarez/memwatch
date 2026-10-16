@@ -32,8 +32,8 @@ end
 
 -- ---- simulator: labels follow the label rule ----
 local function params(over)
-  local p = { name = "x", foreground = false, avail0 = 12, w0 = 4000, age0 = 100, peak0 = 9000,
-              stoppedBefore = 0, frozenCount = 0, compress = 1, phases = {}, after = "hold" }
+  local p = { name = "x", foreground = false, avail0 = 12, w0 = 4000, age0 = 120, peak0 = 9000,
+              frozenCount = 0, compress = 1, phases = {}, after = "hold" }
   for k, v in pairs(over) do p[k] = v end
   local t = 0
   for _, ph in ipairs(p.phases) do ph.from = t; ph.to = t + ph.dur; t = ph.to end
@@ -71,23 +71,27 @@ end
 
 -- ---- episode steps exist only where production would decide ----
 do
-  local tpl = { id = "T-exit", names = { "rg" }, avail0 = 25, w0 = 3000, age0 = 100, peak0 = 9000,
+  local tpl = { id = "T-exit", names = { "rg" }, avail0 = 25, w0 = 3000, age0 = 120, peak0 = 9000,
                 compress = 1.5, phases = { { dur = 10, rate = 150 } }, after = "exit", releaseAt = 30 }
   local ep = gen.episode(tpl, 1, "test")
   check("episode: exit before 60 leaves one decision point", #ep.steps, 1)
   local s1 = ep.steps[1] or { snapshot = { offender = {} } }
   check("episode: the step is grace expiry", s1.t, 0)
   check("episode: snapshot is extreme at t=0", s1.snapshot.offender.kind, "extreme")
-  check("episode: snapshot carries age", s1.snapshot.offender.ageSec, 100)
+  check("episode: snapshot carries age", s1.snapshot.offender.ageSec, 120)
   check("episode: snapshot has no pid", s1.snapshot.offender.pid, nil)
   local hold = { id = "T-hold", names = { "qemu" }, avail0 = 28, w0 = 9000, age0 = 9000, peak0 = 9000,
                  compress = 2, phases = { { dur = 10, rate = 160 } }, after = "hold" }
   local eh = gen.episode(hold, 1, "test")
   check("episode: a latched hold decides at 0, 60 and 120", #eh.steps, 3)
+  -- No growth after the alert's onset: the climb's last qualifying sample
+  -- (one tick past the climb: the tracker tolerates one flat tick) latches
+  -- it to 65 s, so it decides at 0 and 60 and never at 120.
   local stale = { id = "T-stale", names = { "qemu" }, avail0 = 28, w0 = 9000, age0 = 9000, peak0 = 9000,
-                  compress = 2, phases = {}, after = "hold", stoppedBefore = 70 }
+                  compress = 2, phases = {}, after = "hold" }
   local es = gen.episode(stale, 1, "test")
-  check("episode: the latch lapses after 120 s of no qualifying growth", #es.steps, 1)
+  check("episode: the latch lapses 120 s after the last qualifying sample", #es.steps, 2)
+  check("episode: so the last decision is at 60", (es.steps[2] or {}).t, 60)
 end
 
 -- ---- play: production deferral semantics ----
@@ -305,14 +309,33 @@ do
   -- the streak route in four ticks; 150 MB/s needs the net route (6000 MB,
   -- 40 s); 100 MB/s never qualifies within the tracker's 55 s ring.
   check("climb: a fast climb qualifies in four ticks", gen.climbFor({ w0 = 1000, peak0 = 15000 }), 20)
+  check("climb: a very fast one on the net route in three", gen.climbFor({ w0 = 1000, peak0 = 26000 }), 15)
   check("climb: 150 MB/s qualifies on the net route", gen.climbFor({ w0 = 1000, peak0 = 9000 }), 40)
   check("climb: 100 MB/s never qualifies", gen.climbFor({ w0 = 1000, peak0 = 6000 }), nil)
-  -- A slow grower whose qualifying climb ended 30 s before grace expiry is
-  -- latched to 90 s, and the 100 MB/s that follows never renews it: the
-  -- tracker's 12 samples span 55 s, so it reads 5500 MB < 6000 (a 60 s
-  -- window would read 6000). It reads sustained at 120: no decision point.
+  -- The grace gate, as production runs it: the alert rises on the tick the
+  -- offender is first extreme, and the gate opens only once it has gone
+  -- unanswered for the grace window; a process gone by then never opens it.
+  local pg = params({ avail0 = 30, phases = { { dur = 180, rate = 100 } } })
+  gen.prepare(pg)
+  local gt, onsetAt = gen.track(pg, gen.cfg, pg.onsetAt - pg.climbSec - gen.cfg.leadSec, 0)
+  check("gate: the alert rises a grace window before t = 0", onsetAt, -gen.cfg.graceSec)
+  check("gate: closed a tick before expiry", gt[-5].gate, "closed")
+  check("gate: open at expiry", gt[0].gate, "open")
+  check("gate: exposure at expiry is the grace window", gt[0].exposureSec, gen.cfg.graceSec)
+  -- It exits 3 s before expiry: the tracker still holds its row then (fresh
+  -- for 12 s), so only the alert's own liveness keeps the gate shut.
+  local px = params({ avail0 = 30, phases = { { dur = 180, rate = 100 } }, after = "exit" })
+  px.releaseAt = -3
+  gen.prepare(px)
+  local xt = gen.track(px, gen.cfg, px.onsetAt - px.climbSec - gen.cfg.leadSec, 0)
+  check("gate: a process that exits during the grace window never opens it", xt[0].gate, "closed")
+  -- A slow grower whose qualifying climb ended at the alert's onset: the
+  -- 100 MB/s that follows renews the latch only while the climb is still
+  -- in the tracker's 55 s ring (last at -10 s, so latched to 110 s); alone
+  -- it reads 5500 MB < 6000 (a 60 s window would read 6000). It reads
+  -- sustained at 120: no decision point.
   local slow = { id = "T-slow", names = { "java" }, avail0 = 40, w0 = 6000, age0 = 600, peak0 = 12000,
-                 compress = 1, phases = { { dur = 180, rate = 100 } }, after = "hold", stoppedBefore = 30 }
+                 compress = 1, phases = { { dur = 180, rate = 100 } }, after = "hold" }
   local esl = gen.episode(slow, 1, "test")
   check("tracker: a lapsed latch leaves no decision point at 120", #esl.steps, 2)
   check("tracker: the slow grower is still a runaway", esl.labels.class, "runaway")
@@ -333,9 +356,11 @@ do
   check("release: a latched process decides after it releases", at60 and at60.t, 60)
   check("release: its footprint is back to the base", at60 and at60.snapshot.offender.weightMB, 4000)
   check("release: it is no longer growing", at60 and at60.snapshot.offender.slopeMBmin, 0)
-  check("release: the burst's memory is back", at60 and at60.snapshot.availPct, 28)
+  -- The whole burst comes back: the climb (6000 MB), the grace window's
+  -- growth (9600 MB) and the phase's: 20 + 15600 MB / 737.28 MB per point.
+  check("release: the burst's memory is back", at60 and at60.snapshot.availPct, 41)
   -- A template's draws follow its content, not its id's length.
-  local a = { id = "AAAA", names = { "rg" }, avail0 = { 10, 30 }, w0 = 3000, age0 = 100, peak0 = 9000,
+  local a = { id = "AAAA", names = { "rg" }, avail0 = { 10, 30 }, w0 = 3000, age0 = 120, peak0 = 9000,
               phases = {}, after = "hold" }
   local b = {}
   for k, v in pairs(a) do b[k] = v end

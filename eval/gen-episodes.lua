@@ -11,12 +11,14 @@
 -- An episode follows ONE such offender from grace expiry (t = 0) through the
 -- later decision points at t = 60 and t = 120, exactly as production would
 -- re-adjudicate it. A seeded trajectory model drives the offender's
--- footprint: its base (the template's w0), the climb at its peak rate
--- (peak0) that the detector last qualified it on, ending stoppedBefore
--- seconds before t = 0, then the template's growth phases and hold / exit /
--- release. The machine's availability follows (avail0 is its value at
--- t = 0), and the labels fall out of the trajectory mechanically and
--- exactly, with no time grid between a label and its trajectory:
+-- footprint: its base (the template's w0); the climb at its peak rate
+-- (peak0) on which the detector first tags it extreme, the alert's onset,
+-- a grace window before t = 0; growth through that window (graceRate, by
+-- default the first phase's rate); then the template's phases from t = 0
+-- and hold / exit / release. The machine's availability follows (avail0 is
+-- its value at t = 0), and the labels fall out of the trajectory
+-- mechanically and exactly, with no time grid between a label and its
+-- trajectory:
 --
 --   runaway       the trajectory exhausts the machine (availability <= the
 --                 exhaustion floor) at or before it resolves, or it is a
@@ -34,11 +36,13 @@
 --                 from the wrongful-freeze count)
 --
 -- Decision points exist only where production would make one: the process
--- is alive, PRODUCTION's tracker (memwatch_procs, fed one ps row per 5 s
--- sampler tick) reads kind=extreme, PRODUCTION's pressure state machine
--- (memwatch_core) is critical, and availability is above the exhaustion
--- floor. The tracker's latch, its 55 s ring and its two qualifying routes
--- therefore decide when an offender stops being eligible, as they do live.
+-- is alive, availability is above the exhaustion floor, and PRODUCTION's
+-- unattended gate (memwatch_core) is open: the alert, raised when the
+-- pressure state machine went critical on the offender, unanswered for its
+-- grace window, with the offender extreme at its head by PRODUCTION's
+-- tracker (memwatch_procs, fed one ps row per 5 s sampler tick). The
+-- tracker's latch, its 55 s ring and its two qualifying routes therefore
+-- decide when an offender stops being eligible, as they do live.
 -- Each step carries the full model-input snapshot: the offender as the
 -- tracker reports it (weight, rising-tail slope, peak, age) and the state
 -- machine's state.
@@ -68,6 +72,8 @@ M.cfg = {
   horizonSec      = 180,
   tickSec         = 5,      -- the sampler's cadence (core.cfg.pollSec)
   leadSec         = 60,     -- base-footprint history before the climb
+  graceSec        = core.cfg.cool.autoKillGraceSec, -- the alert's unanswered window
+  exposureStepMax = 15,     -- production's EXPOSURE_STEP_MAX: a stalled tick's most grace
 }
 
 -- Deterministic PRNG (xorshift32), identical across Lua 5.4 and 5.5 so a
@@ -103,8 +109,7 @@ function M.sample(tpl, r)
     avail0 = sampleRange(r, tpl.avail0),
     w0 = sampleRange(r, tpl.w0),
     age0 = math.floor(sampleRange(r, tpl.age0)),
-    peak0 = sampleRange(r, tpl.peak0 or 0),     -- the climb's rate before t = 0, MB/min
-    stoppedBefore = sampleRange(r, tpl.stoppedBefore or 0), -- s before t = 0 the climb ended
+    peak0 = sampleRange(r, tpl.peak0 or 0),     -- the climb's rate before the alert, MB/min
     frozenCount = tpl.frozenCount or 0,
     -- How much of the growth the kernel absorbs by compression before it
     -- costs availability (1 = incompressible data, 2-3 = typical heaps).
@@ -123,26 +128,29 @@ function M.sample(tpl, r)
   if p.after == "exit" or p.after == "release" then
     p.releaseAt = math.max(p.growthEnd, sampleRange(r, tpl.releaseAt))
   end
+  -- Growth through the alert's grace window, before t = 0: the template's
+  -- own (graceRate, MB/s), else the trajectory's first phase continuing.
+  if tpl.graceRate ~= nil then p.graceRate = sampleRange(r, tpl.graceRate) end
   return p
 end
 
 local PID = 4242
 
 -- Footprint at time t (MB). Before t = 0: the base, then the climb at the
--- template's peak rate that the detector last qualified, ending
--- stoppedBefore seconds before t = 0, then flat. From t = 0: the
--- template's phases. A release gives the whole burst back (the base); an
--- exit leaves nothing.
+-- template's peak rate on which the detector first tags the offender
+-- extreme, ending at the alert's onset (onsetAt, a grace window before
+-- t = 0), then growth at graceRate through the grace window. From t = 0:
+-- the template's phases. A release gives the whole burst back (the base);
+-- an exit leaves nothing.
 function M.weightAt(p, t)
   if p.releaseAt and t >= p.releaseAt then
     return (p.after == "exit") and 0 or p.w0
   end
   if t < 0 then
-    local cEnd = -(p.stoppedBefore or 0)
-    local cStart = cEnd - p.climbSec
+    local cStart = p.onsetAt - p.climbSec
     if t <= cStart then return p.w0 end
-    if t <= cEnd then return p.w0 + p.climbRate * (t - cStart) end
-    return p.wAt0
+    if t <= p.onsetAt then return p.w0 + p.climbRate * (t - cStart) end
+    return p.wOn + p.graceRate * (t - p.onsetAt)
   end
   local w = p.wAt0
   for _, ph in ipairs(p.phases) do
@@ -163,8 +171,14 @@ end
 -- Sampler ticks from first to last (multiples of tickSec), feeding the
 -- PRODUCTION tracker (memwatch_procs) one ps row per tick while the process
 -- exists, and the production pressure state machine (memwatch_core) the
--- same tick's signals. Returns ticks[t] = { alive, w, avail, run (the
--- tracker's runaway row for the offender, or nil), state, kern, rates }.
+-- same tick's signals. The alert's grace clock runs as production runs it:
+-- the alert rises when the state goes critical with the offender at its
+-- head, and grace accrues, interval by interval, while the offender heads
+-- it as extreme (a stalled interval counts at most exposureStepMax). The
+-- PRODUCTION unattended gate (core.unattendedGate) then says whether the
+-- tick could act. Returns ticks[t] = { alive, w, avail, run (the tracker's
+-- runaway row for the offender, or nil), state, kern, rates, exposureSec,
+-- gate }, plus the first tick the alert's head was extreme (onset).
 local function pressureOf(avail, slopeMBmin)
   local pressure = (20 - avail) / 20
   if pressure < 0 then pressure = 0 end
@@ -182,6 +196,7 @@ function M.track(p, cfg, first, last)
   -- On the sampler's grid, from the later of the first tick and the birth.
   local t0 = math.floor(math.max(first, born) / cfg.tickSec) * cfg.tickSec
   if t0 < born then t0 = t0 + cfg.tickSec end
+  local exposureSec, headed, prevT, alertActive, onset = 0, false, nil, false, nil
   for t = t0, last, cfg.tickSec do
     local alive = not (p.after == "exit" and p.releaseAt and t >= p.releaseAt)
     local w = M.weightAt(p, t)
@@ -198,25 +213,42 @@ function M.track(p, cfg, first, last)
     local kern, rates, pressure = pressureOf(avail, run and run.slopeMBmin or 0)
     local sig = core.signals({ availPct = avail }, rates, kern, run ~= nil and run.kind == "extreme")
     core.smStep(sm, sig, t)
+    -- The alert: up while the state is critical with the offender at its
+    -- head; it rises (grace starting over) on the tick it comes up.
+    local up = alive and run ~= nil and sm.state == "critical"
+    if up and not alertActive then exposureSec, headed = 0, false end
+    alertActive = up
+    if headed and prevT then
+      exposureSec = exposureSec + math.min(math.max(t - prevT, 0), cfg.exposureStepMax)
+    end
+    prevT = t
+    headed = alertActive and run.kind == "extreme"
+    if headed and onset == nil then onset = t end
+    local gate = core.unattendedGate({
+      kind = run and run.kind, alertActive = alertActive, hudHold = false, sameAsHud = run ~= nil,
+      answered = false, interacted = false, final = false, bound = true,
+      exposureSec = exposureSec, graceSec = cfg.graceSec,
+    })
     ticks[t] = { t = t, alive = alive, w = w, avail = avail, run = run, state = sm.state,
-                 kern = kern, rates = rates, pressure = pressure }
+                 kern = kern, rates = rates, pressure = pressure, exposureSec = exposureSec, gate = gate }
   end
-  return ticks
+  return ticks, onset
 end
 
 -- The climb the detector qualified the offender on: at the template's peak
--- rate, the shortest whole number of ticks (at least the streak route's
--- four rises) after which the production tracker reads kind=extreme at the
--- climb's last sample. nil when no climb that fits the tracker's ring does.
+-- rate, the shortest whole number of ticks after which the production
+-- tracker reads kind=extreme at the climb's last sample (the net route can
+-- qualify a fast climb before the streak route's four rises), so the tag
+-- first lands on that sample. nil when no climb that fits the ring does.
 function M.climbFor(p, cfg)
   cfg = cfg or M.cfg
   local rate = (p.peak0 or 0) / 60
   if rate <= 0 then return nil end
   local maxSec = (procs.cfg.windowSamples - 1) * cfg.tickSec
-  for sec = 4 * cfg.tickSec, maxSec, cfg.tickSec do
-    local q = { w0 = p.w0, climbRate = rate, climbSec = sec, stoppedBefore = 0,
-                wAt0 = p.w0 + rate * sec, avail0 = 50, compress = 1, phases = {},
-                age0 = sec + cfg.leadSec, after = "hold" }
+  for sec = cfg.tickSec, maxSec, cfg.tickSec do
+    local q = { w0 = p.w0, climbRate = rate, climbSec = sec, onsetAt = 0, graceRate = 0,
+                wOn = p.w0 + rate * sec, wAt0 = p.w0 + rate * sec, avail0 = 50, compress = 1,
+                phases = {}, age0 = sec + cfg.leadSec, after = "hold" }
     local ticks = M.track(q, cfg, -(sec + cfg.leadSec), 0)
     local k = ticks[0]
     if k and k.run and k.run.kind == "extreme" then return sec end
@@ -224,16 +256,23 @@ function M.climbFor(p, cfg)
   return nil
 end
 
--- Derived fields, idempotent: the climb, and the footprint at t = 0.
+-- Derived fields, idempotent: the climb, the alert's onset a grace window
+-- before t = 0, the growth through that window, and the footprint at t = 0.
 function M.prepare(p, cfg)
   cfg = cfg or M.cfg
   if p.wAt0 then return p end
   p.climbRate = (p.peak0 or 0) / 60
   p.climbSec = M.climbFor(p, cfg)
   assert(p.climbSec, "no climb at peak0 " .. tostring(p.peak0) .. " MB/min qualifies kind=extreme")
-  assert(p.age0 >= (p.stoppedBefore or 0) + p.climbSec,
-    "the process is younger than its climb (age0 " .. tostring(p.age0) .. ")")
-  p.wAt0 = p.w0 + p.climbRate * p.climbSec
+  p.onsetAt = -cfg.graceSec
+  if p.graceRate == nil then p.graceRate = p.phases[1] and p.phases[1].rate or 0 end
+  -- The process lived through the grace window, the climb, and two quiet
+  -- ticks before it (the ring the climb was measured against).
+  assert(p.age0 >= cfg.graceSec + p.climbSec + 2 * cfg.tickSec,
+    "the process is younger than its history: age0 " .. tostring(p.age0) .. " < grace "
+      .. cfg.graceSec .. " + climb " .. p.climbSec .. " + two ticks")
+  p.wOn = p.w0 + p.climbRate * p.climbSec
+  p.wAt0 = p.wOn + p.graceRate * cfg.graceSec
   return p
 end
 
@@ -327,21 +366,23 @@ end
 M.idHash = idHash
 
 -- Build one episode from a template and a seed. Decision points are where
--- production makes one: the process is alive, the production tracker reads
--- kind=extreme, the production state machine is critical, and the machine
--- is above the exhaustion floor.
+-- production makes one: the process is alive, the production unattended
+-- gate is open (the alert unanswered for its grace window, the offender
+-- extreme at its head), and the machine is above the exhaustion floor.
 function M.episode(tpl, seed, split, cfg)
   cfg = cfg or M.cfg
   local r = M.rng((seed * 7919 + idHash(tpl.id)) % 4294967296)
   local p = M.sample(tpl, r)
   local sim = M.simulate(p, cfg)
-  local first = -((p.stoppedBefore or 0) + p.climbSec + cfg.leadSec)
-  local ticks = M.track(p, cfg, first, cfg.horizonSec)
+  local first = p.onsetAt - p.climbSec - cfg.leadSec
+  local ticks, onset = M.track(p, cfg, first, cfg.horizonSec)
+  -- The construction's invariant: the climb first qualifies the offender at
+  -- its last sample, so the alert rises exactly a grace window before t = 0.
+  assert(onset == p.onsetAt, "the alert rose at " .. tostring(onset) .. ", not at " .. p.onsetAt)
   local steps = lfm.jsonArray({})
   for _, t in ipairs(cfg.decisionTimes) do
     local k = ticks[t]
-    if k and k.alive and k.run and k.run.kind == "extreme" and k.state == "critical"
-       and k.avail > cfg.exhaustPct then
+    if k and k.alive and k.gate == "open" and k.avail > cfg.exhaustPct then
       steps[#steps + 1] = { t = t, snapshot = snapshotAt(p, k) }
     end
   end

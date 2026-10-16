@@ -1412,8 +1412,16 @@ if [ -n "${FAKE_STATUS_SEQ:-}" ]; then
   n=$(cat "$FAKE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_SEQ_FILE"
   i=0; for s in $FAKE_STATUS_SEQ; do i=$((i + 1)); status=$s; [ "$i" -ge "$n" ] && break; done
 fi
-# The address curl connected to, as its remote_ip prints it.
-printf '0.010 %s ip=%s' "$status" "${FAKE_REMOTE_IP-127.0.0.1}"
+# The address curl connected to, as its remote_ip prints it. FAKE_REMOTE_SEQ:
+# each request's in turn (the last repeats; "none" prints no address),
+# counted in the file FAKE_REMOTE_SEQ_FILE names.
+ip="${FAKE_REMOTE_IP-127.0.0.1}"
+if [ -n "${FAKE_REMOTE_SEQ:-}" ]; then
+  n=$(cat "$FAKE_REMOTE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_REMOTE_SEQ_FILE"
+  i=0; for a in $FAKE_REMOTE_SEQ; do i=$((i + 1)); ip=$a; [ "$i" -ge "$n" ] && break; done
+  [ "$ip" = none ] && ip=""
+fi
+printf '0.010 %s ip=%s' "$status" "$ip"
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -1565,6 +1573,30 @@ printf '0.010 %s ip=%s' "$status" "${FAKE_REMOTE_IP-127.0.0.1}"
       if not (said:find("must be a process id", 1, true) and not said:find("exit=0", 1, true)) then notPids[#notPids + 1] = v end
     end
     check("runner: nor 0, a negative or a fraction", table.concat(notPids, " "), "")
+  end
+  -- Every reply is held to it, the control re-asks' too: the second request
+  -- is the first scenario's control re-ask (see the G1 pins above).
+  do
+    local seqFile = root .. "/remote-seq"
+    os.remove(seqFile)
+    local ctlSaid = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 203.0.113.7 127.0.0.1' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: a control re-ask from elsewhere fails a --server-pid run too, leaving no result",
+      ctlSaid:find("the server answered from 203.0.113.7", 1, true) ~= nil and ctlSaid:find("exit=0", 1, true) == nil
+      and not landed(pidOut), true)
+    os.remove(seqFile)
+    local ctlBlank = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 none 127.0.0.1' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: and so does one whose address curl did not report",
+      ctlBlank:find("an address curl did not report", 1, true) ~= nil and ctlBlank:find("exit=0", 1, true) == nil
+      and not landed(pidOut), true)
+    os.remove(seqFile)
+    local allLocal = runSaid("--server http://stub --server-pid 1", pidOut,
+      "FAKE_REMOTE_SEQ='127.0.0.1 ::1 127.0.0.2' FAKE_REMOTE_SEQ_FILE='" .. seqFile .. "'")
+    check("runner: a run whose every reply is local lands, under any loopback address",
+      allLocal:find("exit=0", 1, true) ~= nil and landed(pidOut), true)
+    os.remove(seqFile)
+    os.remove(pidOut)
   end
   local nearSaid = runSaid("--server http://127.0.0.1:9 --server-pid 1", pidOut)
   check("runner: a server on this machine takes it", nearSaid:find("exit=0", 1, true) ~= nil and landed(pidOut), true)

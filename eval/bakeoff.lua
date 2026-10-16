@@ -225,12 +225,10 @@ end
 -- an empty body is no reply either. curl runs in the C locale, so its timing
 -- never prints with a decimal comma.
 local RETRYABLE_CURL = { [7] = true, [18] = true, [28] = true, [52] = true, [55] = true, [56] = true }
--- The address curl last connected to (its remote_ip), so a caller can ask
--- where a reply came from. curl prints it canonically: a dotted quad, or
--- IPv6 as inet_ntop writes it, without brackets.
-local lastRemote = nil
 -- direct: no proxy, so the address curl reports is the server's own (a
--- proxy's address would stand in for it).
+-- proxy's address would stand in for it). A reply also returns that
+-- address (curl's remote_ip, printed canonically: a dotted quad, or IPv6
+-- as inet_ntop writes it, without brackets).
 local function postOnce(url, body, reqPath, respPath, hdr, timeout, direct)
   writeFile(reqPath, body)
   os.remove(respPath)
@@ -245,7 +243,7 @@ local function postOnce(url, body, reqPath, respPath, hdr, timeout, direct)
   local p = assert(io.popen(cmd))
   local line = p:read("a") or ""
   p:close()
-  lastRemote = line:match("ip=(%S*)")
+  local remote = line:match("ip=(%S*)")
   local exit = tonumber(line:match("exit=(%d+)"))
   local wall, code = line:match("^%s*([%d%.,]+)%s+(%d%d%d)")
   local ms = wall and math.floor((tonumber((wall:gsub(",", "."))) or 0) * 1000) or 0
@@ -256,7 +254,7 @@ local function postOnce(url, body, reqPath, respPath, hdr, timeout, direct)
   if code < 200 or code > 299 then return nil, ms, "HTTP " .. code, code == 429 or code >= 500 end
   local resp = readFile(respPath) or ""
   if resp == "" then return nil, ms, "HTTP " .. code .. " with an empty body", false end
-  return resp, ms
+  return resp, ms, nil, nil, remote
 end
 
 -- A reply the server sent for the model, or the run fails. A server error
@@ -268,14 +266,23 @@ end
 -- every attempt (so a retried request never reads faster than it was: the
 -- latency gate reads this), the number of attempts, and the ms this runner
 -- waited between them, apart (its own backoff, a flag, is no latency of the
--- model's).
-local function postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait, direct)
+-- model's). localOnly (--server-pid's runs, whose footprint is sampled from
+-- a process on this machine): no proxy, and a reply from anywhere but this
+-- machine, by the address curl connected to, fails the run, since that
+-- footprint would stand as the server's. Every request is held to it.
+local function postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait, localOnly)
   retries, retryWait = retries or 2, retryWait or 2
   local total, waited = 0, 0
   for attempt = 0, retries do
-    local resp, ms, why, again = postOnce(url, body, reqPath, respPath, hdr, timeout, direct)
+    local resp, ms, why, again, remote = postOnce(url, body, reqPath, respPath, hdr, timeout, localOnly)
     total = total + ms
-    if resp then return resp, total, attempt + 1, waited end
+    if resp then
+      if localOnly and not isLoopbackIp(remote) then
+        error("--server-pid samples a process on this machine, but the server answered from "
+          .. ((remote or "") ~= "" and remote or "an address curl did not report"), 0)
+      end
+      return resp, total, attempt + 1, waited
+    end
     if not again or attempt == retries then
       -- A 4xx other than rate limiting is the server refusing the request
       -- (the key, the URL, the API); anything else is a server error.
@@ -455,8 +462,8 @@ local function runMode(args)
       }))
       -- A reply the server sent for the model, never a stale one and never a
       -- server error read as the model's (postJson: the run fails instead).
-      -- With --server-pid, no proxy: where the server answered must be its
-      -- own address.
+      -- With --server-pid, every reply (the control re-asks' too) must come
+      -- from this machine, by the address curl connected to, with no proxy.
       return postJson(server .. "/v1/chat/completions", body, reqPath, respPath, hdrPath, curlTimeout,
         retries, retryWait, serverPid ~= nil)
     end
@@ -530,13 +537,6 @@ local function runMode(args)
     local timings = (lfm.jsonDecode(respBody) or {}).timings
     if type(timings) == "table" and type(timings.predicted_per_second) == "number" then
       tokRates[#tokRates + 1] = timings.predicted_per_second
-    end
-    -- The footprint sampled is a process on this machine's, so a reply from
-    -- anywhere else, by the address curl connected to, fails the run: that
-    -- footprint would stand as the server's.
-    if serverPid and not isLoopbackIp(lastRemote) then
-      error("--server-pid samples a process on this machine, but the server answered from "
-        .. ((lastRemote or "") ~= "" and lastRemote or "an address curl did not report"), 0)
     end
     local mb = sampleServerMB(serverPid)
     if mb and mb > counts.serverMBMax then counts.serverMBMax = mb end

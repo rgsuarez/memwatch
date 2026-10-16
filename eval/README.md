@@ -41,10 +41,13 @@ lua eval/bakeoff.lua run --server http://127.0.0.1:PORT --label 230M-Q4_K_M \
 ```
 
 A reply counts as the model's only when the server sent it. An HTTP status
-other than 2xx, or a request that failed, fails the run instead of scoring
-as an invalid reply. Rate limiting, a server error or a dropped connection
-is tried again `--retries` times, waiting `--retry-wait` seconds and then
-twice that.
+other than 2xx, a 2xx with an empty body, or a request that failed fails
+the run instead of scoring as an invalid reply. Rate limiting, a server
+error or a dropped connection is tried again `--retries` times, waiting
+`--retry-wait` seconds and then twice that, and a retried request's wall
+time counts every attempt and wait. A rerun's result file is the rerun's
+or nothing: a stale one at the path is removed first, and the new one is
+written whole and renamed into place.
 
 Measures per combo: gold/acceptable accuracy, the over-action danger rate
 (raw model freeze/terminate against a must_not), the under-action count
@@ -174,8 +177,8 @@ that decision.
   `/apply-template` reply with no prompt. A flag the mode would not send is
   refused: `--raw-names` and `--no-schema` always, `--variant` other than
   `discriminate` with `--api systemone` (System One sends its own
-  instructions), and `--model` with `--api completion` (no request names
-  one).
+  instructions), `--model` with `--api completion` (no request names one),
+  and `--temperature` and `--reasoning-effort` with any API but chat.
 - A decisions file is one JSON row per decision point: `episode`, `t`,
   `action` (`freeze` or `wait`), `pWait` when the model gives one, and
   `snapshotHash`, the hash of the step's snapshot the row answered

@@ -74,10 +74,12 @@ local function readFile(path)
   return s
 end
 
+-- A write that does not reach the disk (a full volume) raises: the flush
+-- surfaces only at close, so both are checked.
 local function writeFile(path, s)
   local f = assert(io.open(path, "w"))
-  f:write(s)
-  f:close()
+  assert(f:write(s))
+  assert(f:close())
 end
 
 local function shellQuote(s)
@@ -184,16 +186,19 @@ local function withAuthHeader(key, fn)
 end
 
 -- One POST with curl, gated on curl's own exit status and on the HTTP
--- status, so a failed request never reads a stale reply. Returns the body and
--- its wall ms, or nil, why, and whether the request is worth trying again
--- (rate limiting, a server error, or a connection refused, timed out or
--- dropped).
-local RETRYABLE_CURL = { [7] = true, [28] = true, [52] = true, [55] = true, [56] = true }
+-- status, so a failed request never reads a stale reply. Returns the body
+-- and the attempt's wall ms, or nil, the attempt's wall ms, why, and whether
+-- the request is worth trying again (rate limiting, a server error, or a
+-- connection refused, timed out or dropped, or a transfer cut short). A
+-- timeout took at least the time allowed, whatever curl reports. A 2xx with
+-- an empty body is no reply either. curl runs in the C locale, so its timing
+-- never prints with a decimal comma.
+local RETRYABLE_CURL = { [7] = true, [18] = true, [28] = true, [52] = true, [55] = true, [56] = true }
 local function postOnce(url, body, reqPath, respPath, hdr, timeout)
   writeFile(reqPath, body)
   os.remove(respPath)
   local cmd = table.concat({
-    "curl -sS -m " .. tostring(timeout) .. " -X POST -H 'Content-Type: application/json'",
+    "LC_ALL=C curl -sS -m " .. tostring(timeout) .. " -X POST -H 'Content-Type: application/json'",
     hdr and ("-H @" .. shellQuote(hdr)) or "",
     "-d @" .. shellQuote(reqPath), "-o", shellQuote(respPath),
     "-w '%{time_total} %{http_code}'", shellQuote(url),
@@ -203,12 +208,16 @@ local function postOnce(url, body, reqPath, respPath, hdr, timeout)
   local line = p:read("a") or ""
   p:close()
   local exit = tonumber(line:match("exit=(%d+)"))
-  if exit ~= 0 then return nil, "curl exit " .. tostring(exit), RETRYABLE_CURL[exit] == true end
-  local wall, code = line:match("^%s*([%d%.]+)%s+(%d%d%d)")
+  local wall, code = line:match("^%s*([%d%.,]+)%s+(%d%d%d)")
+  local ms = wall and math.floor((tonumber((wall:gsub(",", "."))) or 0) * 1000) or 0
+  if exit == 28 then ms = math.max(ms, math.floor(timeout * 1000)) end
+  if exit ~= 0 then return nil, ms, "curl exit " .. tostring(exit), RETRYABLE_CURL[exit] == true end
   code = tonumber(code)
-  if not code then return nil, "no HTTP status", false end
-  if code < 200 or code > 299 then return nil, "HTTP " .. code, code == 429 or code >= 500 end
-  return readFile(respPath) or "", math.floor(tonumber(wall) * 1000)
+  if not code then return nil, ms, "no HTTP status", false end
+  if code < 200 or code > 299 then return nil, ms, "HTTP " .. code, code == 429 or code >= 500 end
+  local resp = readFile(respPath) or ""
+  if resp == "" then return nil, ms, "HTTP " .. code .. " with an empty body", false end
+  return resp, ms
 end
 
 -- A reply the server sent for the model, or the run fails. A server error
@@ -216,18 +225,30 @@ end
 -- is no answer of the model's: recorded as an invalid reply it would stand as
 -- the deterministic freeze, which scores a runaway as caught. A request worth
 -- trying again is tried retries more times, waiting retryWait seconds, then
--- twice that, and so on. Returns the body and its wall ms.
+-- twice that, and so on. Returns the body, the wall ms the answer took
+-- (every attempt and every wait, so a retried request never reads faster
+-- than it was: the latency gate reads this), and the number of attempts.
 local function postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait)
   retries, retryWait = retries or 2, retryWait or 2
+  local total = 0
   for attempt = 0, retries do
-    local resp, wallOrWhy, again = postOnce(url, body, reqPath, respPath, hdr, timeout)
-    if resp then return resp, wallOrWhy end
+    local resp, ms, why, again = postOnce(url, body, reqPath, respPath, hdr, timeout)
+    total = total + ms
+    if resp then return resp, total, attempt + 1 end
     if not again or attempt == retries then
-      error(string.format("%s gave no reply (%s%s): a server error is not the model's answer;"
-        .. " fix the server and run again", url, wallOrWhy,
-        attempt > 0 and string.format(", after %d retries", attempt) or ""), 0)
+      -- A 4xx other than rate limiting is the server refusing the request
+      -- (the key, the URL, the API); anything else is a server error.
+      local refused = why:match("^HTTP 4%d%d$") ~= nil and why ~= "HTTP 429"
+      error(string.format("%s gave no reply (%s%s): %s is not the model's answer; fix the %s and run again",
+        url, why, attempt > 0 and string.format(", after %d retries", attempt) or "",
+        refused and "the server refused the request, which" or "a server error",
+        refused and "request (the key, the URL or the API)" or "server"), 0)
     end
-    if retryWait > 0 then os.execute("sleep " .. tostring(retryWait * 2 ^ attempt)) end
+    local wait = math.floor(retryWait * 2 ^ attempt)
+    if wait > 0 then
+      os.execute("sleep " .. string.format("%d", wait))
+      total = total + wait * 1000
+    end
   end
 end
 
@@ -292,6 +313,10 @@ local function runMode(args)
   local apiKey = readKey(args)
   local curlTimeout = tonumber(args.timeout) or 60
   local retries, retryWait = retryArgs(args)
+  -- A rerun's file is the rerun's or nothing: a stale result left at the path
+  -- would read as this run's if it failed. The new one is written whole, then
+  -- renamed into place.
+  os.remove(out)
 
   local rows = {}
   local wallTimes, tokRates = {}, {}
@@ -332,7 +357,8 @@ local function runMode(args)
         retries, retryWait)
     end
     local userContent = assert(lfm.serializeSnapshot(scenario.snapshot, { redactNames = redact }))
-    local respBody, wallMs = ask(userContent)
+    local respBody, wallMs, attempts = ask(userContent)
+    if attempts > 1 then counts.retried = (counts.retried or 0) + 1 end
 
     local raw, perr = lfm.parseResponse(respBody)
     local verdict = raw and lfm.validateVerdict(raw) or nil
@@ -424,7 +450,7 @@ local function runMode(args)
       over_danger = overRaw, under_danger = underRaw, over_danger_effective = overEff,
       over_danger_freeze = overFreeze,
       confidence = verdict and verdict.confidence or 0,
-      wall_ms = wallMs,
+      wall_ms = wallMs, attempts = attempts,
       parse_error = (not raw) and tostring(perr) or nil,
     }
     io.write(string.format("%-16s %-22s raw=%-9s eff=%-9s %s %dms\n",
@@ -462,9 +488,18 @@ local function runMode(args)
     wall_p95_ms = percentile(wallTimes, 0.95),
     tok_s_median = percentile(tokRates, 0.50),
     server_mb_max = counts.serverMBMax > 0 and counts.serverMBMax or nil,
+    -- Requests that needed more than one attempt (their wall time counts
+    -- every attempt and wait).
+    retried = counts.retried or 0,
     rows = rows,
   }
-  writeFile(out, assert(lfm.jsonEncode(result)) .. "\n")
+  local partial = out .. ".partial-" .. tag
+  local okWrite, writeErr = pcall(writeFile, partial, assert(lfm.jsonEncode(result)) .. "\n")
+  if not okWrite then
+    os.remove(partial)
+    error(writeErr, 0)
+  end
+  assert(os.rename(partial, out))
   io.write(string.format(
     "\n%s/%s: gold=%.3f acc=%.3f over-danger=%.3f under=%d postRailOver=%d inj=%d/%d valid=%.3f p50=%dms p95=%dms\n-> %s\n",
     label, variant, result.gold_rate, result.acceptable_rate, result.danger_rate,
@@ -495,7 +530,8 @@ end
 -- A server error fails the run, as in run mode, and so does an
 -- /apply-template reply with no prompt. A flag the mode would not send is
 -- refused: --raw-names and --no-schema always, --variant (other than
--- discriminate) with --api systemone, and --model with --api completion.
+-- discriminate) with --api systemone, --model with --api completion, and
+-- --temperature and --reasoning-effort with any API but chat.
 ------------------------------------------------------------------------------
 
 local function episodesMode(args)
@@ -517,7 +553,8 @@ local function episodesMode(args)
   -- schema, so --raw-names and --no-schema do not apply. System One sends its
   -- own instructions (the discriminate clause), so --variant does not apply
   -- to it. A completion request names no model (the server serves one), so
-  -- --model does not apply to it.
+  -- --model does not apply to it. Only the chat path sends sampling settings
+  -- (--temperature, --reasoning-effort).
   if args.raw_names or args.no_schema then
     error("episodes mode redacts names as production does and asks for the schema:"
       .. " --raw-names and --no-schema do not apply", 0)
@@ -528,6 +565,10 @@ local function episodesMode(args)
   end
   if api == "completion" and args.model then
     error("--api completion names no model (the server serves one): name the run with --label", 0)
+  end
+  if api ~= "chat" and (args.temperature or args.reasoning_effort) then
+    error("--api " .. api .. " sends no sampling settings: --temperature and --reasoning-effort apply to"
+      .. " --api chat only", 0)
   end
   local files = listScenarios(dir)
   assert(#files > 0, "no episodes found in " .. dir)
@@ -567,7 +608,7 @@ local function episodesMode(args)
     for _, fname in ipairs(files) do
       local ep = assert(lfm.jsonDecode(readFile(dir .. "/" .. fname)))
       for _, st in ipairs(ep.steps) do
-        local body, tmplMs
+        local body, tmplMs, tmplTries
         if api == "systemone" then
           body = assert(lfm.systemOneBody(st.snapshot, { model = args.model }))
         elseif api == "completion" then
@@ -575,7 +616,7 @@ local function episodesMode(args)
           local msgs = assert(lfm.jsonEncode({ messages = lfm.jsonArray({
             { role = "system", content = systemPrompt }, { role = "user", content = user } }) }))
           local tmpl
-          tmpl, tmplMs = postJson(server .. "/apply-template", msgs, reqPath, tmplPath, hdr, timeout,
+          tmpl, tmplMs, tmplTries = postJson(server .. "/apply-template", msgs, reqPath, tmplPath, hdr, timeout,
             retries, retryWait)
           local doc = lfm.jsonDecode(tmpl)
           -- The template is the server's, not the model's: a reply with no
@@ -592,7 +633,7 @@ local function episodesMode(args)
             maxTokens = tonumber(args.max_tokens) or 128, schema = true, model = args.model,
             temperature = tonumber(args.temperature), reasoningEffort = args.reasoning_effort }))
         end
-        local resp, wallMs = postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait)
+        local resp, wallMs, attempts = postJson(url, body, reqPath, respPath, hdr, timeout, retries, retryWait)
         local action, pWait, err
         if api == "systemone" then
           local v, perr = lfm.parseSystemOne(resp)
@@ -604,7 +645,7 @@ local function episodesMode(args)
           else
             err = perr
           end
-          wallMs = wallMs + tmplMs
+          wallMs, attempts = wallMs + tmplMs, attempts + tmplTries
         else
           local raw, perr = lfm.parseResponse(resp)
           local v = raw and lfm.validateVerdict(raw) or nil
@@ -618,7 +659,7 @@ local function episodesMode(args)
         -- it answered (the scorer computes the same: score-episodes.lua,
         -- M.stepHash).
         assert(of:write(assert(lfm.jsonEncode({ episode = ep.id, t = st.t, action = action or "freeze",
-          pWait = pWait, valid = action ~= nil, wall_ms = wallMs,
+          pWait = pWait, valid = action ~= nil, wall_ms = wallMs, attempts = attempts,
           variant = variant, api = api, model = args.model, label = label, run = runId,
           snapshotHash = lfm.snapshotHash(assert(lfm.jsonEncode(st.snapshot))),
           error = err and tostring(err):sub(1, 120) or nil })), "\n"))

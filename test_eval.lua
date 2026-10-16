@@ -1151,6 +1151,10 @@ printf '0.010 %s' "${FAKE_STATUS:-200}"
   for _ in bodies:gmatch("\n") do requests = requests + 1 end
   check("G1: a redacting run asks each control class again", table.concat(controls, ","), "ambiguous-hog,extreme-runaway")
   check("G1: three scenarios, five requests", requests, 5)
+  local scoredRow
+  for _, r in ipairs(result.rows or {}) do if not r.injection_control then scoredRow = scoredRow or r end end
+  check("runner: run mode's rows record their attempts",
+    scoredRow ~= nil and scoredRow.attempts == 1 and result.retried == 0, true)
   -- The default output names the names condition: a redacted run and a
   -- raw-names run of one model and variant write two files. (Run from a
   -- scratch directory, so the default eval/results is the scratch's own.)
@@ -1176,11 +1180,20 @@ printf '0.010 %s' "${FAKE_STATUS:-200}"
   -- A server error fails the run, writing no results, rather than scoring
   -- the error as the model's invalid reply.
   local outErr = root .. "/run-err.json"
+  local stale = assert(io.open(outErr, "w"))
+  stale:write('{"label":"t","variant":"baseline","stale":true}\n')
+  stale:close()
   local okErr = os.execute(string.format("PATH='%s':\"$PATH\" FAKE_STATUS=503 FAKE_BODY_LOG='%s' lua eval/bakeoff.lua run "
     .. "--server http://stub --label t --scenarios '%s' --retries 0 --out '%s' >/dev/null 2>&1", stubDir, log, corpus, outErr))
   local errFile = io.open(outErr, "r")
   if errFile then errFile:close() end
-  check("runner: in run mode a server error fails the run, writing no results", okErr ~= true and errFile == nil, true)
+  check("runner: in run mode a server error fails the run, leaving no result, not even a stale one",
+    okErr ~= true and errFile == nil, true)
+  local leftovers = 0
+  local lp = io.popen("ls '" .. cwdRoot .. "/eval/results' 2>/dev/null")
+  for n in lp:lines() do if n:find(".partial-", 1, true) then leftovers = leftovers + 1 end end
+  lp:close()
+  check("runner: a run's result is renamed into place, leaving no partial file", leftovers, 0)
   os.execute("rm -rf '" .. root .. "'")
 end
 
@@ -1765,6 +1778,13 @@ if [ -n "${FAKE_STATUS_SEQ:-}" ]; then
   n=$(cat "$FAKE_SEQ_FILE" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s' "$n" > "$FAKE_SEQ_FILE"
   i=0; for s in $FAKE_STATUS_SEQ; do i=$((i + 1)); status=$s; [ "$i" -ge "$n" ] && break; done
 fi
+# A timeout: curl's write-out at its limit, no status, exit 28 (silent: a
+# timeout with no write-out at all).
+if [ "$status" = timeout ]; then printf '60.000 000'; exit 28; fi
+if [ "$status" = silent ]; then exit 28; fi
+# exit6: a host that cannot be resolved; exit18: a transfer cut short.
+if [ "$status" = exit6 ]; then printf '0.001 000'; exit 6; fi
+if [ "$status" = exit18 ]; then printf '0.005 200'; exit 18; fi
 case "$url" in
   */v1/chat/completions) body="$FAKE_CHAT" ;;
   */v1/systemone) body='{"model":"d1","answers":{"action":{"type":"choice","choice":"freeze","probabilities":{"freeze":0.8,"wait":0.2},"confidence":0.4}}}' ;;
@@ -1773,7 +1793,8 @@ case "$url" in
   *) exit 7 ;;
 esac
 printf '%s' "$body" > "$out"
-printf '0.010 %s' "$status"
+# FAKE_COMMA: curl's timing as a comma-decimal locale would print it.
+if [ -n "${FAKE_COMMA:-}" ]; then printf '0,010 %s' "$status"; else printf '0.010 %s' "$status"; fi
 ]])
   stub:close()
   os.execute("chmod +x '" .. stubDir .. "/curl'")
@@ -1868,8 +1889,33 @@ printf '0.010 %s' "$status"
   local r429, ok429, n429 = runSeq("s429", "429 200")
   check("runner: rate limiting is tried again, and the run stands",
     ok429 == true and n429 == #ep.steps and r429.valid == true, true)
-  local _, ok401, _, f401 = runSeq("s401", "401 200")
+  check("runner: the retried row records its attempts, and the time of both",
+    r429.attempts == 2 and (r429.wall_ms or 0) >= 19, true)
+  check("runner: a row answered at once records one attempt", rc.attempts, 1)
+  local rTo, okTo = runSeq("stimeout", "timeout 200")
+  check("runner: a timeout is tried again, and its time counts toward the answer's",
+    okTo == true and rTo.attempts == 2 and (rTo.wall_ms or 0) >= 60000, true)
+  local rSil = runSeq("ssilent", "silent 200", "--timeout 7")
+  check("runner: a timeout that reports no time took at least the time allowed",
+    rSil.attempts == 2 and (rSil.wall_ms or 0) >= 7000 and (rSil.wall_ms or 0) < 60000, true)
+  os.remove(seqFile)
+  local rWait = run("chat", chat, "swait", "--retry-wait 1",
+    "FAKE_STATUS_SEQ=" .. sq("429 200") .. " FAKE_SEQ_FILE=" .. sq(seqFile))
+  check("runner: the wait between attempts counts too", rWait.attempts == 2 and (rWait.wall_ms or 0) >= 1000, true)
+  local _, ok401, _, f401, said401 = runSeq("s401", "401 200")
   check("runner: a refused key is not tried again", ok401 == false and f401 == false, true)
+  check("runner: and is called a refused request, not a server error",
+    said401:find("the server refused the request", 1, true) ~= nil, true)
+  local function requestsMade() local f = io.open(seqFile, "r"); local n = f and tonumber(f:read("a")) or 0; if f then f:close() end; return n end
+  local _, okE6 = runSeq("sexit6", "exit6 200")
+  check("runner: a host that cannot be resolved fails at once, untried", okE6 == false and requestsMade() == 1, true)
+  local rE18, okE18 = runSeq("sexit18", "exit18 200")
+  check("runner: a transfer cut short is tried again", okE18 == true and rE18.attempts == 2, true)
+  local _, okEmpty, _, fEmpty, saidEmpty = run("chat", "", "empty")
+  check("runner: a 2xx with an empty body is no reply: the run fails",
+    okEmpty == false and fEmpty == false and saidEmpty:find("with an empty body", 1, true) ~= nil, true)
+  local rComma, okComma = run("chat", chat, "comma", nil, "FAKE_COMMA=1")
+  check("runner: a timing printed with a decimal comma still reads", okComma == true and rComma.wall_ms == 10, true)
   local _, okNoRetry, _, fNoRetry = runSeq("s503", "503 200", "--retries 0")
   check("runner: with no retries, a server error fails at once", okNoRetry == false and fNoRetry == false, true)
   local _, okTplSrv, _, fTplSrv = runSeq("stpl", "500", nil, "completion")
@@ -1890,6 +1936,10 @@ printf '0.010 %s' "$status"
   check("runner: and records discriminate, the instructions it sends", rsd.variant, "discriminate")
   local _, okCm, _, fCm = run("completion", chat, "cmodel", "--model foo")
   check("runner: a completion run refuses --model, which no request carries", okCm == false and fCm == false, true)
+  local _, okSt, _, fSt = run("systemone", chat, "s1temp", "--temperature 0.5")
+  local _, okCr, _, fCr = run("completion", chat, "creason", "--reasoning-effort low")
+  check("runner: sampling flags are refused where no request carries them",
+    okSt == false and fSt == false and okCr == false and fCr == false, true)
   check("runner: each row says what asked it", rc.variant == "discriminate" and rc.api == "chat", true)
   check("runner: and binds the input it answered, as the scorer hashes it",
     rc.snapshotHash ~= nil and rc.snapshotHash == sc.stepHash(ep.steps[1]), true)

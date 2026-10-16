@@ -21,9 +21,13 @@
 --
 -- G7 passes when the miss rate's one-sided 95% Clopper-Pearson upper bound
 -- is at most 5% AND the candidate's wrongful-freeze rate beats the best
--- deterministic baseline that itself meets the miss bound: the one-sided
--- 95% lower bound of the paired improvement, bootstrapped by template, must
--- be above zero.
+-- deterministic baseline that itself meets the miss bound: the paired
+-- improvement's one-sided sign-flip p-value over templates must be at most
+-- 5%. The test is exact, so a candidate no better than the baseline passes
+-- at most 5% of the time, at any template count; with four or fewer
+-- templates it cannot pass at all. The paired improvement's 95% lower bound,
+-- bootstrapped by template, is reported beside it as a diagnostic only:
+-- with few templates it passes a no-better candidate more often than that.
 --
 -- Usage (from the repo root):
 --   lua eval/score-episodes.lua gate --dir <episodes> --fit-dir <dev episodes> \
@@ -55,6 +59,8 @@ M.cfg = {
   confidence   = 0.95,
   bootstrap    = 2000,
   bootSeed     = 20261015,
+  flipExactMax = 16,     -- templates up to which the sign-flip test enumerates every flip
+  flipDraws    = 20000,  -- seeded random flips past that
   noisyFlip    = 0.10,
   powerShare   = 0.50,   -- the power control's share of the oracle's improvement
   powerTarget  = 0.80,
@@ -252,6 +258,52 @@ end
 -- hair under (at 0.9, 0.1 * 2000 is 199.99...), so it is nudged up first.
 function M.quantileIndex(conf, b)
   return math.max(1, math.floor((1 - conf) * b + 1e-9))
+end
+
+-- The sign-flip permutation test of the paired improvement, one-sided. Under
+-- the null that the candidate is no better than the baseline, each
+-- template's summed difference is as likely negative as positive, so the
+-- p-value is the share of sign flips (one sign per template, since jittered
+-- copies of one template are not independent) whose pooled sum is at least
+-- the observed one. Exact by enumeration up to cfg.flipExactMax templates;
+-- past that, cfg.flipDraws seeded random flips, the observed sum counted as
+-- one of them. A template summing to zero changes no flip's sum and is left
+-- out. With k templates the smallest p is 1/2^k, so four or fewer cannot
+-- reach 0.05. Returns the p-value and k.
+function M.signFlipP(pairs, cfg)
+  cfg = cfg or M.cfg
+  local byTpl, tpls = {}, {}
+  for _, pr in ipairs(pairs) do
+    if byTpl[pr.template] == nil then byTpl[pr.template] = 0; tpls[#tpls + 1] = pr.template end
+    byTpl[pr.template] = byTpl[pr.template] + pr.d
+  end
+  table.sort(tpls)
+  local sums, obs = {}, 0
+  for _, t in ipairs(tpls) do
+    if byTpl[t] ~= 0 then sums[#sums + 1] = byTpl[t]; obs = obs + byTpl[t] end
+  end
+  local k = #sums
+  if k == 0 then return 1, 0 end
+  local ge = 0
+  if k <= cfg.flipExactMax then
+    for mask = 0, (1 << k) - 1 do
+      local t = 0
+      for j = 1, k do
+        if (mask >> (j - 1)) & 1 == 1 then t = t - sums[j] else t = t + sums[j] end
+      end
+      if t >= obs then ge = ge + 1 end
+    end
+    return ge / (1 << k), k
+  end
+  local r = rng(cfg.bootSeed)
+  for _ = 1, cfg.flipDraws do
+    local t = 0
+    for j = 1, k do
+      if r() < 0.5 then t = t - sums[j] else t = t + sums[j] end
+    end
+    if t >= obs then ge = ge + 1 end
+  end
+  return (1 + ge) / (1 + cfg.flipDraws), k
 end
 
 ------------------------------------------------------------------------------
@@ -792,7 +844,9 @@ function M.compare(cand, base, cfg)
       prs[#prs + 1] = { template = ce.template, d = (be.wrongful and 1 or 0) - (ce.wrongful and 1 or 0) }
     end
   end
-  return M.pairedLowerBound(prs, cfg)
+  local lower, point = M.pairedLowerBound(prs, cfg)
+  local p, k = M.signFlipP(prs, cfg)
+  return lower, point, p, k
 end
 
 -- The fewest runaways a set must hold for G7 to decide on it: enough that a
@@ -845,17 +899,19 @@ function M.gate(episodes, candDecide, baselines, cfg)
       best, bestName = b, name
     end
   end
-  local lower, point = nil, nil
-  if best then lower, point = M.compare(cand, best, cfg) end
+  local lower, point, p, flipTemplates = nil, nil, nil, 0
+  if best then lower, point, p, flipTemplates = M.compare(cand, best, cfg) end
   local passMiss = cand.missUpper <= cfg.missBound
-  local passBeat = (lower ~= nil) and lower > 0
+  -- The beat is the sign-flip test's; the bootstrap's bound is reported
+  -- beside it, a diagnostic (see the header).
+  local passBeat = (p ~= nil) and p <= 1 - cfg.confidence
   -- A set too small to let a one-miss baseline qualify decides nothing: it
   -- neither passes nor fails a candidate.
   local minRunaways = M.decisiveRunaways(cfg)
   local decisive = cand.nRunaway >= minRunaways
   return {
     candidate = cand, bestBaseline = bestName, baselines = baseScores,
-    improvementLower = lower, improvementPoint = point,
+    improvementLower = lower, improvementPoint = point, improvementP = p, flipTemplates = flipTemplates,
     passMiss = passMiss, passBeat = passBeat, decisive = decisive, minRunaways = minRunaways,
     pass = decisive and passMiss and passBeat,
   }
@@ -1146,8 +1202,10 @@ function M.main(argv)
           #pw.uncovered > 0 and ("  (not covered: " .. table.concat(pw.uncovered, ",") .. ")") or ""))
       end
     end
-    print(string.format("best baseline: %s  paired improvement point %.3f lower95 %s  ->  G7 %s",
-      tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
+    print(string.format("best baseline: %s  paired improvement point %.3f  sign-flip p %s over %d templates"
+      .. "  (bootstrap lower95 %s, a diagnostic)  ->  G7 %s",
+      tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementP and string.format("%.4f", g.improvementP) or "n/a",
+      g.flipTemplates or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
       (not g.decisive) and "UNDECIDABLE" or g.pass and "PASS" or "FAIL"))
     if not g.decisive then
       print(string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a baseline"
@@ -1168,6 +1226,7 @@ function M.main(argv)
         local f = assert(io.open(partial, "w"))
         assert(f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
           bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
+          improvementP = g.improvementP, flipTemplates = g.flipTemplates,
           missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
           nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
           decisive = g.decisive, minRunaways = g.minRunaways })), "\n"))

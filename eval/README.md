@@ -167,8 +167,14 @@ that decision.
   held when the episode ends is no freeze. Then it applies G7: the
   one-sided 95% Clopper-Pearson upper bound on missed runaways is at most
   5%, and the wrongful-freeze rate beats the best deterministic baseline
-  that meets that bound (paired, one-sided 95% lower bound above zero,
-  bootstrapped by template). The
+  that meets that bound: the paired improvement's one-sided sign-flip
+  p-value over templates (one sign per template, since a template's
+  jittered copies are not independent) is at most 5%. The test is exact,
+  so a candidate no better than the baseline passes at most 5% of the
+  time at any template count, and four or fewer templates can never pass;
+  the bootstrapped 95% lower bound is reported beside it as a diagnostic,
+  since with few templates it passes such a candidate more often than its
+  nominal rate. The
   baselines are always-freeze, a category rule, a time-to-exhaustion rule
   and a depth-3 tree; the last two are fit on another split (`--fit-dir`,
   required, holding runaways and savables and none of the evaluated

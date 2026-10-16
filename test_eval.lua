@@ -187,6 +187,39 @@ do
   check("bootstrap: and at 0.95 the 100th", sc.quantileIndex(0.95, 2000), 100)
 end
 
+-- ---- the beat test: a sign-flip permutation over templates ----
+do
+  local function byTemplate(sums)
+    local prs = {}
+    for i, sum in ipairs(sums) do
+      -- Each template's sum spread over savables of +1, -1 and 0.
+      for _ = 1, math.abs(sum) do prs[#prs + 1] = { template = "T" .. i, d = sum > 0 and 1 or -1 } end
+      prs[#prs + 1] = { template = "T" .. i, d = 0 }
+    end
+    return prs
+  end
+  check("sign-flip: one improving template can never pass", (sc.signFlipP(byTemplate({ 3 }))), 0.5)
+  check("sign-flip: nor four (1/16)", (sc.signFlipP(byTemplate({ 1, 1, 1, 1 }))), 0.0625)
+  check("sign-flip: five can (1/32)", (sc.signFlipP(byTemplate({ 1, 1, 1, 1, 1 }))), 0.03125)
+  local pz, kz = sc.signFlipP(byTemplate({ 1, 0, 1, 0, 1 }))
+  check("sign-flip: a template summing to zero is left out", pz == 0.125 and kz == 3, true)
+  check("sign-flip: a worse candidate does not pass", (sc.signFlipP(byTemplate({ -1, -1, -1, -1, -1 }))) >= 0.5, true)
+  check("sign-flip: no difference at all is p 1", (sc.signFlipP(byTemplate({ 0, 0 }))), 1)
+  check("sign-flip: one strong template among weak ones is no beat (3/8)",
+    (sc.signFlipP(byTemplate({ 4, -1, 1 }))), 0.375)
+  -- Past the enumeration limit: seeded random flips, so reproducible, and
+  -- near the exact answer (14 templates of +1 and 3 of -1: the observed sum
+  -- 11 is reached when 14 or more of the 17 flips are +, 834 of 2^17).
+  local seventeen = {}
+  for i = 1, 17 do seventeen[i] = i <= 14 and 1 or -1 end
+  local p17, k17 = sc.signFlipP(byTemplate(seventeen))
+  check("sign-flip: past the enumeration limit, seeded random flips, reproducibly",
+    k17 == 17 and p17 == (sc.signFlipP(byTemplate(seventeen))), true)
+  check("sign-flip: and near the exact p", math.abs(p17 - 834 / 2 ^ 17) < 0.002, true)
+  check("sign-flip: three improving templates are no beat, though the bootstrap's bound is above zero",
+    (sc.pairedLowerBound(byTemplate({ 1, 1, 1 }))) > 0 and (sc.signFlipP(byTemplate({ 1, 1, 1 }))) > 0.05, true)
+end
+
 -- ---- tree baseline: fits a separable toy set exactly ----
 do
   local eps = {}
@@ -2256,6 +2289,8 @@ do
   check("decidable: a passing gate exits 0", okPass and passStatus, 0)
   check("decidable: and its result file says the set could decide",
     pdoc ~= nil and pdoc.decisive == true and pdoc.pass == true and pdoc.minRunaways == 93, true)
+  check("decidable: and records the beat test's p-value and its templates",
+    pdoc ~= nil and type(pdoc.improvementP) == "number" and pdoc.improvementP <= 0.05 and pdoc.flipTemplates >= 5, true)
   print = function() end
   local okFail, failStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "always-freeze" })
   -- The controls on a decidable set: 0 when they hold; 2 when the set is too
@@ -2282,6 +2317,34 @@ do
   local gShort = sc.gate(short, sc.candidates.oracle(), baselines)
   check("decidable: one runaway under the floor, the oracle is not passed", gShort.decisive == false and gShort.pass == false, true)
   check("decidable: always-freeze fails it", sc.gate(dev, sc.candidates["always-freeze"](), baselines).pass, false)
+  -- A beat carried by three templates is no pass, though the bootstrap's
+  -- bound is above zero: this candidate decides as the oracle on the
+  -- savables of three templates where the best baseline freezes wrongly, and
+  -- as that baseline everywhere else.
+  do
+    local base, oracle = baselines[gO.bestBaseline], sc.candidates.oracle()
+    local baseScore = sc.score(dev, base)
+    local wrongIn, tpls = {}, {}
+    for _, ep in ipairs(dev) do
+      local pe = baseScore.perEpisode[ep.id]
+      if pe and pe.class == "savable" then
+        if wrongIn[ep.template] == nil then wrongIn[ep.template] = 0; tpls[#tpls + 1] = ep.template end
+        if pe.wrongful then wrongIn[ep.template] = wrongIn[ep.template] + 1 end
+      end
+    end
+    table.sort(tpls)
+    local three = {}
+    for _, t in ipairs(tpls) do if wrongIn[t] > 0 and #three < 3 then three[#three + 1] = t end end
+    local inThree = {}
+    for _, t in ipairs(three) do inThree[t] = true end
+    local mix3 = function(st, ep)
+      if inThree[ep.template] and ep.labels.class == "savable" then return oracle(st, ep) end
+      return base(st, ep)
+    end
+    local g3 = sc.gate(dev, mix3, baselines)
+    check("decidable: a beat carried by three templates is no pass, though the bootstrap's bound is above zero",
+      #three == 3 and (g3.improvementLower or 0) > 0 and g3.flipTemplates == 3 and g3.passBeat == false, true)
+  end
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)
   check("cli: the ttx candidate is the fitted baseline", sc.resolveCandidate("ttx", baselines) == baselines.ttx, true)

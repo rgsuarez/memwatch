@@ -264,6 +264,35 @@ do
   local _, wa, wn, _, worst = sc.nullSize(shape(5, 100), quick)
   check("sign-flip: equal only in aggregate, its diagnostic finds a null the test passes over 5%",
     wa / wn > 0.05 and worst ~= nil and worst.m >= 1 and worst.j >= 1, true)
+  -- Where the largest template outweighs the rest, the gaps scale down to
+  -- what the others can carry, so the diagnostic still reads its 18 nulls.
+  local few = setmetatable({ sizeDatasets = 50 }, { __index = sc.cfg })
+  local _, _, _, _, lop = sc.nullSize(shape(10, { 5, 5, 5, 5, 5, 5, 5, 5, 5, 600 }), few)
+  check("sign-flip: beside one large template, the diagnostic still reads its nulls, at scaled gaps",
+    lop ~= nil and lop.of == 18 and lop.gap < 0.08, true)
+  -- The grid scales together: worse on the 600 and better on the nine 5s, the
+  -- largest carriable gap is 45/600, so 0.08, 0.15 and 0.3 become 0.02,
+  -- 0.0375 and 0.075.
+  local seen, savedAN = {}, sc.asymNull
+  sc.asymNull = function(tpls, count, m, j, gap)
+    local b, c, g = savedAN(tpls, count, m, j, gap)
+    if gap ~= math.huge then seen[#seen + 1] = g end
+    return b, c, g
+  end
+  sc.nullSize(shape(10, { 5, 5, 5, 5, 5, 5, 5, 5, 5, 600 }), setmetatable({ sizeDatasets = 1 }, { __index = sc.cfg }))
+  sc.asymNull = savedAN
+  check("sign-flip: the diagnostic's gaps scale down together to what the shape can carry",
+    #seen == 18 and math.abs(seen[1] - 0.02) < 1e-12 and math.abs(seen[2] - 0.0375) < 1e-12
+      and math.abs(seen[3] - 0.075) < 1e-12, true)
+  -- The per-template size is the worse of two couplings: one that always
+  -- passes the beat, under either coupling alone, is the size.
+  local savedPD = sc.pairDiff
+  sc.pairDiff = function(_, _, _, independent) return independent and 1 or 0 end
+  local onlyIndependent = sc.nullSize(shape(6, 3), few)
+  sc.pairDiff = function(_, _, _, independent) return independent and 0 or 1 end
+  local onlyDisjoint = sc.nullSize(shape(6, 3), few)
+  sc.pairDiff = savedPD
+  check("sign-flip: the per-template size is the worse of its two couplings", onlyIndependent == 50 and onlyDisjoint == 50, true)
   -- The aggregate-only null's construction, at an unequal shape: the
   -- candidate worse on the largest templates, better on the next ones, and
   -- no different on the rest, its expected wrongful freezes equal to the
@@ -275,20 +304,28 @@ do
   check("sign-flip: the aggregate-only null is worse on the largest template, better on the next three, even in sum",
     base.D == 0.4 and cand.D == 0.6 and cand.C == 0 and cand.B == 0 and cand.E == 0 and base.C == base.B
       and base.B == base.E and base.C > 0 and base.A == 0 and cand.A == 0 and math.abs(weighted) < 1e-12, true)
-  check("sign-flip: and there is none when the better templates cannot carry the balance",
-    sc.asymNull(names, counts, 2, 1, 0.5), nil)
-  -- The size check's coupling: both models wrong together as rarely as
-  -- their rates allow, so at equal rates of 0.3 a savable differs either way
-  -- 30% of the time (21% were they independent), and at 0.5 always.
-  local tally = { [-1] = 0, [0] = 0, [1] = 0 }
+  local sbase, scand, sgap = sc.asymNull(names, counts, 2, 1, 0.5)
+  local sweighted = 0
+  for _, t in ipairs(names) do sweighted = sweighted + counts[t] * (sbase[t] - scand[t]) end
+  check("sign-flip: a gap the better templates cannot carry shrinks to the largest they can",
+    math.abs(sgap - 5 / 23) < 1e-12 and math.abs(sbase.B - 1) < 1e-12 and math.abs(sweighted) < 1e-12, true)
+  -- The size check's couplings. Disjoint, both models are wrong together as
+  -- rarely as their rates allow: at equal rates of 0.3 a savable differs
+  -- either way 30% of the time, and at 0.5 always; at 0.8 and 0.6 they must
+  -- overlap by 0.4, so it differs 40% one way and 20% the other.
+  -- Independent, at 0.3 it differs 21% each way.
+  local tally, ind, over = { [-1] = 0, [0] = 0, [1] = 0 }, { [-1] = 0, [0] = 0, [1] = 0 }, { [-1] = 0, [0] = 0, [1] = 0 }
   local always = true
   for i = 1, 1000 do
     local u = (i - 0.5) / 1000
     tally[sc.pairDiff(u, 0.3, 0.3)] = tally[sc.pairDiff(u, 0.3, 0.3)] + 1
+    ind[sc.pairDiff(u, 0.3, 0.3, true)] = ind[sc.pairDiff(u, 0.3, 0.3, true)] + 1
+    over[sc.pairDiff(u, 0.8, 0.6)] = over[sc.pairDiff(u, 0.8, 0.6)] + 1
     if sc.pairDiff(u, 0.5, 0.5) == 0 then always = false end
   end
-  check("sign-flip: the size check's savables disagree as often as their rates allow",
-    tally[1] == 300 and tally[-1] == 300 and always, true)
+  check("sign-flip: disjoint, the size check's savables disagree as often as their rates allow",
+    tally[1] == 300 and tally[-1] == 300 and always and over[1] == 400 and over[-1] == 200, true)
+  check("sign-flip: independent, as often as chance makes them", ind[1] == 210 and ind[-1] == 210, true)
   check("sign-flip: the size check counts only savable templates",
     select(4, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
   check("sign-flip: a set needs five savable templates for the beat to be reachable", sc.minBeatTemplates(), 5)
@@ -2393,13 +2430,17 @@ do
   local okCB, cb = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   local shown = {}
   print = function(...) shown[#shown + 1] = table.concat({ ... }, " ") end
-  sc.nullSize = function() return 0, 400, 400, 10, { m = 1, j = 9, gap = 0.15 } end
+  sc.nullSize = function() return 0, 400, 400, 10, { m = 1, j = 9, gap = 0.15, of = 18 } end
   local okCK, ck = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = function() return 0, 0, 400, 10, nil end
+  local okCN, cn = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.nullSize = savedNull
   print = quiet3
-  local aggShown = false
+  local aggShown, notMeasured = false, false
   for _, line in ipairs(shown) do
-    if line:find("in aggregate only, a diagnostic", 1, true) and line:find("400 of 400", 1, true) then aggShown = true end
+    if line:find("in aggregate only, a diagnostic", 1, true) and line:find("400 of 400", 1, true)
+        and line:find("worst of its 18 nulls", 1, true) then aggShown = true end
+    if line:find("in aggregate only, a diagnostic: not measured", 1, true) then notMeasured = true end
   end
   check("decidable: controls that hold exit 0", okC0 and c0, 0)
   check("decidable: an underpowered set exits 2", okC2 and c2, 2)
@@ -2408,6 +2449,7 @@ do
   check("decidable: at the rule's edge, 28 of 400 fails", okCE and ce, 1)
   check("decidable: and 27 of 400 does not", okCB and cb, 0)
   check("decidable: an aggregate-only share is reported, and never fails the controls", okCK and ck == 0 and aggShown, true)
+  check("decidable: and without a null to read, the controls say so", okCN and cn == 0 and notMeasured, true)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a failing gate exits 1", okFail and failStatus, 1)
   -- One runaway short of the floor, the same set decides nothing.

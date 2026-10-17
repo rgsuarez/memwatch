@@ -1043,8 +1043,9 @@ end
 -- savables, the noisiest (rates b and b + gap, b = 0.5 - gap / 2), and
 -- steadily better on the next j (rates a and 0), a chosen so the expected
 -- wrongful freezes match in aggregate; any other template shows no
--- difference. Returns the baseline's and the candidate's rate per template,
--- or nil when the better templates cannot carry the balance (a above 1).
+-- difference. A gap the better templates cannot carry (a above 1) shrinks to
+-- the largest they can, and no gap passes 1. Returns the baseline's and the
+-- candidate's rate per template, and the gap used.
 function M.asymNull(tpls, count, m, j, gap)
   local order = {}
   for i, t in ipairs(tpls) do order[i] = t end
@@ -1055,20 +1056,21 @@ function M.asymNull(tpls, count, m, j, gap)
   local nWorse, nBetter = 0, 0
   for i = 1, m do nWorse = nWorse + count[order[i]] end
   for i = m + 1, m + j do nBetter = nBetter + count[order[i]] end
+  gap = math.min(gap, 1, nBetter / nWorse)
   local a = nWorse * gap / nBetter
-  if a > 1 then return nil end
   local base, cand = {}, {}
   for _, t in ipairs(tpls) do base[t], cand[t] = 0, 0 end
   for i = 1, m do base[order[i]], cand[order[i]] = 0.5 - gap / 2, 0.5 + gap / 2 end
   for i = m + 1, m + j do base[order[i]] = a end
-  return base, cand
+  return base, cand, gap
 end
 
 -- One savable's paired difference (the baseline's wrongful freeze minus the
--- candidate's) at the two models' rates, from one uniform draw u, both wrong
--- as rarely as the rates allow (the coupling M.nullSize draws under).
-function M.pairDiff(u, pb, pc)
-  local both = math.max(0, pb + pc - 1)
+-- candidate's) at the two models' rates, from one uniform draw u. Coupled
+-- disjoint, both are wrong as rarely as the rates allow; independent, as
+-- often as chance makes them (M.nullSize draws under both).
+function M.pairDiff(u, pb, pc, independent)
+  local both = independent and pb * pc or math.max(0, pb + pc - 1)
   local up, down = pb - both, pc - both -- P(+1), P(-1)
   return u < up and 1 or (u < up + down and -1 or 0)
 end
@@ -1076,20 +1078,22 @@ end
 -- The beat test's size at a set's shape: no-better candidates pass it in
 -- what share of cfg.sizeDatasets null datasets. As the generator draws
 -- them, a template's savables are independent episodes given the template.
--- On each savable the two models' wrongful freezes are drawn jointly, both
--- wrong as rarely as their rates allow: they disagree as often as they can,
--- so the fewest templates sum to zero and the test sits nearest its nominal
--- size, the hardest coupling for it. Two measurements:
+-- On each savable the two models' wrongful freezes are drawn jointly
+-- (M.pairDiff). Two measurements:
 --   per template, the beat's guarantee: the candidate's rate equals the
 --     baseline's on every template, both drawn per template in [0.05,
 --     0.95], so each paired difference, and each template's sum, is
---     symmetric about zero: the test is exact here;
+--     symmetric about zero: the test is exact here. Its share is the worse
+--     of two couplings, disjoint (the fewest templates sum to zero, the
+--     harder at the shapes measured) and independent (the harder with very
+--     few savables per template);
 --   in aggregate only, a diagnostic: the worst pass share over a grid of
 --     M.asymNull's nulls (one to three worse templates, the rest or half of
---     them better, each gap in cfg.sizeGaps), where the test is not exact.
+--     them better, the gaps of cfg.sizeGaps scaled down together where the
+--     shape cannot carry the largest), where the test is not exact.
 -- Returns the per-template passes, the aggregate diagnostic's worst passes,
--- the datasets, the savable templates, and that worst null ({ m, j, gap },
--- or nil when the set has too few templates for one).
+-- the datasets, the savable templates, and that worst null ({ m, j, gap,
+-- of = the nulls read }, or nil when the set has fewer than two templates).
 function M.nullSize(eps, cfg)
   cfg = cfg or M.cfg
   local count, tpls = {}, {}
@@ -1100,40 +1104,48 @@ function M.nullSize(eps, cfg)
     end
   end
   table.sort(tpls)
-  local function passOnce(r, base, cand)
+  local function passOnce(r, base, cand, independent)
     local prs = {}
     for _, t in ipairs(tpls) do
-      for _ = 1, count[t] do prs[#prs + 1] = { template = t, d = M.pairDiff(r(), base[t], cand[t]) } end
+      for _ = 1, count[t] do prs[#prs + 1] = { template = t, d = M.pairDiff(r(), base[t], cand[t], independent) } end
     end
     return M.beatPasses(M.signFlipP(prs), cfg)
   end
-  local r = rng(cfg.bootSeed + 1)
   local perPasses = 0
-  for _ = 1, cfg.sizeDatasets do
-    local rates = {}
-    for _, t in ipairs(tpls) do rates[t] = 0.05 + 0.9 * r() end
-    if passOnce(r, rates, rates) then perPasses = perPasses + 1 end
+  for i, independent in ipairs({ false, true }) do
+    local r, n = rng(cfg.bootSeed + 2 * i - 1), 0
+    for _ = 1, cfg.sizeDatasets do
+      local rates = {}
+      for _, t in ipairs(tpls) do rates[t] = 0.05 + 0.9 * r() end
+      if passOnce(r, rates, rates, independent) then n = n + 1 end
+    end
+    perPasses = math.max(perPasses, n)
   end
   local ra = rng(cfg.bootSeed + 2)
-  local aggPasses, worst = 0, nil
+  local aggPasses, worst, read = 0, nil, 0
+  local largest = math.max(table.unpack(cfg.sizeGaps))
   for m = 1, math.min(3, #tpls - 1) do
     local rest = #tpls - m
     local js = { rest }
     local half = math.max(1, math.ceil(rest / 2))
     if half ~= rest then js[2] = half end
     for _, j in ipairs(js) do
-      for _, gap in ipairs(cfg.sizeGaps) do
-        local base, cand = M.asymNull(tpls, count, m, j, gap)
-        if base then
-          local n = 0
-          for _ = 1, cfg.sizeDatasets do
-            if passOnce(ra, base, cand) then n = n + 1 end
-          end
-          if worst == nil or n > aggPasses then aggPasses, worst = n, { m = m, j = j, gap = gap } end
+      -- The largest gap this split can carry scales the grid, so a shape
+      -- whose largest template outweighs the rest still gets its nulls.
+      local _, _, room = M.asymNull(tpls, count, m, j, math.huge)
+      local scale = math.min(1, room / largest)
+      for _, g in ipairs(cfg.sizeGaps) do
+        local base, cand, gap = M.asymNull(tpls, count, m, j, g * scale)
+        local n = 0
+        for _ = 1, cfg.sizeDatasets do
+          if passOnce(ra, base, cand, false) then n = n + 1 end
         end
+        read = read + 1
+        if worst == nil or n > aggPasses then aggPasses, worst = n, { m = m, j = j, gap = gap } end
       end
     end
   end
+  if worst then worst.of = read end
   return perPasses, aggPasses, cfg.sizeDatasets, #tpls, worst
 end
 
@@ -1453,14 +1465,18 @@ function M.main(argv)
       local perPasses, aggPasses, sizeN, sizeTpls, worst = M.nullSize(eps)
       local alpha = 1 - M.cfg.confidence
       local lowerShare = 1 - M.cpUpper(sizeN - perPasses, sizeN)
-      print(string.format("size: candidates no better than the best baseline on any template passed the beat test in"
-        .. " %d of %d null datasets shaped like this set (%d savable templates): %.3f, at most %.3f expected: %s",
-        perPasses, sizeN, sizeTpls, perPasses / sizeN, alpha, lowerShare > alpha and "FAILED (anti-conservative)" or "ok"))
+      print(string.format("size: candidates whose rate equals the best baseline's on every template passed the beat"
+        .. " test in %d of %d null datasets shaped like this set (%d savable templates; the worse of two couplings):"
+        .. " %.3f, at most %.3f expected: %s", perPasses, sizeN, sizeTpls, perPasses / sizeN, alpha,
+        lowerShare > alpha and "FAILED (anti-conservative)" or "ok"))
       if lowerShare > alpha then status = 1 end
       if worst then
         print(string.format("size in aggregate only, a diagnostic (the beat promises nothing there): the worst of its"
-          .. " nulls, a candidate wrongly freezing %.2f more often on the %d largest templates and steadily better on"
-          .. " %d others, passed %d of %d: %.3f", worst.gap, worst.m, worst.j, aggPasses, sizeN, aggPasses / sizeN))
+          .. " %d nulls, a candidate wrongly freezing %.3f more often on the %d largest templates and steadily better"
+          .. " on %d others, passed %d of %d: %.3f", worst.of or 0, worst.gap, worst.m, worst.j, aggPasses, sizeN,
+          aggPasses / sizeN))
+      else
+        print("size in aggregate only, a diagnostic: not measured, since the set has fewer than two savable templates")
       end
     end
   else

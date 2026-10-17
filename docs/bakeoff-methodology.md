@@ -97,8 +97,8 @@ positive pooled improvement on the set; it establishes neither a gain on
 every template nor a pooled gain beyond the set's templates, and under a
 null equal only in pooled total it can pass a no-better candidate more
 often than 5%. A template the set lacks is its coverage to guard). Its
-wait counts only through the
-proposed wait rail, on its own probability: the contract it would be
+wait counts only through the proposed wait rail, on its own probability:
+the contract it would be
 wired under (the live path does not consult the rail yet). The held-out set is
 generated from templates kept outside this repository and is scored once
 per candidate. Decision models (the d1 rows in the registry) answer the

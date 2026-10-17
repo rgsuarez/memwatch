@@ -354,6 +354,9 @@ do
   check("sign-flip: independent, as often as chance makes them", ind[1] == 210 and ind[-1] == 210, true)
   check("sign-flip: the size check counts only savable templates",
     select(4, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
+  check("sign-flip: with fewer than two savable templates, the diagnostic reads no null",
+    select(5, sc.nullSize(shape(1, 5), quick)) == nil
+      and select(5, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)) == nil, true)
   check("sign-flip: a set needs five savable templates for the beat to be reachable", sc.minBeatTemplates(), 5)
   check("sign-flip: seven at 99% and four at 90%",
     sc.minBeatTemplates({ confidence = 0.99 }) == 7 and sc.minBeatTemplates({ confidence = 0.9 }) == 4, true)

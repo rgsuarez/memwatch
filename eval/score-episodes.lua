@@ -30,20 +30,21 @@
 -- symmetric about zero, and the test is exact (its flips counted in whole
 -- numbers, up to 50 differing templates; a set with more is refused). Four
 -- or fewer templates cannot pass at all, so a set needs five savable
--- templates to decide. The beat so asks whether the candidate beats the
--- baseline template by template, not in pooled total: under a null equal
--- only in aggregate no test of this kind is exact, and this one is not
--- conservative there, since a candidate steadily better on many templates
--- and worse on a few noisy ones can pass more often than 5% (in a search,
--- about 4 to 7% where templates hold 2 to 14 savables, far more beside one
--- large template). `controls` holds the per-template size to 5% and reports
--- the aggregate-only one at the set's shape as a diagnostic. The comparator
--- is chosen on the evaluated set itself (the fewest wrongful freezes), which
--- shrinks the measured improvement; the exactness argument is for a fixed
--- comparator. A difference skewed within a template (all its savables worse
--- together, rarely) needs savables that are not independent, which the
--- generator does not produce, and a template the set lacks is its coverage
--- to guard.
+-- templates to decide. A pass rejects that null, from the templates' summed
+-- differences: it does not show the candidate better on every template
+-- (seven templates better and one worse can pass), nor better in pooled
+-- total. Under a null equal only in aggregate no test of this kind is exact,
+-- and this one is not conservative there, since a candidate steadily better
+-- on many templates and worse on a few noisy ones can pass more often than
+-- 5% (in a search, about 4 to 7% where templates hold 2 to 14 savables, far
+-- more beside one large template). `controls` holds the per-template size to
+-- 5% and reports the aggregate-only one at the set's shape as a diagnostic.
+-- The comparator is chosen on the evaluated set itself (the fewest wrongful
+-- freezes), which shrinks the measured improvement; the exactness argument
+-- is for a fixed comparator. A difference skewed within a template (all its
+-- savables worse together, rarely) needs savables that are not independent,
+-- which the generator does not produce, and a template the set lacks is its
+-- coverage to guard.
 -- The paired improvement's 95% lower bound, bootstrapped by template, is
 -- reported beside the test as a diagnostic only: with few templates it
 -- passes a no-better candidate more often than its nominal 5%.
@@ -287,14 +288,14 @@ end
 -- so each template's sum is as likely negative as positive, and the p-value
 -- is the share of sign flips (one sign per template, since a template's
 -- jittered copies share its structure: independent given the template, not
--- of it) whose pooled sum is at least the observed one. The sums are whole numbers, so the flips' distribution is
--- convolved exactly, in whole-number counts; up to M.flipTemplatesMax
--- differing templates, every count and so every p-value is a double exactly,
--- and a set with more is refused rather than rounded. A template summing to
--- zero changes no flip's sum and is left out. With k templates the smallest
--- p is 1/2^k, so four or fewer cannot reach 0.05. Under a null equal only in
--- aggregate the test is neither exact nor conservative (see the header).
--- Returns the p-value and k.
+-- of it) whose pooled sum is at least the observed one. The sums are whole
+-- numbers, so the flips' distribution is convolved exactly, in whole-number
+-- counts; up to M.flipTemplatesMax differing templates, every count and so
+-- every p-value is a double exactly, and a set with more is refused rather
+-- than rounded. A template summing to zero changes no flip's sum and is left
+-- out. With k templates the smallest p is 1/2^k, so four or fewer cannot
+-- reach 0.05. Under a null equal only in aggregate the test is neither exact
+-- nor conservative (see the header). Returns the p-value and k.
 M.flipTemplatesMax = 50
 function M.signFlipP(prs)
   local byTpl, tpls = {}, {}
@@ -914,13 +915,14 @@ end
 
 -- The fewest savable templates a set must hold for the beat test to be
 -- reachable at all: with k templates its smallest p is 1/2^k, so the set
--- needs the k at which that reaches 1 - confidence (5 at 95%, 7 at 99%).
+-- needs the first k at which that p passes the beat (5 at 95%, 7 at 99%).
+-- The comparison is the beat's own, so the two agree at every confidence.
 function M.minBeatTemplates(cfg)
   cfg = cfg or M.cfg
   local conf = cfg.confidence
   assert(type(conf) == "number" and conf > 0 and conf < 1, "the confidence must be between 0 and 1")
-  local alpha, k = 1 - conf, 0
-  while 2 ^ -k > alpha + 1e-12 do k = k + 1 end
+  local k = 0
+  while not M.beatPasses(2 ^ -k, cfg) do k = k + 1 end
   return k
 end
 
@@ -1147,6 +1149,15 @@ function M.nullSize(eps, cfg)
   end
   if worst then worst.of = read end
   return perPasses, aggPasses, cfg.sizeDatasets, #tpls, worst
+end
+
+-- On a set that can decide, why the beat was out of reach for this
+-- candidate, or nil: it differed from the comparator on too few templates.
+function M.beatOutOfReachWhy(g)
+  if g.decisive and g.bestBaseline and g.flipTemplates < g.minTemplates then
+    return string.format("the candidate differs from %s on %d savable templates; the beat test can pass only on %d"
+      .. " or more (a tied template is no evidence of a beat)", g.bestBaseline, g.flipTemplates, g.minTemplates)
+  end
 end
 
 -- Why a gate's set decides nothing, for the operator.
@@ -1384,10 +1395,8 @@ function M.main(argv)
       g.flipTemplates or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
       (not g.decisive) and "UNDECIDABLE" or g.pass and "PASS" or "FAIL"))
     if not g.decisive then print(M.undecidableWhy(g)) end
-    if g.decisive and g.bestBaseline and g.flipTemplates < g.minTemplates then
-      print(string.format("the candidate differs from %s on %d savable templates; the beat test can pass only on %d"
-        .. " or more (a tied template is no evidence of a beat)", g.bestBaseline, g.flipTemplates, g.minTemplates))
-    end
+    local outOfReach = M.beatOutOfReachWhy(g)
+    if outOfReach then print(outOfReach) end
     -- 0 pass, 1 fail, 2 a set too small to decide.
     status = (not g.decisive) and 2 or g.pass and 0 or 1
     print("tree baseline (fit on " .. (a.fitDir or a.dir) .. "):\n" .. M.describeTree(tree, "  "))

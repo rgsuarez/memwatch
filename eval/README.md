@@ -175,13 +175,14 @@ that decision.
   A template's savables are independent episodes given the template and
   each paired difference is -1, 0 or +1, so under that null each
   template's sum is symmetric about zero and the test is exact (up to 50
-  differing templates; the scorer refuses more rather than round). The
-  beat so asks whether the candidate beats the baseline template by
-  template, not in pooled total: under a null equal only in aggregate no
-  test of this kind is exact, and this one can pass a candidate steadily
-  better on many templates and worse on a few noisy ones more often than
-  5% (in a search, about 4 to 7% where templates hold 2 to 14 savables,
-  far more beside one large template). The comparator is the baseline
+  differing templates; the scorer refuses more rather than round). A
+  pass rejects that null, from the templates' summed differences: it does
+  not show the candidate better on every template (seven better and one
+  worse can pass), nor better in pooled total. Under a null equal only in
+  aggregate no test of this kind is exact, and this one can pass a
+  candidate steadily better on many templates and worse on a few noisy
+  ones more often than 5% (in a search, about 4 to 7% where templates
+  hold 2 to 14 savables, far more beside one large template). The comparator is the baseline
   with the fewest wrongful freezes on the evaluated set itself; the
   exactness argument is for a fixed comparator. Four or fewer savable
   templates can never pass, so a set with fewer than five decides

@@ -225,6 +225,8 @@ do
   local pOut = sc.signFlipP(byTemplate({ -1, -1, -1, 1, 1, 1, 2, 3, 3, 3 }))
   check("sign-flip: at the threshold, 51/1024 passes the beat and 52/1024 does not",
     pIn == 51 / 1024 and pOut == 52 / 1024 and sc.beatPasses(pIn) and not sc.beatPasses(pOut), true)
+  check("sign-flip: and at the cap's lattice, the counts on either side of 5% fall on either side of the beat",
+    sc.beatPasses(56294995342131 / 2 ^ 50) and not sc.beatPasses(56294995342132 / 2 ^ 50), true)
   check("sign-flip: a difference that is not a whole number is refused",
     (pcall(sc.signFlipP, { { template = "T", d = 0.5 } })), false)
   check("sign-flip: but a whole number held as a float counts",
@@ -332,6 +334,10 @@ do
   check("sign-flip: seven at 99% and four at 90%",
     sc.minBeatTemplates({ confidence = 0.99 }) == 7 and sc.minBeatTemplates({ confidence = 0.9 }) == 4, true)
   check("sign-flip: and a confidence outside (0, 1) is refused", (pcall(sc.minBeatTemplates, { confidence = 1 })), false)
+  -- It reads the beat's own comparison: at 75%, two templates reach 1/4
+  -- exactly; just under a power of two, one more is needed.
+  check("sign-flip: the template floor agrees with the beat at a power of two",
+    sc.minBeatTemplates({ confidence = 0.75 }) == 2 and sc.minBeatTemplates({ confidence = 1 - 2 ^ -5 + 2 ^ -45 }) == 6, true)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----
@@ -2521,6 +2527,9 @@ do
     local g4m = sc.gate(dev, mix4, baselines)
     check("decidable: a candidate differing on four templates of a decisive set fails, not undecided",
       n4 == 4 and g4m.decisive == true and g4m.flipTemplates == 4 and g4m.pass == false, true)
+    local note = sc.beatOutOfReachWhy(g4m)
+    check("decidable: and the gate says why the beat was out of reach",
+      note ~= nil and note:find("on 4 savable templates", 1, true) ~= nil and sc.beatOutOfReachWhy(gO) == nil, true)
   end
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)

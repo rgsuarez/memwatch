@@ -2466,7 +2466,10 @@ do
   sc.nullSize = function() return 400, 0, 400, 10 end
   local okCS, cs = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.nullSize = function() return 30, 0, 400, 10 end
+  local edgeShown = {}
+  print = function(...) edgeShown[#edgeShown + 1] = table.concat({ ... }, " ") end
   local okCE, ce = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  print = function() end
   sc.nullSize = function() return 29, 0, 400, 10 end
   local okCB, cb = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   local shown = {}
@@ -2488,6 +2491,14 @@ do
   check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
   check("decidable: so does a beat test that passes no-better candidates per template", okCS and cs, 1)
   check("decidable: at the rule's edge, 30 of 400 fails", okCE and ce, 1)
+  check("decidable: and its size line prints that bound, at the level the rule holds it", (function()
+    for _, line in ipairs(edgeShown) do
+      if line:find("in 30 of 400 null datasets", 1, true) and line:find("its lower bound 0.051 at 97.5%", 1, true) then
+        return true
+      end
+    end
+    return false
+  end)(), true)
   check("decidable: and 29 of 400 does not", okCB and cb, 0)
   check("decidable: an aggregate-only share is reported, and never fails the controls", okCK and ck == 0 and aggShown, true)
   check("decidable: and without a null to read, the controls say so", okCN and cn == 0 and notMeasured, true)

@@ -286,6 +286,17 @@ do
   check("sign-flip: the diagnostic's gaps scale down together to what the shape can carry",
     #seen == 18 and math.abs(seen[1] - 0.02) < 1e-12 and math.abs(seen[2] - 0.0375) < 1e-12
       and math.abs(seen[3] - 0.075) < 1e-12, true)
+  -- Where the shape can carry them, the gaps are the configured ones.
+  seen = {}
+  sc.asymNull = function(tpls, count, m, j, gap)
+    local b, c, g = savedAN(tpls, count, m, j, gap)
+    if gap ~= math.huge then seen[#seen + 1] = g end
+    return b, c, g
+  end
+  sc.nullSize(shape(10, 10), setmetatable({ sizeDatasets = 1 }, { __index = sc.cfg }))
+  sc.asymNull = savedAN
+  check("sign-flip: at a like-sized shape, the gaps are the configured ones",
+    #seen == 18 and seen[1] == 0.08 and seen[2] == 0.15 and seen[3] == 0.3, true)
   -- The per-template size is the worse of two couplings: one that always
   -- passes the beat, under either coupling alone, is the size.
   local savedPD = sc.pairDiff
@@ -295,6 +306,8 @@ do
   local onlyDisjoint = sc.nullSize(shape(6, 3), few)
   sc.pairDiff = savedPD
   check("sign-flip: the per-template size is the worse of its two couplings", onlyIndependent == 50 and onlyDisjoint == 50, true)
+  local _, _, _, _, noGrid = sc.nullSize(shape(5, 5), setmetatable({ sizeDatasets = 1, sizeGaps = {} }, { __index = sc.cfg }))
+  check("sign-flip: with no gaps configured, the diagnostic reads no null, and does not fail", noGrid, nil)
   -- The aggregate-only null's construction, at an unequal shape: the
   -- candidate worse on the largest templates, better on the next ones, and
   -- no different on the rest, its expected wrongful freezes equal to the
@@ -311,6 +324,16 @@ do
   for _, t in ipairs(names) do sweighted = sweighted + counts[t] * (sbase[t] - scand[t]) end
   check("sign-flip: a gap the better templates cannot carry shrinks to the largest they can",
     math.abs(sgap - 5 / 23) < 1e-12 and math.abs(sbase.B - 1) < 1e-12 and math.abs(sweighted) < 1e-12, true)
+  -- At that edge float error can land the balance a hair above 1 (25 worse
+  -- savables against 7 better); a rate never leaves [0, 1].
+  local ebase = sc.asymNull({ "B", "W" }, { B = 7, W = 25 }, 1, 1, math.huge)
+  check("sign-flip: at the edge, the balancing rate stays at most 1", ebase.B <= 1 and ebase.B > 0.999, true)
+  -- And no gap passes 1, even where the better templates could carry more
+  -- (one of 10 worse, five of 5 better): the worse template's rates then
+  -- run from 0 to 1, and the better ones carry 10 of their 25.
+  local wbase, wcand, wgap = sc.asymNull({ "W", "B1", "B2", "B3", "B4", "B5" },
+    { W = 10, B1 = 5, B2 = 5, B3 = 5, B4 = 5, B5 = 5 }, 1, 5, 2)
+  check("sign-flip: no gap passes 1", wgap == 1 and wbase.W == 0 and wcand.W == 1 and math.abs(wbase.B1 - 0.4) < 1e-12, true)
   -- The size check's couplings. Disjoint, both models are wrong together as
   -- rarely as their rates allow: at equal rates of 0.3 a savable differs
   -- either way 30% of the time, and at 0.5 always; at 0.8 and 0.6 they must

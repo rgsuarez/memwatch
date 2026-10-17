@@ -1059,7 +1059,7 @@ function M.asymNull(tpls, count, m, j, gap)
   for i = 1, m do nWorse = nWorse + count[order[i]] end
   for i = m + 1, m + j do nBetter = nBetter + count[order[i]] end
   gap = math.min(gap, 1, nBetter / nWorse)
-  local a = nWorse * gap / nBetter
+  local a = math.min(1.0, nWorse * gap / nBetter) -- at the cap, float error can land a hair above 1
   local base, cand = {}, {}
   for _, t in ipairs(tpls) do base[t], cand[t] = 0, 0 end
   for i = 1, m do base[order[i]], cand[order[i]] = 0.5 - gap / 2, 0.5 + gap / 2 end
@@ -1095,7 +1095,8 @@ end
 --     shape cannot carry the largest), where the test is not exact.
 -- Returns the per-template passes, the aggregate diagnostic's worst passes,
 -- the datasets, the savable templates, and that worst null ({ m, j, gap,
--- of = the nulls read }, or nil when the set has fewer than two templates).
+-- of = the nulls read }, or nil when the set has fewer than two templates or
+-- cfg.sizeGaps is empty).
 function M.nullSize(eps, cfg)
   cfg = cfg or M.cfg
   local count, tpls = {}, {}
@@ -1125,8 +1126,8 @@ function M.nullSize(eps, cfg)
   end
   local ra = rng(cfg.bootSeed + 2)
   local aggPasses, worst, read = 0, nil, 0
-  local largest = math.max(table.unpack(cfg.sizeGaps))
-  for m = 1, math.min(3, #tpls - 1) do
+  local largest = #cfg.sizeGaps > 0 and math.max(table.unpack(cfg.sizeGaps)) or 0
+  for m = 1, largest > 0 and math.min(3, #tpls - 1) or 0 do
     local rest = #tpls - m
     local js = { rest }
     local half = math.max(1, math.ceil(rest / 2))
@@ -1488,7 +1489,8 @@ function M.main(argv)
           .. " on %d others, passed %d of %d: %.3f", worst.of or 0, worst.gap, worst.m, worst.j, aggPasses, sizeN,
           aggPasses / sizeN))
       else
-        print("size in aggregate only, a diagnostic: not measured, since the set has fewer than two savable templates")
+        print("size in aggregate only, a diagnostic: not measured (fewer than two savable templates, or no gaps"
+          .. " configured)")
       end
     end
   else

@@ -31,14 +31,15 @@
 -- numbers, up to 50 differing templates; a set with more is refused). Four
 -- or fewer templates cannot pass at all, so a set needs five savable
 -- templates to decide. A pass rejects that null, from the templates' summed
--- differences: it does not show the candidate better on every template
--- (seven templates better and one worse can pass), nor better in pooled
--- total. Under a null equal only in aggregate no test of this kind is exact,
--- and this one is not conservative there, since a candidate steadily better
--- on many templates and worse on a few noisy ones can pass more often than
--- 5% (in a search, about 4 to 7% where templates hold 2 to 14 savables, far
--- more beside one large template). `controls` holds the per-template size to
--- 5% and reports the aggregate-only one at the set's shape as a diagnostic.
+-- differences, and needs the observed pooled improvement to be positive; it
+-- does not establish a gain on every template (seven templates better and
+-- one worse can pass), nor a pooled gain beyond this set's templates. Under
+-- a null equal only in aggregate no test of this kind is exact, and this one
+-- is not conservative there, since a candidate steadily better on many
+-- templates and worse on a few noisy ones can pass more often than 5% (in a
+-- search, about 4 to 7% where templates hold 2 to 14 savables, far more
+-- beside one large template). `controls` holds the per-template size to 5%
+-- and reports the aggregate-only one at the set's shape as a diagnostic.
 -- The comparator is chosen on the evaluated set itself (the fewest wrongful
 -- freezes), which shrinks the measured improvement; the exactness argument
 -- is for a fixed comparator. A difference skewed within a template (all its

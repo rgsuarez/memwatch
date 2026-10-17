@@ -176,18 +176,19 @@ that decision.
   each paired difference is -1, 0 or +1, so under that null each
   template's sum is symmetric about zero and the test is exact (up to 50
   differing templates; the scorer refuses more rather than round). A
-  pass rejects that null, from the templates' summed differences: it does
-  not show the candidate better on every template (seven better and one
-  worse can pass), nor better in pooled total. Under a null equal only in
-  aggregate no test of this kind is exact, and this one can pass a
+  pass rejects that null, from the templates' summed differences, and
+  needs the observed pooled improvement to be positive; it does not
+  establish a gain on every template (seven better and one worse can
+  pass), nor a pooled gain beyond the set's templates. Under a null equal
+  only in aggregate no test of this kind is exact, and this one can pass a
   candidate steadily better on many templates and worse on a few noisy
   ones more often than 5% (in a search, about 4 to 7% where templates
-  hold 2 to 14 savables, far more beside one large template). The comparator is the baseline
-  with the fewest wrongful freezes on the evaluated set itself; the
-  exactness argument is for a fixed comparator. Four or fewer savable
-  templates can never pass, so a set with fewer than five decides
-  nothing. A template the set lacks is its coverage to guard. The
-  bootstrapped 95% lower bound is reported beside the test as a
+  hold 2 to 14 savables, far more beside one large template). The
+  comparator is the baseline with the fewest wrongful freezes on the
+  evaluated set itself; the exactness argument is for a fixed comparator.
+  Four or fewer savable templates can never pass, so a set with fewer than
+  five decides nothing. A template the set lacks is its coverage to guard.
+  The bootstrapped 95% lower bound is reported beside the test as a
   diagnostic, since with few templates it passes a no-better candidate
   more often than its nominal rate. `controls` also measures the test's
   size at the set's shape: per template, failing if it is clearly above

@@ -183,6 +183,194 @@ do
   end
   check("bootstrap: uniform improvement has lower bound 1", (sc.pairedLowerBound(ones)), 1)
   check("bootstrap: no improvement has lower bound 0", (sc.pairedLowerBound(zeros)), 0)
+  check("bootstrap: the lower bound at 0.9 reads the 200th of 2000", sc.quantileIndex(0.9, 2000), 200)
+  check("bootstrap: and at 0.95 the 100th", sc.quantileIndex(0.95, 2000), 100)
+end
+
+-- ---- the beat test: a sign-flip permutation over templates ----
+do
+  local function byTemplate(sums)
+    local prs = {}
+    for i, sum in ipairs(sums) do
+      -- Each template's sum spread over savables of +1, -1 and 0.
+      for _ = 1, math.abs(sum) do prs[#prs + 1] = { template = "T" .. i, d = sum > 0 and 1 or -1 } end
+      prs[#prs + 1] = { template = "T" .. i, d = 0 }
+    end
+    return prs
+  end
+  check("sign-flip: one improving template can never pass", (sc.signFlipP(byTemplate({ 3 }))), 0.5)
+  check("sign-flip: nor four (1/16)", (sc.signFlipP(byTemplate({ 1, 1, 1, 1 }))), 0.0625)
+  check("sign-flip: five can (1/32)", (sc.signFlipP(byTemplate({ 1, 1, 1, 1, 1 }))), 0.03125)
+  local pz, kz = sc.signFlipP(byTemplate({ 1, 0, 1, 0, 1 }))
+  check("sign-flip: a template summing to zero is left out", pz == 0.125 and kz == 3, true)
+  check("sign-flip: a worse candidate does not pass", (sc.signFlipP(byTemplate({ -1, -1, -1, -1, -1 }))) >= 0.5, true)
+  check("sign-flip: no difference at all is p 1", (sc.signFlipP(byTemplate({ 0, 0 }))), 1)
+  check("sign-flip: one strong template among weak ones is no beat (3/8)",
+    (sc.signFlipP(byTemplate({ 4, -1, 1 }))), 0.375)
+  -- Exact in whole-number counts: 14 templates of +1 and 3 of -1 reach the
+  -- observed sum, 11, when 14 or more of the 17 flips are +: 834 of 2^17.
+  local seventeen = {}
+  for i = 1, 17 do seventeen[i] = i <= 14 and 1 or -1 end
+  local p17, k17 = sc.signFlipP(byTemplate(seventeen))
+  check("sign-flip: exact past sixteen templates (834 / 2^17)", k17 == 17 and p17 == 834 / 2 ^ 17, true)
+  local fifty = {}
+  for i = 1, 50 do fifty[i] = 1 end
+  check("sign-flip: and at fifty, its cap (2^-50)", (sc.signFlipP(byTemplate(fifty))), 2 ^ -50)
+  fifty[51] = 1
+  check("sign-flip: fifty-one differing templates are refused, not rounded",
+    (pcall(sc.signFlipP, byTemplate(fifty))), false)
+  -- At the threshold: at ten templates the p-values nearest 5%, 51 and 52
+  -- of 1024, fall on either side of it.
+  local pIn = sc.signFlipP(byTemplate({ -1, -1, -1, 1, 1, 2, 2, 2, 2, 3 }))
+  local pOut = sc.signFlipP(byTemplate({ -1, -1, -1, 1, 1, 1, 2, 3, 3, 3 }))
+  check("sign-flip: at the threshold, 51/1024 passes the beat and 52/1024 does not",
+    pIn == 51 / 1024 and pOut == 52 / 1024 and sc.beatPasses(pIn) and not sc.beatPasses(pOut), true)
+  check("sign-flip: and at the cap's lattice, the counts on either side of 5% fall on either side of the beat",
+    sc.beatPasses(56294995342131 / 2 ^ 50) and not sc.beatPasses(56294995342132 / 2 ^ 50), true)
+  check("sign-flip: a difference that is not a whole number is refused",
+    (pcall(sc.signFlipP, { { template = "T", d = 0.5 } })), false)
+  check("sign-flip: but a whole number held as a float counts",
+    select(2, pcall(sc.signFlipP, { { template = "T", d = 1.0 } })), 0.5)
+  check("sign-flip: so are fractions that cancel within a template",
+    (pcall(sc.signFlipP, { { template = "T", d = 0.5 }, { template = "T", d = -0.5 } })), false)
+  check("sign-flip: and a difference outside -1, 0 and 1, either way",
+    (pcall(sc.signFlipP, { { template = "T", d = 2 } })) or (pcall(sc.signFlipP, { { template = "T", d = -2 } })), false)
+  check("sign-flip: three improving templates are no beat, though the bootstrap's bound is above zero",
+    (sc.pairedLowerBound(byTemplate({ 1, 1, 1 }))) > 0 and (sc.signFlipP(byTemplate({ 1, 1, 1 }))) > 0.05, true)
+  -- The size at the regenerated sets' shapes: candidates no better than the
+  -- baseline pass the beat at most 5% of the time (sealed: 17 templates of 5
+  -- savables; dev: 10 of 10; and an unequal shape, 12 templates of 2 to 14).
+  -- Fewer draws than the controls take, for speed. per: savables per
+  -- template, one count for all or a list.
+  local function shape(nTpl, per)
+    local eps = {}
+    for t = 1, nTpl do
+      for _ = 1, type(per) == "table" and per[t] or per do
+        eps[#eps + 1] = { template = "T" .. t, labels = { class = "savable" } }
+      end
+    end
+    return eps
+  end
+  -- Held to the controls' own rule: the share's one-sided lower bound, at
+  -- 97.5% since the share is the worse of two couplings.
+  local quick = setmetatable({ sizeDatasets = 200 }, { __index = sc.cfg })
+  local function sizeOk(passes, n) return 1 - sc.cpUpper(n - passes, n, 1 - (1 - sc.cfg.confidence) / 2) <= 0.05 end
+  local sp, _, sn, st = sc.nullSize(shape(17, 5), quick)
+  check("sign-flip: at sealed's shape, its size per template is within 5%", st == 17 and sizeOk(sp, sn), true)
+  local dp, _, dn, dt = sc.nullSize(shape(10, 10), quick)
+  check("sign-flip: at dev's shape, per template", dt == 10 and sizeOk(dp, dn), true)
+  local up, _, un, ut = sc.nullSize(shape(12, { 2, 5, 9, 14, 2, 5, 9, 14, 2, 5, 9, 14 }), quick)
+  check("sign-flip: at an unequal shape, per template", ut == 12 and sizeOk(up, un), true)
+  -- Equal only in aggregate, the test makes no promise, and the diagnostic
+  -- sees why: at five templates of 100, a candidate steadily better on four
+  -- and worse on the fifth passes it well over 5% of the time.
+  local _, wa, wn, _, worst = sc.nullSize(shape(5, 100), quick)
+  check("sign-flip: equal only in aggregate, its diagnostic finds a null the test passes over 5%",
+    wa / wn > 0.05 and worst ~= nil and worst.m >= 1 and worst.j >= 1, true)
+  -- Where the largest template outweighs the rest, the gaps scale down to
+  -- what the others can carry, so the diagnostic still reads its 18 nulls.
+  local few = setmetatable({ sizeDatasets = 50 }, { __index = sc.cfg })
+  local _, _, _, _, lop = sc.nullSize(shape(10, { 5, 5, 5, 5, 5, 5, 5, 5, 5, 600 }), few)
+  check("sign-flip: beside one large template, the diagnostic still reads its nulls, at scaled gaps",
+    lop ~= nil and lop.of == 18 and lop.gap < 0.08, true)
+  -- The grid scales together: worse on the 600 and better on the nine 5s, the
+  -- largest carriable gap is 45/600, so 0.08, 0.15 and 0.3 become 0.02,
+  -- 0.0375 and 0.075.
+  local seen, savedAN = {}, sc.asymNull
+  sc.asymNull = function(tpls, count, m, j, gap)
+    local b, c, g = savedAN(tpls, count, m, j, gap)
+    if gap ~= math.huge then seen[#seen + 1] = g end
+    return b, c, g
+  end
+  sc.nullSize(shape(10, { 5, 5, 5, 5, 5, 5, 5, 5, 5, 600 }), setmetatable({ sizeDatasets = 1 }, { __index = sc.cfg }))
+  sc.asymNull = savedAN
+  check("sign-flip: the diagnostic's gaps scale down together to what the shape can carry",
+    #seen == 18 and math.abs(seen[1] - 0.02) < 1e-12 and math.abs(seen[2] - 0.0375) < 1e-12
+      and math.abs(seen[3] - 0.075) < 1e-12, true)
+  -- Where the shape can carry them, the gaps are the configured ones.
+  seen = {}
+  sc.asymNull = function(tpls, count, m, j, gap)
+    local b, c, g = savedAN(tpls, count, m, j, gap)
+    if gap ~= math.huge then seen[#seen + 1] = g end
+    return b, c, g
+  end
+  sc.nullSize(shape(10, 10), setmetatable({ sizeDatasets = 1 }, { __index = sc.cfg }))
+  sc.asymNull = savedAN
+  check("sign-flip: at a like-sized shape, the gaps are the configured ones",
+    #seen == 18 and seen[1] == 0.08 and seen[2] == 0.15 and seen[3] == 0.3, true)
+  -- The per-template size is the worse of two couplings: one that always
+  -- passes the beat, under either coupling alone, is the size.
+  local savedPD = sc.pairDiff
+  sc.pairDiff = function(_, _, _, independent) return independent and 1 or 0 end
+  local onlyIndependent = sc.nullSize(shape(6, 3), few)
+  sc.pairDiff = function(_, _, _, independent) return independent and 0 or 1 end
+  local onlyDisjoint = sc.nullSize(shape(6, 3), few)
+  sc.pairDiff = savedPD
+  check("sign-flip: the per-template size is the worse of its two couplings", onlyIndependent == 50 and onlyDisjoint == 50, true)
+  local _, _, _, _, noGrid = sc.nullSize(shape(5, 5), setmetatable({ sizeDatasets = 1, sizeGaps = {} }, { __index = sc.cfg }))
+  check("sign-flip: with no gaps configured, the diagnostic reads no null, and does not fail", noGrid, nil)
+  -- The aggregate-only null's construction, at an unequal shape: the
+  -- candidate worse on the largest templates, better on the next ones, and
+  -- no different on the rest, its expected wrongful freezes equal to the
+  -- baseline's in aggregate; none when the better templates cannot carry it.
+  local counts, names = { A = 2, B = 5, C = 9, D = 14, E = 3 }, { "A", "B", "C", "D", "E" }
+  local base, cand = sc.asymNull(names, counts, 1, 3, 0.2)
+  local weighted = 0
+  for _, t in ipairs(names) do weighted = weighted + counts[t] * (base[t] - cand[t]) end
+  check("sign-flip: the aggregate-only null is worse on the largest template, better on the next three, even in sum",
+    base.D == 0.4 and cand.D == 0.6 and cand.C == 0 and cand.B == 0 and cand.E == 0 and base.C == base.B
+      and base.B == base.E and base.C > 0 and base.A == 0 and cand.A == 0 and math.abs(weighted) < 1e-12, true)
+  local sbase, scand, sgap = sc.asymNull(names, counts, 2, 1, 0.5)
+  local sweighted = 0
+  for _, t in ipairs(names) do sweighted = sweighted + counts[t] * (sbase[t] - scand[t]) end
+  check("sign-flip: a gap the better templates cannot carry shrinks to the largest they can",
+    math.abs(sgap - 5 / 23) < 1e-12 and math.abs(sbase.B - 1) < 1e-12 and math.abs(sweighted) < 1e-12, true)
+  -- At that edge float error can land the balance a hair above 1 (25 worse
+  -- savables against 7 better); a rate never leaves [0, 1].
+  local ebase = sc.asymNull({ "B", "W" }, { B = 7, W = 25 }, 1, 1, math.huge)
+  check("sign-flip: at the edge, the balancing rate stays at most 1", ebase.B <= 1 and ebase.B > 0.999, true)
+  -- And no gap passes 1, even where the better templates could carry more
+  -- (one of 10 worse, five of 5 better): the worse template's rates then
+  -- run from 0 to 1, and the better ones carry 10 of their 25.
+  local wbase, wcand, wgap = sc.asymNull({ "W", "B1", "B2", "B3", "B4", "B5" },
+    { W = 10, B1 = 5, B2 = 5, B3 = 5, B4 = 5, B5 = 5 }, 1, 5, 2)
+  check("sign-flip: no gap passes 1", wgap == 1 and wbase.W == 0 and wcand.W == 1 and math.abs(wbase.B1 - 0.4) < 1e-12, true)
+  -- The size check's couplings. Disjoint, both models are wrong together as
+  -- rarely as their rates allow: at equal rates of 0.3 a savable differs
+  -- either way 30% of the time, and at 0.5 always; at 0.8 and 0.6 they must
+  -- overlap by 0.4, so it differs 40% one way and 20% the other.
+  -- Independent, at 0.3 it differs 21% each way.
+  local tally, ind, over = { [-1] = 0, [0] = 0, [1] = 0 }, { [-1] = 0, [0] = 0, [1] = 0 }, { [-1] = 0, [0] = 0, [1] = 0 }
+  local always = true
+  for i = 1, 1000 do
+    local u = (i - 0.5) / 1000
+    tally[sc.pairDiff(u, 0.3, 0.3)] = tally[sc.pairDiff(u, 0.3, 0.3)] + 1
+    ind[sc.pairDiff(u, 0.3, 0.3, true)] = ind[sc.pairDiff(u, 0.3, 0.3, true)] + 1
+    over[sc.pairDiff(u, 0.8, 0.6)] = over[sc.pairDiff(u, 0.8, 0.6)] + 1
+    if sc.pairDiff(u, 0.5, 0.5) == 0 then always = false end
+  end
+  check("sign-flip: disjoint, the size check's savables disagree as often as their rates allow",
+    tally[1] == 300 and tally[-1] == 300 and always and over[1] == 400 and over[-1] == 200, true)
+  check("sign-flip: independent, as often as chance makes them", ind[1] == 210 and ind[-1] == 210, true)
+  check("sign-flip: the size check counts only savable templates",
+    select(4, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)), 0)
+  check("sign-flip: with fewer than two savable templates, the diagnostic reads no null",
+    select(5, sc.nullSize(shape(1, 5), quick)) == nil
+      and select(5, sc.nullSize({ { template = "R", labels = { class = "runaway" } } }, quick)) == nil, true)
+  check("sign-flip: a set needs five savable templates for the beat to be reachable", sc.minBeatTemplates(), 5)
+  check("sign-flip: seven at 99% and four at 90%",
+    sc.minBeatTemplates({ confidence = 0.99 }) == 7 and sc.minBeatTemplates({ confidence = 0.9 }) == 4, true)
+  check("sign-flip: and a confidence outside (0, 1) is refused",
+    (pcall(sc.minBeatTemplates, { confidence = 1 })) or (pcall(sc.minBeatTemplates, { confidence = 0 })), false)
+  -- It reads the beat's own comparison: at 75%, two templates reach 1/4
+  -- exactly; just under a power of two, one more is needed.
+  check("sign-flip: the template floor agrees with the beat at a power of two",
+    sc.minBeatTemplates({ confidence = 0.75 }) == 2 and sc.minBeatTemplates({ confidence = 1 - 2 ^ -5 + 2 ^ -45 }) == 6, true)
+  -- A confidence whose floor passes the exact cap is refused, rather than
+  -- deciding a set the test would then refuse to count.
+  check("sign-flip: a floor above the cap is refused, and one at it is not",
+    (pcall(sc.minBeatTemplates, { confidence = 1 - 2 ^ -51 })) == false
+      and sc.minBeatTemplates({ confidence = 1 - 2 ^ -50 }) == 50, true)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----
@@ -2254,6 +2442,9 @@ do
   check("decidable: a passing gate exits 0", okPass and passStatus, 0)
   check("decidable: and its result file says the set could decide",
     pdoc ~= nil and pdoc.decisive == true and pdoc.pass == true and pdoc.minRunaways == 93, true)
+  check("decidable: and records the beat test's p-value and its templates",
+    pdoc ~= nil and type(pdoc.improvementP) == "number" and pdoc.improvementP <= 0.05 and pdoc.flipTemplates >= 5
+      and pdoc.savableTemplates == 10 and pdoc.minTemplates == 5, true)
   print = function() end
   local okFail, failStatus = pcall(sc.main, { "gate", "--dir", devDir, "--fit-dir", fitDir, "--candidate", "always-freeze" })
   -- The controls on a decidable set: 0 when they hold; 2 when the set is too
@@ -2265,10 +2456,52 @@ do
   sc.candidates["always-freeze"] = sc.candidates.oracle
   local okC1, c1 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.cfg.powerTarget, sc.candidates["always-freeze"] = savedTarget, savedFreeze
+  -- A beat test passing no-better candidates too often per template fails
+  -- the controls, at the lower-bound rule's edge. The share is the worse of
+  -- two couplings, so its bound is taken at 97.5% (Bonferroni): 30 of 400
+  -- (lower bound 5.12%) fails, 29 (4.91%) does not. The aggregate-only share
+  -- is reported and never fails them, however high: the test promises
+  -- nothing there.
+  local savedNull = sc.nullSize
+  sc.nullSize = function() return 400, 0, 400, 10 end
+  local okCS, cs = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = function() return 30, 0, 400, 10 end
+  local edgeShown = {}
+  print = function(...) edgeShown[#edgeShown + 1] = table.concat({ ... }, " ") end
+  local okCE, ce = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  print = function() end
+  sc.nullSize = function() return 29, 0, 400, 10 end
+  local okCB, cb = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  local shown = {}
+  print = function(...) shown[#shown + 1] = table.concat({ ... }, " ") end
+  sc.nullSize = function() return 0, 400, 400, 10, { m = 1, j = 9, gap = 0.15, of = 18 } end
+  local okCK, ck = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = function() return 0, 0, 400, 10, nil end
+  local okCN, cn = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
+  sc.nullSize = savedNull
   print = quiet3
+  local aggShown, notMeasured = false, false
+  for _, line in ipairs(shown) do
+    if line:find("in aggregate only, a diagnostic", 1, true) and line:find("400 of 400", 1, true)
+        and line:find("worst of its 18 nulls", 1, true) then aggShown = true end
+    if line:find("in aggregate only, a diagnostic: not measured", 1, true) then notMeasured = true end
+  end
   check("decidable: controls that hold exit 0", okC0 and c0, 0)
   check("decidable: an underpowered set exits 2", okC2 and c2, 2)
   check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
+  check("decidable: so does a beat test that passes no-better candidates per template", okCS and cs, 1)
+  check("decidable: at the rule's edge, 30 of 400 fails", okCE and ce, 1)
+  check("decidable: and its size line prints that bound, at the level the rule holds it", (function()
+    for _, line in ipairs(edgeShown) do
+      if line:find("in 30 of 400 null datasets", 1, true) and line:find("its lower bound 0.051 at 97.5%", 1, true) then
+        return true
+      end
+    end
+    return false
+  end)(), true)
+  check("decidable: and 29 of 400 does not", okCB and cb, 0)
+  check("decidable: an aggregate-only share is reported, and never fails the controls", okCK and ck == 0 and aggShown, true)
+  check("decidable: and without a null to read, the controls say so", okCN and cn == 0 and notMeasured, true)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")
   check("decidable: a failing gate exits 1", okFail and failStatus, 1)
   -- One runaway short of the floor, the same set decides nothing.
@@ -2279,7 +2512,77 @@ do
   end
   local gShort = sc.gate(short, sc.candidates.oracle(), baselines)
   check("decidable: one runaway under the floor, the oracle is not passed", gShort.decisive == false and gShort.pass == false, true)
+  check("decidable: and the gate says it needs more runaways",
+    sc.undecidableWhy(gShort):find("runaways", 1, true) ~= nil and sc.undecidableWhy(gShort):find("savable templates", 1, true) == nil, true)
+  local both = sc.undecidableWhy({ candidate = { nRunaway = 80 }, minRunaways = 93, savableTemplates = 4, minTemplates = 5 })
+  check("decidable: short of both floors, it names both", both:find("80 runaways", 1, true) ~= nil
+    and both:find("4 savable templates", 1, true) ~= nil, true)
+  -- So does a set with too few savable templates for the beat to be
+  -- reachable: four decide nothing, five do.
+  local function keepSavableTemplates(nKeep)
+    local tpls, seenT = {}, {}
+    for _, ep in ipairs(dev) do
+      if ep.labels.class == "savable" and not seenT[ep.template] then seenT[ep.template] = true; tpls[#tpls + 1] = ep.template end
+    end
+    table.sort(tpls)
+    local keep = {}
+    for i = 1, nKeep do keep[tpls[i]] = true end
+    local out = {}
+    for _, ep in ipairs(dev) do
+      if ep.labels.class ~= "savable" or keep[ep.template] then out[#out + 1] = ep end
+    end
+    return out
+  end
+  local g4 = sc.gate(keepSavableTemplates(4), sc.candidates.oracle(), baselines)
+  check("decidable: four savable templates decide nothing, and say why", g4.decisive == false and g4.savableTemplates == 4
+    and sc.undecidableWhy(g4):find("savable templates", 1, true) ~= nil, true)
+  check("decidable: five do", sc.gate(keepSavableTemplates(5), sc.candidates.oracle(), baselines).decisive, true)
   check("decidable: always-freeze fails it", sc.gate(dev, sc.candidates["always-freeze"](), baselines).pass, false)
+  -- A beat carried by three templates is no pass, though the bootstrap's
+  -- bound is above zero: this candidate decides as the oracle on the
+  -- savables of three templates where the best baseline freezes wrongly, and
+  -- as that baseline everywhere else.
+  do
+    local base, oracle = baselines[gO.bestBaseline], sc.candidates.oracle()
+    local baseScore = sc.score(dev, base)
+    local wrongIn, tpls = {}, {}
+    for _, ep in ipairs(dev) do
+      local pe = baseScore.perEpisode[ep.id]
+      if pe and pe.class == "savable" then
+        if wrongIn[ep.template] == nil then wrongIn[ep.template] = 0; tpls[#tpls + 1] = ep.template end
+        if pe.wrongful then wrongIn[ep.template] = wrongIn[ep.template] + 1 end
+      end
+    end
+    table.sort(tpls)
+    local function mixOn(n)
+      local chosen = {}
+      for _, t in ipairs(tpls) do if wrongIn[t] > 0 and #chosen < n then chosen[#chosen + 1] = t; chosen[t] = true end end
+      return #chosen, function(st, ep)
+        if chosen[ep.template] and ep.labels.class == "savable" then return oracle(st, ep) end
+        return base(st, ep)
+      end
+    end
+    local n3, mix3 = mixOn(3)
+    local g3 = sc.gate(dev, mix3, baselines)
+    check("decidable: a beat carried by three templates is no pass, though the bootstrap's bound is above zero",
+      n3 == 3 and (g3.improvementLower or 0) > 0 and g3.flipTemplates == 3 and g3.passBeat == false, true)
+    -- On a set that can decide, a candidate differing from the baseline on
+    -- only four templates fails rather than leaving the set undecided: a
+    -- tied template is no evidence of a beat.
+    local n4, mix4 = mixOn(4)
+    local g4m = sc.gate(dev, mix4, baselines)
+    check("decidable: a candidate differing on four templates of a decisive set fails, not undecided",
+      n4 == 4 and g4m.decisive == true and g4m.flipTemplates == 4 and g4m.pass == false, true)
+    local note = sc.beatOutOfReachWhy(g4m)
+    check("decidable: and the gate says why the beat was out of reach",
+      note ~= nil and note:find("on 4 savable templates", 1, true) ~= nil and sc.beatOutOfReachWhy(gO) == nil, true)
+    -- Only then: not on a set that cannot decide, not without a comparator,
+    -- and not when the candidate differs on exactly enough templates.
+    check("decidable: the note is for a decisive set short of templates only",
+      sc.beatOutOfReachWhy({ decisive = false, bestBaseline = "ttx", flipTemplates = 3, minTemplates = 5 }) == nil
+        and sc.beatOutOfReachWhy({ decisive = true, bestBaseline = nil, flipTemplates = 0, minTemplates = 5 }) == nil
+        and sc.beatOutOfReachWhy({ decisive = true, bestBaseline = "ttx", flipTemplates = 5, minTemplates = 5 }) == nil, true)
+  end
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)
   check("cli: the ttx candidate is the fitted baseline", sc.resolveCandidate("ttx", baselines) == baselines.ttx, true)

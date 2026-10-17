@@ -21,9 +21,34 @@
 --
 -- G7 passes when the miss rate's one-sided 95% Clopper-Pearson upper bound
 -- is at most 5% AND the candidate's wrongful-freeze rate beats the best
--- deterministic baseline that itself meets the miss bound: the one-sided
--- 95% lower bound of the paired improvement, bootstrapped by template, must
--- be above zero.
+-- deterministic baseline that itself meets the miss bound: the paired
+-- improvement's one-sided sign-flip p-value over templates must be at most
+-- 5%. Its null: the candidate's wrongful-freeze probability equals the
+-- baseline's on every template. A template's savables are independent
+-- episodes given the template, and each paired difference is -1, 0 or +1,
+-- so under that null each difference, and each template's sum, is
+-- symmetric about zero, and the test is exact (its flips counted in whole
+-- numbers, up to 50 differing templates; a set with more is refused). Four
+-- or fewer templates cannot pass at all, so a set needs five savable
+-- templates to decide. A pass rejects that null, from the templates' summed
+-- differences, and needs the observed pooled improvement to be positive; it
+-- does not establish a gain on every template (seven templates better and
+-- one worse can pass), nor a pooled gain beyond this set's templates. Under
+-- a null equal only in aggregate no test of this kind is exact, and this one
+-- is not conservative there, since a candidate steadily better on many
+-- templates and worse on a few noisy ones can pass more often than 5% (in a
+-- search, about 4 to 7% where templates hold 2 to 14 savables, far more
+-- beside one large template). `controls` holds the per-template size to 5%
+-- and reports the aggregate-only one at the set's shape as a diagnostic.
+-- The comparator is chosen on the evaluated set itself (the fewest wrongful
+-- freezes), which shrinks the measured improvement; the exactness argument
+-- is for a fixed comparator. A difference skewed within a template (all its
+-- savables worse together, rarely) needs savables that are not independent,
+-- which the generator does not produce, and a template the set lacks is its
+-- coverage to guard.
+-- The paired improvement's 95% lower bound, bootstrapped by template, is
+-- reported beside the test as a diagnostic only: with few templates it
+-- passes a no-better candidate more often than its nominal 5%.
 --
 -- Usage (from the repo root):
 --   lua eval/score-episodes.lua gate --dir <episodes> --fit-dir <dev episodes> \
@@ -55,6 +80,8 @@ M.cfg = {
   confidence   = 0.95,
   bootstrap    = 2000,
   bootSeed     = 20261015,
+  sizeDatasets = 400,    -- null datasets the controls' size check draws
+  sizeGaps     = { 0.08, 0.15, 0.3 }, -- the aggregate-only diagnostic's rate gaps on the worse templates
   noisyFlip    = 0.10,
   powerShare   = 0.50,   -- the power control's share of the oracle's improvement
   powerTarget  = 0.80,
@@ -244,8 +271,73 @@ function M.pairedLowerBound(pairs, cfg)
     stats[b] = meanOf(sample)
   end
   table.sort(stats)
-  local idx = math.max(1, math.floor((1 - cfg.confidence) * cfg.bootstrap))
-  return stats[idx], point
+  return stats[M.quantileIndex(cfg.confidence, cfg.bootstrap)], point
+end
+
+-- The order statistic a one-sided lower bound at conf reads among b sorted
+-- resamples: the floor of (1 - conf) * b, which float arithmetic can land a
+-- hair under (at 0.9, 0.1 * 2000 is 199.99...), so it is nudged up first.
+function M.quantileIndex(conf, b)
+  return math.max(1, math.floor((1 - conf) * b + 1e-9))
+end
+
+-- The sign-flip permutation test of the paired improvement, one-sided. Each
+-- paired difference is -1, 0 or +1 (baseline wrongful minus candidate
+-- wrongful on one savable), and anything else is refused. Under the null that
+-- the candidate's wrongful-freeze probability equals the baseline's on every
+-- template, each independent savable's difference is symmetric about zero,
+-- so each template's sum is as likely negative as positive, and the p-value
+-- is the share of sign flips (one sign per template, since a template's
+-- jittered copies share its structure: independent given the template, not
+-- of it) whose pooled sum is at least the observed one. The sums are whole
+-- numbers, so the flips' distribution is convolved exactly, in whole-number
+-- counts; up to M.flipTemplatesMax differing templates, every count and so
+-- every p-value is a double exactly, and a set with more is refused rather
+-- than rounded. A template summing to zero changes no flip's sum and is left
+-- out. With k templates the smallest p is 1/2^k, so four or fewer cannot
+-- reach 0.05. Under a null equal only in aggregate the test is neither exact
+-- nor conservative (see the header). Returns the p-value and k.
+M.flipTemplatesMax = 50
+function M.signFlipP(prs)
+  local byTpl, tpls = {}, {}
+  for _, pr in ipairs(prs) do
+    local d = type(pr.d) == "number" and math.tointeger(pr.d)
+    assert(d and d >= -1 and d <= 1, "a paired difference that is not -1, 0 or 1")
+    if byTpl[pr.template] == nil then byTpl[pr.template] = 0; tpls[#tpls + 1] = pr.template end
+    byTpl[pr.template] = byTpl[pr.template] + d
+  end
+  table.sort(tpls)
+  local sums, obs = {}, 0
+  for _, t in ipairs(tpls) do
+    if byTpl[t] ~= 0 then sums[#sums + 1] = byTpl[t]; obs = obs + byTpl[t] end
+  end
+  local k = #sums
+  if k == 0 then return 1, 0 end
+  assert(k <= M.flipTemplatesMax, string.format("%d templates differ; the beat test counts its flips exactly"
+    .. " only up to %d, so it refuses more rather than round its p-value", k, M.flipTemplatesMax))
+  -- ways[v]: how many of the 2^j flips of the first j sums reach v.
+  local ways = { [0] = 1 }
+  for j = 1, k do
+    local sj = sums[j]
+    local nxt = {}
+    for v, w in pairs(ways) do
+      nxt[v + sj] = (nxt[v + sj] or 0) + w
+      nxt[v - sj] = (nxt[v - sj] or 0) + w
+    end
+    ways = nxt
+  end
+  local ge = 0
+  for v, w in pairs(ways) do
+    if v >= obs then ge = ge + w end
+  end
+  return ge / (1 << k), k
+end
+
+-- Whether a beat test's p-value passes G7's beat: at most 1 - confidence.
+-- No p-value over M.flipTemplatesMax or fewer templates falls between 5% and
+-- the double 1 - 0.95, so at the default this is p <= 0.05 exactly.
+function M.beatPasses(p, cfg)
+  return p ~= nil and p <= 1 - (cfg or M.cfg).confidence
 end
 
 ------------------------------------------------------------------------------
@@ -786,7 +878,9 @@ function M.compare(cand, base, cfg)
       prs[#prs + 1] = { template = ce.template, d = (be.wrongful and 1 or 0) - (ce.wrongful and 1 or 0) }
     end
   end
-  return M.pairedLowerBound(prs, cfg)
+  local lower, point = M.pairedLowerBound(prs, cfg)
+  local p, k = M.signFlipP(prs)
+  return lower, point, p, k
 end
 
 -- The fewest runaways a set must hold for G7 to decide on it: enough that a
@@ -820,6 +914,21 @@ function M.decisiveRunaways(cfg)
   return hi
 end
 
+-- The fewest savable templates a set must hold for the beat test to be
+-- reachable at all: with k templates its smallest p is 1/2^k, so the set
+-- needs the first k at which that p passes the beat (5 at 95%, 7 at 99%).
+-- The comparison is the beat's own, so the two agree at every confidence.
+function M.minBeatTemplates(cfg)
+  cfg = cfg or M.cfg
+  local conf = cfg.confidence
+  assert(type(conf) == "number" and conf > 0 and conf < 1, "the confidence must be between 0 and 1")
+  local k = 0
+  while k <= M.flipTemplatesMax and not M.beatPasses(2 ^ -k, cfg) do k = k + 1 end
+  assert(k <= M.flipTemplatesMax, string.format("at this confidence the beat needs more than the %d templates"
+    .. " its test counts exactly", M.flipTemplatesMax))
+  return k
+end
+
 function M.gate(episodes, candDecide, baselines, cfg)
   cfg = cfg or M.cfg
   local cand = M.score(episodes, candDecide, cfg)
@@ -839,18 +948,26 @@ function M.gate(episodes, candDecide, baselines, cfg)
       best, bestName = b, name
     end
   end
-  local lower, point = nil, nil
-  if best then lower, point = M.compare(cand, best, cfg) end
+  local lower, point, p, flipTemplates = nil, nil, nil, 0
+  if best then lower, point, p, flipTemplates = M.compare(cand, best, cfg) end
   local passMiss = cand.missUpper <= cfg.missBound
-  local passBeat = (lower ~= nil) and lower > 0
+  -- The beat is the sign-flip test's; the bootstrap's bound is reported
+  -- beside it, a diagnostic (see the header).
+  local passBeat = M.beatPasses(p, cfg)
   -- A set too small to let a one-miss baseline qualify decides nothing: it
-  -- neither passes nor fails a candidate.
-  local minRunaways = M.decisiveRunaways(cfg)
-  local decisive = cand.nRunaway >= minRunaways
+  -- neither passes nor fails a candidate. Neither does one with too few
+  -- savable templates for the beat to be reachable.
+  local minRunaways, minTemplates = M.decisiveRunaways(cfg), M.minBeatTemplates(cfg)
+  local savTpl, savableTemplates = {}, 0
+  for _, pe in pairs(cand.perEpisode) do
+    if pe.class == "savable" and not savTpl[pe.template] then savTpl[pe.template] = true; savableTemplates = savableTemplates + 1 end
+  end
+  local decisive = cand.nRunaway >= minRunaways and savableTemplates >= minTemplates
   return {
     candidate = cand, bestBaseline = bestName, baselines = baseScores,
-    improvementLower = lower, improvementPoint = point,
+    improvementLower = lower, improvementPoint = point, improvementP = p, flipTemplates = flipTemplates,
     passMiss = passMiss, passBeat = passBeat, decisive = decisive, minRunaways = minRunaways,
+    savableTemplates = savableTemplates, minTemplates = minTemplates,
     pass = decisive and passMiss and passBeat,
   }
 end
@@ -924,6 +1041,142 @@ function M.powerControl(eps, baselines, bestName, trials, cfg)
     if M.gate(eps, mix, baselines, cfg).pass then passes = passes + 1 end
   end
   return passes
+end
+
+-- An aggregate-only null at a set's shape, the kind the beat test is not
+-- exact under: the candidate is worse on the m templates with the most
+-- savables, the noisiest (rates b and b + gap, b = 0.5 - gap / 2), and
+-- steadily better on the next j (rates a and 0), a chosen so the expected
+-- wrongful freezes match in aggregate; any other template shows no
+-- difference. A gap the better templates cannot carry (a above 1) shrinks to
+-- the largest they can, and no gap passes 1. Returns the baseline's and the
+-- candidate's rate per template, and the gap used.
+function M.asymNull(tpls, count, m, j, gap)
+  local order = {}
+  for i, t in ipairs(tpls) do order[i] = t end
+  table.sort(order, function(x, y)
+    if count[x] ~= count[y] then return count[x] > count[y] end
+    return x < y
+  end)
+  local nWorse, nBetter = 0, 0
+  for i = 1, m do nWorse = nWorse + count[order[i]] end
+  for i = m + 1, m + j do nBetter = nBetter + count[order[i]] end
+  gap = math.min(gap, 1, nBetter / nWorse)
+  local a = math.min(1.0, nWorse * gap / nBetter) -- at the cap, float error can land a hair above 1
+  local base, cand = {}, {}
+  for _, t in ipairs(tpls) do base[t], cand[t] = 0, 0 end
+  for i = 1, m do base[order[i]], cand[order[i]] = 0.5 - gap / 2, 0.5 + gap / 2 end
+  for i = m + 1, m + j do base[order[i]] = a end
+  return base, cand, gap
+end
+
+-- One savable's paired difference (the baseline's wrongful freeze minus the
+-- candidate's) at the two models' rates, from one uniform draw u. Coupled
+-- disjoint, both are wrong as rarely as the rates allow; independent, as
+-- often as chance makes them (M.nullSize draws under both).
+function M.pairDiff(u, pb, pc, independent)
+  local both = independent and pb * pc or math.max(0, pb + pc - 1)
+  local up, down = pb - both, pc - both -- P(+1), P(-1)
+  return u < up and 1 or (u < up + down and -1 or 0)
+end
+
+-- The beat test's size at a set's shape: no-better candidates pass it in
+-- what share of cfg.sizeDatasets null datasets. As the generator draws
+-- them, a template's savables are independent episodes given the template.
+-- On each savable the two models' wrongful freezes are drawn jointly
+-- (M.pairDiff). Two measurements:
+--   per template, the beat's guarantee: the candidate's rate equals the
+--     baseline's on every template, both drawn per template in [0.05,
+--     0.95], so each paired difference, and each template's sum, is
+--     symmetric about zero: the test is exact here. Its share is the worse
+--     of two couplings, disjoint (the fewest templates sum to zero, the
+--     harder at the shapes measured) and independent (the harder with very
+--     few savables per template);
+--   in aggregate only, a diagnostic: the worst pass share over a grid of
+--     M.asymNull's nulls (one to three worse templates, the rest or half of
+--     them better, the gaps of cfg.sizeGaps scaled down together where the
+--     shape cannot carry the largest), where the test is not exact.
+-- Returns the per-template passes, the aggregate diagnostic's worst passes,
+-- the datasets, the savable templates, and that worst null ({ m, j, gap,
+-- of = the nulls read }, or nil when the set has fewer than two templates or
+-- cfg.sizeGaps is empty).
+function M.nullSize(eps, cfg)
+  cfg = cfg or M.cfg
+  local count, tpls = {}, {}
+  for _, ep in ipairs(eps) do
+    if ep.labels.class == "savable" then
+      if not count[ep.template] then count[ep.template] = 0; tpls[#tpls + 1] = ep.template end
+      count[ep.template] = count[ep.template] + 1
+    end
+  end
+  table.sort(tpls)
+  local function passOnce(r, base, cand, independent)
+    local prs = {}
+    for _, t in ipairs(tpls) do
+      for _ = 1, count[t] do prs[#prs + 1] = { template = t, d = M.pairDiff(r(), base[t], cand[t], independent) } end
+    end
+    return M.beatPasses(M.signFlipP(prs), cfg)
+  end
+  local perPasses = 0
+  for i, independent in ipairs({ false, true }) do
+    local r, n = rng(cfg.bootSeed + 2 * i - 1), 0
+    for _ = 1, cfg.sizeDatasets do
+      local rates = {}
+      for _, t in ipairs(tpls) do rates[t] = 0.05 + 0.9 * r() end
+      if passOnce(r, rates, rates, independent) then n = n + 1 end
+    end
+    perPasses = math.max(perPasses, n)
+  end
+  local ra = rng(cfg.bootSeed + 2)
+  local aggPasses, worst, read = 0, nil, 0
+  local largest = #cfg.sizeGaps > 0 and math.max(table.unpack(cfg.sizeGaps)) or 0
+  for m = 1, largest > 0 and math.min(3, #tpls - 1) or 0 do
+    local rest = #tpls - m
+    local js = { rest }
+    local half = math.max(1, math.ceil(rest / 2))
+    if half ~= rest then js[2] = half end
+    for _, j in ipairs(js) do
+      -- The largest gap this split can carry scales the grid, so a shape
+      -- whose largest template outweighs the rest still gets its nulls.
+      local _, _, room = M.asymNull(tpls, count, m, j, math.huge)
+      local scale = math.min(1, room / largest)
+      for _, g in ipairs(cfg.sizeGaps) do
+        local base, cand, gap = M.asymNull(tpls, count, m, j, g * scale)
+        local n = 0
+        for _ = 1, cfg.sizeDatasets do
+          if passOnce(ra, base, cand, false) then n = n + 1 end
+        end
+        read = read + 1
+        if worst == nil or n > aggPasses then aggPasses, worst = n, { m = m, j = j, gap = gap } end
+      end
+    end
+  end
+  if worst then worst.of = read end
+  return perPasses, aggPasses, cfg.sizeDatasets, #tpls, worst
+end
+
+-- On a set that can decide, why the beat was out of reach for this
+-- candidate, or nil: it differed from the comparator on too few templates.
+function M.beatOutOfReachWhy(g)
+  if g.decisive and g.bestBaseline and g.flipTemplates < g.minTemplates then
+    return string.format("the candidate differs from %s on %d savable templates; the beat test can pass only on %d"
+      .. " or more (a tied template is no evidence of a beat)", g.bestBaseline, g.flipTemplates, g.minTemplates)
+  end
+end
+
+-- Why a gate's set decides nothing, for the operator.
+function M.undecidableWhy(g)
+  local why = {}
+  if g.candidate.nRunaway < g.minRunaways then
+    why[#why + 1] = string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a"
+      .. " baseline missing one can be the comparator: generate more episodes per template", g.candidate.nRunaway,
+      g.minRunaways)
+  end
+  if g.savableTemplates < g.minTemplates then
+    why[#why + 1] = string.format("this set holds %d savable templates; the beat test can pass only on %d or more"
+      .. " (its smallest p over k templates is 1/2^k): add savable templates", g.savableTemplates, g.minTemplates)
+  end
+  return table.concat(why, "; also ")
 end
 
 -- What a decisions file holds: rows the runner recorded as invalid replies
@@ -1140,13 +1393,14 @@ function M.main(argv)
           #pw.uncovered > 0 and ("  (not covered: " .. table.concat(pw.uncovered, ",") .. ")") or ""))
       end
     end
-    print(string.format("best baseline: %s  paired improvement point %.3f lower95 %s  ->  G7 %s",
-      tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
+    print(string.format("best baseline: %s  paired improvement point %.3f  sign-flip p %s over %d templates"
+      .. "  (bootstrap lower95 %s, a diagnostic)  ->  G7 %s",
+      tostring(g.bestBaseline), g.improvementPoint or 0, g.improvementP and string.format("%.4f", g.improvementP) or "n/a",
+      g.flipTemplates or 0, g.improvementLower and string.format("%.3f", g.improvementLower) or "n/a",
       (not g.decisive) and "UNDECIDABLE" or g.pass and "PASS" or "FAIL"))
-    if not g.decisive then
-      print(string.format("this set holds %d runaways; G7 decides only on one with %d or more, so that a baseline"
-        .. " missing one can be the comparator: generate more episodes per template", g.candidate.nRunaway, g.minRunaways))
-    end
+    if not g.decisive then print(M.undecidableWhy(g)) end
+    local outOfReach = M.beatOutOfReachWhy(g)
+    if outOfReach then print(outOfReach) end
     -- 0 pass, 1 fail, 2 a set too small to decide.
     status = (not g.decisive) and 2 or g.pass and 0 or 1
     print("tree baseline (fit on " .. (a.fitDir or a.dir) .. "):\n" .. M.describeTree(tree, "  "))
@@ -1162,9 +1416,11 @@ function M.main(argv)
         local f = assert(io.open(partial, "w"))
         assert(f:write(assert(lfm.jsonEncode({ candidate = name, pass = g.pass, passMiss = g.passMiss, passBeat = g.passBeat,
           bestBaseline = g.bestBaseline, improvementLower = g.improvementLower, improvementPoint = g.improvementPoint,
+          improvementP = g.improvementP, flipTemplates = g.flipTemplates,
           missUpper = g.candidate.missUpper, missRate = g.candidate.missRate, wrongfulRate = g.candidate.wrongfulRate,
           nRunaway = g.candidate.nRunaway, nSavable = g.candidate.nSavable, nLate = g.candidate.nLate,
-          decisive = g.decisive, minRunaways = g.minRunaways })), "\n"))
+          decisive = g.decisive, minRunaways = g.minRunaways, savableTemplates = g.savableTemplates,
+          minTemplates = g.minTemplates })), "\n"))
         assert(f:close())
         assert(os.rename(partial, a.out))
       end)
@@ -1194,8 +1450,7 @@ function M.main(argv)
     -- and says so first: the gate passes nothing on it, so neither control is
     -- read.
     if not gO.decisive then
-      print(string.format("UNDECIDABLE: this set holds %d runaways, under the %d G7 decides on, so the controls"
-        .. " are not read: generate more episodes per template", gO.candidate.nRunaway, gO.minRunaways))
+      print("UNDECIDABLE: " .. M.undecidableWhy(gO) .. "; the controls are not read")
       status = 2
     elseif not gO.bestBaseline then
       print("UNDECIDABLE: no baseline meets the miss bound on this set, so the gate compares against nothing"
@@ -1215,6 +1470,32 @@ function M.main(argv)
         M.cfg.powerShare * 100, gO.bestBaseline, passes, trials, M.cfg.powerTarget * 100,
         powered and "ok" or "UNDERPOWERED"))
       if not powered and status == 0 then status = 2 end
+      -- The beat test's size at this set's shape (see M.nullSize). Per
+      -- template, its guarantee: a share whose lower bound is above
+      -- 1 - confidence is a test passing no-better candidates too often, a
+      -- failed control. In aggregate only, a diagnostic: reported, never a
+      -- failure, since the test makes no promise there.
+      local perPasses, aggPasses, sizeN, sizeTpls, worst = M.nullSize(eps)
+      local alpha = 1 - M.cfg.confidence
+      -- The per-template share is the worse of two couplings' measurements, so
+      -- its lower bound is taken at 1 - alpha / 2 (a Bonferroni split): a valid
+      -- test then fails this control at most alpha of the time.
+      local lowerShare = 1 - M.cpUpper(sizeN - perPasses, sizeN, 1 - alpha / 2)
+      print(string.format("size: candidates whose rate equals the best baseline's on every template passed the beat"
+        .. " test in %d of %d null datasets shaped like this set (%d savable templates; the worse of two couplings):"
+        .. " %.3f, its lower bound %.3f at %.1f%%, at most %.3f expected: %s", perPasses, sizeN, sizeTpls,
+        perPasses / sizeN, lowerShare, 100 * (1 - alpha / 2), alpha,
+        lowerShare > alpha and "FAILED (anti-conservative)" or "ok"))
+      if lowerShare > alpha then status = 1 end
+      if worst then
+        print(string.format("size in aggregate only, a diagnostic (the beat promises nothing there): the worst of its"
+          .. " %d nulls, a candidate wrongly freezing %.3f more often on the %d largest templates and steadily better"
+          .. " on %d others, passed %d of %d: %.3f", worst.of or 0, worst.gap, worst.m, worst.j, aggPasses, sizeN,
+          aggPasses / sizeN))
+      else
+        print("size in aggregate only, a diagnostic: not measured (fewer than two savable templates, or no gaps"
+          .. " configured)")
+      end
     end
   else
     error(USAGE, 0)

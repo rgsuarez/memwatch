@@ -1483,7 +1483,8 @@ function M.main(argv)
       local lowerShare = 1 - M.cpUpper(sizeN - perPasses, sizeN, 1 - alpha / 2)
       print(string.format("size: candidates whose rate equals the best baseline's on every template passed the beat"
         .. " test in %d of %d null datasets shaped like this set (%d savable templates; the worse of two couplings):"
-        .. " %.3f, at most %.3f expected: %s", perPasses, sizeN, sizeTpls, perPasses / sizeN, alpha,
+        .. " %.3f, its lower bound %.3f at %.1f%%, at most %.3f expected: %s", perPasses, sizeN, sizeTpls,
+        perPasses / sizeN, lowerShare, 100 * (1 - alpha / 2), alpha,
         lowerShare > alpha and "FAILED (anti-conservative)" or "ok"))
       if lowerShare > alpha then status = 1 end
       if worst then

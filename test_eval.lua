@@ -251,9 +251,10 @@ do
     end
     return eps
   end
-  -- Held to the controls' own rule: the share's one-sided lower bound.
+  -- Held to the controls' own rule: the share's one-sided lower bound, at
+  -- 97.5% since the share is the worse of two couplings.
   local quick = setmetatable({ sizeDatasets = 200 }, { __index = sc.cfg })
-  local function sizeOk(passes, n) return 1 - sc.cpUpper(n - passes, n) <= 0.05 end
+  local function sizeOk(passes, n) return 1 - sc.cpUpper(n - passes, n, 1 - (1 - sc.cfg.confidence) / 2) <= 0.05 end
   local sp, _, sn, st = sc.nullSize(shape(17, 5), quick)
   check("sign-flip: at sealed's shape, its size per template is within 5%", st == 17 and sizeOk(sp, sn), true)
   local dp, _, dn, dt = sc.nullSize(shape(10, 10), quick)

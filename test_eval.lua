@@ -2424,15 +2424,17 @@ do
   local okC1, c1 = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   sc.cfg.powerTarget, sc.candidates["always-freeze"] = savedTarget, savedFreeze
   -- A beat test passing no-better candidates too often per template fails
-  -- the controls, at the lower-bound rule's edge: 28 of 400 (lower bound
-  -- 5.02%) fails, 27 (4.81%) does not. The aggregate-only share is reported
-  -- and never fails them, however high: the test promises nothing there.
+  -- the controls, at the lower-bound rule's edge. The share is the worse of
+  -- two couplings, so its bound is taken at 97.5% (Bonferroni): 30 of 400
+  -- (lower bound 5.12%) fails, 29 (4.91%) does not. The aggregate-only share
+  -- is reported and never fails them, however high: the test promises
+  -- nothing there.
   local savedNull = sc.nullSize
   sc.nullSize = function() return 400, 0, 400, 10 end
   local okCS, cs = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
-  sc.nullSize = function() return 28, 0, 400, 10 end
+  sc.nullSize = function() return 30, 0, 400, 10 end
   local okCE, ce = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
-  sc.nullSize = function() return 27, 0, 400, 10 end
+  sc.nullSize = function() return 29, 0, 400, 10 end
   local okCB, cb = pcall(sc.main, { "controls", "--dir", devDir, "--fit-dir", fitDir })
   local shown = {}
   print = function(...) shown[#shown + 1] = table.concat({ ... }, " ") end
@@ -2452,8 +2454,8 @@ do
   check("decidable: an underpowered set exits 2", okC2 and c2, 2)
   check("decidable: a failed control exits 1, even on an underpowered set", okC1 and c1, 1)
   check("decidable: so does a beat test that passes no-better candidates per template", okCS and cs, 1)
-  check("decidable: at the rule's edge, 28 of 400 fails", okCE and ce, 1)
-  check("decidable: and 27 of 400 does not", okCB and cb, 0)
+  check("decidable: at the rule's edge, 30 of 400 fails", okCE and ce, 1)
+  check("decidable: and 29 of 400 does not", okCB and cb, 0)
   check("decidable: an aggregate-only share is reported, and never fails the controls", okCK and ck == 0 and aggShown, true)
   check("decidable: and without a null to read, the controls say so", okCN and cn == 0 and notMeasured, true)
   os.execute("rm -rf '" .. devDir .. "' '" .. fitDir .. "'")

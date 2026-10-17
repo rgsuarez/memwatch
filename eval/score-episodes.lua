@@ -1473,7 +1473,10 @@ function M.main(argv)
       -- failure, since the test makes no promise there.
       local perPasses, aggPasses, sizeN, sizeTpls, worst = M.nullSize(eps)
       local alpha = 1 - M.cfg.confidence
-      local lowerShare = 1 - M.cpUpper(sizeN - perPasses, sizeN)
+      -- The per-template share is the worse of two couplings' measurements, so
+      -- its lower bound is taken at 1 - alpha / 2 (a Bonferroni split): a valid
+      -- test then fails this control at most alpha of the time.
+      local lowerShare = 1 - M.cpUpper(sizeN - perPasses, sizeN, 1 - alpha / 2)
       print(string.format("size: candidates whose rate equals the best baseline's on every template passed the beat"
         .. " test in %d of %d null datasets shaped like this set (%d savable templates; the worse of two couplings):"
         .. " %.3f, at most %.3f expected: %s", perPasses, sizeN, sizeTpls, perPasses / sizeN, alpha,

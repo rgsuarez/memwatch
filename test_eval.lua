@@ -356,11 +356,17 @@ do
   check("sign-flip: a set needs five savable templates for the beat to be reachable", sc.minBeatTemplates(), 5)
   check("sign-flip: seven at 99% and four at 90%",
     sc.minBeatTemplates({ confidence = 0.99 }) == 7 and sc.minBeatTemplates({ confidence = 0.9 }) == 4, true)
-  check("sign-flip: and a confidence outside (0, 1) is refused", (pcall(sc.minBeatTemplates, { confidence = 1 })), false)
+  check("sign-flip: and a confidence outside (0, 1) is refused",
+    (pcall(sc.minBeatTemplates, { confidence = 1 })) or (pcall(sc.minBeatTemplates, { confidence = 0 })), false)
   -- It reads the beat's own comparison: at 75%, two templates reach 1/4
   -- exactly; just under a power of two, one more is needed.
   check("sign-flip: the template floor agrees with the beat at a power of two",
     sc.minBeatTemplates({ confidence = 0.75 }) == 2 and sc.minBeatTemplates({ confidence = 1 - 2 ^ -5 + 2 ^ -45 }) == 6, true)
+  -- A confidence whose floor passes the exact cap is refused, rather than
+  -- deciding a set the test would then refuse to count.
+  check("sign-flip: a floor above the cap is refused, and one at it is not",
+    (pcall(sc.minBeatTemplates, { confidence = 1 - 2 ^ -51 })) == false
+      and sc.minBeatTemplates({ confidence = 1 - 2 ^ -50 }) == 50, true)
 end
 
 -- ---- tree baseline: fits a separable toy set exactly ----
@@ -2555,6 +2561,12 @@ do
     local note = sc.beatOutOfReachWhy(g4m)
     check("decidable: and the gate says why the beat was out of reach",
       note ~= nil and note:find("on 4 savable templates", 1, true) ~= nil and sc.beatOutOfReachWhy(gO) == nil, true)
+    -- Only then: not on a set that cannot decide, not without a comparator,
+    -- and not when the candidate differs on exactly enough templates.
+    check("decidable: the note is for a decisive set short of templates only",
+      sc.beatOutOfReachWhy({ decisive = false, bestBaseline = "ttx", flipTemplates = 3, minTemplates = 5 }) == nil
+        and sc.beatOutOfReachWhy({ decisive = true, bestBaseline = nil, flipTemplates = 0, minTemplates = 5 }) == nil
+        and sc.beatOutOfReachWhy({ decisive = true, bestBaseline = "ttx", flipTemplates = 5, minTemplates = 5 }) == nil, true)
   end
   check("decidable: the power control passes at its target",
     sc.powerControl(dev, baselines, gO.bestBaseline, 10) / 10 >= sc.cfg.powerTarget, true)

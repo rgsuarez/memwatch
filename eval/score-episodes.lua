@@ -922,7 +922,9 @@ function M.minBeatTemplates(cfg)
   local conf = cfg.confidence
   assert(type(conf) == "number" and conf > 0 and conf < 1, "the confidence must be between 0 and 1")
   local k = 0
-  while not M.beatPasses(2 ^ -k, cfg) do k = k + 1 end
+  while k <= M.flipTemplatesMax and not M.beatPasses(2 ^ -k, cfg) do k = k + 1 end
+  assert(k <= M.flipTemplatesMax, string.format("at this confidence the beat needs more than the %d templates"
+    .. " its test counts exactly", M.flipTemplatesMax))
   return k
 end
 
